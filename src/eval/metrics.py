@@ -190,3 +190,71 @@ def subgroup_panel(p: np.ndarray, y: np.ndarray, groups: dict[str, np.ndarray]) 
                     cell["ece"] = expected_calibration_error(p[m], y[m])
                 result[attr][str(cat)] = cell
     return result
+
+
+# -------------------------------------------------------------------- competing-risk calib
+def cr_d_calibration(cif: np.ndarray, events: np.ndarray,
+                     event_times: np.ndarray, n_bins: int = 10) -> dict:
+    """D-calibration for competing-risks models (arXiv:2602.00194).
+
+    cif:    [N, K, H]  cause-specific CIF evaluated at observed event times
+    events: [N]        event type (0..K-1)
+    event_times: [N]   observed event time bin indices (0..H-1)
+    n_bins: number of bins for the uniformity test in [0,1]
+
+    Returns D-calib p-value (chi-squared) and per-bin histogram."""
+    K = cif.shape[1]
+    probs = cif[np.arange(len(events)), events, event_times]
+    probs = probs[np.isfinite(probs) & (probs > 0) & (probs < 1)]
+    if len(probs) < n_bins:
+        return {"d_calib_p": float("nan"), "d_calib_bins": [], "n": 0}
+
+    edges = np.linspace(0, 1, n_bins + 1)
+    hist, _ = np.histogram(probs, bins=edges)
+    expected = np.full(n_bins, len(probs) / n_bins)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        chi2 = np.sum((hist - expected) ** 2 / expected)
+    from scipy.stats import chi2 as chi2_dist
+    p = float(chi2_dist.sf(chi2, n_bins - 1))
+    return {
+        "d_calib_p": p,
+        "d_calib_bins": hist.tolist(),
+        "d_calib_chi2": float(chi2),
+        "n": int(len(probs)),
+    }
+
+
+def aj_k_calibration(cif: np.ndarray, events: np.ndarray,
+                     event_times: np.ndarray, time_horizon: int) -> dict:
+    """Aalen-Johansen K-calibration: for each cause k, group predicted CIF into
+    deciles and compare mean predicted vs observed. Returns per-cause slope."""
+    K = cif.shape[1]
+    results = {}
+    for k in range(K):
+        mask = events == k
+        if mask.sum() < 20:
+            continue
+        p = cif[mask, k, event_times[mask]]
+        y = np.ones_like(p)
+        finite = np.isfinite(p)
+        p, y = p[finite], y[finite]
+        if len(np.unique(p)) < 3:
+            continue
+        dec = np.percentile(p, np.linspace(10, 100, 10))
+        preds, obss = [], []
+        for i in range(10):
+            lo = dec[i - 1] if i > 0 else 0
+            hi = dec[i]
+            in_bucket = (p > lo) & (p <= hi)
+            if in_bucket.sum() >= 5:
+                preds.append(p[in_bucket].mean())
+                obss.append(y[in_bucket].mean())
+        if len(preds) < 3:
+            continue
+        slope, _ = np.polyfit(preds, obss, 1) if len(preds) >= 2 else (float("nan"), float("nan"))
+        results[k] = {
+            "aj_k_slope": float(slope),
+            "n_deciles": len(preds),
+            "n": int(mask.sum()),
+        }
+    return results
