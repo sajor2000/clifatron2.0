@@ -1,0 +1,268 @@
+# GPT2 Training Configuration
+# Hyperparameters optimized for clinical narrative generation
+
+# Global Settings
+vocab_size: 1380  # 1,375 clinical tokens + 5 special tokens
+max_length: 8192  # Extended context window (default GPT2 is 1024)
+val_fraction: 0.1  # Validation fraction (random split mode only)
+test_fraction: 0.1  # Test fraction (random split mode only)
+seed: 42
+
+# Data Processing
+enable_packing: true  # Pack multiple hospitalizations into sequences
+pack_to_max_length: 8192  # Pack sequences to full context window
+repeat_short_sequences: true  # Repeat short sequences to fill remainder
+
+# Logging Configuration
+logging_steps: 10
+eval_steps: 100
+save_steps: 100
+save_total_limit: 1
+prediction_loss_only: true  # Only compute loss - perplexity = exp(eval_loss)
+
+# Weights & Biases
+wandb_project: "CLIFATRON"
+wandb_entity: null  # Set to your W&B entity name if needed
+run_name: null  # Auto-generated if null
+
+# Model-Specific Configurations
+models:
+  # GPT2-nano (12M parameters)
+  # 4 layers, 256 hidden size, 4 attention heads
+  # Memory: ~2-3 GB per GPU with gradient checkpointing
+  nano:
+    num_epochs: 25
+    batch_size: 24  # Per device batch size
+    per_device_eval_batch_size: 16  # Smaller to avoid OOM during eval
+    gradient_accumulation_steps: 4  # Effective batch = 24 * 4 * 2 = 192
+    learning_rate: 6.0e-4  # Higher for smaller model
+    weight_decay: 0.1
+    warmup_steps: 500
+    lr_scheduler: "cosine"
+    max_grad_norm: 1.0
+
+    # Notes:
+    # - Effective batch size: 192 (24 * 4 * 2 GPUs)
+    # - Training time (2x L40): ~12-24 hours for 25 epochs
+    # - Memory efficient: fits on 1x 8GB GPU, CPU training possible
+
+  # GPT2-micro (25M parameters)
+  # 6 layers, 384 hidden size, 6 attention heads
+  # Memory: ~3-4 GB per GPU with gradient checkpointing
+  micro:
+    num_epochs: 20
+    batch_size: 16  # Per device batch size
+    per_device_eval_batch_size: 12  # Smaller to avoid OOM during eval
+    gradient_accumulation_steps: 6  # Effective batch = 16 * 6 * 2 = 192
+    learning_rate: 5.0e-4  # Higher for smaller model
+    weight_decay: 0.1
+    warmup_steps: 1000
+    lr_scheduler: "cosine"
+    max_grad_norm: 1.0
+
+    # Notes:
+    # - Effective batch size: 192 (16 * 6 * 2 GPUs)
+    # - Training time (2x L40): ~18-36 hours for 20 epochs
+    # - Memory efficient: fits comfortably on 1x 8GB GPU
+
+  # GPT2-tiny (45M parameters)
+  # 8 layers, 512 hidden size, 8 attention heads
+  # Memory: ~4-6 GB per GPU with gradient checkpointing
+  tiny:
+    num_epochs: 25
+    batch_size: 12  # Per device batch size
+    per_device_eval_batch_size: 8  # Smaller to avoid OOM during eval
+    gradient_accumulation_steps: 8  # Effective batch = 12 * 8 * 2 = 192
+    learning_rate: 4.0e-4  # Higher for smaller model
+    weight_decay: 0.1
+    warmup_steps: 1500
+    lr_scheduler: "cosine"
+    max_grad_norm: 1.0
+
+    # Notes:
+    # - Effective batch size: 192 (12 * 8 * 2 GPUs)
+    # - Training time (2x L40): ~1-1.5 days for 15 epochs
+    # - Memory efficient: fits comfortably on 1x 8GB or 1x 16GB GPU
+
+  # GPT2-small (124M parameters)
+  # 12 layers, 768 hidden size, 12 attention heads
+  # Memory: ~6-8 GB per GPU with gradient checkpointing
+  small:
+    num_epochs: 11
+    batch_size: 8  # Per device batch size
+    per_device_eval_batch_size: 6  # Smaller to avoid OOM during eval
+    gradient_accumulation_steps: 12  # Effective batch = 8 * 12 * 2 = 192
+    learning_rate: 3.0e-4  # Standard GPT2 learning rate
+    weight_decay: 0.1
+    warmup_steps: 2000
+    lr_scheduler: "cosine"
+    max_grad_norm: 1.0
+
+    # Notes:
+    # - Effective batch size: 192 (8 * 12 * 2 GPUs)
+    # - Training time (2x L40): ~1-2 days for 4 epochs
+    # - Memory efficient: fits comfortably on 2x 16GB GPUs
+
+  # GPT2-medium (355M parameters)
+  # 24 layers, 1024 hidden size, 16 attention heads
+  # Memory: ~10-12 GB per GPU with gradient checkpointing
+  medium:
+    num_epochs: 3
+    batch_size: 6  # Per device batch size
+    per_device_eval_batch_size: 4  # Smaller to avoid OOM during eval
+    gradient_accumulation_steps: 16  # Effective batch = 6 * 16 * 2 = 192
+    learning_rate: 2.5e-4  # Slightly lower for larger model
+    weight_decay: 0.1
+    warmup_steps: 2000
+    lr_scheduler: "cosine"
+    max_grad_norm: 1.0
+
+    # Notes:
+    # - Effective batch size: 192 (6 * 16 * 2 GPUs)
+    # - Training time (2x L40): ~2-3 days for 3 epochs
+    # - Requires 2x GPUs with 16GB+ VRAM each
+
+# Training Optimization Settings
+optimization:
+  # Mixed Precision
+  bf16: true  # Auto-detected based on GPU (BF16 for compute capability >= 8.0)
+  fp16: false  # Fallback for older GPUs
+
+  # Memory Optimization
+  gradient_checkpointing: true  # Trade 10-20% speed for 30-50% memory savings
+  gradient_checkpointing_kwargs:
+    use_reentrant: false  # Recommended for modern PyTorch
+
+  # Optimizer Settings
+  optim: "adamw_torch"  # Standard AdamW optimizer
+  adam_beta1: 0.9
+  adam_beta2: 0.95  # Slightly lower beta2 for better stability
+  adam_epsilon: 1.0e-8
+
+  # Gradient Clipping
+  max_grad_norm: 1.0  # Clip gradients to prevent exploding gradients
+
+# Checkpointing Strategy
+checkpointing:
+  save_strategy: "steps"
+  save_steps: 100
+  save_total_limit: 3  # Keep only last 3 checkpoints
+  load_best_model_at_end: true
+  metric_for_best_model: "eval_loss"
+  greater_is_better: false
+
+# Evaluation Strategy
+evaluation:
+  eval_strategy: "steps"
+  eval_steps: 100
+  per_device_eval_batch_size: null  # Set per model (see models section)
+  eval_accumulation_steps: null  # Accumulate eval predictions if needed
+
+# DeepSpeed Configuration
+deepspeed:
+  enabled: true
+  config_file: null  # Auto-selected based on GPU configuration
+  zero_stage: null  # Auto-selected (ZeRO-2 for multi-GPU, ZeRO-3 for single GPU)
+
+# Data Loading
+dataloader:
+  num_workers: 4  # Number of data loading workers
+  pin_memory: true  # Pin memory for faster GPU transfer
+  prefetch_factor: 2  # Prefetch batches for overlap
+
+# Reproducibility
+reproducibility:
+  seed: 42
+  deterministic: false  # Set to true for full reproducibility (slower)
+
+# Hardware Configuration (Auto-detected)
+hardware:
+  auto_detect: true  # Automatically detect GPU configuration
+  gpu_profiles_path: "AR/gpt2_hf/config/gpu_profiles.yaml"
+
+# Model Output Directories
+output:
+  base_dir: "models/gpt2_hf"
+  checkpoints_dir: "models/gpt2_hf/checkpoints"
+  preprocessed_dir: "models/gpt2_hf/preprocessed"
+  logs_dir: "models/gpt2_hf/logs"
+
+# Data Paths
+data:
+  clif_config_path: "clif_config.json"  # Path to CLIF config
+  tokenizer_path: "AR/gpt2_hf/tokenizer/clinical_tokenizer"  # GPT2 tokenizer path
+  token_registry_path: "OutputTokens/token_registry.json"
+
+# Training Resume
+resume:
+  auto_resume: true  # Automatically resume from latest checkpoint
+  resume_from_checkpoint: null  # Path to specific checkpoint (if not auto)
+
+# Distributed Training
+distributed:
+  backend: "nccl"  # NCCL for NVIDIA GPUs
+  find_unused_parameters: false
+  gradient_as_bucket_view: true  # Memory optimization
+
+# Warnings and Validation
+validation:
+  validate_config_on_start: true
+  warn_on_memory_issues: true
+  check_cuda_availability: true
+
+# Performance Monitoring
+monitoring:
+  log_level: "info"
+  disable_tqdm: false  # Show progress bars
+  report_to: ["wandb"]  # Report metrics to W&B
+  logging_first_step: true
+  logging_nan_inf_filter: true
+
+# Advanced Settings
+advanced:
+  # Attention Implementation
+  attn_implementation: "sdpa"  # PyTorch scaled_dot_product_attention (Flash Attention)
+
+  # Tokenizer Settings
+  model_max_length: 8192
+  padding_side: "right"
+  truncation_side: "right"
+
+  # Training Stability
+  log_on_each_node: true
+  skip_memory_metrics: false
+
+# Notes and Best Practices
+#
+# Batch Size Guidelines:
+# - GPT2-nano: 24 per GPU, gradient_accumulation=4, effective=192
+# - GPT2-micro: 16 per GPU, gradient_accumulation=6, effective=192
+# - GPT2-tiny: 12 per GPU, gradient_accumulation=8, effective=192
+# - GPT2-small: 8 per GPU, gradient_accumulation=12, effective=192
+# - GPT2-medium: 6 per GPU, gradient_accumulation=16, effective=192
+#
+# Learning Rate Guidelines:
+# - GPT2-nano: 6.0e-4 (higher for very small model)
+# - GPT2-micro: 5.0e-4 (higher for small model)
+# - GPT2-tiny: 4.0e-4 (higher for small model)
+# - GPT2-small: 3.0e-4 (standard)
+# - GPT2-medium: 2.5e-4 (slightly lower for stability)
+#
+# Memory Optimization:
+# - Enable gradient_checkpointing to reduce memory by 30-50%
+# - Use packing to reduce padding waste from ~46% to <5%
+# - Use BF16 on modern GPUs (A100, L40, H100) for better stability than FP16
+#
+# Training Time Estimates (2x L40 48GB):
+# - GPT2-nano: ~12-24 hours for 25 epochs
+# - GPT2-micro: ~18-36 hours for 20 epochs
+# - GPT2-tiny: ~1-1.5 days for 15 epochs
+# - GPT2-small: ~1-2 days for 11 epochs
+# - GPT2-medium: ~2-3 days for 3 epochs
+#
+# Hardware Requirements:
+# - GPT2-nano: Minimum 1x 8GB GPU, CPU training possible
+# - GPT2-micro: Minimum 1x 8GB GPU, Recommended 1x 16GB GPU
+# - GPT2-tiny: Minimum 1x 8GB GPU, Recommended 1x 16GB GPU
+# - GPT2-small: Minimum 2x 16GB GPUs, Recommended 2x L40 48GB
+# - GPT2-medium: Minimum 2x 24GB GPUs, Recommended 2x L40 48GB or 1x A100 40GB

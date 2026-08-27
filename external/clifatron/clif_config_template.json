@@ -1,0 +1,8 @@
+{
+  "site": "your_site_name",
+  "data_directory": "/path/to/clif/data",
+  "filetype": "parquet",
+  "timezone": "US/Central",
+  "output_dir": "<add you project root path here>/OutputTokens",
+  "wandb_api_key": "your_wandb_api_key_here"
+}

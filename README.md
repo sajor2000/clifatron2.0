@@ -36,6 +36,7 @@ outcomes are states doctors *act on* (never treatments — those are inputs only
 
 ## Layout
 ```
+external/clifatron/      vendored upstream CLIFATRON (tokenETL, AR trainers, benchmark) — see its VENDORED.md
 configs/                data.yaml · model.yaml · train.yaml
 src/data/tokenize.py     CLIF parquet → fused event-token shards + vocab (decile ablation arm)
 src/model/encoder.py     from-scratch time-aware decoder (ablation arm; default = CLIFATRON Qwen2)

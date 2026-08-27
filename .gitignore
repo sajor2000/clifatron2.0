@@ -23,6 +23,11 @@ wandb/
 runs/
 *.log
 
+# secrets — real filled-in config (template is tracked); never commit a live wandb key
+clif_config.json
+config/secrets.json
+config/credentials.json
+
 # os / editor
 .DS_Store
 .idea/

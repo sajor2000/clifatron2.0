@@ -1,0 +1,181 @@
+# Benchmark Configuration for Task 3: 72-hour Outcome Prediction
+# Multi-class classification task: Predict patient outcome in hours 24-72 based on first 24 hours
+
+# Paths
+paths:
+  # Root directory for CLIFATRON project
+  root_dir: "/home/vchaudha/CLIFATRON"
+
+  # Output tokens directory (from clif_config.json)
+  output_tokens: "/home/vchaudha/CLIFATRON/OutputTokens"
+
+  # Narrative sequences
+  narratives_dir: "/home/vchaudha/CLIFATRON/OutputTokens/narratives"
+  train_val_sequences: "/home/vchaudha/CLIFATRON/OutputTokens/narratives/train_val_sequences.parquet"
+  test_sequences: "/home/vchaudha/CLIFATRON/OutputTokens/narratives/test_sequences.parquet"
+
+  # Benchmark data directory
+  benchmark_data: "/home/vchaudha/CLIFATRON/benchmark/data"
+
+  # Results directory
+  results_dir: "/home/vchaudha/CLIFATRON/benchmark/results/task3-outcome-72hr"
+
+  # Model checkpoints
+  model_checkpoints:
+    gpt2: "/home/vchaudha/CLIFATRON/models/gpt2/checkpoints"
+    gpt2_hf: "/home/vchaudha/CLIFATRON/models/gpt2_hf/checkpoints"
+    qwen2: "/home/vchaudha/CLIFATRON/models/qwen2/checkpoints"
+
+# Task Configuration
+task:
+  name: "task3-outcome-72hr"
+  description: "Multi-class classification: Predict patient outcome in hours 24-72 (expired, imv_off, imv_on, other_o2)"
+
+  # Task 3 uses task3_label column from data
+  task_type: "multiclass"
+
+  # Class labels (priority order)
+  classes:
+    - "expired"       # disposition_expired found in hours 24-72
+    - "imv_off"       # was on IMV in 24-72hr, last resp_device (0-72hr, deduped) is NOT imv
+    - "imv_on"        # was on IMV in 24-72hr, last resp_device (0-72hr, deduped) IS imv
+    - "other_o2"      # never on IMV during 24-72hr (only other oxygen support)
+
+  num_classes: 4
+
+# Model Configuration
+models:
+  available_models:
+    - "gpt2"
+    - "gpt2_hf"
+    - "qwen2"
+
+  # Vocabulary settings
+  vocab_file: "/home/vchaudha/CLIFATRON/AR/gpt2_hf/tokenizer/clinical_tokenizer/vocab.json"
+  vocab_size: 1373
+
+  # Model sizes to benchmark
+  model_sizes:
+    gpt2_hf: ["small", "medium"]
+    qwen2: ["small"]
+    gpt2: ["custom"]
+
+# Method 1: Embedding-based Classification with XGBoost
+method1_embedding:
+  # Which layer to extract embeddings from
+  embedding_layer: "mean"  # Options: "last", "mean"
+
+  # Classifier options
+  classifier:
+    type: "xgboost"  # Options: "xgboost", "logistic_regression"
+
+    # XGBoost parameters (for multi-class)
+    xgboost:
+      max_depth: 6
+      learning_rate: 0.1
+      n_estimators: 100
+      objective: "multi:softmax"  # Multi-class classification
+      num_class: 4
+      eval_metric: "mlogloss"
+      verbose: false
+
+    # Logistic regression parameters (for multi-class)
+    logistic_regression:
+      max_iter: 1000
+      C: 1.0
+      solver: "lbfgs"
+      multi_class: "multinomial"
+
+  # Batch size for embedding extraction
+  batch_size: 16
+  max_length: 8192
+
+# Method 2: Monte Carlo Sampling with Sliding Window
+method2_montecarlo:
+  # Number of trajectory samples per sequence
+  num_samples: 100
+
+  # Sliding window generation parameters
+  max_new_tokens: 8192  # Maximum tokens to generate per trajectory
+  sliding_window_step: 512  # Tokens to remove from start when sliding
+
+  # Sampling strategies
+  sampling_strategies:
+    - name: "temperature"
+      temperature: [0.7, 1.0, 1.3]
+    - name: "top_k"
+      top_k: [10, 50, 100]
+    - name: "nucleus"
+      top_p: [0.9, 0.95, 0.99]
+
+  # Aggregation method for multi-class
+  aggregation: "majority_vote"  # Options: "majority_vote", "probability_voting"
+
+# Evaluation Metrics
+metrics:
+  compute:
+    - "accuracy"
+    - "precision"  # Macro-averaged for multi-class
+    - "recall"     # Macro-averaged for multi-class
+    - "f1"         # Macro-averaged for multi-class
+    - "confusion_matrix"
+
+  # Additional analysis
+  save_predictions: true
+  save_confusion_matrix: true
+  save_per_class_metrics: true
+
+# Computing Resources
+compute:
+  device: "auto"  # Options: "auto", "cuda", "cpu"
+  mixed_precision: true
+  num_workers: 4
+
+  # Distributed computing (automatically detected)
+  # Set RANK, WORLD_SIZE, LOCAL_RANK environment variables for multi-GPU/multi-node
+  distributed:
+    # Backend for distributed training
+    backend: "nccl"  # Options: "nccl" (GPU), "gloo" (CPU/GPU)
+
+    # Whether to use DistributedDataParallel for model
+    use_ddp: true
+
+    # CPU fallback on GPU OOM
+    fallback_cpu: true
+
+# Logging
+logging:
+  level: "INFO"
+  save_logs: true
+  log_file: "benchmark.log"
+
+  # WandB integration (optional)
+  use_wandb: false
+  wandb_project: "clifatron-benchmark"
+  wandb_entity: null
+
+# Data Processing
+data:
+  # Test set ratio (if splitting train_val further)
+  test_size: 0.2
+
+  # Random seed for reproducibility
+  random_seed: 42
+
+  # Minimum sequence length
+  min_sequence_length: 10
+
+  # Maximum sequence length
+  max_sequence_length: 8192
+
+  # 24-hour ICU truncation (input is first 24hr, label is from hours 24-72)
+  truncate_at_24hr_icu: true
+
+  # Whether to balance classes
+  balance_classes: false
+
+# Output Format
+output:
+  format: "json"  # Options: "json", "csv", "both"
+  include_metadata: true
+  timestamp_results: true

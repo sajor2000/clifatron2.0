@@ -1,0 +1,12 @@
+{
+  "tokenizer_class": "ClinicalTokenizer",
+  "model_max_length": 8192,
+  "vocab_size": 1389,
+  "special_tokens": {
+    "pad_token": "[PAD]",
+    "unk_token": "[UNK]",
+    "bos_token": "[BOS]",
+    "eos_token": "[EOS]",
+    "sep_token": "[SEP]"
+  }
+}

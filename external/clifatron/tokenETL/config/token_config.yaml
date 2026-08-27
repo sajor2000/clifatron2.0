@@ -1,0 +1,471 @@
+tables:
+  patient:
+    enabled: true
+    columns:
+    - patient_id
+    - sex_category
+    - race_category
+    - ethnicity_category
+    tokenization:
+      patient_id:
+        enabled: false
+      sex_category:
+        enabled: true
+        method: mapping
+        map_unmapped_to_other: true
+        mapping:
+          male: sex_male
+          female: sex_female
+          other: sex_other
+      race_category:
+        enabled: false
+      ethnicity_category:
+        enabled: false
+  hospitalization:
+    enabled: true
+    columns:
+    - hospitalization_id
+    - patient_id
+    - admission_dttm
+    - discharge_dttm
+    - age_at_admission
+    - discharge_category
+    tokenization:
+      hospitalization_id:
+        enabled: false
+      patient_id:
+        enabled: false
+      admission_dttm:
+        enabled: false
+      discharge_dttm:
+        enabled: false
+      age_at_admission:
+        enabled: true
+        method: bins
+        prefix: age_
+        bins:
+        - name: '18_25'
+          min: 18
+          max: 25
+        - name: '26_35'
+          min: 26
+          max: 35
+        - name: '36_45'
+          min: 36
+          max: 45
+        - name: '46_55'
+          min: 46
+          max: 55
+        - name: '56_65'
+          min: 56
+          max: 65
+        - name: '66_75'
+          min: 66
+          max: 75
+        - name: '76_85'
+          min: 76
+          max: 85
+        - name: 86_plus
+          min: 86
+          max: 999
+      discharge_category:
+        enabled: true
+        method: mapping
+        prefix: disposition_
+        map_unmapped_to_other: true
+        mapping:
+          Home: home
+          Skilled Nursing Facility (SNF): snf
+          Expired: expired
+          Acute Inpatient Rehab Facility: rehab
+          Hospice: hospice
+          Long Term Care Hospital (LTACH): ltach
+          Acute Care Hospital: tranfer
+          Group Home: home
+          Chemical Dependency: home
+          Against Medical Advice (AMA): home
+          Assisted Living: home
+          Still Admitted: other
+          Missing: other
+          Other: other
+          Psychiatric Hospital: home
+          Shelter: home
+          Jail: home
+  adt:
+    enabled: true
+    columns:
+    - hospitalization_id
+    - location_category
+    - in_dttm
+    tokenization:
+      hospitalization_id:
+        enabled: false
+      location_category:
+        enabled: true
+        method: mapping
+        prefix: transfer_to_
+        map_unmapped_to_other: true
+        mapping:
+          ed: ed
+          ward: ward
+          stepdown: stepdown
+          icu: icu
+          procedural: procedural
+          l&d: other
+          hospice: hospice
+          psych: other
+          rehab: other
+          radiology: other
+          dialysis: other
+          other: other
+      in_dttm:
+        enabled: false
+  patient_assessments:
+    enabled: true
+    columns:
+    - hospitalization_id
+    - recorded_dttm
+    - assessment_category
+    - numerical_value
+    tokenization:
+      enabled: true
+      lowercase_category: true
+      prefix: assessment_
+      assessments:
+        gcs_total:
+          description: Glasgow Coma Scale Total Score
+          map_unmapped_to_other: false
+          mapping:
+            3: gcs_total_3
+            4: gcs_total_4
+            5: gcs_total_5
+            6: gcs_total_6
+            7: gcs_total_7
+            8: gcs_total_8
+            9: gcs_total_9
+            10: gcs_total_10
+            11: gcs_total_11
+            12: gcs_total_12
+            13: gcs_total_13
+            14: gcs_total_14
+            15: gcs_total_15
+        rass:
+          description: Richmond Agitation-Sedation Scale
+          map_unmapped_to_other: false
+          mapping:
+            -5: rass_neg_5
+            -4: rass_neg_4
+            -3: rass_neg_3
+            -2: rass_neg_2
+            -1: rass_neg_1
+            0: rass_0
+            1: rass_1
+            2: rass_2
+            3: rass_3
+            4: rass_4
+  hospital_diagnosis:
+    enabled: true
+    columns:
+    - hospitalization_id
+    - diagnosis_code
+    - diagnosis_code_format
+    - diagnosis_primary
+    tokenization:
+      hospitalization_id:
+        enabled: false
+      diagnosis_code:
+        enabled: false
+      diagnosis_code_format:
+        enabled: false
+      diagnosis_primary:
+        enabled: false
+      elixhauser:
+        enabled: true
+        method: derived
+        source: clifpy.elixhauser
+        description: Elixhauser comorbidity flags derived from diagnosis codes
+        prefix: elix_
+        fill_no_history: no_patient_history
+        comorbidities:
+        - congestive_heart_failure
+        - cardiac_arrhythmias
+        - valvular_disease
+        - pulmonary_circulation_disorders
+        - peripheral_vascular_disorders
+        - hypertension_uncomplicated
+        - hypertension_complicated
+        - paralysis
+        - other_neurological_disorders
+        - chronic_pulmonary_disease
+        - diabetes_uncomplicated
+        - diabetes_complicated
+        - hypothyroidism
+        - renal_failure
+        - liver_disease
+        - peptic_ulcer_disease_excluding_bleeding
+        - aids_hiv
+        - lymphoma
+        - metastatic_cancer
+        - solid_tumor_without_metastasis
+        - rheumatoid_arthritis_collagen_vascular_disease
+        - coagulopathy
+        - obesity
+        - weight_loss
+        - fluid_and_electrolyte_disorders
+        - blood_loss_anemia
+        - deficiency_anemia
+        - alcohol_abuse
+        - drug_abuse
+        - psychoses
+        - depression
+  respiratory_support:
+    enabled: true
+    columns:
+    - hospitalization_id
+    - recorded_dttm
+    - device_id
+    - device_name
+    - device_category
+    - vent_brand_name
+    - mode_name
+    - mode_category
+    - tracheostomy
+    - fio2_set
+    - lpm_set
+    - tidal_volume_set
+    - resp_rate_set
+    - pressure_control_set
+    - pressure_support_set
+    - flow_rate_set
+    - peak_inspiratory_pressure_set
+    - inspiratory_time_set
+    - peep_set
+    - tidal_volume_obs
+    - resp_rate_obs
+    - plateau_pressure_obs
+    - peak_inspiratory_pressure_obs
+    - peep_obs
+    - minute_vent_obs
+    - mean_airway_pressure_obs
+    tokenization:
+      hospitalization_id:
+        enabled: false
+      recorded_dttm:
+        enabled: false
+      device_id:
+        enabled: false
+      device_name:
+        enabled: false
+      device_category:
+        enabled: true
+        method: mapping
+        prefix: resp_device_
+        map_unmapped_to_other: true
+        mapping:
+          IMV: imv
+          NIPPV: nippv
+          CPAP: cpap
+          High Flow NC: high_flow_nc
+          Face Mask: face_mask
+          Trach Collar: trach_collar
+          Nasal Cannula: nasal_cannula
+          Room Air: room_air
+          Other: other
+      vent_brand_name:
+        enabled: false
+      mode_name:
+        enabled: false
+      mode_category:
+        enabled: true
+        method: mapping
+        prefix: resp_mode_
+        map_unmapped_to_other: true
+        mapping:
+          Assist Control-Volume Control: ac_vc
+          Pressure Control: pc
+          Pressure-Regulated Volume Control: prvc
+          SIMV: simv
+          Pressure Support/CPAP: ps_cpap
+          Volume Support: vs
+          Blow by: blow_by
+          Other: other
+      tracheostomy:
+        enabled: true
+        method: mapping
+        prefix: ""
+        map_unmapped_to_other: false
+        mapping:
+          1: tracheostomy_present
+      fio2_set:
+        enabled: true
+        method: numeric_binning
+        source: config/critical_illness_tokenization_final_with_intervals.csv
+        description: FiO2 set values tokenized using interval-aware binning
+      lpm_set:
+        enabled: true
+        method: numeric_binning
+        source: config/critical_illness_tokenization_final_with_intervals.csv
+        description: LPM set values tokenized using interval-aware binning
+      tidal_volume_set:
+        enabled: true
+        method: numeric_binning
+        source: config/critical_illness_tokenization_final_with_intervals.csv
+        description: Tidal volume set values tokenized using interval-aware binning
+      resp_rate_set:
+        enabled: true
+        method: numeric_binning
+        source: config/critical_illness_tokenization_final_with_intervals.csv
+        description: Respiratory rate set values tokenized using interval-aware binning
+      pressure_control_set:
+        enabled: true
+        method: numeric_binning
+        source: config/critical_illness_tokenization_final_with_intervals.csv
+        description: Pressure control set values tokenized using interval-aware binning
+      pressure_support_set:
+        enabled: true
+        method: numeric_binning
+        source: config/critical_illness_tokenization_final_with_intervals.csv
+        description: Pressure support set values tokenized using interval-aware binning
+      flow_rate_set:
+        enabled: true
+        method: numeric_binning
+        source: config/critical_illness_tokenization_final_with_intervals.csv
+        description: Flow rate set values tokenized using interval-aware binning
+      peak_inspiratory_pressure_set:
+        enabled: true
+        method: numeric_binning
+        source: config/critical_illness_tokenization_final_with_intervals.csv
+        description: Peak inspiratory pressure set values tokenized using interval-aware binning
+      inspiratory_time_set:
+        enabled: true
+        method: numeric_binning
+        source: config/critical_illness_tokenization_final_with_intervals.csv
+        description: Inspiratory time set values tokenized using interval-aware binning
+      peep_set:
+        enabled: true
+        method: numeric_binning
+        source: config/critical_illness_tokenization_final_with_intervals.csv
+        description: PEEP set values tokenized using interval-aware binning
+      tidal_volume_obs:
+        enabled: true
+        method: numeric_binning
+        source: config/critical_illness_tokenization_final_with_intervals.csv
+        description: Tidal volume observed values tokenized using interval-aware binning
+      resp_rate_obs:
+        enabled: true
+        method: numeric_binning
+        source: config/critical_illness_tokenization_final_with_intervals.csv
+        description: Respiratory rate observed values tokenized using interval-aware binning
+      plateau_pressure_obs:
+        enabled: true
+        method: numeric_binning
+        source: config/critical_illness_tokenization_final_with_intervals.csv
+        description: Plateau pressure observed values tokenized using interval-aware binning
+      peak_inspiratory_pressure_obs:
+        enabled: true
+        method: numeric_binning
+        source: config/critical_illness_tokenization_final_with_intervals.csv
+        description: Peak inspiratory pressure observed values tokenized using interval-aware binning
+      peep_obs:
+        enabled: true
+        method: numeric_binning
+        source: config/critical_illness_tokenization_final_with_intervals.csv
+        description: PEEP observed values tokenized using interval-aware binning
+      minute_vent_obs:
+        enabled: true
+        method: numeric_binning
+        source: config/critical_illness_tokenization_final_with_intervals.csv
+        description: Minute ventilation observed values tokenized using interval-aware binning
+      mean_airway_pressure_obs:
+        enabled: true
+        method: numeric_binning
+        source: config/critical_illness_tokenization_final_with_intervals.csv
+        description: Mean airway pressure observed values tokenized using interval-aware binning
+  crrt_therapy:
+    enabled: true
+    columns:
+    - hospitalization_id
+    - recorded_dttm
+    tokenization:
+      add_token: crrt_occurring
+      hospitalization_id:
+        enabled: false
+      recorded_dttm:
+        enabled: false
+  ecmo_mcs:
+    enabled: true
+    columns:
+    - hospitalization_id
+    - recorded_dttm
+    tokenization:
+      add_token: ecmo_occurring
+      hospitalization_id:
+        enabled: false
+      recorded_dttm:
+        enabled: false
+  medication_admin_continuous:
+    enabled: true
+    columns:
+    - hospitalization_id
+    - admin_dttm
+    - med_category
+    - med_dose
+    - med_dose_unit
+    unit_conversion:
+      enabled: true
+      override: true
+      preferred_units:
+        amiodarone: mg/min
+        angiotension: ng/kg/min
+        cisatracurium: mcg/kg/min
+        dexmedetomidine: mcg/kg/hr
+        diltiazem: mg/hr
+        dobutamine: mcg/kg/min
+        dopamine: mcg/kg/min
+        epinephrine: mcg/kg/min
+        esmolol: mcg/kg/min
+        fentanyl: mcg/kg/hr
+        hydromorphone: mg/hr
+        ketamine: mcg/kg/hr
+        labetalol: mg/min
+        lidocaine: mg/min
+        lorazepam: mg/hr
+        midazolam: mg/hr
+        milrinone: mcg/kg/min
+        nicardipine: mg/hr
+        nitroprusside: mcg/kg/min
+        norepinephrine: mcg/kg/min
+        pentobarbital: mcg/kg/hr
+        phenylephrine: mcg/kg/min
+        procainamide: mg/min
+        propofol: mcg/kg/min
+        remifentanil: mcg/kg/min
+        rocuronium: mcg/kg/min
+        vasopressin: u/min
+        vecuronium: mcg/kg/min
+  labs:
+    enabled: true
+    columns:
+    - hospitalization_id
+    - lab_result_dttm
+    - lab_category
+    - lab_value_numeric
+    tokenization:
+      enabled: true
+      method: numeric_binning
+      source: config/critical_illness_tokenization_final_with_intervals.csv
+      category_filter: labs
+      description: Labs are tokenized using interval-aware numeric binning from critical_illness_tokenization_final_with_intervals.csv
+  vitals:
+    enabled: true
+    columns:
+    - hospitalization_id
+    - recorded_dttm
+    - vital_category
+    - vital_value
+    tokenization:
+      enabled: true
+      method: numeric_binning
+      source: config/critical_illness_tokenization_final_with_intervals.csv
+      category_filter: vitals
+      description: Vitals are tokenized using interval-aware numeric binning from critical_illness_tokenization_final_with_intervals.csv

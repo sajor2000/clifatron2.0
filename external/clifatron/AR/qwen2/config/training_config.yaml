@@ -1,0 +1,127 @@
+# Training Configuration for Qwen2 SFT with TRL Packing
+#
+# This file contains hyperparameters for supervised fine-tuning using:
+# - TRL's ConstantLengthDataset for efficient packing
+# - SFTTrainer for supervised fine-tuning
+# - Optuna for hyperparameter optimization
+
+# Vocabulary
+vocab_size: 1389  # 5 special + 1,329 clinical + 55 time tokens (day_1-30+, hour_1-24)
+
+# Sequence packing (TRL ConstantLengthDataset)
+max_length: 8192  # Maximum sequence length
+num_of_sequences: 4096  # Number of packed sequences to pre-generate
+                        # Dataset has 85M tokens → 10,372 sequences needed for 100% coverage
+                        # 4096 = ~40% coverage (good balance of memory vs data usage)
+                        # Increase to 8192 for more coverage, or 10372 for all data
+infinite_dataset: false  # Don't cycle through data indefinitely
+append_concat_token: true  # Add EOS between packed documents
+add_special_tokens: true  # Add BOS/EOS to sequences
+
+# Data splits (temporal mode)
+train_val_fraction: 0.9  # 90% train, 10% val from 2018-2023 data
+seed: 42  # Random seed for reproducibility
+
+# Optuna hyperparameter search
+optuna_enabled: true  # Enable Optuna by default
+optuna_trials: 50  # Number of Optuna trials
+optuna_direction: "minimize"  # Minimize eval_loss
+
+# HP search ranges (used by Optuna)
+learning_rate_min: 5.0e-5
+learning_rate_max: 5.0e-4
+learning_rate_log: true  # Use log scale for LR search
+gradient_accumulation_min: 1
+gradient_accumulation_max: 3
+
+# Early stopping
+early_stopping_patience: 3  # Stop if no improvement for N eval steps
+
+# Logging and checkpointing
+logging_steps: 10  # Log metrics every N steps
+eval_steps: 100  # Evaluate on validation set every N steps
+save_steps: 100  # Save checkpoint every N steps
+save_total_limit: 1  # Keep only last 1 checkpoint (saves space)
+prediction_loss_only: true  # Only compute loss during eval (saves memory)
+
+# Weights & Biases
+wandb_project: "CLIFATRON"  # W&B project name
+wandb_entity: null  # W&B entity (username or team), null for default
+
+# Model-specific configurations
+models:
+  # Qwen2-0.5B: Prototyping and testing
+  # Optimized for 2x L40 GPUs (48GB each) with BF16
+  # NOTE: TRL packing is more memory-intensive than regular training
+  "0.5b":
+    num_epochs: 4
+    batch_size: 4  # Per-device (reduced due to packing overhead)
+    per_device_eval_batch_size: 2  # Eval batch size
+    gradient_accumulation_steps: 8  # Effective batch size = 4 * 8 * 2 = 64
+    learning_rate: 2.0e-4  # Default (overridden by Optuna)
+    weight_decay: 0.01
+    warmup_steps: 500
+    lr_scheduler: "cosine"  # cosine, linear, constant_with_warmup
+    max_grad_norm: 1.0  # Gradient clipping
+
+  # Qwen2-1.5B: Balance between speed and performance
+  "1.5b":
+    num_epochs: 5
+    batch_size: 2  # Per-device
+    per_device_eval_batch_size: 1  # Eval batch size
+    gradient_accumulation_steps: 16  # Effective batch size = 2 * 16 * num_gpus
+    learning_rate: 1.5e-4  # Default
+    weight_decay: 0.01
+    warmup_steps: 1000
+    lr_scheduler: "cosine"
+    max_grad_norm: 1.0
+
+  # Qwen2-7B: Best performance, requires multi-GPU
+  "7b":
+    num_epochs: 3
+    batch_size: 1  # Per-device (minimum due to memory)
+    per_device_eval_batch_size: 1  # Eval batch size
+    gradient_accumulation_steps: 16  # Effective batch size = 1 * 16 * num_gpus
+    learning_rate: 1.0e-4  # Default (lower for larger model)
+    weight_decay: 0.01
+    warmup_steps: 2000
+    lr_scheduler: "cosine"
+    max_grad_norm: 1.0
+
+# Hardware recommendations:
+#
+# Qwen2-0.5B (461M parameters):
+#   RECOMMENDED CONFIGURATION (2x L40 48GB):
+#   - Batch size: 4 per device
+#   - Gradient accumulation: 8 steps
+#   - Effective batch size: 64 (4 * 8 * 2)
+#   - Memory usage: ~20GB per GPU with BF16 + packing
+#   - Training time: ~2-3 days for 5 epochs (with Optuna HP search)
+#   - Mixed precision: BF16 recommended
+#
+#   Alternative configurations:
+#   - Single GPU: 24GB+ VRAM (e.g., A10G, RTX 4090)
+#     - Reduce batch_size to 2, increase gradient_accumulation_steps to 16
+#   - 8x A100 40GB: Use batch_size=4, gradient_accumulation_steps=2
+#
+# Qwen2-1.5B (1.54B parameters):
+#   - 2x L40 48GB: batch_size=2, gradient_accumulation=16 (effective: 64)
+#   - 8x A100 40GB: batch_size=2, gradient_accumulation=4 (effective: 64)
+#   - Training time: ~3-5 days on 2x L40
+#   - Mixed precision: BF16 recommended
+#   - DeepSpeed ZeRO-2 recommended
+#
+# Qwen2-7B (7.61B parameters):
+#   - 2x L40 48GB: Not recommended (insufficient memory)
+#   - 8x A100 40GB: batch_size=1, gradient_accumulation=8 (effective: 64)
+#   - Training time: ~5-7 days on 8x A100
+#   - Mixed precision: BF16 required
+#   - DeepSpeed ZeRO-3 required
+
+# Notes:
+# - TRL packing uses more memory than regular training due to attention mask overhead
+# - Batch sizes are smaller than non-packed training to accommodate this
+# - Effective batch size should still be similar (64-192) for training stability
+# - Optuna will search for optimal LR and gradient accumulation within specified ranges
+# - Early stopping prevents overfitting during HP search
+# - Use --no-optuna flag to disable HP search and use fixed hyperparameters

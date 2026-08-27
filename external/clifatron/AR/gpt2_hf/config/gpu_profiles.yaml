@@ -1,0 +1,206 @@
+# GPU Profiles for Automatic Configuration
+# Defines expected specifications and optimal settings for different GPU models
+
+gpu_models:
+  # NVIDIA L40 (Ada Lovelace) - Data Center GPU
+  L40:
+    expected_vram_gb: 48
+    compute_capability: [8, 9]
+    bf16_supported: true
+    fp16_supported: true
+    zero_stage: "zero2"
+    description: "NVIDIA L40 with 48GB VRAM - optimal for GPT2 training"
+    recommended_configs:
+      - gpu_count: 2
+        use_case: "2x L40 for GPT2-medium training"
+        zero_stage: "zero2"
+        notes: "Excellent price/performance for GPT2 models"
+
+  # NVIDIA A100 (Ampere) - High Performance GPU
+  A100:
+    expected_vram_gb: [40, 80]  # Two variants
+    compute_capability: [8, 0]
+    bf16_supported: true
+    fp16_supported: true
+    zero_stage: "zero2"
+    description: "NVIDIA A100 with 40GB or 80GB VRAM - top tier for large models"
+    recommended_configs:
+      - gpu_count: 8
+        use_case: "8x A100 for large-scale distributed training"
+        zero_stage: "zero2"
+        notes: "ZeRO-2 optimal with 8 GPUs for best throughput"
+      - gpu_count: 4
+        use_case: "4x A100 for medium-scale training"
+        zero_stage: "zero2"
+      - gpu_count: 2
+        use_case: "2x A100 for small-scale training"
+        zero_stage: "zero2"
+
+  # NVIDIA V100 (Volta) - Previous Generation
+  V100:
+    expected_vram_gb: [16, 32]
+    compute_capability: [7, 0]
+    bf16_supported: false
+    fp16_supported: true
+    zero_stage: "zero3"
+    description: "NVIDIA V100 - legacy GPU, use FP16 only"
+    notes: "No BF16 support. Consider ZeRO-3 for memory efficiency"
+
+  # NVIDIA H100 (Hopper) - Next Generation
+  H100:
+    expected_vram_gb: 80
+    compute_capability: [9, 0]
+    bf16_supported: true
+    fp16_supported: true
+    fp8_supported: true
+    zero_stage: "zero2"
+    description: "NVIDIA H100 with 80GB VRAM - latest generation"
+    notes: "Supports FP8 for maximum efficiency"
+
+  # NVIDIA RTX Series (Workstation GPUs)
+  RTX:
+    expected_vram_gb: [24, 48]  # RTX 6000 Ada, A6000
+    compute_capability: [8, 6]
+    bf16_supported: true
+    fp16_supported: true
+    zero_stage: "zero2"
+    description: "NVIDIA RTX Workstation GPUs (6000 Ada, A6000)"
+    notes: "Good for development and smaller scale training"
+
+  # Fallback for unknown GPUs
+  Unknown:
+    expected_vram_gb: 16
+    compute_capability: [7, 0]
+    bf16_supported: false
+    fp16_supported: true
+    zero_stage: "zero3"
+    description: "Unknown GPU - conservative settings"
+    notes: "Using safe defaults. Performance may be suboptimal"
+
+# Model Size Requirements
+# Minimum VRAM per GPU for each model size with ZeRO-2/ZeRO-3
+model_requirements:
+  # GPT2-small (124M parameters)
+  "small":
+    min_vram_per_gpu: 8
+    recommended_vram_per_gpu: 12
+    description: "GPT2-small (124M params) - fits on consumer GPUs"
+    zero2_memory_estimate_gb: 6
+    zero3_memory_estimate_gb: 4
+    notes: "Can train on single GPU with 12GB+ VRAM"
+
+  # GPT2-medium (355M parameters)
+  "medium":
+    min_vram_per_gpu: 12
+    recommended_vram_per_gpu: 16
+    description: "GPT2-medium (355M params) - requires professional GPUs"
+    zero2_memory_estimate_gb: 10
+    zero3_memory_estimate_gb: 6
+    notes: "Recommended 2+ GPUs for faster training"
+
+# DeepSpeed ZeRO Stage Selection Rules
+zero_stage_selection:
+  rules:
+    - condition: "gpu_count >= 8 and vram_per_gpu >= 40"
+      zero_stage: "zero2"
+      reason: "Many GPUs with high VRAM - ZeRO-2 optimal for throughput"
+
+    - condition: "gpu_count >= 4 and vram_per_gpu >= 24"
+      zero_stage: "zero2"
+      reason: "Multiple GPUs - ZeRO-2 provides good memory distribution"
+
+    - condition: "gpu_count == 2 and vram_per_gpu >= 40"
+      zero_stage: "zero2"
+      reason: "2 GPUs with high VRAM - ZeRO-2 sufficient"
+
+    - condition: "gpu_count == 1 or vram_per_gpu < 24"
+      zero_stage: "zero3"
+      reason: "Single GPU or limited VRAM - ZeRO-3 for maximum memory efficiency"
+
+  defaults:
+    multi_gpu_default: "zero2"
+    single_gpu_default: "zero3"
+    fallback: "zero3"
+
+# Multi-GPU Communication Settings
+communication:
+  nvlink:
+    description: "High-speed GPU-to-GPU interconnect (900GB/s for A100)"
+    recommended_for: ["A100", "H100", "L40"]
+    gradient_accumulation_factor: 1.0
+    notes: "Optimal for multi-GPU training"
+
+  pcie:
+    description: "PCIe 4.0 interconnect (~64GB/s)"
+    recommended_for: ["RTX", "V100"]
+    gradient_accumulation_factor: 1.5
+    notes: "May benefit from increased gradient accumulation"
+
+  infiniband:
+    description: "Multi-node interconnect (200Gb/s+)"
+    recommended_for: ["A100", "H100"]
+    multi_node: true
+    notes: "Required for multi-node distributed training"
+
+# Batch Size Scaling Guidelines (for future use)
+# NOTE: Current implementation keeps config file batch sizes
+batch_size_scaling:
+  enabled: false  # User requested to keep config file values
+  notes: "Automatic batch size scaling is disabled. Using training_config.yaml values."
+
+# Memory Safety Margins
+memory_safety:
+  reserved_memory_gb: 2  # Reserve 2GB for CUDA overhead
+  oom_threshold: 0.95  # Warn if using >95% of available VRAM
+  gradient_checkpointing_threshold: 0.85  # Enable if using >85% VRAM
+
+# Precision Settings
+precision:
+  bf16:
+    compute_capability_min: [8, 0]
+    description: "BFloat16 - stable training, modern GPUs"
+    recommended: true
+
+  fp16:
+    compute_capability_min: [7, 0]
+    description: "Float16 - legacy GPUs, may require loss scaling"
+    recommended: false
+    notes: "Use only if BF16 not supported"
+
+  fp32:
+    description: "Full precision - slowest but most stable"
+    use_case: "Debugging or extreme numerical sensitivity"
+
+# Training Optimizations
+optimizations:
+  gradient_checkpointing:
+    enabled_by_default: false
+    memory_saving: "30-50%"
+    speed_penalty: "10-20%"
+    notes: "Enable if hitting OOM errors"
+
+  flash_attention:
+    enabled_by_default: true
+    compute_capability_min: [8, 0]
+    memory_saving: "40-60% for long sequences"
+    speed_improvement: "2-4x"
+    notes: "GPT2 uses standard attention, Flash Attention via PyTorch SDPA"
+
+  cpu_offload:
+    zero2_optimizer_offload: true
+    zero3_parameter_offload: true
+    notes: "Enabled in DeepSpeed configs for memory efficiency"
+
+# Validation Checks
+validation:
+  min_cuda_version: "11.8"
+  min_pytorch_version: "2.0.0"
+  min_deepspeed_version: "0.12.0"
+  min_transformers_version: "4.35.0"
+
+# Monitoring and Logging
+monitoring:
+  log_gpu_memory_every_n_steps: 100
+  alert_on_memory_spike: true
+  memory_spike_threshold_gb: 5
+  track_gpu_utilization: true

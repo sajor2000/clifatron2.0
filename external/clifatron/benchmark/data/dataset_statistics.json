@@ -1,0 +1,85 @@
+{
+  "statistics": {
+    "train_val": {
+      "task1_home": {
+        "total_examples": 30684,
+        "positive_examples": 18956,
+        "negative_examples": 11728,
+        "positive_ratio": 0.6177812540737844
+      },
+      "task2_ltach": {
+        "total_examples": 30684,
+        "positive_examples": 1099,
+        "negative_examples": 29585,
+        "positive_ratio": 0.03581671229305175
+      },
+      "task3_imv": {
+        "total_examples": 4542,
+        "label_counts": {
+          "imv_on": 2098,
+          "expired": 213,
+          "imv_off": 2231
+        }
+      },
+      "task4_hypoxic": {
+        "total_examples": 4542,
+        "mean_proportion": 0.1351355307194545,
+        "min_proportion": 0.0,
+        "max_proportion": 1.0
+      }
+    },
+    "test": {
+      "task1_home": {
+        "total_examples": 5169,
+        "positive_examples": 3212,
+        "negative_examples": 1957,
+        "positive_ratio": 0.6213967885471078
+      },
+      "task2_ltach": {
+        "total_examples": 5169,
+        "positive_examples": 115,
+        "negative_examples": 5054,
+        "positive_ratio": 0.02224801702456955
+      },
+      "task3_imv": {
+        "total_examples": 761,
+        "label_counts": {
+          "expired": 25,
+          "imv_on": 286,
+          "imv_off": 450
+        }
+      },
+      "task4_hypoxic": {
+        "total_examples": 761,
+        "mean_proportion": 0.05931420424910759,
+        "min_proportion": 0.0,
+        "max_proportion": 1.0
+      }
+    }
+  },
+  "configuration": {
+    "positive_class": "disposition_home",
+    "disposition_tokens": [
+      "disposition_home",
+      "disposition_expired",
+      "disposition_rehab",
+      "disposition_snf",
+      "disposition_hospice",
+      "disposition_ltach",
+      "disposition_other"
+    ],
+    "min_sequence_length": 10,
+    "max_sequence_length": 8192,
+    "truncate_at_24hr_icu": true
+  },
+  "disposition_tokens": [
+    "disposition_home",
+    "disposition_expired",
+    "disposition_rehab",
+    "disposition_snf",
+    "disposition_hospice",
+    "disposition_ltach",
+    "disposition_other"
+  ],
+  "timestamp": "2025-11-01T12:21:48.513381"
+}

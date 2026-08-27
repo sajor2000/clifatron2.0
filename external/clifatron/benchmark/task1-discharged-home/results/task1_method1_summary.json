@@ -1,0 +1,106 @@
+{
+  "gpt2": {
+    "method": "embedding_xgboost",
+    "model_type": "gpt2",
+    "layer": "mean",
+    "classifier": "xgboost",
+    "metrics": {
+      "accuracy": 0.6908492938672858,
+      "precision": 0.7563532401524777,
+      "recall": 0.7412826899128269,
+      "f1": 0.7487421383647799,
+      "auroc": 0.7380664358425959,
+      "auprc": 0.8024466813793301
+    },
+    "metadata": {
+      "timestamp": "2025-11-01T21:05:47.813790",
+      "num_train_examples": 30684,
+      "num_test_examples": 5169,
+      "embedding_dim": 768,
+      "xgboost_params": {
+        "max_depth": 6,
+        "learning_rate": 0.1,
+        "n_estimators": 100,
+        "scale_pos_weight": 0.6186959274108462
+      }
+    }
+  },
+  "gpt2_hf": {
+    "method": "embedding_xgboost",
+    "model_type": "gpt2_hf",
+    "layer": "mean",
+    "classifier": "xgboost",
+    "metrics": {
+      "accuracy": 0.718127297349584,
+      "precision": 0.7777777777777778,
+      "recall": 0.7649439601494396,
+      "f1": 0.7713074870506985,
+      "auroc": 0.7802945456836301,
+      "auprc": 0.8394604134303025
+    },
+    "metadata": {
+      "timestamp": "2025-11-01T21:06:20.517519",
+      "num_train_examples": 30684,
+      "num_test_examples": 5169,
+      "embedding_dim": 768,
+      "xgboost_params": {
+        "max_depth": 6,
+        "learning_rate": 0.1,
+        "n_estimators": 100,
+        "scale_pos_weight": 0.6186959274108462
+      }
+    }
+  },
+  "qwen2": {
+    "method": "embedding_xgboost",
+    "model_type": "qwen2",
+    "layer": "mean",
+    "classifier": "xgboost",
+    "metrics": {
+      "accuracy": 0.706132714258077,
+      "precision": 0.77088,
+      "recall": 0.75,
+      "f1": 0.7602966703487455,
+      "auroc": 0.7607128925700823,
+      "auprc": 0.8205833371628617
+    },
+    "metadata": {
+      "timestamp": "2025-11-01T21:06:53.374931",
+      "num_train_examples": 30684,
+      "num_test_examples": 5169,
+      "embedding_dim": 896,
+      "xgboost_params": {
+        "max_depth": 6,
+        "learning_rate": 0.1,
+        "n_estimators": 100,
+        "scale_pos_weight": 0.6186959274108462
+      }
+    }
+  },
+  "qwen2optuna": {
+    "method": "embedding_xgboost",
+    "model_type": "qwen2optuna",
+    "layer": "mean",
+    "classifier": "xgboost",
+    "metrics": {
+      "accuracy": 0.7322499516347456,
+      "precision": 0.7810578105781057,
+      "recall": 0.7907845579078456,
+      "f1": 0.7858910891089109,
+      "auroc": 0.7900043971540041,
+      "auprc": 0.8457337383865453
+    },
+    "metadata": {
+      "timestamp": "2025-11-01T21:07:26.354220",
+      "num_train_examples": 30684,
+      "num_test_examples": 5169,
+      "embedding_dim": 896,
+      "xgboost_params": {
+        "max_depth": 6,
+        "learning_rate": 0.1,
+        "n_estimators": 100,
+        "scale_pos_weight": 0.6186959274108462
+      }
+    }
+  }
+}
