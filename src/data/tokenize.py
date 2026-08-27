@@ -48,7 +48,7 @@ def _read_table(con, base: Path, spec: dict) -> pl.DataFrame:
     val = spec.get("value_col")
     val_sql = f"CAST({val} AS DOUBLE)" if val else "NULL"
     unit = spec.get("unit_col")
-    unit_sql = f"CAST({unit} AS VARCHAR)" if unit else "NULL"
+    unit_sql = f"CAST({unit} AS VARCHAR)" if unit else "CAST('' AS VARCHAR)"
     time_col = spec["availability_col"]
     q = f"""
         SELECT hospitalization_id       AS hosp_id,
@@ -76,11 +76,25 @@ def validate_units(events: pl.DataFrame, cfg: dict) -> None:
     ]
     if mismatches and cfg["unit_normalization"].get("on_mismatch") == "error":
         raise ValueError("Non-canonical CLIF units: " + "; ".join(sorted(mismatches)))
+    unconfigured_concepts = set(
+        row[0] for row in observed.iter_rows() if row[0] not in expected
+    ) & set(events["concept"].unique().to_list())
+    if unconfigured_concepts and cfg["unit_normalization"].get("on_mismatch") == "error":
+        raise ValueError(
+            "Numeric concepts missing canonical unit mapping: "
+            + ", ".join(sorted(unconfigured_concepts))
+        )
 
 
 def build_value_bins(events: pl.DataFrame, n_bins: int,
                      forced_edges: dict[str, list[float]] | None = None) -> dict[str, list[float]]:
-    """Per-concept quantile edges with clinical cutpoints replacing nearest edges."""
+    """Per-concept quantile edges with clinical cutpoints replacing nearest edges.
+
+    Finite forced edges are retained regardless of the reference data range
+    so frozen vocab remains valid across sites with wider distributions."""
+    if n_bins < 2:
+        raise ValueError(f"n_bins must be >= 2, got {n_bins}")
+
     edges: dict[str, list[float]] = {}
     forced_edges = forced_edges or {}
     numeric = events.filter(pl.col("value").is_not_null())
@@ -88,20 +102,35 @@ def build_value_bins(events: pl.DataFrame, n_bins: int,
         vals = numeric.filter(pl.col("concept") == concept)["value"].drop_nulls()
         if len(vals) < n_bins:
             continue
+        if not np.isfinite(vals.to_numpy()).all():
+            raise ValueError(f"{concept} contains non-finite values; filter before binning")
+
         qs = np.linspace(0, 1, n_bins + 1)[1:-1]
         concept_edges = sorted(set(float(vals.quantile(q)) for q in qs))
         lo, hi = float(vals.min()), float(vals.max())
-        pinned = sorted(set(float(edge) for edge in forced_edges.get(concept, []) if lo < edge < hi))
+
+        pinned = sorted(set(
+            float(edge) for edge in forced_edges.get(concept, [])
+            if np.isfinite(float(edge))
+        ))
         if len(pinned) > n_bins - 1:
-            raise ValueError(f"{concept} has more forced edges than available bin boundaries")
+            raise ValueError(
+                f"{concept} has {len(pinned)} forced edges but only {n_bins - 1} boundaries"
+            )
+
         for edge in pinned:
-            if any(np.isclose(edge, existing) for existing in concept_edges):
-                continue
-            removable = [existing for existing in concept_edges if existing not in pinned]
-            if len(concept_edges) >= n_bins - 1 and removable:
-                concept_edges.remove(min(removable, key=lambda existing: abs(existing - edge)))
-            concept_edges.append(edge)
-            concept_edges.sort()
+            existing = next(
+                (i for i, e in enumerate(concept_edges) if np.isclose(e, edge)),
+                None,
+            )
+            if existing is not None:
+                concept_edges[existing] = edge
+            else:
+                removable = [e for e in concept_edges if not any(np.isclose(e, p) for p in pinned)]
+                if len(concept_edges) >= n_bins - 1 and removable:
+                    concept_edges.remove(min(removable, key=lambda e: abs(e - edge)))
+                concept_edges.append(edge)
+                concept_edges.sort()
         edges[concept] = concept_edges
     return edges
 
@@ -134,6 +163,8 @@ def _bin_of(value: float | None, concept: str, edges: dict[str, list[float]]) ->
 
 def _soft_bins(value: float | None, concept: str, edges: dict[str, list[float]],
                kernel_bins: int) -> list[tuple[int | None, float]]:
+    """Return fixed-width (2*kernel_bins+1) assignments so every event produces
+    a uniform-length list for the [B,T,K] dense tensor the encoder expects."""
     hard_bin = _bin_of(value, concept, edges)
     if hard_bin is None or kernel_bins <= 0:
         return [(hard_bin, 1.0)]
@@ -151,14 +182,21 @@ def _soft_bins(value: float | None, concept: str, edges: dict[str, list[float]],
     if lower is not None and upper is not None and upper > lower:
         center += float(np.clip((value - lower) / (upper - lower), 0, 1)) - 0.5
 
-    candidates = np.arange(
-        max(0, hard_bin - kernel_bins),
-        min(len(boundaries), hard_bin + kernel_bins) + 1,
-    )
-    sigma = max(kernel_bins / 2, 0.5)
+    half = kernel_bins
+    candidates = np.arange(max(0, hard_bin - half), min(len(boundaries), hard_bin + half) + 1)
+    sigma = max(half / 2, 0.5)
     weights = np.exp(-0.5 * ((candidates - center) / sigma) ** 2)
     weights /= weights.sum()
-    return [(int(bin_idx), float(weight)) for bin_idx, weight in zip(candidates, weights)]
+
+    width = 2 * half + 1
+    padded_bins = [hard_bin] * width
+    padded_weights = [1.0] + [0.0] * (width - 1)
+    for idx, weight in zip(candidates, weights):
+        slot = int(idx) - (hard_bin - half)
+        if 0 <= slot < width:
+            padded_bins[slot] = int(idx)
+            padded_weights[slot] = float(weight)
+    return list(zip(padded_bins, padded_weights))
 
 
 def tokenize_site(cfg: dict, site: str, base: Path, out: Path,
@@ -175,6 +213,13 @@ def tokenize_site(cfg: dict, site: str, base: Path, out: Path,
     print(f"  {site}: {len(events):,} raw events, {events['hosp_id'].n_unique():,} stays")
 
     if vocab is None:  # --build-vocab path
+        build_from = cfg["value_binning"].get("build_from_site")
+        if build_from is not None and site != build_from:
+            raise ValueError(
+                f"value_binning.build_from_site is {build_from!r} but "
+                f"--build-vocab was called with --site {site!r}. "
+                f"Only {build_from!r} may build the frozen vocabulary."
+            )
         bin_cfg = cfg["value_binning"]
         edges = build_value_bins(events, bin_cfg["n_bins"], bin_cfg.get("forced_edges"))
         vocab = build_vocab(events, edges)
@@ -188,16 +233,23 @@ def tokenize_site(cfg: dict, site: str, base: Path, out: Path,
         bin_cfg = cfg["value_binning"]
         for c, v in zip(group["concept"], group["value"]):
             b = _bin_of(v, c, edges)
-            hard_token = vocab.get(fused_token(c, b), SPECIAL["<pad>"])
+            key = fused_token(c, b) if b is not None else fused_token(c, None)
+            hard_token = vocab.get(key)
+            if hard_token is None:
+                raise KeyError(f"unknown token {key!r} — frozen vocab does not cover this concept+bin")
             token.append(hard_token)
             assignments = (
                 _soft_bins(v, c, edges, bin_cfg["soft_kernel_bins"])
                 if bin_cfg.get("soft_discretization")
                 else [(b, 1.0)]
             )
-            soft_token.append([vocab.get(fused_token(c, soft_bin), SPECIAL["<pad>"])
-                               for soft_bin, _ in assignments])
-            soft_weight.append([weight for _, weight in assignments])
+            soft_tokens, weights = [], []
+            for soft_bin, weight in assignments:
+                st_key = fused_token(c, soft_bin) if soft_bin is not None else fused_token(c, None)
+                soft_tokens.append(vocab.get(st_key, SPECIAL["<pad>"]))
+                weights.append(weight)
+            soft_token.append(soft_tokens)
+            soft_weight.append(weights)
             valnum.append(float(v) if v is not None else float("nan"))  # ORA value-regression target
         return pl.DataFrame({
             "hosp_id": group["hosp_id"][0],

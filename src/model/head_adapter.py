@@ -58,6 +58,14 @@ class CLIFATRONHeads(nn.Module):
             tie_weights=tie_weights,
             input_embedding=backbone.get_input_embeddings(),
         )
+        if not tie_weights:
+            try:
+                pretrained = backbone.get_output_embeddings()
+                if pretrained is not None:
+                    with torch.no_grad():
+                        self.next_event.projection.weight.copy_(pretrained.weight)
+            except Exception:
+                pass
         self.cr = CompetingRiskHead(d, n_targets, cr_bins)
         self.th = ThresholdHazardHead(d, n_targets, th_bins, n_value_bins=n_value_bins)
         self.vr = ValueRegressionHead(d, backbone.config.vocab_size) if enable_value else None

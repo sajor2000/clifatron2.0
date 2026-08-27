@@ -20,7 +20,9 @@ class DataConfigTest(unittest.TestCase):
                     "lab_value_numeric": [123.0],
                     "reference_unit": ["10^3/µL"],
                 }
-            ).with_columns(pl.col("lab_result_dttm").str.to_datetime()).write_parquet(base / "clif_labs.parquet")
+            ).with_columns(pl.col("lab_result_dttm").str.to_datetime()).write_parquet(
+                base / "clif_labs.parquet"
+            )
             spec = {
                 "file": "clif_labs",
                 "availability_col": "lab_result_dttm",
@@ -33,15 +35,40 @@ class DataConfigTest(unittest.TestCase):
         self.assertEqual(events["concept"].to_list(), ["platelet_count"])
         validate_units(
             events,
-            {"unit_normalization": {"on_mismatch": "error", "concepts": {"platelet_count": "10^3/uL"}}},
+            {
+                "unit_normalization": {
+                    "on_mismatch": "error",
+                    "concepts": {"platelet_count": "10^3/uL"},
+                }
+            },
         )
 
     def test_rejects_noncanonical_units(self):
-        events = pl.DataFrame({"concept": ["lactate"], "unit": ["mg/dL"]})
+        events = pl.DataFrame({"concept": ["lactate"], "unit": ["mg/dL"], "value": [2.0]})
         with self.assertRaisesRegex(ValueError, "Non-canonical CLIF units"):
             validate_units(
                 events,
-                {"unit_normalization": {"on_mismatch": "error", "concepts": {"lactate": "mmol/L"}}},
+                {
+                    "unit_normalization": {
+                        "on_mismatch": "error",
+                        "concepts": {"lactate": "mmol/L"},
+                    }
+                },
+            )
+
+    def test_rejects_numeric_concept_without_unit_mapping(self):
+        events = pl.DataFrame(
+            {"concept": ["creatinine"], "unit": ["mg/dL"], "value": [1.2]}
+        )
+        with self.assertRaisesRegex(ValueError, "missing canonical unit mapping"):
+            validate_units(
+                events,
+                {
+                    "unit_normalization": {
+                        "on_mismatch": "error",
+                        "concepts": {"lactate": "mmol/L"},
+                    }
+                },
             )
 
 

@@ -114,8 +114,14 @@ class CLIFEncoder(nn.Module):
         """Encode hard [B,T] IDs or soft [B,T,K] IDs plus normalized weights."""
         if token.ndim == 3 and token_weight is None:
             raise ValueError("token_weight is required for soft token IDs")
-        if token_weight is not None and token.shape != token_weight.shape:
-            raise ValueError("token and token_weight must have matching shapes")
+        if token_weight is not None:
+            if token.ndim != 3 or token_weight.ndim != 3:
+                raise ValueError(
+                    "soft token and weight tensors must both be 3D [B,T,K]; "
+                    f"got token.ndim={token.ndim}, weight.ndim={token_weight.ndim}"
+                )
+            if token.shape != token_weight.shape:
+                raise ValueError("token and token_weight must have matching shapes")
         x = self.tok_emb(token)
         if token_weight is not None:
             x = (x * token_weight.unsqueeze(-1)).sum(-2)
