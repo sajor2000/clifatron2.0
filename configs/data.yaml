@@ -1,6 +1,9 @@
-# CLIF 2.1 tokenizer config. VERIFY field names against your data dictionary.
+# CLIF 2.1 tokenizer config. Field names verified 2026-08-27 against:
+# https://clif-icu.com/data-dictionary/data-dictionary-2.1.0
 # Concepts follow ICareFM's split: measurements are prediction TARGETS,
 # treatments are INPUTS ONLY (never targets) -> see notes/METHODS.md rule 1.
+
+schema_version: "2.1.0"
 
 anchor:
   # cohort anchor = first ICU admission; obs window then prediction window
@@ -11,28 +14,30 @@ anchor:
 tables:
   vitals:
     file: "clif_vitals"
-    time_col: "recorded_dttm"
+    availability_col: "recorded_dttm"     # CLIF has no separate vital storetime
     concept_col: "vital_category"        # mCIDE controlled vocab
     value_col: "vital_value"
   labs:
     file: "clif_labs"
-    time_col: "lab_result_dttm"
+    availability_col: "lab_result_dttm"   # result availability; MIMIC storetime maps here
     concept_col: "lab_category"
     value_col: "lab_value_numeric"
+    unit_col: "reference_unit"
   resp_support:
     file: "clif_respiratory_support"
-    time_col: "recorded_dttm"
+    availability_col: "recorded_dttm"
     concept_col: "device_category"       # imv, nippv, high_flow, ...
     value_col: null                      # categorical event
   meds:                                   # INPUT ONLY (not a target)
     file: "clif_medication_admin_continuous"
-    time_col: "admin_dttm"
+    availability_col: "admin_dttm"
     concept_col: "med_category"          # norepinephrine, propofol, heparin, furosemide...
-    value_col: "med_dose"
+    value_col: null                       # ablation emits category only; default tokenETL normalizes doses
+    dose_tokenization: "tokenetl_only"    # weight-aware preferred-unit conversion in vendored tokenETL
     input_only: true
   adt:
     file: "clif_adt"
-    time_col: "in_dttm"
+    availability_col: "in_dttm"
     concept_col: "location_category"
     value_col: null
 
@@ -41,14 +46,30 @@ target_concepts:
   - {name: map,               source: vitals, direction: below, unit: mmHg}
   - {name: lactate,           source: labs,   direction: above, unit: mmol/L}
   - {name: spo2,              source: vitals, direction: below, unit: "%"}
-  - {name: respiratory_rate,  source: vitals, direction: above, unit: /min}
+  - {name: respiratory_rate,  source: vitals, direction: above, unit: "breaths per minute"}
   - {name: creatinine,        source: labs,   direction: above, unit: mg/dL}
   - {name: bilirubin_total,   source: labs,   direction: above, unit: mg/dL}
-  - {name: platelet_count,    source: labs,   direction: below, unit: k/uL}
-  - {name: heart_rate,        source: vitals, direction: above, unit: /min}
+  - {name: platelet_count,    source: labs,   direction: below, unit: "10^3/uL"}
+  - {name: heart_rate,        source: vitals, direction: above, unit: "beats per minute"}
   - {name: sbp,               source: vitals, direction: below, unit: mmHg}
-  - {name: temp_c,            source: vitals, direction: above, unit: C}
+  - {name: temp_c,            source: vitals, direction: above, unit: celsius}
   # extend toward K~35 as coverage allows
+
+# CLIF 2.1 already requires these canonical units. Validate before pooling values
+# into reference-site bins; do not silently mix site-specific units.
+unit_normalization:
+  on_mismatch: "error"
+  concepts:
+    map: mmHg
+    lactate: mmol/L
+    spo2: "%"
+    respiratory_rate: "breaths per minute"
+    creatinine: mg/dL
+    bilirubin_total: mg/dL
+    platelet_count: "10^3/uL"
+    heart_rate: "beats per minute"
+    sbp: mmHg
+    temp_c: celsius
 
 value_binning:
   # REVISED 2026-08-27 (tokenization thread a76bb9). Lee 2026 (arXiv:2604.16775): reference-range

@@ -32,25 +32,50 @@ SPECIAL = {"<pad>": 0, "<bos>": 1, "<eos>": 2}
 
 
 def _read_table(con, base: Path, spec: dict) -> pl.DataFrame:
-    """Melt one CLIF table to long events: (hosp_id, dttm, concept, value)."""
+    """Melt one CLIF table to long events ordered by its availability timestamp."""
     fp = base / f"{spec['file']}.parquet"
     if not fp.exists():
         print(f"  [skip] {fp.name} not found")
         return pl.DataFrame(
-            schema={"hosp_id": pl.Int64, "dttm": pl.Datetime, "concept": pl.Utf8, "value": pl.Float64}
+            schema={
+                "hosp_id": pl.Utf8,
+                "dttm": pl.Datetime,
+                "concept": pl.Utf8,
+                "value": pl.Float64,
+                "unit": pl.Utf8,
+            }
         )
     val = spec.get("value_col")
     val_sql = f"CAST({val} AS DOUBLE)" if val else "NULL"
+    unit = spec.get("unit_col")
+    unit_sql = f"CAST({unit} AS VARCHAR)" if unit else "NULL"
+    time_col = spec["availability_col"]
     q = f"""
         SELECT hospitalization_id       AS hosp_id,
-               {spec['time_col']}        AS dttm,
+               {time_col}                AS dttm,
                {spec['concept_col']}     AS concept,
-               {val_sql}                 AS value
+               {val_sql}                 AS value,
+               {unit_sql}                AS unit
         FROM read_parquet('{fp}')
         WHERE {spec['concept_col']} IS NOT NULL
-          AND {spec['time_col']} IS NOT NULL
+          AND {time_col} IS NOT NULL
     """
     return con.execute(q).pl()
+
+
+def validate_units(events: pl.DataFrame, cfg: dict) -> None:
+    def normalized(unit: str) -> str:
+        return unit.strip().lower().replace("¬µ", "u").replace("µ", "u").replace("μ", "u")
+
+    expected = cfg.get("unit_normalization", {}).get("concepts", {})
+    observed = events.filter(pl.col("unit").is_not_null()).select("concept", "unit").unique()
+    mismatches = [
+        f"{concept}: expected {expected[concept]!r}, found {unit!r}"
+        for concept, unit in observed.iter_rows()
+        if concept in expected and normalized(unit) != normalized(expected[concept])
+    ]
+    if mismatches and cfg["unit_normalization"].get("on_mismatch") == "error":
+        raise ValueError("Non-canonical CLIF units: " + "; ".join(sorted(mismatches)))
 
 
 def build_value_bins(events: pl.DataFrame, n_bins: int) -> dict[str, list[float]]:
@@ -102,6 +127,7 @@ def tokenize_site(cfg: dict, site: str, base: Path, out: Path,
             df = df.with_columns(source=pl.lit(name))
             frames.append(df)
     events = pl.concat(frames, how="vertical_relaxed").sort(["hosp_id", "dttm"])
+    validate_units(events, cfg)
     print(f"  {site}: {len(events):,} raw events, {events['hosp_id'].n_unique():,} stays")
 
     if vocab is None:  # --build-vocab path
