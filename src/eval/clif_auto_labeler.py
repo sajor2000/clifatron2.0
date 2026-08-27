@@ -247,6 +247,7 @@ def auto_label(data_dir: str, outcomes: list[str] | None = None):
     result = dfs[0]
     for df in dfs[1:]:
         result = result.join(df, on="hospitalization_id", how="full")
+    result = result.drop([c for c in result.columns if c.endswith("_right")])
     return result.fill_null(0)
 
 
