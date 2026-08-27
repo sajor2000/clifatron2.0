@@ -102,6 +102,12 @@ clinical bins are NOT how you achieve it. CORRECTED tokenization decision:
 3. Retrospective reports/discharge summaries = LABEL source only; only pre-anchor notes may be features.
 4. MIMIC-IV-Ext-CLIF is PhysioNet credentialed; Rush + UChicago institutional — none leave their node.
 
+## HANDOFF → notes/NEXT_STEPS.md (2026-08-27)
+Full agent-handoff written: finalized token+arch decisions (with the 2026 evidence tables + citations
+from research threads a76bb9/aeb4d2), ordered file-level next steps (config↔code reconcile → run Method-3
+on real ckpt → phase-2 head pretrain → tokenization ablation → clif-validate/ → notes modality), open
+items to verify, hard rules, env mechanics. A fresh agent should read notes/NEXT_STEPS.md first.
+
 ## Status (2026-08-27)
 Deep research (notes/RESEARCH.md) + PIVOT to build-on-CLIFATRON (notes/INTEGRATION.md).
 METHOD-3 WEDGE BUILT (keeper methods layer, all py_compile clean; panel numerically validated

@@ -14,6 +14,10 @@ ICU model **transportable and clinically deployable**:
 
 **Thesis:** one small model → many outcomes → many hospitals → one node (2× L40, no cluster).
 
+> **Taking this over? Start with [`notes/NEXT_STEPS.md`](notes/NEXT_STEPS.md)** — a full handoff:
+> finalized token/architecture decisions, the 2026 evidence base with citations, and ordered,
+> file-level next steps. Read it before touching code.
+
 ## Design principle — clinically derived
 The model must be most sensitive where clinical **danger** is, and legible to a clinician. Concretely:
 outcomes are states doctors *act on* (never treatments — those are inputs only); threshold heads are
