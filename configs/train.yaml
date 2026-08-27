@@ -1,0 +1,47 @@
+# 2x L40 (48 GB each, Ada, no NVLink). DDP via torchrun --nproc_per_node=2.
+optimizer:
+  name: adamw
+  lr: 3.0e-4
+  weight_decay: 0.1
+  betas: [0.9, 0.95]
+  grad_clip: 1.0
+
+schedule:
+  warmup_steps: 2000
+  total_steps: 60000
+  cosine_decay: true
+
+batch:
+  per_gpu: 128          # 2 GPUs -> global 256 sequences x 512 events
+  grad_accum: 1
+
+runtime:
+  precision: bf16
+  compile: true
+  ddp: true
+  num_workers: 8
+  ckpt_every: 2000
+  ckpt_dir: "checkpoints"
+  # trunk saved separately from heads so probes/finetune reuse it
+
+finetune:
+  freeze_trunk: true
+  tasks:                # K supervised task heads (all CLIF-derivable)
+    - in_hospital_mortality
+    - new_imv_24h
+    - new_vasopressor_24h
+    - aki_kdigo_48h
+    - new_rrt_48h
+    - sepsis_48h
+    - resp_failure_48h
+  zero_shot_holdout:    # answered via threshold_hazard head, NO trained head
+    - delirium
+  lr: 1.0e-3
+  epochs: 20
+
+eval:
+  sites: [mimic, rush]
+  ensemble: mean        # inference-time ensembling (Elemento)
+  calibration: temperature_scaling   # Cadence
+  slices: [sex_category, race_category]   # TRIPOD+AI dual-sex + race
+  size_ablation: [10_000_000, 30_000_000, 100_000_000]  # params, small-beats-big

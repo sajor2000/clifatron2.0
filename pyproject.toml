@@ -1,0 +1,29 @@
+[project]
+name = "clif-foundation-model"
+version = "0.1.0"
+description = "Compact multimodal foundation model for critical care on federated CLIF 2.1"
+requires-python = ">=3.11"
+dependencies = [
+    "torch>=2.4",            # bf16 + torch.compile on L40 (Ada)
+    "duckdb>=1.1",           # read CLIF parquet without loading to memory
+    "polars>=1.0",           # fast melt / pivot
+    "pyarrow>=17",
+    "numpy>=1.26",
+    "pyyaml>=6",
+    "scikit-learn>=1.5",     # AUROC/AUPRC, calibration, isotonic (ICI)
+    "lightgbm>=4.5",         # LPE baseline (task-specific ML floor)
+    "xgboost>=2.1",          # CLIFATRON Method 1 baseline (XGBoost-on-embeddings)
+    "transformers>=4.44",    # load CLIFATRON GPT2/Qwen2 checkpoints (head_adapter)
+    "sentence-transformers>=3.0",  # leakage-safe note embeddings (small clinical model)
+    "tqdm>=4.66",
+]
+
+[tool.uv]
+# 2x L40 box is Linux/CUDA; pin CUDA wheels there via `uv sync --extra cuda` if needed.
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src"]

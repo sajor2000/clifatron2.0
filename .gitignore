@@ -1,0 +1,29 @@
+# data & model artifacts — NEVER commit (PHI / large binaries)
+# NOTE: leading slash = repo-root only, so src/data/ source is NOT ignored
+/data/
+/checkpoints/
+/benchmark/results/
+*.parquet
+*.csv
+*.pt
+*.bin
+*.ckpt
+*.safetensors
+vocab.json
+
+# python
+__pycache__/
+*.pyc
+.venv/
+uv.lock
+.ipynb_checkpoints/
+
+# experiment tracking
+wandb/
+runs/
+*.log
+
+# os / editor
+.DS_Store
+.idea/
+.vscode/

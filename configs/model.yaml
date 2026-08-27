@@ -1,0 +1,55 @@
+# ~30M-param Qwen2/Llama-style trunk. REVISED 2026-08-27 per notes/RESEARCH.md §2-§3
+# + the two 2026-preprint research threads (tokenization a76bb9, architecture aeb4d2).
+# Flat causal decoder over FUSED code=value tokens with TIME-AWARE admission-relative RoPE
+# (Lee 2026 arXiv:2604.16775; Context Clues 2412.16178; RAVEN 2603.24562; HealthFormer 2026).
+#
+# Backbone verdict (arch thread): KEEP transformer, do NOT switch to Mamba — at 8k/30M Mamba is
+# within noise and the objective (not the backbone) drives EHR performance (ORA 2602.00541).
+# Mamba/HyMaTE hybrid = stretch ablation only. We also attach to CLIFATRON's Qwen2 checkpoint.
+
+trunk:
+  d_model: 512
+  n_layers: 8              # 8 x 512 x 8 heads, SwiGLU+RMSNorm+RoPE ~= 25M trunk (+ emb below)
+  n_heads: 8
+  ffn_mult: 4              # SwiGLU hidden = ffn_mult * d_model
+  dropout: 0.1
+  max_tokens: 8192         # match CLIFATRON trunk (we attach to it); 4096 = Lee-tokenizer ablation arm
+  # TIME-AWARE RoPE (single highest-leverage arch change per aeb4d2): rotate by admission-relative
+  # MINUTES, shared across tokens within one event (same timestamp -> same position). Not token index.
+  rope_base: 10000.0
+  rope_position: "admission_minutes"   # {admission_minutes | token_index(ablation)}
+  rope_time_alibi: false               # optional log-Δt ALiBi bias for severe irregular sampling (HealthFormer)
+  # Untied emb beat tied by +4-7% AUPRC, gap WIDENS under federation (medRxiv 2026.04.24, 31.6M GPT).
+  # BUDGET TENSION: untied + large vocab blows the ~30M budget. At untied, vocab*d*2 lives in the
+  # embedding tables — so cap fused-decile vocab ~8-12k (untied => ~8-12M emb + ~25M trunk ~= 33-37M).
+  # A ~30k vocab would force tied. Chosen: untied + ~10k vocab. Reconcile next_event_loss (heads.py
+  # currently ties LM head to input emb) -> add a separate output projection when untied.
+  tied_embeddings: false
+  target_vocab: 10000       # fused-decile CLIF-native, frozen from reference site (see data.yaml)
+
+heads:
+  # (A) next-event token — LOW weight auxiliary (weakest learner alone; kept for
+  #     open-ended zero-shot via SCOPE/REACH rollout). RESEARCH.md §3.
+  next_event: {enabled: true, weight: 0.2}
+  # (B) competing-risk time-to-event CIF — SurvivEHR
+  competing_risk: {enabled: true, weight: 1.0, n_time_bins: 16, horizon_hours: 48}
+  # (C) threshold-conditioned hazard — ICareFM (PRIMARY zero-shot engine)
+  threshold_hazard:
+    enabled: true
+    weight: 1.0
+    horizon_hours: 48
+    n_time_bins: 48                 # hourly discrete hazard over 48h
+    tau_sampling: "empirical_bins"  # sample τ from each concept's decile edges at train time
+    direction_embed: true           # learned direction (above/below) embedding
+    threshold_embed_dim: 32         # learned threshold embedding
+  # (D) value regression — the ORA "mark" (arXiv:2602.00541). NOW ENABLED:
+  #     predicting the continuous value lifts physiology/regression tasks +33-38% vs NTP.
+  value_regression: {enabled: true, weight: 0.5}
+
+# Multi-task loss balancing (RESEARCH.md §3): uncertainty (Kendall 1/2σ²) + grad-norm,
+# so dense mortality signal doesn't starve sparse auxiliaries. Fallback: fixed weights above.
+loss_balancing: "uncertainty"       # uncertainty | fixed
+curriculum: "ntp_then_tte"          # warm up on next-event, then phase in TTE heads
+
+precision: "bf16"
+compile: true

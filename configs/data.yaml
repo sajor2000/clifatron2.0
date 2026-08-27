@@ -1,0 +1,86 @@
+# CLIF 2.1 tokenizer config. VERIFY field names against your data dictionary.
+# Concepts follow ICareFM's split: measurements are prediction TARGETS,
+# treatments are INPUTS ONLY (never targets) -> see notes/METHODS.md rule 1.
+
+anchor:
+  # cohort anchor = first ICU admission; obs window then prediction window
+  icu_location_category: "icu"          # clif_adt.location_category
+  obs_hours: 24                          # features/context up to hour 24
+  horizon_hours: 48                      # ICareFM uses 48h hazard horizon
+
+tables:
+  vitals:
+    file: "clif_vitals"
+    time_col: "recorded_dttm"
+    concept_col: "vital_category"        # mCIDE controlled vocab
+    value_col: "vital_value"
+  labs:
+    file: "clif_labs"
+    time_col: "lab_result_dttm"
+    concept_col: "lab_category"
+    value_col: "lab_value_numeric"
+  resp_support:
+    file: "clif_respiratory_support"
+    time_col: "recorded_dttm"
+    concept_col: "device_category"       # imv, nippv, high_flow, ...
+    value_col: null                      # categorical event
+  meds:                                   # INPUT ONLY (not a target)
+    file: "clif_medication_admin_continuous"
+    time_col: "admin_dttm"
+    concept_col: "med_category"          # norepinephrine, propofol, heparin, furosemide...
+    value_col: "med_dose"
+    input_only: true
+  adt:
+    file: "clif_adt"
+    time_col: "in_dttm"
+    concept_col: "location_category"
+    value_col: null
+
+# Target measurement concepts (K hazard heads, ICareFM-style). Treatments excluded.
+target_concepts:
+  - {name: map,               source: vitals, direction: below, unit: mmHg}
+  - {name: lactate,           source: labs,   direction: above, unit: mmol/L}
+  - {name: spo2,              source: vitals, direction: below, unit: "%"}
+  - {name: respiratory_rate,  source: vitals, direction: above, unit: /min}
+  - {name: creatinine,        source: labs,   direction: above, unit: mg/dL}
+  - {name: bilirubin_total,   source: labs,   direction: above, unit: mg/dL}
+  - {name: platelet_count,    source: labs,   direction: below, unit: k/uL}
+  - {name: heart_rate,        source: vitals, direction: above, unit: /min}
+  - {name: sbp,               source: vitals, direction: below, unit: mmHg}
+  - {name: temp_c,            source: vitals, direction: above, unit: C}
+  # extend toward K~35 as coverage allows
+
+value_binning:
+  # REVISED 2026-08-27 (tokenization thread a76bb9). Lee 2026 (arXiv:2604.16775): reference-range
+  # anchoring buys NO consistent gain over population deciles at matched granularity -> deciles win
+  # on simplicity + balanced token frequency + transport. Frozen decile EDGES transport across sites
+  # (Federated GEMs 2608.02939: only 0.025 AUROC cross-site penalty). So: deciles, frozen, NOT clinical bins.
+  scheme: "decile"                        # {decile | clinical_segment(CLIFATRON ablation arm) | continuous_fused(McCann ablation)}
+  n_bins: 10                              # per-concept deciles -> fused value-bin tokens
+  build_from_site: "mimic"                # freeze bin EDGES on reference site, apply identically to all sites
+  # SOFT DISCRETIZATION (Lee's one encoder that WINS on the dangerous tails we care about: severe
+  # hypokalemia/hypernatremia/hypotension/CRRT/K-extremes). Spread mass to adjacent bins. This is how
+  # we honor "most sensitive where it's most dangerous for the patient" WITHOUT hard clinical bins.
+  soft_discretization: true
+  soft_kernel_bins: 1                     # +/- neighbor bins to receive soft mass
+  # Clinical derivation as a CONSTRAINT (not the base scheme): force ICU DECISION thresholds to be
+  # guaranteed bin edges so tokens are legible at decision points AND boundaries align with the
+  # threshold-hazard head's queries. Does not contradict Lee (he anchored the WHOLE scheme; we only
+  # pin a few cutpoints on top of the decile grid).
+  forced_edges:                           # concept: [physical-value cutpoints guaranteed to be bin boundaries]
+    lactate:    [2.0, 4.0]                # Sepsis-3 / Surviving Sepsis
+    map:        [65.0]                    # vasopressor trigger
+    spo2:       [88.0, 90.0]
+    creatinine: [1.5, 2.0, 3.0]           # ~KDIGO stages (verify vs baseline)
+    pao2_fio2:  [100.0, 200.0, 300.0]     # ARDS Berlin severity (if P/F available)
+  # continuous_fused (McCann medRxiv 2026.08.04): -34% seq len, +30% numeric acc, but WORSE calibration
+  # than discrete. Calibration is our headline -> ablation arm, not default. Naive unfused xVal collapses
+  # to the median (Lee) -> never use unfused.
+
+notes:
+  enabled: false                          # turn on for multimodal branch
+  file: "clif_notes"                      # site-specific; VERIFY name + timestamp col
+  time_col: "note_dttm"
+  text_col: "note_text"
+  leakage_guard: "note_dttm <= anchor + obs_hours"   # pre-anchor notes only (rule 3)
+  encoder: "abhinand/MedEmbed-small-v0.1"            # small clinical sentence encoder
