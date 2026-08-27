@@ -19,6 +19,7 @@ import torch.nn as nn
 
 from src.model.heads import (
     CompetingRiskHead,
+    NextEventHead,
     ThresholdHazardHead,
     ValueRegressionHead,
     next_event_loss,
@@ -41,8 +42,8 @@ class CLIFATRONHeads(nn.Module):
     pass `anchor_idx` explicitly, else the last real token (from attention_mask) is used."""
 
     def __init__(self, backbone, n_targets: int, *, freeze_backbone: bool = True,
-                 cr_bins: int = 16, th_bins: int = 48, n_value_bins: int = 10,
-                 enable_value: bool = True):
+                  cr_bins: int = 16, th_bins: int = 48, n_value_bins: int = 10,
+                  enable_value: bool = True, tie_weights: bool = False):
         super().__init__()
         self.backbone = backbone
         d = hidden_dim(backbone)
@@ -51,6 +52,12 @@ class CLIFATRONHeads(nn.Module):
                 p.requires_grad = False
             self.backbone.eval()
         self.frozen = freeze_backbone
+        self.next_event = NextEventHead(
+            d,
+            backbone.config.vocab_size,
+            tie_weights=tie_weights,
+            input_embedding=backbone.get_input_embeddings(),
+        )
         self.cr = CompetingRiskHead(d, n_targets, cr_bins)
         self.th = ThresholdHazardHead(d, n_targets, th_bins, n_value_bins=n_value_bins)
         self.vr = ValueRegressionHead(d, backbone.config.vocab_size) if enable_value else None
@@ -91,8 +98,7 @@ class CLIFATRONHeads(nn.Module):
             out["val"] = self.vr.loss(H, batch["input_ids"], batch["value"], batch["val_mask"])
             total = total + w_val * out["val"]
         if not self.frozen:  # joint next-token only makes sense when the backbone trains
-            logits = self.backbone(input_ids=batch["input_ids"],
-                                   attention_mask=batch["attention_mask"]).logits
+            logits = self.next_event(H)
             out["ntp"] = next_event_loss(logits, batch["input_ids"])
             total = total + w_ntp * out["ntp"]
         out["total"] = total

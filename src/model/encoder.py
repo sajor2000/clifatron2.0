@@ -9,7 +9,7 @@ ablation (28 matched decoders on MIMIC-IV-Ext-CLIF):
     and ~11% shorter sequences (replaces the continuous-time Delta-t ALiBi bias).
   - context 4096 tokens covers >99.95% of first-24h stays.
 
-Backbone: Llama-style — RMSNorm, RoPE, SwiGLU, tied embeddings, causal SDPA.
+Backbone: Llama-style — RMSNorm, RoPE, SwiGLU, untied embeddings by default, causal SDPA.
 Returns per-token hidden states H_t; heads (see heads.py) consume the state at the
 anchor/last position (ICareFM-style per-step patient state).
 """
@@ -18,6 +18,8 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+from src.model.heads import NextEventHead
 
 
 class RMSNorm(nn.Module):
@@ -93,6 +95,12 @@ class CLIFEncoder(nn.Module):
         xe = cfg["trunk"]
         d = xe["d_model"]
         self.tok_emb = nn.Embedding(vocab_size, d, padding_idx=0)
+        self.lm_head = NextEventHead(
+            d,
+            vocab_size,
+            tie_weights=xe.get("tied_embeddings", False),
+            input_embedding=self.tok_emb,
+        )
         self.n_heads = xe["n_heads"]
         self.head_dim = d // xe["n_heads"]
         self.blocks = nn.ModuleList(
@@ -111,8 +119,7 @@ class CLIFEncoder(nn.Module):
         return self.ln_f(x)                                      # per-token states H_t
 
     def lm_logits(self, H: torch.Tensor) -> torch.Tensor:
-        """Tied-embedding next-token logits."""
-        return F.linear(H, self.tok_emb.weight)
+        return self.lm_head(H)
 
 
 def count_params(m: nn.Module) -> int:

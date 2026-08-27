@@ -1,7 +1,7 @@
 """Self-supervised pretraining on one site's event shards (2x L40, DDP).
 
 Loss = w_A*next_event + w_B*competing_risk + w_C*threshold_hazard + w_D*value_regression
-(ORA marked-TTE; RESEARCH.md §3). next_event uses tied embeddings (enc.lm_logits).
+(ORA marked-TTE; RESEARCH.md §3). next_event uses the configured tied/untied projection.
 The threshold-hazard batch samples a random target concept + random τ (from that
 concept's decile edges) + direction each step (ICareFM), and derives crossed_bin
 from the future event stream inside the 48h horizon.
@@ -56,7 +56,7 @@ class Model(torch.nn.Module):
     def forward(self, batch):
         H = self.enc(batch["token"], batch["pos_min"])           # fused token + RoPE
         h_last = H[torch.arange(H.size(0)), batch["last_idx"]]
-        la = next_event_loss(self.enc.lm_logits(H), batch["token"])   # tied embeddings
+        la = next_event_loss(self.enc.lm_logits(H), batch["token"])
         lb = self.cr.loss(h_last, batch["cr_type"], batch["cr_bin"])
         lc = self.th.loss(
             h_last, batch["th_target"], batch["th_tau"], batch["th_dir"], batch["th_crossed"]

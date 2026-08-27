@@ -1,6 +1,6 @@
 """Prediction heads.
 
-(A) NextEventHead        — next-event type softmax (SurvivEHR / HealthFormer)
+(A) NextEventHead        — tied/untied next-event projection (SurvivEHR / HealthFormer)
 (B) CompetingRiskHead    — per-type discrete-time CIF over horizon (SurvivEHR)
 (C) ThresholdHazardHead  — ICareFM: P(concept k crosses threshold τ, in `direction`,
                            within horizon h). Learned threshold + direction embeddings,
@@ -19,9 +19,24 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
+class NextEventHead(nn.Module):
+    """Next-token projection, untied by default with an explicit tied ablation."""
+
+    def __init__(self, d: int, vocab_size: int, *, tie_weights: bool = False,
+                 input_embedding: nn.Embedding | None = None):
+        super().__init__()
+        self.projection = nn.Linear(d, vocab_size, bias=False)
+        if tie_weights:
+            if input_embedding is None:
+                raise ValueError("input_embedding is required when tie_weights=True")
+            self.projection.weight = input_embedding.weight
+
+    def forward(self, h: torch.Tensor) -> torch.Tensor:
+        return self.projection(h)
+
+
 def next_event_loss(logits: torch.Tensor, target_tok: torch.Tensor) -> torch.Tensor:
-    """Tied-embedding next-token CE. `logits` = enc.lm_logits(H) [B,T,V]; predict
-    token[t+1] from state[t]. pad id 0 ignored."""
+    """Next-token CE. `logits` is [B,T,V]; token[t+1] is predicted from state[t]."""
     return F.cross_entropy(
         logits[:, :-1].reshape(-1, logits.size(-1)),
         target_tok[:, 1:].reshape(-1),
