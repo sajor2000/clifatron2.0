@@ -223,9 +223,17 @@ Do these roughly in order. Each is scoped to be a single clean commit. **Commit 
 ---
 
 ## 7. Environment / mechanics
+
+**Compute tiers (three options):**
 - **Dev (this Mac):** torch NOT installed. Verify with `python3 -m py_compile <file>` and run metric checks
   via `uv run --with numpy --with scikit-learn python -c "..."`. `python` is absent — use `python3`.
 - **Training (2× L40, Linux):** 48GB each, no NVLink, bf16, DDP via `torchrun`. `uv sync` installs deps.
+  The default training box.
+- **Azure hourly GPU (burst):** rent by the hour for bigger runs / faster ablation sweeps.
+  **COMPLIANCE GATE (hard rule 4):** only inside a **BAA/DUA-covered Azure tenant** — each site's PHI
+  (Rush, UChicago) may not leave its governed environment, and MIMIC's PhysioNet DUA governs its cloud use.
+  Use the lab's compliant tenant; do NOT spin up an ad-hoc personal subscription for real data. Fine for
+  code/synthetic-data smoke tests anywhere. (The lab already runs Azure Foundry/blob/containers.)
 - **Package management:** `uv` only (`uv add` for libs, `uvx` to run). Never `pip install` into a shared interpreter.
 - **Multi-machine workflow:** this repo is worked across computers. **Always `git pull` at session start;
   `git commit` + `git push` after each change** so no work is stranded. Data/checkpoints/`clif_config.json`

@@ -101,6 +101,8 @@ clinical bins are NOT how you achieve it. CORRECTED tokenization decision:
 2. Vocab = CLIFATRON frozen mCIDE, applied identically to all 3 sites — no cross-site pooling of raw data.
 3. Retrospective reports/discharge summaries = LABEL source only; only pre-anchor notes may be features.
 4. MIMIC-IV-Ext-CLIF is PhysioNet credentialed; Rush + UChicago institutional — none leave their node.
+   Compute = 3 tiers: MacBook (dev, MPS), 2× L40 Linux box (default training, DDP), and Azure hourly GPU
+   (burst) — Azure ONLY inside a BAA/DUA-covered lab tenant (never an ad-hoc personal sub for real PHI).
 
 ## HANDOFF → notes/NEXT_STEPS.md (2026-08-27)
 Full agent-handoff written: finalized token+arch decisions (with the 2026 evidence tables + citations
