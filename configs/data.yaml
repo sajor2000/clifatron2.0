@@ -84,6 +84,9 @@ value_binning:
   # we honor "most sensitive where it's most dangerous for the patient" WITHOUT hard clinical bins.
   soft_discretization: true
   soft_kernel_bins: 1                     # +/- neighbor bins to receive soft mass
+  # tokenizer output keeps `token` as the hard NTP target and adds `soft_token` +
+  # `soft_weight` as the weighted encoder input. The same frozen edges are the
+  # numeric-binning override for the default tokenETL path; packing remains upstream.
   # Clinical derivation as a CONSTRAINT (not the base scheme): force ICU DECISION thresholds to be
   # guaranteed bin edges so tokens are legible at decision points AND boundaries align with the
   # threshold-hazard head's queries. Does not contradict Lee (he anchored the WHOLE scheme; we only

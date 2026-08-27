@@ -54,7 +54,8 @@ class Model(torch.nn.Module):
         self.vr = ValueRegressionHead(d, vocab_size) if h["value_regression"]["enabled"] else None
 
     def forward(self, batch):
-        H = self.enc(batch["token"], batch["pos_min"])           # fused token + RoPE
+        encoder_token = batch.get("soft_token", batch["token"])
+        H = self.enc(encoder_token, batch["pos_min"], batch.get("soft_weight"))
         h_last = H[torch.arange(H.size(0)), batch["last_idx"]]
         la = next_event_loss(self.enc.lm_logits(H), batch["token"])
         lb = self.cr.loss(h_last, batch["cr_type"], batch["cr_bin"])
@@ -105,6 +106,7 @@ def main():
     raise SystemExit(
         "Wire up the DataLoader/collate next — model, heads, DDP, and losses are ready.\n"
         "Batch keys required: token, pos_min, value, val_mask, last_idx,\n"
+        "  optional soft_token + soft_weight,\n"
         "  cr_type, cr_bin, th_target, th_tau, th_dir, th_crossed."
     )
 

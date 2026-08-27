@@ -110,9 +110,15 @@ class CLIFEncoder(nn.Module):
         self.d_model = d
         self.rope_base = xe.get("rope_base", 10000.0)
 
-    def forward(self, token, pos_min) -> torch.Tensor:
-        """token: [B, T] fused ids (0=pad). pos_min: [B, T] minutes since admission."""
-        x = self.tok_emb(token)                                  # [B, T, d]
+    def forward(self, token, pos_min, token_weight=None) -> torch.Tensor:
+        """Encode hard [B,T] IDs or soft [B,T,K] IDs plus normalized weights."""
+        if token.ndim == 3 and token_weight is None:
+            raise ValueError("token_weight is required for soft token IDs")
+        if token_weight is not None and token.shape != token_weight.shape:
+            raise ValueError("token and token_weight must have matching shapes")
+        x = self.tok_emb(token)
+        if token_weight is not None:
+            x = (x * token_weight.unsqueeze(-1)).sum(-2)
         cos, sin = build_rope_cache(pos_min, self.head_dim, self.rope_base)
         for blk in self.blocks:
             x = blk(x, cos, sin)

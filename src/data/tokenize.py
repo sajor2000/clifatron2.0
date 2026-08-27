@@ -78,16 +78,31 @@ def validate_units(events: pl.DataFrame, cfg: dict) -> None:
         raise ValueError("Non-canonical CLIF units: " + "; ".join(sorted(mismatches)))
 
 
-def build_value_bins(events: pl.DataFrame, n_bins: int) -> dict[str, list[float]]:
-    """Per-concept quantile edges (deciles by default). Numeric concepts only."""
+def build_value_bins(events: pl.DataFrame, n_bins: int,
+                     forced_edges: dict[str, list[float]] | None = None) -> dict[str, list[float]]:
+    """Per-concept quantile edges with clinical cutpoints replacing nearest edges."""
     edges: dict[str, list[float]] = {}
+    forced_edges = forced_edges or {}
     numeric = events.filter(pl.col("value").is_not_null())
     for concept in numeric["concept"].unique().to_list():
         vals = numeric.filter(pl.col("concept") == concept)["value"].drop_nulls()
         if len(vals) < n_bins:
             continue
         qs = np.linspace(0, 1, n_bins + 1)[1:-1]
-        edges[concept] = [float(vals.quantile(q)) for q in qs]
+        concept_edges = sorted(set(float(vals.quantile(q)) for q in qs))
+        lo, hi = float(vals.min()), float(vals.max())
+        pinned = sorted(set(float(edge) for edge in forced_edges.get(concept, []) if lo < edge < hi))
+        if len(pinned) > n_bins - 1:
+            raise ValueError(f"{concept} has more forced edges than available bin boundaries")
+        for edge in pinned:
+            if any(np.isclose(edge, existing) for existing in concept_edges):
+                continue
+            removable = [existing for existing in concept_edges if existing not in pinned]
+            if len(concept_edges) >= n_bins - 1 and removable:
+                concept_edges.remove(min(removable, key=lambda existing: abs(existing - edge)))
+            concept_edges.append(edge)
+            concept_edges.sort()
+        edges[concept] = concept_edges
     return edges
 
 
@@ -117,6 +132,35 @@ def _bin_of(value: float | None, concept: str, edges: dict[str, list[float]]) ->
     return int(np.searchsorted(edges[concept], value, side="right"))
 
 
+def _soft_bins(value: float | None, concept: str, edges: dict[str, list[float]],
+               kernel_bins: int) -> list[tuple[int | None, float]]:
+    hard_bin = _bin_of(value, concept, edges)
+    if hard_bin is None or kernel_bins <= 0:
+        return [(hard_bin, 1.0)]
+
+    boundaries = edges[concept]
+    lower = boundaries[hard_bin - 1] if hard_bin else None
+    upper = boundaries[hard_bin] if hard_bin < len(boundaries) else None
+    if lower is None and upper is not None:
+        width = boundaries[1] - upper if len(boundaries) > 1 else 1.0
+        lower = upper - max(width, 1e-12)
+    if upper is None and lower is not None:
+        width = lower - boundaries[-2] if len(boundaries) > 1 else 1.0
+        upper = lower + max(width, 1e-12)
+    center = hard_bin
+    if lower is not None and upper is not None and upper > lower:
+        center += float(np.clip((value - lower) / (upper - lower), 0, 1)) - 0.5
+
+    candidates = np.arange(
+        max(0, hard_bin - kernel_bins),
+        min(len(boundaries), hard_bin + kernel_bins) + 1,
+    )
+    sigma = max(kernel_bins / 2, 0.5)
+    weights = np.exp(-0.5 * ((candidates - center) / sigma) ** 2)
+    weights /= weights.sum()
+    return [(int(bin_idx), float(weight)) for bin_idx, weight in zip(candidates, weights)]
+
+
 def tokenize_site(cfg: dict, site: str, base: Path, out: Path,
                   vocab: dict | None, edges: dict | None):
     con = duckdb.connect()
@@ -131,7 +175,8 @@ def tokenize_site(cfg: dict, site: str, base: Path, out: Path,
     print(f"  {site}: {len(events):,} raw events, {events['hosp_id'].n_unique():,} stays")
 
     if vocab is None:  # --build-vocab path
-        edges = build_value_bins(events, cfg["value_binning"]["n_bins"])
+        bin_cfg = cfg["value_binning"]
+        edges = build_value_bins(events, bin_cfg["n_bins"], bin_cfg.get("forced_edges"))
         vocab = build_vocab(events, edges)
         print(f"  built vocab: {len(vocab):,} tokens, {len(edges):,} numeric concepts")
 
@@ -139,14 +184,26 @@ def tokenize_site(cfg: dict, site: str, base: Path, out: Path,
     def encode(group: pl.DataFrame) -> pl.DataFrame:
         dt = group["dttm"].to_numpy()
         pos_min = (dt - dt[0]).astype("timedelta64[s]").astype(np.int64) // 60  # since admission
-        token, valnum = [], []
+        token, soft_token, soft_weight, valnum = [], [], [], []
+        bin_cfg = cfg["value_binning"]
         for c, v in zip(group["concept"], group["value"]):
             b = _bin_of(v, c, edges)
-            token.append(vocab.get(fused_token(c, b), SPECIAL["<pad>"]))
+            hard_token = vocab.get(fused_token(c, b), SPECIAL["<pad>"])
+            token.append(hard_token)
+            assignments = (
+                _soft_bins(v, c, edges, bin_cfg["soft_kernel_bins"])
+                if bin_cfg.get("soft_discretization")
+                else [(b, 1.0)]
+            )
+            soft_token.append([vocab.get(fused_token(c, soft_bin), SPECIAL["<pad>"])
+                               for soft_bin, _ in assignments])
+            soft_weight.append([weight for _, weight in assignments])
             valnum.append(float(v) if v is not None else float("nan"))  # ORA value-regression target
         return pl.DataFrame({
             "hosp_id": group["hosp_id"][0],
             "token": [token],
+            "soft_token": [soft_token],
+            "soft_weight": [soft_weight],
             "pos_min": [pos_min.tolist()],
             "value": [valnum],
             "n_events": len(token),
