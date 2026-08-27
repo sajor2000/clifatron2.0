@@ -167,13 +167,16 @@ def _soft_bins(value: float | None, concept: str, edges: dict[str, list[float]],
         return [(hard_bin, 1.0)]
 
     boundaries = edges[concept]
+    if len(boundaries) < 2:
+        return [(hard_bin, 1.0)]
+
     lower = boundaries[hard_bin - 1] if hard_bin else None
     upper = boundaries[hard_bin] if hard_bin < len(boundaries) else None
     if lower is None and upper is not None:
-        width = boundaries[1] - upper if len(boundaries) > 1 else 1.0
+        width = boundaries[1] - upper
         lower = upper - max(width, 1e-12)
     if upper is None and lower is not None:
-        width = lower - boundaries[-2] if len(boundaries) > 1 else 1.0
+        width = lower - boundaries[-2]
         upper = lower + max(width, 1e-12)
     center = hard_bin
     if lower is not None and upper is not None and upper > lower:
@@ -247,7 +250,7 @@ def tokenize_site(cfg: dict, site: str, base: Path, out: Path,
                 )
             token.append(hard_token)
             assignments = (
-                _soft_bins(v, c, edges, bin_cfg["soft_kernel_bins"])
+                _soft_bins(v_for_bin, c, edges, bin_cfg["soft_kernel_bins"])
                 if bin_cfg.get("soft_discretization")
                 else [(b, 1.0)]
             )
@@ -272,6 +275,9 @@ def tokenize_site(cfg: dict, site: str, base: Path, out: Path,
     shards = events.group_by("hosp_id", maintain_order=True).map_groups(encode)
     out.mkdir(parents=True, exist_ok=True)
     shards.write_parquet(out / "events.parquet")
+    # DATA-CLASSIFICATION: PHI — contains hosp_id + per-stay token sequences + timing.
+    # Do not export off-node. For external validation, use clif_validate.py which
+    # returns only aggregate metrics. See NEXT_STEPS.md §6 rule 4.
     if edges is not None:
         (out / "vocab.json").write_text(json.dumps({"vocab": vocab, "edges": edges}))
     print(f"  wrote {out/'events.parquet'} ({len(shards):,} stays)")

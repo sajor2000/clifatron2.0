@@ -96,7 +96,7 @@ value_binning:
     map:        [65.0]                    # vasopressor trigger
     spo2:       [88.0, 90.0]
     creatinine: [1.5, 2.0, 3.0]           # ~KDIGO stages (verify vs baseline)
-    pao2_fio2:  [100.0, 200.0, 300.0]     # ARDS Berlin severity (if P/F available)
+    # pao2_fio2 not in target_concepts — add when P/F is available in the data
   # continuous_fused (McCann medRxiv 2026.08.04): -34% seq len, +30% numeric acc, but WORSE calibration
   # than discrete. Calibration is our headline -> ablation arm, not default. Naive unfused xVal collapses
   # to the median (Lee) -> never use unfused.

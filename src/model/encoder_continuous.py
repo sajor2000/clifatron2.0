@@ -10,7 +10,7 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 
-from src.model.encoder import CLIFEncoder as BaseEncoder
+from src.model.encoder import CLIFEncoder as BaseEncoder, build_rope_cache
 
 
 class ContinuousFusedEncoder(BaseEncoder):
@@ -36,10 +36,7 @@ class ContinuousFusedEncoder(BaseEncoder):
         if continuous_value is not None:
             x = x + self.value_proj(continuous_value.unsqueeze(-1))
 
-        cos, sin = __import__("src.model.encoder",
-                              fromlist=["build_rope_cache"]).build_rope_cache(
-            pos_min, self.head_dim, self.rope_base
-        )
+        cos, sin = build_rope_cache(pos_min, self.head_dim, self.rope_base)
         for blk in self.blocks:
             x = blk(x, cos, sin)
         return self.ln_f(x)

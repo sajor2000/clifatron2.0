@@ -22,11 +22,22 @@ import numpy as np
 
 
 def normalize_value(value: float | None, concept: str) -> float:
-    """Z-score normalizer stub. Real version computes mean/std from
-    reference-site data and serializes along with frozen vocab."""
+    """Z-score normalizer — STUB.
+
+    The real implementation must compute per-concept mean/std from the
+    reference site's data and serialize those statistics alongside the
+    frozen vocabulary. Until then, this stub raises an error to prevent
+    silently training on raw un-normalized values.
+
+    ponytail: global stub, implement when reference-site stats are available.
+    """
     if value is None or not np.isfinite(value):
         return 0.0
-    return float(value)
+    raise NotImplementedError(
+        "normalize_value is a stub — implement Z-score normalization with "
+        "reference-site per-concept mean/std before training the "
+        "continuous_fused arm"
+    )
 
 
 def continuous_fused_embedding(x_concept, x_value, value_proj, embedding):

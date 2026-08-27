@@ -122,6 +122,10 @@ class CLIFEncoder(nn.Module):
                 )
             if token.shape != token_weight.shape:
                 raise ValueError("token and token_weight must have matching shapes")
+        elif token.ndim == 3:
+            raise ValueError(
+                f"soft tokens (3D) require token_weight; got token.ndim={token.ndim}"
+            )
         x = self.tok_emb(token)
         if token_weight is not None:
             x = (x * token_weight.unsqueeze(-1)).sum(-2)

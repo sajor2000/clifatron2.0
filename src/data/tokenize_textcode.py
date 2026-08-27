@@ -29,16 +29,16 @@ CACHE_DTYPE = np.float32
 
 
 def code_description(concept: str, source_table: str) -> str:
-    """Map a CLIF concept to a human-readable description.
+    """Map a CLIF concept to a human-readable description — STUB.
 
-    For labs: "serum bicarbonate level"
-    For vitals: "mean arterial blood pressure measurement"
-    For meds: "continuous norepinephrine infusion"
-    For respiratory: "invasive mechanical ventilation via endotracheal tube"
+    The real implementation must read descriptions from the CLIF mCIDE
+    vocabulary CSV files under external/clifatron/mCIDE/. This stub
+    generates plausible synthetic descriptions from the concept name,
+    which are adequate for smoke-testing the embedding pipeline but
+    should NOT be used for the actual TextCode ablation arm.
 
-    The exact descriptions come from the CLIF mCIDE vocabulary CSV files
-    under external/clifatron/mCIDE/. This is a stub that generates plausible
-    descriptions from the concept name.
+    ponytail: global stub, implement from real mCIDE CSVs before running
+    the textcode ablation arm.
     """
     desc = concept.replace("_", " ")
     if source_table == "labs":
