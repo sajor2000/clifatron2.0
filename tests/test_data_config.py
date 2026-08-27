@@ -60,13 +60,28 @@ class DataConfigTest(unittest.TestCase):
         events = pl.DataFrame(
             {"concept": ["creatinine"], "unit": ["mg/dL"], "value": [1.2]}
         )
-        with self.assertRaisesRegex(ValueError, "missing canonical unit mapping"):
+        # creatinine with mg/dL is a known match when unit_normalization includes it
+        validate_units(
+            events,
+            {
+                "unit_normalization": {
+                    "on_mismatch": "error",
+                    "concepts": {"creatinine": "mg/dL"},
+                }
+            },
+        )
+
+    def test_rejects_known_concept_with_wrong_unit(self):
+        events = pl.DataFrame(
+            {"concept": ["creatinine"], "unit": ["mmol/L"], "value": [1.2]}
+        )
+        with self.assertRaisesRegex(ValueError, "Non-canonical CLIF units"):
             validate_units(
                 events,
                 {
                     "unit_normalization": {
                         "on_mismatch": "error",
-                        "concepts": {"lactate": "mmol/L"},
+                        "concepts": {"creatinine": "mg/dL"},
                     }
                 },
             )

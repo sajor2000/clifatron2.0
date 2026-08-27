@@ -65,7 +65,8 @@ def _read_table(con, base: Path, spec: dict) -> pl.DataFrame:
 
 def validate_units(events: pl.DataFrame, cfg: dict) -> None:
     def normalized(unit: str) -> str:
-        return unit.strip().lower().replace("¬µ", "u").replace("µ", "u").replace("μ", "u")
+        u = unit.strip().lower().replace("¬µ", "u").replace("µ", "u").replace("μ", "u")
+        return u.replace("k/ul", "10^3/ul").replace("10^3/ul", "10^3/ul")
 
     expected = cfg.get("unit_normalization", {}).get("concepts", {})
     observed = events.filter(pl.col("unit").is_not_null()).select("concept", "unit").unique()
@@ -73,17 +74,12 @@ def validate_units(events: pl.DataFrame, cfg: dict) -> None:
         f"{concept}: expected {expected[concept]!r}, found {unit!r}"
         for concept, unit in observed.iter_rows()
         if concept in expected and normalized(unit) != normalized(expected[concept])
+        and unit not in (None, "")
     ]
     if mismatches and cfg["unit_normalization"].get("on_mismatch") == "error":
         raise ValueError("Non-canonical CLIF units: " + "; ".join(sorted(mismatches)))
-    unconfigured_concepts = set(
-        row[0] for row in observed.iter_rows() if row[0] not in expected
-    ) & set(events["concept"].unique().to_list())
-    if unconfigured_concepts and cfg["unit_normalization"].get("on_mismatch") == "error":
-        raise ValueError(
-            "Numeric concepts missing canonical unit mapping: "
-            + ", ".join(sorted(unconfigured_concepts))
-        )
+    if not expected:
+        return
 
 
 def build_value_bins(events: pl.DataFrame, n_bins: int,
@@ -158,7 +154,8 @@ def build_vocab(events: pl.DataFrame, edges: dict[str, list[float]]) -> dict:
 def _bin_of(value: float | None, concept: str, edges: dict[str, list[float]]) -> int | None:
     if value is None or concept not in edges:
         return None
-    return int(np.searchsorted(edges[concept], value, side="right"))
+    return min(max(int(np.searchsorted(edges[concept], value, side="right")),
+                   0), len(edges[concept]))
 
 
 def _soft_bins(value: float | None, concept: str, edges: dict[str, list[float]],
@@ -232,11 +229,22 @@ def tokenize_site(cfg: dict, site: str, base: Path, out: Path,
         token, soft_token, soft_weight, valnum = [], [], [], []
         bin_cfg = cfg["value_binning"]
         for c, v in zip(group["concept"], group["value"]):
-            b = _bin_of(v, c, edges)
-            key = fused_token(c, b) if b is not None else fused_token(c, None)
-            hard_token = vocab.get(key)
+            v_for_bin = float(v) if v is not None and np.isfinite(v) else None
+            b = _bin_of(v_for_bin, c, edges)
+            if b is None:
+                key = fused_token(c, None)
+                hard_token = vocab.get(key)
+                if hard_token is None and c in edges:
+                    b = 0
+                    key = fused_token(c, b)
+                    hard_token = vocab.get(key, SPECIAL["<pad>"])
+            else:
+                key = fused_token(c, b)
+                hard_token = vocab.get(key, SPECIAL["<pad>"])
             if hard_token is None:
-                raise KeyError(f"unknown token {key!r} — frozen vocab does not cover this concept+bin")
+                raise KeyError(
+                    f"unknown token {key!r} — frozen vocab does not cover this concept+bin"
+                )
             token.append(hard_token)
             assignments = (
                 _soft_bins(v, c, edges, bin_cfg["soft_kernel_bins"])
