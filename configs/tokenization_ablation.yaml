@@ -1,0 +1,115 @@
+# Tokenization ablation design (NEXT_STEPS.md §4).
+# Evidence: Lee 2026 (arxiv:2604.16775) — deciles+soft wins tails; McCann 2026
+# (medRxiv 2026.08.04) — continuous-fused better numeric, worse calibration;
+# Al Attrach 2025 (arxiv:2512.05217) — frozen text encoders beat trainable.
+
+# ------------------------------------------------------------------- shared
+shared:
+  outcomes:
+    - in_hospital_mortality
+    - aki_kdigo_48h
+    - new_imv_24h
+    - new_vasopressor_24h
+    - resp_failure_48h
+  zero_shot_outcomes:
+    - delirium
+  n_folds: 5
+  seed_base: 42
+  metrics: [auroc, auprc, ece, brier, calib_slope, calib_intercept, ici]
+  calibration: temperature_scaling
+  # All arms use the SAME frozen CLIFEncoder trunk — only tokenization varies.
+  # Keeps total params comparable and isolates the tokenizer effect.
+  trunk: clif_encoder
+  freeze_trunk: true
+  curriculum: ntp_then_tte
+
+# --------------------------------------------------------------------- arms
+arms:
+  # (1) CLIFATRON clinical bins — baseline (vendored tokenETL).
+  # Their scheme: clinical-segment-anchored *quantiles*, not fixed ranges.
+  # Bins from external/clifatron/tokenETL/config/critical_illness_tokenization_final_with_intervals.csv
+  clifatron_clinical_bins:
+    description: "CLIFATRON clinical-segment bins (baseline)"
+    tokenizer: clifatron_clinical
+    soft_discretization: false
+    lr: 1e-3
+    total_steps: 20000
+    per_gpu_batch: 128
+    tags: [tokenization, baseline, clinical-bins]
+
+  # (2) Global deciles only — Lee's simplest winner.
+  # Per-concept population deciles, frozen from reference site.
+  # No soft discretization, no clinical-threshold edges.
+  global_deciles:
+    description: "Per-concept population deciles, frozen from reference site"
+    tokenizer: decile
+    soft_discretization: false
+    lr: 1e-3
+    total_steps: 20000
+    per_gpu_batch: 128
+    tags: [tokenization, decile, lee-2026]
+
+  # (3) Deciles + soft discretization — Lee's best encoder on dangerous tails.
+  # This is our DEFAULT tokenizer (configs/data.yaml).
+  # Wins on severe hypokalemia / hypernatremia / hypotension / CRRT / K-extremes.
+  deciles_plus_soft:
+    description: "Deciles with soft discretization (kernel=1) + forced clinical edges"
+    tokenizer: decile
+    soft_discretization: true
+    soft_kernel_bins: 1
+    forced_edges: true
+    lr: 1e-3
+    total_steps: 20000
+    per_gpu_batch: 128
+    tags: [tokenization, decile, soft-discretization, lee-2026]
+
+  # (4) Continuous-fused — McCann 2026.
+  # Value channel as a continuous embedding + numeric head + Monte Carlo.
+  #   +30% numeric accuracy, −34% seq length, worse calibration.
+  # Hypothesis: loses on calibration metrics, wins on regression outcomes.
+  continuous_fused:
+    description: "Continuous-fused value channel (McCann 2026) — ablation"
+    tokenizer: continuous_fused
+    soft_discretization: false
+    lr: 1e-3
+    total_steps: 20000
+    per_gpu_batch: 128
+    tags: [tokenization, continuous-fused, mccann-2026, ablation]
+
+  # (5) TextCode — frozen BioClinical-ModernBERT descriptions.
+  # Each CLIF code mapped to natural language description → frozen BERT embedding.
+  # Al Attrach 2025: frozen > trainable, 10+ AUROC gap, 15× fewer trainable params.
+  # Hypothesis: competitive on all tasks but worse than fused on rare concepts.
+  textcode:
+    description: "Frozen BioClinical-ModernBERT code embeddings (TextCode)"
+    tokenizer: textcode
+    textcode_encoder: "thomas-sounack/BioClinical-ModernBERT-large"
+    soft_discretization: false
+    lr: 1e-3
+    total_steps: 20000
+    per_gpu_batch: 128
+    tags: [tokenization, textcode, frozen-encoder, al-attrach-2025]
+
+# ---------------------------------------------------------------- reporting
+report:
+  output_dir: "results/tokenization_ablation"
+  figure_format: [csv, json]
+  primary_table:
+    orientation: outcome_by_arm
+  headroom_figure:
+    # clifatron clinical bins as baseline
+    x_axis: outcome
+    y_axis: "AUROC gain over CLIFATRON clinical bins"
+    series: [global_deciles, deciles_plus_soft, continuous_fused, textcode]
+  calibration_detail:
+    note: "Compare ECE, Brier, slope, ICI across arms. McCann predicts continuous-fused loses here."
+    metrics: [ece, brier, calib_slope, ici]
+  tail_sensitivity:
+    note: "Lee predicts deciles+soft wins. Test: severe hypokalemia, CRRT, K-extremes."
+    outcomes: [aki_kdigo_48h, resp_failure_48h]
+  evidence_table:
+    clifatron_clinical_bins: "CLIFATRON vendor — clinical-segment-anchored quantiles"
+    global_deciles: "Lee 2026 arxiv:2604.16775 — deciles ≈ clinical at matched granularity"
+    deciles_plus_soft: "Lee 2026 — soft discretization wins dangerous tails"
+    continuous_fused: "McCann 2026 medRxiv 2026.08.04 — +30% numeric, worse calibration"
+    textcode: "Al Attrach 2025 arxiv:2512.05217 — frozen encoders beat trainable"
