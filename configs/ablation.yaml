@@ -1,0 +1,117 @@
+# Finetune-vs-from-scratch ablation design (2026-08-27 audit).
+# Evidence: Mataraso et al. JAMIA Open 2025 (PMC12349770) — task-specific
+# supervised pretraining beats self-supervised when aligned; self-supervised
+# wins transfer. Al Attrach et al. arxiv:2512.05217 — frozen encoders beat
+# trainable by 10+ AUROC points with 15× fewer params.
+# Hypothesis: frozen-backbone head-training > joint fine-tune > from-scratch >
+# no-pretrain for in-domain tasks; from-scratch may close gap for transfer.
+
+# ------------------------------------------------------------------- shared
+shared:
+  # Outcomes derived from standard CLIF 2.1 fields (no manual annotation).
+  outcomes:
+    - in_hospital_mortality
+    - aki_kdigo_48h
+    - new_imv_24h
+    - new_vasopressor_24h
+    - resp_failure_48h
+  # Held-out — zero-shot via threshold_hazard head only.
+  zero_shot_outcomes:
+    - delirium
+  n_folds: 5
+  seed_base: 42
+  metrics: [auroc, auprc, ece, brier, calib_slope, calib_intercept, ici]
+  calibration: temperature_scaling  # Cadence — applied before metric evaluation
+
+# --------------------------------------------------------------------- arms
+arms:
+  # (1) FROZEN BACKBONE — CLIFATRON Qwen2 checkpoint, our heads only.
+  # Strongest evidence: Al Attrach frozen > trainable, Mataraso task-aligned
+  # supervised beats self-supervised. Our threshold/CR/ORA objective IS the
+  # task-aligned supervision.
+  frozen_backbone_head_only:
+    description: "Frozen CLIFATRON backbone, train only threshold/CR/value/next-event heads"
+    trunk: clifatron_checkpoint
+    freeze_trunk: true
+    tie_weights: false
+    curriculum: ntp_then_tte
+    lr: 1e-3              # 3× trunk LR (heads train fast)
+    total_steps: 20000
+    per_gpu_batch: 128
+    tags: [finetune, frozen-encoder, supervised]
+
+  # (2) JOINT FINE-TUNE — CLIFATRON checkpoint, unfrozen backbone + heads.
+  # Ablation arm: does unfreezing help or hurt? Al Attrach says it hurts
+  # (catastrophic forgetting). We test it.
+  joint_finetune:
+    description: "CLIFATRON init, unfreeze backbone + heads, NTP→TTE curriculum"
+    trunk: clifatron_checkpoint
+    freeze_trunk: false
+    tie_weights: false
+    curriculum: ntp_then_tte
+    lr: [5e-5, 1e-3]     # backbone slower, heads faster
+    total_steps: 30000
+    per_gpu_batch: 128
+    tags: [finetune, joint-training, supervised]
+
+  # (3) FROM-SCRATCH — CLIFEncoder from random init on CLIF data only.
+  # Test: can our compact ~30M encoder close the gap without a checkpoint?
+  # TOO-BERT (PMC12177421) showed from-scratch can beat pretrained on specific
+  # clinical tasks. Keeps our tokenizer (fused decile + soft + RoPE).
+  from_scratch:
+    description: "Random-init CLIFEncoder on CLIF 2.1 data, NTP→TTE curriculum"
+    trunk: clif_encoder
+    freeze_trunk: false
+    tied_embeddings: false
+    curriculum: ntp_then_tte
+    lr: 3e-4
+    total_steps: 60000     # needs more steps (no warm-start)
+    per_gpu_batch: 128
+    tags: [from-scratch, pretraining, supervised]
+
+  # (4) NO PRETRAIN BASELINE — TaskHead on frozen random-embedding.
+  # Negative control: upper-bound on how much pretraining helps.
+  no_pretrain_baseline:
+    description: "Frozen random CLIFEncoder + TaskHead only (no pretraining)"
+    trunk: clif_encoder
+    freeze_trunk: true
+    tied_embeddings: false
+    curriculum: none        # no NTP warmup — heads train from step 0
+    lr: 1e-3
+    total_steps: 5000
+    per_gpu_batch: 128
+    tags: [baseline, no-pretraining, supervised]
+
+  # (5) [FUTURE] textcode — frozen BioClinical-ModernBERT descriptions.
+  # Requires TextCode implementation in tokenizer (MEDS format interop).
+  # textcode:
+  #   description: "Frozen BioClinical-ModernBERT-Large code embeddings"
+  #   trunk: bioclinical_modernbert
+  #   freeze_trunk: true
+  #   tokenizer: textcode
+  #   lr: 1e-3
+  #   total_steps: 20000
+  #   tags: [finetune, textcode, frozen-encoder, supervised]
+
+# ---------------------------------------------------------------- reporting
+report:
+  output_dir: "results/ablation"
+  figure_format: [csv, json]
+  primary_table:
+    # rows = outcomes; columns = arm→{AUROC, AUPRC, ECE}
+    orientation: outcome_by_arm
+  headroom_figure:
+    # no-pretrain baseline as floor, frozen-head-only as target
+    x_axis: outcome
+    y_axis: "AUROC gain over no-pretrain"
+    series: [frozen_backbone_head_only, joint_finetune, from_scratch]
+  transfer_gap:
+    # For each arm, compare in-domain vs held-out (delirium) AUROC.
+    metric: auroc
+    note: "Delirium is zero-shot via threshold_hazard head — no local labels"
+  evidence_table:
+    # Map each arm to supporting citations.
+    frozen_backbone_head_only: "Al Attrach 2025 (frozen>trainable); Mataraso 2025 (task-aligned supervised wins)"
+    joint_finetune: "Al Attrach 2025 (unfreezing hurts — catastrophic forgetting)"
+    from_scratch: "TOO-BERT PMC12177421 (from-scratch beats pretrained on specific tasks)"
+    no_pretrain_baseline: "Standard control — upper-bounds pretraining benefit"
