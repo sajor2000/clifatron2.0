@@ -401,19 +401,36 @@ def main():
     model = load_checkpoint(args.checkpoint)
 
     def predict_fn(labels_df):
-        """Real inference. Assembled from the surfaces U1/U2 already landed.
+        """Real inference seam.
 
-        No fallback: if this cannot run, the run fails rather than degrading into a
-        report shaped like a result.
+        DELIBERATELY UNIMPLEMENTED, and failing closed rather than approximating.
+
+        The pieces exist -- `src/data/tokenize.py::tokenize_site` produces the event
+        shards, `src/data/dataset.py::ModelDataset` / `make_dataloader` batch them, and
+        `zero_shot_predictions` above consumes those batches -- but wiring them needs
+        four things this CLI does not yet receive: the resolved data config, the
+        bundle-pinned vocabulary and numeric edges, a policy-checked output directory
+        for the intermediate shards, and the episode frame rather than its path
+        (`tokenize_site(cfg, site, base, out, vocab, edges, ..., episodes=...)`).
+
+        Raising here is the point. The whole of D1 was a placeholder that produced
+        something plausible instead of stopping, and an approximate call against a
+        signature this module cannot satisfy would be the same defect wearing different
+        clothes -- it would fail at a site, at runtime, with a confusing error, after
+        the operator had already been told the run was under way.
+
+        U5 is data-free by contract: the seam, the fail-closed behaviour, and the export
+        path are in scope and tested; running real inference on governed site data is
+        not. Supply `predict_fn` from a caller that has the bundle artifacts, or wire
+        this once the bundle-manifest vocabulary lands with U9.
         """
-        from src.data.dataset import ModelDataset, make_dataloader  # noqa: F401
-        from src.data.tokenize import tokenize_site
-        batches = tokenize_site(args.data, episode_artifact=args.episode_artifact)
-        return zero_shot_predictions(
-            model, batches,
-            target_indices=[i for i, _ in enumerate(outcome_cfgs)],
-            tau_bins=[o.get("tau_bin", 0) for o in outcome_cfgs],
-            directions=[o.get("direction", "above") for o in outcome_cfgs])
+        raise ArtifactMismatch(
+            "real inference is not wired into this CLI yet: it needs the resolved data "
+            "config, the bundle-pinned vocabulary and numeric edges, and a "
+            "policy-checked shard directory. Pass an explicit predict_fn from a caller "
+            "that holds the bundle artifacts. Refusing rather than approximating -- an "
+            "approximate prediction path is the defect this unit exists to remove."
+        )
 
     result = evaluate_site(args.checkpoint, args.data, args.episode_artifact,
                            outcome_cfgs, predict_fn=predict_fn)

@@ -267,6 +267,7 @@ class ValidatorFailsClosedTest(unittest.TestCase):
 
     # ---------------------------------------------------------------- D2
     def test_checkpoint_without_head_weights_fails_closed(self):
+        """D2: head_weights.pt was optional and loaded with strict=False."""
         from src.eval.clif_validate import ArtifactMismatch, load_checkpoint
         empty = self.out / "bundle"
         empty.mkdir()
@@ -275,6 +276,7 @@ class ValidatorFailsClosedTest(unittest.TestCase):
         self.assertIn("head_weights.pt", str(ctx.exception))
 
     def test_bundle_without_a_manifest_fails_closed(self):
+        """D2: provenance must be establishable before any inference runs."""
         from src.eval.clif_validate import ArtifactMismatch, verify_bundle_compatibility
         empty = self.out / "nomanifest"
         empty.mkdir()
@@ -282,6 +284,7 @@ class ValidatorFailsClosedTest(unittest.TestCase):
             verify_bundle_compatibility(str(empty))
 
     def test_vocab_hash_mismatch_fails_closed(self):
+        """D2: scoring one vocabulary's model against another's tokens."""
         from src.eval.clif_validate import ArtifactMismatch, verify_bundle_compatibility
         bundle = self.out / "mismatch"
         bundle.mkdir()
@@ -294,6 +297,7 @@ class ValidatorFailsClosedTest(unittest.TestCase):
         self.assertIn("vocab_hash mismatch", str(ctx.exception))
 
     def test_null_vocab_hash_fails_closed(self):
+        """D2: mirrors value_stats.py rejecting schema-2 artifacts with vocab_hash: null."""
         from src.eval.clif_validate import ArtifactMismatch, verify_bundle_compatibility
         bundle = self.out / "nullhash"
         bundle.mkdir()
@@ -305,6 +309,7 @@ class ValidatorFailsClosedTest(unittest.TestCase):
             verify_bundle_compatibility(str(bundle))
 
     def test_unsupported_clif_version_fails_closed(self):
+        """D2: an unsupported CLIF version is a failure, not a warning."""
         from src.eval.clif_validate import ArtifactMismatch, verify_bundle_compatibility
         bundle = self.out / "oldclif"
         bundle.mkdir()
