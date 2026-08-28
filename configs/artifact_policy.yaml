@@ -1,0 +1,56 @@
+policy_version: "1.0.0"
+default_deny: true
+identifier_logging: prohibited
+encryption_at_rest: required
+least_privilege_access: required
+
+classes:
+  raw_clif:
+    directory: site_governed_input
+    formats: [parquet]
+    export_allowed: false
+    backup: site_governed
+    retention: site_governed
+    deletion: site_governed_secure_delete
+  patient_level_phi:
+    directory: output/intermediate_phi
+    formats: [parquet]
+    export_allowed: false
+    includes: [episode_shards, split_assignments, labels, predictions, caches, access_logs]
+    backup: prohibited_unless_site_approved
+    retention: delete_after_approved_project_window
+    deletion: secure_delete
+  governed_model_artifact:
+    directory: checkpoints
+    formats: [safetensors, json, yaml]
+    export_allowed: false
+    includes: [checkpoints, weights]
+    backup: encrypted_site_storage
+    retention: approved_model_lifecycle
+    deletion: secure_delete
+  aggregate_no_phi:
+    directory: output/final_no_phi
+    formats: [json, csv, pdf, png]
+    export_allowed: true
+    disclosure_review_required: true
+    minimum_cell_size: 10
+    includes: [cohort_reports, metrics, figures, provenance]
+    backup: approved_project_storage
+    retention: approved_project_lifecycle
+    deletion: standard_delete
+  operational_logs:
+    directory: output/intermediate_phi
+    formats: [jsonl]
+    export_allowed: false
+    prohibited_content: [identifiers, patient_rows, local_source_paths, free_text]
+    backup: prohibited
+    retention: delete_after_approved_project_window
+    deletion: secure_delete
+
+compatibility_manifests:
+  clifatron_checkpoint:
+    required_hashes: [checkpoint, tokenizer, vocabulary, packed_schema, outcome_spec, clif_version]
+    vocabulary_origin: checkpoint_pinned
+  experimental_representation:
+    required_hashes: [training_split, vocabulary, numeric_edges, target_map, outcome_spec, clif_version]
+    vocabulary_origin: reference_training_partition

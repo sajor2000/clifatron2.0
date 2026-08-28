@@ -495,22 +495,27 @@ Examples:
         remove_unused_columns=False,  # Keep document_attention_mask for 2D attention
     )
 
-    # Custom data collator for packed sequences
+    # Custom data collator for v2 packed sequences with segment metadata.
     def data_collator(features):
-        """Collator that handles packed sequences with 1D attention masks."""
+        """Collator that preserves v2 schema when segments are present."""
         import torch
 
-        # Convert lists to tensors
-        # Use standard 1D attention mask - document isolation enforced by [SEP] tokens
         batch = {
             "input_ids": torch.tensor([f["input_ids"] for f in features], dtype=torch.long),
             "attention_mask": torch.tensor([f["attention_mask"] for f in features], dtype=torch.long),
             "labels": torch.tensor([f["labels"] for f in features], dtype=torch.long),
         }
-
-        # Note: document_ids are available in features but not used for now
-        # They could be used for custom attention mechanisms in the future
-
+        if all("segments" in f for f in features):
+            raise ValueError(
+                "v2 packed records contain multiple document segments; Qwen2 SFT does not yet "
+                "apply block-diagonal attention from document_ids, so training would leak across documents"
+            )
+            batch["segments"] = [f["segments"] for f in features]
+            batch["document_ids"] = torch.tensor(
+                [f["document_ids"] for f in features], dtype=torch.long
+            )
+            if all("packed_schema_version" in f for f in features):
+                batch["packed_schema_version"] = features[0]["packed_schema_version"]
         return batch
 
     # Initialize Trainer with packing support

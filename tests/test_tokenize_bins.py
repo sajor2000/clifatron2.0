@@ -46,6 +46,14 @@ class TokenizeBinsTest(unittest.TestCase):
         bins = [b for b, _ in assignments]
         self.assertIn(3, bins)
 
+    def test_soft_bins_lowest_bin_weights_stay_normalized(self):
+        assignments = _soft_bins(
+            -1.0, "lactate", {"lactate": [0.0, 2.0, 4.0]}, kernel_bins=1
+        )
+        self.assertEqual(len(assignments), 3)
+        self.assertAlmostEqual(sum(w for _, w in assignments), 1.0)
+        self.assertLessEqual(max(w for _, w in assignments), 1.0)
+
     def test_encoder_rejects_2d_with_weights(self):
         cfg = {
             "trunk": {

@@ -1,0 +1,110 @@
+contract_version: "1.0.0"
+clif_version: "2.1.0"
+mcide_version: "2.1.0"
+
+source_tables:
+  hospitalization: clif_hospitalization
+  adt: clif_adt
+
+episode:
+  unit: first_eligible_icu_episode_per_patient
+  identifier: hospitalization_id
+  linked_encounter_identifier: hospitalization_joined_id
+  patient_identifier: patient_id
+  icu_location_category: icu
+  minimum_age: 18
+  require_icu_presence_at_anchor: true
+
+anchor:
+  source: first_icu_in_dttm
+  hours_after_icu_admission: 24
+
+windows:
+  observation:
+    start_hours_from_icu_admission: 0
+    end_hours_from_icu_admission: 24
+    end_inclusive: true
+  prediction:
+    start_hours_from_anchor: 0
+    start_inclusive: false
+    horizon_hours: 48
+    end_inclusive: true
+
+terminal_events:
+  death: competing_event
+  discharge: censor
+  icu_transfer: censor
+  end_of_record: censor
+  independent_censoring_assumption: >-
+    Conditional on anchor-available features, discharge, transfer, and end of
+    record are independent of the unobserved physiologic event time.
+  sensitivity_analyses:
+    - retain_early_discharge_as_censoring
+    - treat_death_as_competing_event
+
+outcomes:
+  map_below_65_48h:
+    source: vitals
+    concept: map
+    direction: below
+    threshold: 65.0
+    unit: mmHg
+    minimum_post_anchor_measurements: 1
+    baseline_lookback_hours: 6
+    required_measurement_within_hours_of_horizon: 12
+  lactate_above_4_48h:
+    source: labs
+    concept: lactate
+    direction: above
+    threshold: 4.0
+    unit: mmol/L
+    minimum_post_anchor_measurements: 1
+    baseline_lookback_hours: 6
+    required_measurement_within_hours_of_horizon: 12
+  spo2_below_88_48h:
+    source: vitals
+    concept: spo2
+    direction: below
+    threshold: 88.0
+    unit: "%"
+    minimum_post_anchor_measurements: 1
+    baseline_lookback_hours: 6
+    required_measurement_within_hours_of_horizon: 12
+
+treatment_sources:
+  - meds
+  - resp_support
+  - adt
+treatment_target_policy: context_only
+
+prerequisites:
+  data_qa:
+    owner: site_data_lead
+    completion_artifact: site_local_data_qa_report
+    phase_gate: before_real_data_cohort_build
+    status: required
+    escalation: study_lead
+  outcome_approval:
+    owner: clinical_statistical_leads
+    completion_artifact: signed_outcome_contract
+    phase_gate: before_real_data_labels
+    status: required
+    escalation: study_lead
+  governance_approval:
+    owner: site_governance
+    completion_artifact: approved_artifact_policy
+    phase_gate: before_real_data_artifacts
+    status: required
+    escalation: site_principal_investigator
+  checkpoint_acquisition:
+    owner: model_lead
+    completion_artifact: checkpoint_compatibility_manifest
+    phase_gate: before_training
+    status: required
+    escalation: study_lead
+  environment_qualification:
+    owner: platform_lead
+    completion_artifact: environment_qualification_report
+    phase_gate: before_training
+    status: required
+    escalation: study_lead

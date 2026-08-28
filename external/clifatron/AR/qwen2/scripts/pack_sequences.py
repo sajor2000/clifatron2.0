@@ -25,8 +25,15 @@ from tokenizer.clinical_tokenizer import ClinicalTokenizer
 from data.hospitalization_dataset import load_hospitalization_dataset
 
 
+PACKED_SCHEMA_VERSION = "2.0.0"
+
+
 class OfflinePacker:
-    """Packs pre-tokenized hospitalizations into fixed-length sequences with document isolation."""
+    """Packs pre-tokenized hospitalizations into fixed-length sequences with document isolation.
+
+    v2 schema preserves episode keys and source-span metadata so continuation
+    segments across packed rows remain traceable for TTE target construction.
+    """
 
     def __init__(
         self,
@@ -40,116 +47,160 @@ class OfflinePacker:
         self.sep_token_id = sep_token_id
         self.num_sep_tokens = num_sep_tokens
 
-        # Buffers for packing
         self.buffer_input_ids = []
         self.buffer_attention_mask = []
         self.buffer_labels = []
-        self.buffer_doc_boundaries = []  # Track document boundaries for 2D masks
+        self.buffer_doc_boundaries = []
+        self.buffer_episode_keys = []
+        self.buffer_source_spans = []
 
-        # Track packed sequences
         self.packed_sequences = []
 
     def add_hospitalization(self, example: Dict):
         """Add a hospitalization to the buffer and pack when ready."""
-        # Track document start position
         doc_start = len(self.buffer_input_ids)
 
-        # Add document content
         self.buffer_input_ids.extend(example["input_ids"])
         self.buffer_attention_mask.extend(example["attention_mask"])
         self.buffer_labels.extend(example["labels"])
 
-        # Track document end position (before SEP separator)
         doc_end = len(self.buffer_input_ids)
         self.buffer_doc_boundaries.append((doc_start, doc_end))
+        episode_key = example.get("episode_key", f"doc-{len(self.buffer_doc_boundaries)}")
+        source_start = example.get("source_start", 0)
+        source_end = example.get("source_end", len(example["input_ids"]))
+        self.buffer_episode_keys.append(episode_key)
+        self.buffer_source_spans.append((source_start, source_end))
 
-        # Add separator SEP tokens (typically just 1 [SEP] token)
         separator_ids = [self.sep_token_id] * self.num_sep_tokens
         self.buffer_input_ids.extend(separator_ids)
         self.buffer_attention_mask.extend([1] * self.num_sep_tokens)
-        self.buffer_labels.extend([-100] * self.num_sep_tokens)  # Don't learn from SEP
+        self.buffer_labels.extend([-100] * self.num_sep_tokens)
 
-        # Pack if buffer is large enough
         while len(self.buffer_input_ids) >= self.max_seq_length:
             self._pack_sequence()
 
     def _pack_sequence(self):
-        """Extract a full sequence from buffer with 1D document IDs."""
+        """Extract a full sequence from buffer with 1D document IDs and segment metadata."""
         packed_input_ids = self.buffer_input_ids[:self.max_seq_length]
         packed_attention_mask = self.buffer_attention_mask[:self.max_seq_length]
         packed_labels = self.buffer_labels[:self.max_seq_length]
 
-        # Get document boundaries for this sequence
         current_boundaries = []
         for start, end in self.buffer_doc_boundaries:
             if end <= self.max_seq_length:
-                # Document fully in this sequence
                 current_boundaries.append((start, end))
             elif start < self.max_seq_length < end:
-                # Document split across sequences
                 current_boundaries.append((start, self.max_seq_length))
 
-        # Create 1D document ID array (much more memory efficient than 2D mask)
         document_ids = self._create_document_ids(
             seq_length=self.max_seq_length,
             doc_boundaries=current_boundaries
         )
+        segments = self._segment_manifest(current_boundaries)
 
-        # Keep overflow for next sequence
         self.buffer_input_ids = self.buffer_input_ids[self.max_seq_length:]
         self.buffer_attention_mask = self.buffer_attention_mask[self.max_seq_length:]
         self.buffer_labels = self.buffer_labels[self.max_seq_length:]
 
-        # Update document boundaries for next sequence
         new_boundaries = []
-        for start, end in self.buffer_doc_boundaries:
+        new_episode_keys = []
+        new_source_spans = []
+        for i, (start, end) in enumerate(self.buffer_doc_boundaries):
             if end <= self.max_seq_length:
-                # Document fully consumed
                 continue
             elif start < self.max_seq_length < end:
-                # Document split - add second part
                 new_boundaries.append((0, end - self.max_seq_length))
+                new_episode_keys.append(self.buffer_episode_keys[i])
+                key = self.buffer_episode_keys[i]
+                orig_start, orig_end = self.buffer_source_spans[i]
+                new_source_spans.append((orig_start + (self.max_seq_length - start), orig_end))
             else:
-                # Document entirely in buffer - shift positions
                 new_boundaries.append((start - self.max_seq_length, end - self.max_seq_length))
+                new_episode_keys.append(self.buffer_episode_keys[i])
+                new_source_spans.append(self.buffer_source_spans[i])
         self.buffer_doc_boundaries = new_boundaries
+        self.buffer_episode_keys = new_episode_keys
+        self.buffer_source_spans = new_source_spans
 
-        # Store packed sequence with 1D document IDs
         self.packed_sequences.append({
             "input_ids": packed_input_ids,
             "attention_mask": packed_attention_mask,
             "labels": packed_labels,
-            "document_ids": document_ids,  # 1D array: which document each token belongs to
+            "document_ids": document_ids,
+            "packed_schema_version": PACKED_SCHEMA_VERSION,
+            "segments": segments,
         })
 
+    def _segment_manifest(self, boundaries: list) -> dict[str, list]:
+        episode_keys = []
+        source_starts = []
+        source_ends = []
+        packed_starts = []
+        packed_ends = []
+        continuation_indices = []
+        continues_from_prev = []
+        continues_to_next = []
+        episode_index: dict[str, int] = {}
+        full_boundaries = self.buffer_doc_boundaries
+        for i, (p_start, p_end) in enumerate(boundaries):
+            key = self.buffer_episode_keys[i]
+            orig_start, orig_end = self.buffer_source_spans[i]
+            orig_full_start, orig_full_end = full_boundaries[i]
+            episode_index.setdefault(key, 0)
+            ci = episode_index[key]
+            episode_index[key] = ci + 1
+            continues_from = orig_start > orig_full_start
+            continues_to = (orig_start + p_end - p_start) < orig_end
+            episode_keys.append(key)
+            source_starts.append(orig_start)
+            source_ends.append(min(orig_end, orig_start + p_end - p_start))
+            packed_starts.append(p_start)
+            packed_ends.append(p_end)
+            continuation_indices.append(ci)
+            continues_from_prev.append(continues_from)
+            continues_to_next.append(continues_to)
+        return {
+            "episode_keys": episode_keys,
+            "segment_source_starts": source_starts,
+            "segment_source_ends": source_ends,
+            "segment_packed_starts": packed_starts,
+            "segment_packed_ends": packed_ends,
+            "segment_continuation_indices": continuation_indices,
+            "segment_continues_from_previous": continues_from_prev,
+            "segment_continues_to_next": continues_to_next,
+        }
+
     def flush(self):
-        """Pad and pack remaining buffer content with 1D document IDs."""
+        """Pad and pack remaining buffer content with segment metadata."""
         if len(self.buffer_input_ids) > 0:
             pad_length = self.max_seq_length - len(self.buffer_input_ids)
 
-            # Pad to max_seq_length
             padded_input_ids = self.buffer_input_ids + [self.pad_token_id] * pad_length
             padded_attention_mask = self.buffer_attention_mask + [0] * pad_length
             padded_labels = self.buffer_labels + [-100] * pad_length
 
-            # Create 1D document ID array
             document_ids = self._create_document_ids(
                 seq_length=self.max_seq_length,
                 doc_boundaries=self.buffer_doc_boundaries
             )
+            segments = self._segment_manifest(self.buffer_doc_boundaries)
 
             self.packed_sequences.append({
                 "input_ids": padded_input_ids,
                 "attention_mask": padded_attention_mask,
                 "labels": padded_labels,
-                "document_ids": document_ids,  # 1D array: which document each token belongs to
+                "document_ids": document_ids,
+                "packed_schema_version": PACKED_SCHEMA_VERSION,
+                "segments": segments,
             })
 
-            # Clear buffer
             self.buffer_input_ids = []
             self.buffer_attention_mask = []
             self.buffer_labels = []
             self.buffer_doc_boundaries = []
+            self.buffer_episode_keys = []
+            self.buffer_source_spans = []
 
     def _create_document_ids(
         self,
@@ -276,13 +327,28 @@ def pack_and_save(
 
     print(f"  ✓ Created {len(packed_sequences)} packed sequences")
 
-    # Convert to polars DataFrame
-    df = pl.DataFrame({
+    has_v2 = any("packed_schema_version" in seq for seq in packed_sequences)
+    columns = {
         "input_ids": [seq["input_ids"] for seq in packed_sequences],
         "attention_mask": [seq["attention_mask"] for seq in packed_sequences],
         "labels": [seq["labels"] for seq in packed_sequences],
-        "document_ids": [seq["document_ids"] for seq in packed_sequences],  # 1D document IDs (memory efficient)
-    })
+        "document_ids": [seq["document_ids"] for seq in packed_sequences],
+    }
+    if has_v2:
+        for col in (
+            "packed_schema_version",
+            "episode_keys",
+            "segment_source_starts",
+            "segment_source_ends",
+            "segment_packed_starts",
+            "segment_packed_ends",
+            "segment_continuation_indices",
+            "segment_continues_from_previous",
+            "segment_continues_to_next",
+        ):
+            segments = [seq.get("segments", {}) for seq in packed_sequences]
+            columns[col] = [s.get(col, []) for s in segments]
+    df = pl.DataFrame(columns)
 
     # Save to parquet
     print(f"Saving to {output_path}...")
