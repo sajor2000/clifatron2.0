@@ -28,18 +28,47 @@ from pathlib import Path
 import numpy as np
 
 from src.eval import metrics as M
+from src.eval import schema as _schema
+
+
+class PartitionError(ValueError):
+    """Raised when a fit/evaluate workflow is handed rows without usable partition roles."""
+
+
+INSUFFICIENT_PARTITIONS = "insufficient_partitions"
 
 
 # --------------------------------------------------------------------------- data
-def load_site(path: str, seq_col: str, label_col: str, group_cols: list[str]):
-    """Load one site's narratives into (sequences, labels, groups, ids). Polars, no pooling."""
+def load_site(path: str, seq_col: str, label_col: str, group_cols: list[str],
+              partition_col: str = "partition"):
+    """Load one site's narratives into (sequences, labels, groups, partitions). No pooling.
+
+    `partition_col` is REQUIRED to exist (U5 D6). Every fit/evaluate workflow downstream
+    needs to know which rows may fit a predictor, which may fit a calibrator, and which
+    may be scored -- and inferring that from array shape is exactly how the diagonal
+    ended up fitting and scoring on identical rows. The column comes from the U1 split
+    artifact (`src/data/splits.py`; `clif_auto_labeler.auto_label` already returns it).
+    """
     import polars as pl
     df = pl.read_parquet(path)
+    if partition_col not in df.columns:
+        raise PartitionError(
+            f"{path} has no {partition_col!r} column. Site arrays without partition "
+            "roles cannot enter a fit/evaluate workflow: there is no way to keep the "
+            "rows that fit a predictor disjoint from the rows that score it. Join the "
+            "U1 split artifact onto this table first."
+        )
     seqs = df[seq_col].to_list()
     labels = np.asarray(df[label_col].to_list())
     groups = {g: np.asarray(df[g].to_list()) for g in group_cols if g in df.columns}
-    ids = np.arange(len(labels))
-    return seqs, labels, groups, ids
+    partitions = np.asarray(df[partition_col].to_list())
+    unknown = sorted(set(partitions.tolist()) - set(_schema.PARTITION_ROLES))
+    if unknown:
+        raise PartitionError(
+            f"{path}: unknown partition roles {unknown}; expected a subset of "
+            f"{sorted(_schema.PARTITION_ROLES)}"
+        )
+    return seqs, labels, groups, partitions
 
 
 def collate(seqs: list[list[int]], pad_id: int = 0):
@@ -107,42 +136,124 @@ def fit_xgboost(X_tr, y_tr):
 
 
 # ------------------------------------------------------------------- matrix assembly
-def transportability_matrix(states: dict, labels: dict, groups: dict, method: str = "probe"):
-    """states/labels/groups keyed by site. Returns nested dict:
-    matrix[train_site][test_site] = full panel; plus an 'ensemble' row (mean of per-site probs).
-    `method` in {'probe','xgboost'} — our head vs CLIFATRON Method 1, same embeddings."""
+def _role_mask(partitions: np.ndarray, role: str) -> np.ndarray:
+    return np.asarray(partitions) == role
+
+
+def transportability_matrix(states: dict, labels: dict, groups: dict, partitions: dict,
+                            method: str = "probe",
+                            allow_cross_site_ensemble: bool = False):
+    """states/labels/groups/partitions keyed by site. Returns matrix[train_site][test_site].
+
+    `method` in {'probe','xgboost'} -- our head vs CLIFATRON Method 1, same embeddings.
+
+    **Partition isolation (U5 D6, D7).** Each site's predictor is fitted on that site's
+    `train` rows, its calibrator on `calibration` rows, and every reported number comes
+    from `test` rows. The previous implementation fitted on `states[s], labels[s]` --
+    the whole site -- and then scored `matrix[tr][te]` including the `tr == te` diagonal,
+    so the diagonal fitted and scored on identical rows and `full_panel(recalibrate=True)`
+    re-fitted temperature on `labels[te]` on top of that. LPE had the same defect: it was
+    fitted on the very test labels it was scoring against.
+
+    The diagonal is still reported, and is now legitimate: train and test are disjoint
+    partitions of the same site, which is internal validation rather than fit-on-self.
+
+    A site missing a required partition yields an `insufficient_partitions` cell rather
+    than a number -- fail closed, not fall back to the whole array.
+
+    **`allow_cross_site_ensemble` defaults to False (U5 D8).** The Elemento-style
+    inference-time ensemble averages site-local model predictions across sites, which
+    presupposes a cross-site derived-model exchange that `AGENTS.md` and this plan's
+    Scope Boundaries both list as unapproved. It is not a metric option; it is a
+    governance boundary, so it is off unless a caller names the approval.
+    """
     sites = list(states.keys())
     fit = fit_probe if method == "probe" else fit_xgboost
-    predictors = {s: fit(states[s], labels[s]) for s in sites}   # train one per site (local)
+
+    missing = [s for s in sites if s not in partitions]
+    if missing:
+        raise PartitionError(
+            f"sites {missing} were passed without partition roles. Unsplit site arrays "
+            "cannot enter a fit/evaluate workflow."
+        )
+
+    # One predictor per site, fitted on that site's TRAIN rows only (local).
+    predictors, calibrations = {}, {}
+    for s in sites:
+        tr_mask = _role_mask(partitions[s], "train")
+        if tr_mask.sum() == 0 or len(np.unique(labels[s][tr_mask])) < 2:
+            predictors[s] = None
+            continue
+        predictors[s] = fit(states[s][tr_mask], labels[s][tr_mask])
+
+        # Calibrator fitted on the CALIBRATION partition, never on anything scored.
+        cal_mask = _role_mask(partitions[s], "calibration")
+        if method == "probe" and cal_mask.sum() > 0 and len(np.unique(labels[s][cal_mask])) > 1:
+            cal_logits = predictors[s](states[s][cal_mask])
+            calibrations[s] = M.fit_temperature(cal_logits, labels[s][cal_mask])
 
     matrix, probs_on = {}, {t: {} for t in sites}
     for tr in sites:
         matrix[tr] = {}
         for te in sites:
-            raw = predictors[tr](states[te])
-            if method == "probe":                                # logits -> panel recalibrates
+            te_mask = _role_mask(partitions[te], "test")
+            if predictors[tr] is None or te_mask.sum() == 0:
+                matrix[tr][te] = {
+                    "status": INSUFFICIENT_PARTITIONS,
+                    "reason": ("train partition unusable at the fitting site"
+                               if predictors[tr] is None
+                               else "no test partition at the evaluating site"),
+                }
+                continue
+
+            X_te, y_te = states[te][te_mask], labels[te][te_mask]
+            raw = predictors[tr](X_te)
+            if method == "probe":
                 logits = raw
                 p = 1.0 / (1.0 + np.exp(-raw))
-                cell = M.full_panel(p, labels[te], logits=logits, recalibrate=True)
-            else:                                                # xgboost already probs
+                cell = M.full_panel(p, y_te, logits=logits,
+                                    temperature=calibrations.get(tr))
+            else:
                 p = raw
-                cell = M.full_panel(p, labels[te], recalibrate=False)
+                cell = M.full_panel(p, y_te)
+            cell["status"] = _schema.EVALUABLE
+
             if te in groups:
-                cell["subgroups"] = M.subgroup_panel(p, labels[te], groups[te])
-            if tr != te:                                         # LPE only for external transport
-                cell["lpe"] = M.local_patient_equivalence(cell.get("auroc", 0.0),
-                                                          states[te], labels[te])
+                cell["subgroups"] = M.subgroup_panel(
+                    p, y_te, {k: v[te_mask] for k, v in groups[te].items()})
+
+            if tr != te:
+                # LPE fits a local model; it needs its OWN fit partition (D7). Fitting it
+                # on the rows being scored made it a comparison against itself.
+                lpe_mask = _role_mask(partitions[te], "train")
+                if lpe_mask.sum() > 0 and len(np.unique(labels[te][lpe_mask])) > 1:
+                    cell["lpe"] = M.local_patient_equivalence(
+                        cell.get("auroc", 0.0),
+                        states[te][lpe_mask], labels[te][lpe_mask],
+                        eval_X=X_te, eval_y=y_te)
+                else:
+                    cell["lpe"] = None
+
             matrix[tr][te] = cell
             probs_on[te][tr] = p
 
-    # Elemento inference-time ensemble: mean of the site models' probs on each test site
-    matrix["ensemble"] = {}
-    for te in sites:
-        p_ens = np.mean([probs_on[te][tr] for tr in sites], axis=0)
-        cell = M.full_panel(p_ens, labels[te], recalibrate=False)
-        if te in groups:
-            cell["subgroups"] = M.subgroup_panel(p_ens, labels[te], groups[te])
-        matrix["ensemble"][te] = cell
+    if allow_cross_site_ensemble:
+        matrix["ensemble"] = {}
+        for te in sites:
+            te_mask = _role_mask(partitions[te], "test")
+            available = [probs_on[te][tr] for tr in sites if tr in probs_on[te]]
+            if not available or te_mask.sum() == 0:
+                matrix["ensemble"][te] = {"status": INSUFFICIENT_PARTITIONS,
+                                          "reason": "no usable per-site predictions"}
+                continue
+            p_ens = np.mean(available, axis=0)
+            y_te = labels[te][te_mask]
+            cell = M.full_panel(p_ens, y_te)
+            cell["status"] = _schema.EVALUABLE
+            if te in groups:
+                cell["subgroups"] = M.subgroup_panel(
+                    p_ens, y_te, {k: v[te_mask] for k, v in groups[te].items()})
+            matrix["ensemble"][te] = cell
     return matrix
 
 
@@ -155,6 +266,10 @@ def main():
     ap.add_argument("--seq-col", default="sequence")
     ap.add_argument("--label-col", default="label")
     ap.add_argument("--group-cols", default="sex,race,age_band")
+    ap.add_argument("--partition-col", default="partition",
+                    help="column carrying the U1 split role (train/validation/calibration/test)")
+    ap.add_argument("--allow-cross-site-ensemble", action="store_true",
+                    help="requires a recorded derived-model transfer approval; off by default")
     ap.add_argument("--method", choices=["probe", "xgboost", "both"], default="both")
     ap.add_argument("--out", default="benchmark/results/method3.json")
     ap.add_argument("--device", default="cuda")
@@ -164,16 +279,21 @@ def main():
     group_cols = [g for g in args.group_cols.split(",") if g]
     backbone = load_backbone(args.checkpoint)
 
-    states, labels, groups = {}, {}, {}
+    states, labels, groups, partitions = {}, {}, {}, {}
     for entry in args.site:
         name, path = entry.split("=", 1)
-        seqs, y, g, _ = load_site(path, args.seq_col, args.label_col, group_cols)
+        seqs, y, g, part = load_site(path, args.seq_col, args.label_col, group_cols,
+                                     partition_col=args.partition_col)
         states[name] = extract_anchor_states(backbone, seqs, args.device)
-        labels[name], groups[name] = y, g
-        print(f"[{name}] {len(y)} stays, prevalence={float(np.mean(y)):.3f}")
+        labels[name], groups[name], partitions[name] = y, g, part
+        # Aggregate shape only: counts per partition role, never the path or the rows.
+        roles = {r: int((part == r).sum()) for r in sorted(set(part.tolist()))}
+        print(f"[{name}] {len(y)} stays, partitions={roles}")
 
     methods = ["probe", "xgboost"] if args.method == "both" else [args.method]
-    result = {m: transportability_matrix(states, labels, groups, method=m) for m in methods}
+    result = {m: transportability_matrix(
+        states, labels, groups, partitions, method=m,
+        allow_cross_site_ensemble=args.allow_cross_site_ensemble) for m in methods}
 
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)

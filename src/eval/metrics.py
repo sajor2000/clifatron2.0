@@ -18,6 +18,8 @@ import numpy as np
 from sklearn.isotonic import IsotonicRegression
 from sklearn.metrics import average_precision_score, brier_score_loss, roc_auc_score
 
+from src.eval import schema as _schema
+
 _EPS = 1e-7
 
 
@@ -153,8 +155,39 @@ def _defined_prediction_mask(*arrays: np.ndarray) -> np.ndarray:
     return mask
 
 
+def fit_temperature(cal_logits: np.ndarray, cal_labels: np.ndarray) -> float:
+    """Fit a calibration temperature on a CALIBRATION partition (U5 D4).
+
+    The two-argument signature is the control. There is no single-array form of this
+    function, so a caller cannot reach "fit on the labels I am about to score" without
+    deliberately passing the same array twice.
+
+    Disjointness of the fitting and calibration data is the caller's responsibility --
+    the same invariant scikit-learn states for its own prefit path
+    (`CalibratedClassifierCV(FrozenEstimator(base))`): "The user has to take care
+    manually that data for model fitting and calibration are disjoint." We keep the
+    hand-rolled LBFGS implementation rather than adopting
+    `CalibratedClassifierCV(method="temperature")`, which would require raising the
+    `scikit-learn>=1.5` pin to `>=1.8` (`FrozenEstimator` needs `>=1.6`). Recorded
+    deliberately: the pin is unchanged and this code depends on nothing above 1.5.
+
+    Apply the returned T via `full_panel(..., temperature=T)`.
+    """
+    cal_labels = np.asarray(cal_labels).astype(int)
+    if len(np.unique(cal_labels)) < 2:
+        raise ValueError(
+            "calibration partition is single-class; a temperature fitted on it is "
+            "meaningless. Report the outcome as non-evaluable instead."
+        )
+    return temperature_scale(cal_logits, cal_labels)
+
+
 def temperature_scale(logits: np.ndarray, labels: np.ndarray) -> float:
-    """Cadence single-scalar temperature T* minimizing NLL (LBFGS). Divide logits by T*."""
+    """Cadence single-scalar temperature T* minimizing NLL (LBFGS). Divide logits by T*.
+
+    Low-level primitive. Prefer `fit_temperature`, which refuses a degenerate
+    calibration partition and carries the disjointness contract in its docstring.
+    """
     import torch
     z = torch.tensor(_clamp_saturated_logits(logits), dtype=torch.float64)
     y = torch.tensor(np.asarray(labels), dtype=torch.float64)
@@ -172,15 +205,33 @@ def temperature_scale(logits: np.ndarray, labels: np.ndarray) -> float:
 
 
 def local_patient_equivalence(fm_auroc: float, X, y,
-                              sizes=(250, 500, 1000, 2000, 4000, 8000, 16000)) -> int:
+                              sizes=(250, 500, 1000, 2000, 4000, 8000, 16000),
+                              eval_X=None, eval_y=None) -> int:
     """ICareFM LPE: smallest local-LightGBM training size whose AUROC matches the FM.
-    Returns crossing size, or -1 if never reached within `sizes`."""
+    Returns crossing size, or -1 if never reached within `sizes`.
+
+    `X`/`y` are the FIT rows. `eval_X`/`eval_y`, when supplied, are the disjoint rows the
+    local model is scored on -- normally the same test partition the foundation model was
+    scored on, so the two AUROCs are comparable (U5 D7). Previously this was called with
+    the test rows as `X`/`y` and split them internally, so the local model was fitted on
+    the very labels it was then compared against, and the crossing size it reported was
+    optimistic by an unknown margin.
+
+    Omitting `eval_X`/`eval_y` falls back to an internal split of `X`/`y`, which is
+    appropriate only when `X`/`y` are already a dedicated fit partition.
+    """
     import lightgbm as lgb
     from sklearn.model_selection import train_test_split
     y = np.asarray(y).astype(int)
     if len(np.unique(y)) < 2:
         return -1
-    Xtr, Xte, ytr, yte = train_test_split(X, y, test_size=0.3, random_state=0, stratify=y)
+    if eval_X is not None and eval_y is not None:
+        eval_y = np.asarray(eval_y).astype(int)
+        if len(np.unique(eval_y)) < 2:
+            return -1
+        Xtr, ytr, Xte, yte = X, y, eval_X, eval_y
+    else:
+        Xtr, Xte, ytr, yte = train_test_split(X, y, test_size=0.3, random_state=0, stratify=y)
     for n in sizes:
         if n > len(Xtr):
             break
@@ -192,9 +243,24 @@ def local_patient_equivalence(fm_auroc: float, X, y,
 
 
 def full_panel(p: np.ndarray, y: np.ndarray, logits: np.ndarray | None = None,
-               recalibrate: bool = True, nan_policy: str = "drop") -> dict:
-    """Every scalar metric for one (task, site) cell. If `logits` given and recalibrate,
-    temperature-scale first so calibration + DCA reflect the deployable model.
+               temperature: float | None = None, nan_policy: str = "drop",
+               unsafe_fit_on_eval_labels: bool = False) -> dict:
+    """Every scalar metric for one (task, site) cell. Uncalibrated unless told otherwise.
+
+    **This function does not fit a calibrator (U5 D4).** It previously did, by default:
+    `recalibrate=True` fitted `temperature_scale(logits, y)` on the same `y` it then
+    scored, so calibration slope, ECE, ICI, Brier and DCA were every one of them fitted
+    on their own test labels. The leak was the default argument, which is why the fix
+    inverts the default rather than documenting a caveat.
+
+    To report calibrated metrics, fit on a disjoint partition and pass the result:
+
+        T = fit_temperature(cal_logits, cal_labels)      # calibration partition
+        panel = full_panel(p_test, y_test, logits=test_logits, temperature=T)
+
+    `unsafe_fit_on_eval_labels=True` restores the old single-array behaviour for
+    synthetic tests only. It is named so that it cannot be reached by accident and so
+    that it is greppable in review.
 
     NaN predictions (undefined model output — a broken probe/ensemble/model) are NOT
     silently coerced to a neutral 0.5, which would fabricate valid-looking metrics.
@@ -204,6 +270,14 @@ def full_panel(p: np.ndarray, y: np.ndarray, logits: np.ndarray | None = None,
                  return NaN metrics rather than fabricated ones.
       - "raise": raise ValueError on any NaN prediction (fail loud in strict pipelines).
     Saturated ±inf logits (a legitimate p==0/1) are clamped, not dropped."""
+    if temperature is not None and unsafe_fit_on_eval_labels:
+        raise ValueError(
+            "pass either a pre-fit `temperature` or `unsafe_fit_on_eval_labels=True`, "
+            "not both -- they are contradictory calibration sources"
+        )
+    if temperature is not None and logits is None:
+        raise ValueError("`temperature` requires `logits` to apply it to")
+
     p = np.asarray(p, dtype=float)
     y = np.asarray(y).astype(int)
     logits = None if logits is None else np.asarray(logits, dtype=float)
@@ -228,8 +302,11 @@ def full_panel(p: np.ndarray, y: np.ndarray, logits: np.ndarray | None = None,
                 "prevalence": float("nan"), "n_dropped_nan": n_dropped}
 
     T = 1.0
-    if recalibrate and logits is not None and len(np.unique(y)) > 1:
+    if unsafe_fit_on_eval_labels and logits is not None and len(np.unique(y)) > 1:
         T = temperature_scale(logits, y)
+    elif temperature is not None:
+        T = float(temperature)
+    if T != 1.0 and logits is not None:
         p = _sigmoid(_clamp_saturated_logits(logits) / T)
     p = np.clip(p, 0.0, 1.0)  # bound saturated probs; NaN already removed above
     out = score(p, y)
@@ -249,20 +326,60 @@ def full_panel(p: np.ndarray, y: np.ndarray, logits: np.ndarray | None = None,
 
 def subgroup_panel(p: np.ndarray, y: np.ndarray, groups: dict[str, np.ndarray]) -> dict:
     """Per-subgroup metrics for TRIPOD+AI fairness reporting (aggregate only).
-    `groups` maps attribute name -> per-example category array (e.g. sex, race, age_band)."""
+
+    `groups` maps attribute name -> per-example category array (e.g. sex, race, age_band).
+
+    Every category present in the data appears in the output, carrying an explicit
+    status (U5 D5). The previous implementation silently dropped cells below a
+    hard-coded `n >= 30`, which had three problems: a dropped cell is indistinguishable
+    from one that was never evaluated; a lone dropped cell is a subtraction away from
+    the attribute total; and 30 disagreed with the repo-wide `minimum_cell_size: 10`
+    for no recorded reason.
+
+    Suppression here is denominator AND numerator (see `schema.suppress_cell`), followed
+    by complementary suppression across siblings.
+    """
     p, y = np.asarray(p, float), np.asarray(y).astype(int)
     result = {}
     for attr, vals in groups.items():
         vals = np.asarray(vals)
-        result[attr] = {}
+        cells: dict[str, dict] = {}
         for cat in np.unique(vals):
             m = vals == cat
-            if m.sum() >= 30:
-                cell = score(p[m], y[m])
-                if not np.isnan(cell["auroc"]):
-                    cell["ece"] = expected_calibration_error(p[m], y[m])
-                result[attr][str(cat)] = cell
+            n = int(m.sum())
+            n_pos = int(y[m].sum())
+            status, reason = _schema.suppress_cell(n, n_pos)
+            if status != _schema.EVALUABLE:
+                cells[str(cat)] = {"status": status, "reason": reason, "n": n}
+                continue
+            cell = score(p[m], y[m])
+            cells[str(cat)] = {
+                "status": _schema.EVALUABLE,
+                "n": n,
+                "prevalence": _schema.round_prevalence(cell["prevalence"]),
+                "auroc": cell["auroc"],
+                "auprc": cell["auprc"],
+                "ece": expected_calibration_error(p[m], y[m]),
+            }
+        result[attr] = _schema.apply_complementary_suppression(cells)
     return result
+
+
+def net_benefit_releasable(p: np.ndarray, y: np.ndarray, thresholds=None) -> dict | None:
+    """`net_benefit` guarded by the curve-release minimum. Returns None when too small.
+
+    A decision curve is not a scalar: NB(pt) = TP/N - (FP/N)(pt/(1-pt)) over 50
+    thresholds is 50 equations in TP and FP, and with n and prevalence also released
+    they invert to per-patient counts at 50 cut-points. Cell-size suppression alone does
+    not bound that, so curve release carries its own, higher threshold.
+
+    Use this on any path whose output leaves the site. `net_benefit` remains available
+    for site-local analysis that is not exported.
+    """
+    y = np.asarray(y).astype(int)
+    if len(y) < _schema.CURVE_RELEASE_MIN:
+        return None
+    return net_benefit(p, y, thresholds=thresholds)
 
 
 # -------------------------------------------------------------------- competing-risk calib
