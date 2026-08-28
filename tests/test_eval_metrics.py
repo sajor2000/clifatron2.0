@@ -44,9 +44,9 @@ class CalibrationPartitionTest(unittest.TestCase):
         """Calibration is fitted on one partition and applied to another. The signature
         itself is the control: there is no way to call it with a single array."""
         cal_logits, cal_y = _separable(seed=1)
-        T = M.fit_temperature(cal_logits, cal_y)
-        self.assertIsInstance(T, float)
-        self.assertGreater(T, 0.0)
+        cal = M.fit_temperature(cal_logits, cal_y)
+        self.assertIsInstance(cal, M.Calibrator)
+        self.assertGreater(float(cal), 0.0)
 
     def test_temperature_fitted_on_calibration_applies_to_disjoint_test(self):
         logits, y = _separable(n=800, seed=2)
@@ -57,7 +57,7 @@ class CalibrationPartitionTest(unittest.TestCase):
         uncal = M.full_panel(M._sigmoid(test_logits), test_y, logits=test_logits)
         cal = M.full_panel(M._sigmoid(test_logits), test_y, logits=test_logits, temperature=T)
 
-        self.assertEqual(cal["temperature"], T)
+        self.assertEqual(cal["temperature"], float(T))
         self.assertAlmostEqual(uncal["auroc"], cal["auroc"], places=10,
                                msg="temperature scaling is monotone; it cannot change ranking")
         self.assertNotAlmostEqual(uncal["brier"], cal["brier"], places=12,
@@ -86,6 +86,21 @@ class CalibrationPartitionTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             M.full_panel(M._sigmoid(logits), y, logits=logits, temperature=1.5,
                          unsafe_fit_on_eval_labels=True)
+
+    def test_calibrator_refuses_to_be_applied_to_the_rows_it_was_fitted_on(self):
+        """Review finding #19. Inverting the default made the leak inconvenient, not
+        impossible: a caller could fit on the test rows and pass the scalar straight
+        back. The calibrator now carries the identity of the rows it saw."""
+        logits, y = _separable(n=300, seed=9)
+        leaked = M.fit_temperature(logits, y)
+        with self.assertRaises(ValueError) as ctx:
+            M.full_panel(M._sigmoid(logits), y, logits=logits, temperature=leaked)
+        self.assertIn("disjoint", str(ctx.exception))
+
+    def test_calibrator_applies_cleanly_to_disjoint_rows(self):
+        logits, y = _separable(n=800, seed=10)
+        cal = M.fit_temperature(logits[:400], y[:400])
+        M.full_panel(M._sigmoid(logits[400:]), y[400:], logits=logits[400:], temperature=cal)
 
     def test_fit_temperature_refuses_a_single_class_calibration_partition(self):
         with self.assertRaises(ValueError):
@@ -128,7 +143,7 @@ class SubgroupSuppressionTest(unittest.TestCase):
         p, y, groups = self._groups({"F": 400, "M": 300, "Y": 20})
         panel = M.subgroup_panel(p, y, groups)
         self.assertEqual(panel["sex"]["Y"]["status"], S.EVALUABLE,
-                         f"n=20 clears MIN_CELL_SIZE={S.MIN_CELL_SIZE}")
+                         f"n=20 clears MIN_CELL_SIZE={S.min_cell_size()}")
 
     def test_a_lone_suppressed_cell_cannot_be_recovered_by_differencing(self):
         p, y, groups = self._groups({"F": 400, "M": 300, "X": 4})
@@ -145,7 +160,8 @@ class SubgroupSuppressionTest(unittest.TestCase):
         for cell in panel["sex"].values():
             if cell["status"] == S.EVALUABLE:
                 self.assertEqual(cell["prevalence"],
-                                 round(cell["prevalence"], S.PREVALENCE_DECIMALS))
+                                 S.round_prevalence(cell["prevalence"]),
+                                 "exported prevalence must already be quantised")
 
     def test_cells_carry_no_patient_level_fields(self):
         p, y, groups = self._groups({"F": 400, "M": 300})
@@ -158,14 +174,14 @@ class SubgroupSuppressionTest(unittest.TestCase):
 class NetBenefitResolutionTest(unittest.TestCase):
     def test_small_cell_gets_no_curve(self):
         rng = np.random.default_rng(0)
-        n = S.CURVE_RELEASE_MIN - 1
+        n = S.curve_release_min() - 1
         y = rng.integers(0, 2, size=n)
         p = rng.uniform(size=n)
         self.assertIsNone(M.net_benefit_releasable(p, y))
 
     def test_large_cell_gets_a_curve(self):
         rng = np.random.default_rng(0)
-        n = S.CURVE_RELEASE_MIN * 4
+        n = S.curve_release_min() * 4
         y = rng.integers(0, 2, size=n)
         p = rng.uniform(size=n)
         curve = M.net_benefit_releasable(p, y)

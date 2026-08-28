@@ -22,8 +22,8 @@ from src.eval.attestation import AuthenticationError, verify_report
 from src.eval.schema import EVALUABLE, validate_export
 
 
-def load_site_results(paths: list[str], *, signing_keys: dict[str, bytes] | None = None
-                      ) -> list[dict]:
+def load_site_results(paths: list[str], *, signing_keys: dict[str, bytes] | None = None,
+                      require_signatures: bool = True) -> list[dict]:
     """Load site artifacts through the allow-listed schema (U5 D9).
 
     This was a bare `json.loads` with no schema check at all, feeding a table builder
@@ -32,11 +32,23 @@ def load_site_results(paths: list[str], *, signing_keys: dict[str, bytes] | None
     loader where an allow-list is required, and it is the reader-side twin of the
     writer-side gate in `src/eval/schema.py`.
 
-    `signing_keys` maps site_id -> shared secret. When supplied, each report's signature
-    is verified before its contents are read, so a forged or altered report cannot enter
-    the cross-site comparison.
+    `signing_keys` maps site_id -> shared secret. Verification is REQUIRED by default
+    (U5 review #12): the previous behaviour verified only when keys happened to be
+    supplied, so both ends of the trust boundary defaulted to unauthenticated. Pass
+    `require_signatures=False` only for a local dry run over synthetic fixtures.
+
+    Duplicate `release_id` values are rejected (U5 review #13). A valid signed report can
+    otherwise be supplied N times and each copy counts as another site, biasing the mean
+    and inflating n_sites in the headline figure.
     """
-    results = []
+    if require_signatures and not signing_keys:
+        raise AuthenticationError(
+            "no signing keys supplied. Aggregating unauthenticated site reports lets a "
+            "forged or altered report enter the cross-site comparison unattributed. Pass "
+            "signing_keys={site_id: secret}, or require_signatures=False for a synthetic "
+            "dry run."
+        )
+    results, seen_releases = [], {}
     for p in paths:
         blob = json.loads(Path(p).read_text())
         validate_export(blob)
@@ -48,6 +60,14 @@ def load_site_results(paths: list[str], *, signing_keys: dict[str, bytes] | None
                     "report cannot enter the aggregate"
                 )
             verify_report(blob, signing_keys[site])
+        release = blob.get("release_id")
+        if release in seen_releases:
+            raise AuthenticationError(
+                f"release_id {release!r} appears twice (already loaded from "
+                f"{seen_releases[release]!r}). A replayed report would be counted as an "
+                "additional site."
+            )
+        seen_releases[release] = Path(p).name
         results.append(blob)
     return results
 
@@ -110,8 +130,13 @@ def forest_plot_data(results: list[dict],
         stats = row[primary_metric]
         # site_id is the OPAQUE identifier from the schema. `site_name` and `site` are
         # gone deliberately: the latter used to carry str(data_path).
-        sites = sorted(r["site_id"] for r in results)
-        for site_idx, (site, val) in enumerate(zip(sites, stats["values"])):
+        # Pair each site with ITS OWN value, then sort the pairs (U5 review #1).
+        # Sorting the site list independently of `stats["values"]` -- which stays in
+        # `results` order -- attributed every point in the headline figure to the wrong
+        # hospital whenever --results were passed non-alphabetically.
+        pairs = sorted(zip((r["site_id"] for r in results), stats["values"]),
+                       key=lambda sv: sv[0])
+        for site_idx, (site, val) in enumerate(pairs):
             ci = 1.96 * stats["std"] / max(stats["n_sites"], 1) ** 0.5
             forest.append({
                 "outcome": outcome,
@@ -126,11 +151,21 @@ def forest_plot_data(results: list[dict],
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--results", nargs="+", required=True)
-    ap.add_argument("--out", default="results/forest_plot.json")
+    ap.add_argument("--out", default="output/final_no_phi/forest_plot.json")
+    ap.add_argument("--signing-keys", default=None,
+                    help="JSON file mapping site_id -> hex shared secret. Required "
+                         "unless --unsigned-dry-run is passed.")
+    ap.add_argument("--unsigned-dry-run", action="store_true",
+                    help="skip signature verification; synthetic fixtures only")
     args = ap.parse_args()
 
-    results = load_site_results(args.results)
-    sites = [r.get("site_name", r.get("site", "?")) for r in results]
+    keys = None
+    if args.signing_keys:
+        keys = {k: bytes.fromhex(v)
+                for k, v in json.loads(Path(args.signing_keys).read_text()).items()}
+    results = load_site_results(args.results, signing_keys=keys,
+                                require_signatures=not args.unsigned_dry_run)
+    sites = [r["site_id"] for r in results]
     print(f"Loaded {len(results)} sites: {', '.join(sites)}")
 
     forest = forest_plot_data(results)

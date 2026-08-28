@@ -1,38 +1,45 @@
 """Allow-listed aggregate result schema for site-local evaluation export (U5).
 
-Every artifact that leaves a site passes through here. The contract is an ALLOW-LIST,
-not a deny-list: a field that is not named below cannot be exported, so a new debug
-value, a captured error string, or a fresh provenance key fails closed instead of
-travelling. The deny-list (`PROHIBITED_SUBSTRINGS`) is kept as a second, independent
-check for the specific field names we know are dangerous.
+Every artifact that leaves a site passes through `validate_export`. The contract is an
+ALLOW-LIST, not a deny-list: a field that is not named below cannot be exported, so a
+new debug value, a captured error string, or a fresh provenance key fails closed instead
+of travelling. A recursive value scan and a named-substring deny-list run behind it as
+independent second checks.
 
 Validation runs at the WRITER, not only the reader. Development sites (MIMIC, Rush,
-UChicago) export through `src/eval/clif_validate.py` rather than the shippable wheel,
-so the sites holding real PHI must hit the same allow-list the aggregator does.
+UChicago) export through `src/eval/clif_validate.py` rather than the shippable wheel, so
+the sites holding real PHI must hit the same gate the aggregator does.
 
-Three disclosure controls live here, and they are not interchangeable:
+**The gate enforces suppression itself.** An earlier version computed suppression at the
+producers (`subgroup_panel`, `evaluate_site`) and checked only field NAMES here, so a
+payload assembled by any other route could export an n=1 cell through a boundary
+documented as fail-closed. `validate_export` now re-derives `suppress_cell` for every
+evaluable cell and rejects anything that would not have survived it. A boundary that
+trusts its callers is not a boundary.
+
+Three disclosure controls, not interchangeable:
 
   1. Denominator suppression  — a cell with n < MIN_CELL_SIZE is suppressed.
   2. Numerator suppression    — a cell whose positive OR negative count is below the
-                                same threshold is suppressed even when n clears it.
-                                `n * prevalence` recovers the exact positive count, so
-                                guarding the denominator alone is not suppression.
+                                same threshold is suppressed even when n clears it,
+                                because `n * prevalence` recovers the positive count.
   3. Resolution bounding      — a cell below CURVE_RELEASE_MIN reports scalar summaries
                                 only. A released DCA curve is 50 equations in TP and FP;
                                 with n and prevalence also released those invert to
                                 per-patient counts at 50 cut-points.
 
-Per-outcome label-validity reporting is REQUIRED, not optional. The allow-list closes
-the disclosure channel; without this block it would also close the validity channel,
-leaving a site with mis-mapped units or a differently-coded mCIDE concept returning a
-plausible AUROC that nothing in the payload can contradict. Fields follow TRIPOD+AI's
-participants / outcome / missing-data reporting applied to the federated case
-(Collins et al., BMJ 2024;385:e078378, doi:10.1136/bmj-2023-078378).
+Per-outcome label-validity reporting is REQUIRED. The allow-list closes the disclosure
+channel; without this block it would close the validity channel too, leaving a site with
+mis-mapped units or a differently-coded mCIDE concept returning a plausible AUROC that
+nothing in the payload can contradict. Fields follow TRIPOD+AI's participants / outcome /
+missing-data reporting (Collins et al., BMJ 2024;385:e078378).
 """
 
 from __future__ import annotations
 
+import functools
 import math
+import re
 from pathlib import Path
 
 import yaml
@@ -51,29 +58,31 @@ class DisclosureError(ValueError):
 
 
 # ---------------------------------------------------------------- outcome status
-# The seven states a per-outcome result can be in. `EVALUABLE` is the only one that
-# carries metrics; every other state carries a reason and no numbers, so a consumer
-# can never mistake "we could not compute this" for "this scored badly".
 EVALUABLE = "evaluable"
 UNSUPPORTED_AT_SITE = "unsupported_at_site"
 SINGLE_CLASS = "single_class"
 INSUFFICIENT_N = "insufficient_n"
+INSUFFICIENT_PARTITIONS = "insufficient_partitions"
 SMALL_CELL_SUPPRESSED = "small_cell_suppressed"
 ARTIFACT_MISMATCH = "artifact_mismatch"
 RUNTIME_FAILURE = "runtime_failure"
 
 OUTCOME_STATUSES = frozenset({
     EVALUABLE, UNSUPPORTED_AT_SITE, SINGLE_CLASS, INSUFFICIENT_N,
-    SMALL_CELL_SUPPRESSED, ARTIFACT_MISMATCH, RUNTIME_FAILURE,
+    INSUFFICIENT_PARTITIONS, SMALL_CELL_SUPPRESSED, ARTIFACT_MISMATCH, RUNTIME_FAILURE,
 })
 
 NON_EVALUABLE_STATUSES = OUTCOME_STATUSES - {EVALUABLE}
 
-# Site and partition roles (R15). A site carries exactly one role; a within-site
-# partition carries exactly one role. Keeping them as closed sets is what stops
-# "development" quietly becoming "external confirmation" in a later report.
 SITE_ROLES = frozenset({"reference", "development", "external_confirmation"})
 PARTITION_ROLES = frozenset({"train", "validation", "calibration", "test"})
+
+# Closed set, and only one value may be written to disk. `pending_review` is a LOCAL
+# DRAFT state: `write_export` refuses it, so a release boundary cannot be crossed without
+# a recorded disclosure decision (review finding #16).
+DRAFT_DISCLOSURE_STATUS = "pending_review"
+RELEASABLE_DISCLOSURE_STATUSES = frozenset({"reviewed_approved"})
+DISCLOSURE_STATUSES = RELEASABLE_DISCLOSURE_STATUSES | {DRAFT_DISCLOSURE_STATUS}
 
 
 # ---------------------------------------------------------------- policy constants
@@ -81,9 +90,9 @@ def load_min_cell_size(policy_path: str | Path = DEFAULT_ARTIFACT_POLICY) -> int
     """Read the suppression threshold from the landed artifact policy.
 
     Single source of truth. `configs/artifact_policy.yaml` set `minimum_cell_size: 10`
-    in U1 and `tests/test_artifact_policy.py` asserts it; re-deciding the number here
-    is how a codebase ends up with two thresholds and a suppression rule that silently
-    stops applying (which is exactly what `subgroup_panel`'s hard-coded 30 was).
+    in U1 and `tests/test_artifact_policy.py` asserts it; re-deciding the number here is
+    how a codebase ends up with two thresholds and a suppression rule that silently stops
+    applying (which is exactly what `subgroup_panel`'s hard-coded 30 was).
     """
     policy = yaml.safe_load(Path(policy_path).read_text())
     try:
@@ -99,75 +108,96 @@ def load_min_cell_size(policy_path: str | Path = DEFAULT_ARTIFACT_POLICY) -> int
     return value
 
 
-MIN_CELL_SIZE = load_min_cell_size()
+@functools.lru_cache(maxsize=1)
+def min_cell_size() -> int:
+    """Cached accessor. Deferred rather than loaded at import (review finding #32).
 
-# Materially larger than MIN_CELL_SIZE, per the U5 approach. A cell can clear the count
-# threshold and still be inverted through its own curves, so curve release needs its own,
-# higher bar. 5x the cell minimum: with n >= 50 a 50-point DCA curve is underdetermined
-# for per-patient recovery.
-CURVE_RELEASE_MIN = 5 * MIN_CELL_SIZE
+    Reading a YAML file as an import side effect meant importing any eval module failed
+    when the policy file was absent or malformed, which is both surprising and
+    inconsistent with every other config load in this repo.
+    """
+    return load_min_cell_size()
 
-# Exported prevalence is rounded so `n * prevalence` cannot be inverted to an exact
-# positive count. Two decimal places against a MIN_CELL_SIZE-bounded n leaves the
-# integer ambiguous.
-PREVALENCE_DECIMALS = 2
+
+def curve_release_min() -> int:
+    """Threshold above which a cell may release its DCA / calibration curves.
+
+    5x the cell minimum. A cell can clear the count threshold and still be inverted
+    through its own curves, so curve release needs its own, higher bar: `net_benefit`
+    emits 50 threshold points, and at n >= 50 that system is underdetermined for
+    per-patient recovery. The multiplier is a judgment call, recorded here rather than
+    left as a bare literal.
+    """
+    return 5 * min_cell_size()
+
+
+def prevalence_step() -> float:
+    """Quantisation step for exported prevalence. Coarsening, NOT a guarantee.
+
+    **Read this before relying on it.** A previous version rounded to 2 decimals and
+    claimed that left the positive count ambiguous. It did not: for every n from 20 to
+    100, `round(pos/n, 2)` admits exactly one candidate integer. The count was fully
+    recoverable and the reassuring comment was false — which is worse than no comment,
+    because a reviewer reading it would stop looking.
+
+    Quantising here does not fix that, and this docstring will not claim it does. For any
+    n where 1/n <= step, distinct counts still map to distinct exported values. Making
+    prevalence genuinely ambiguous requires exporting an interval rather than a point,
+    which is a reporting-format decision this unit does not take.
+
+    **The numerator guarantee is `suppress_cell`, not this function.** A released cell
+    has at least MIN_CELL_SIZE positives and at least MIN_CELL_SIZE negatives, so
+    recovering the exact positive count from `n * prevalence` identifies a group of at
+    least MIN_CELL_SIZE patients — never an individual. That is the property the
+    disclosure argument actually rests on. This step only reduces the precision of what
+    is published; treat it as defence in depth.
+    """
+    return 1.0 / (2 * min_cell_size())
 
 
 # ---------------------------------------------------------------- deny-list
-# Second line of defence behind the allow-list. Substring match, case-insensitive, so
-# `patient_id`, `PatientID`, and `subject_patient_id` are all caught.
+# Second line of defence behind the allow-list. Substring match, case-insensitive.
+# Free-text LOG redaction uses its own separate list in `src/eval/log_sanitizer.py`:
+# these two matched with different semantics and must be free to diverge (finding #33).
 PROHIBITED_SUBSTRINGS = (
     "patient_id", "patientid", "hospitalization_id", "hosp_id", "encounter_id",
     "subject_id", "stay_id", "mrn", "sequence", "token", "pos_min",
     "charttime", "storetime", "timestamp", "birth", "dob", "name", "address",
 )
 
-# Values that look like a local filesystem path must never appear, regardless of the
-# key they sit under. `results["site"] = str(data_path)` is how the site's directory
-# layout used to travel.
 _PATH_MARKERS = ("/", "\\")
+
+# A signature is 64 lowercase hex characters (HMAC-SHA256). Checked by FORMAT rather
+# than exempted from checking: the previous `_OPAQUE_FIELDS` escape hatch existed to stop
+# base64 tripping the path heuristic, but the value is hex and never needed it, and an
+# allow-listed field exempt from all inspection is a hole (finding #28).
+_SIGNATURE_RE = re.compile(r"\A[0-9a-f]{64}\Z")
+
+# Subgroup keys must name a single attribute, never a crosstab. A joint cell
+# (`sex_x_race`) is what makes cross-attribute differencing possible, so the joint is
+# refused at the boundary rather than reasoned about (finding #26).
+_CROSSTAB_MARKERS = ("_x_", "*", "×", " by ", "__")
 
 
 # ---------------------------------------------------------------- allow-list
-# Top-level envelope fields. Anything else fails closed.
 ENVELOPE_FIELDS = frozenset({
-    "schema_version",        # this module's METRIC_SCHEMA_VERSION
-    "metric_version",        # version of the metric implementations
-    "model_bundle_id",       # opaque identifier for the frozen bundle
-    "model_version",         # bundle version, used to key the disclosure ledger
-    "vocab_hash",
-    "outcome_spec_hash",
-    "target_map_hash",
-    "clif_version",
-    "site_id",               # OPAQUE site identifier - never a path, never a name
-    "site_role",
-    "partition_role",
-    "generated_by",          # tool identifier, not a user or host name
-    "outcomes",              # mapping: outcome name -> outcome block
-    "disclosure_status",
-    "signature",             # site->aggregator report authentication
+    "schema_version", "metric_version", "model_bundle_id", "model_version",
+    "vocab_hash", "outcome_spec_hash", "target_map_hash", "clif_version",
+    "site_id", "site_role", "partition_role", "generated_by", "outcomes",
+    "disclosure_status", "release_id", "signature",
 })
 
 REQUIRED_ENVELOPE_FIELDS = frozenset({
     "schema_version", "metric_version", "model_bundle_id", "model_version",
     "vocab_hash", "outcome_spec_hash", "clif_version", "site_id", "site_role",
-    "partition_role", "outcomes", "disclosure_status",
+    "partition_role", "outcomes", "disclosure_status", "release_id",
 })
 
-# Per-outcome block.
 OUTCOME_FIELDS = frozenset({
-    "status",                # one of OUTCOME_STATUSES
-    "reason",               # free-form-ish explanation for a non-evaluable status
-    "metrics",              # scalar metrics; absent unless status == EVALUABLE
-    "curves",               # DCA / calibration bins; absent below CURVE_RELEASE_MIN
-    "subgroups",            # mapping attribute -> category -> cell block
-    "label_validity",       # REQUIRED - see LABEL_VALIDITY_FIELDS
-    "intervals",            # aggregate confidence intervals
+    "status", "reason", "metrics", "curves", "subgroups", "label_validity", "intervals",
 })
-
 REQUIRED_OUTCOME_FIELDS = frozenset({"status", "label_validity"})
 
-# Scalar metrics permitted inside an outcome block.
 METRIC_FIELDS = frozenset({
     "auroc", "auprc", "n", "prevalence", "ece", "brier", "calib_slope",
     "calib_intercept", "ici", "temperature", "n_dropped_nan",
@@ -180,27 +210,24 @@ CURVE_FIELDS = frozenset({
     "cr_d_calibration_bins",
 })
 
-# Per-outcome label-validity block (TRIPOD+AI participants/outcome/missing-data).
 LABEL_VALIDITY_FIELDS = frozenset({
-    "outcome_definition_id",
-    "outcome_definition_version",
-    "status_counts",              # counts across the seven U1 outcome states
-    "evaluable_denominator_fraction",
-    "measurement_density",        # post-anchor measurement density summary
+    "outcome_definition_id", "outcome_definition_version", "status_counts",
+    "evaluable_denominator_fraction", "measurement_density",
 })
-
 REQUIRED_LABEL_VALIDITY_FIELDS = frozenset({
     "outcome_definition_id", "outcome_definition_version",
     "status_counts", "evaluable_denominator_fraction",
 })
 
-# The seven U1 outcome states that `status_counts` must account for.
 U1_OUTCOME_STATES = (
     "positive", "negative", "censored", "competing_event",
     "prevalent", "not_ascertainable", "unsupported_at_site",
 )
 
-CELL_FIELDS = frozenset({"status", "reason", "n", "prevalence", "auroc", "auprc", "ece"})
+# A suppressed cell carries NO n (finding #3) — the count is the thing suppression
+# exists to hide. `n_band` carries a coarse size signal instead when one is needed.
+CELL_FIELDS = frozenset({"status", "reason", "n", "n_band", "prevalence",
+                         "auroc", "auprc", "ece"})
 
 
 # ---------------------------------------------------------------- suppression
@@ -212,29 +239,45 @@ def suppress_cell(n: int, n_positive: int) -> tuple[str, str | None]:
     suppression: a cell of n=12 at prevalence 0.0833 clears any size threshold while
     identifying exactly one outcome-positive patient.
     """
-    if n < MIN_CELL_SIZE:
-        return INSUFFICIENT_N, f"n < {MIN_CELL_SIZE}"
+    floor = min_cell_size()
+    if n < floor:
+        return INSUFFICIENT_N, f"n < {floor}"
     n_negative = n - n_positive
     if n_positive == 0 or n_negative == 0:
         return SINGLE_CLASS, "outcome has a single class in this cell"
-    if n_positive < MIN_CELL_SIZE or n_negative < MIN_CELL_SIZE:
+    if n_positive < floor or n_negative < floor:
         return SMALL_CELL_SUPPRESSED, (
-            f"positive or negative count < {MIN_CELL_SIZE}; releasing n and prevalence "
-            "would recover the exact event count"
+            f"positive or negative count < {floor}; releasing n and prevalence would "
+            "recover the exact event count"
         )
     return EVALUABLE, None
 
 
-def round_prevalence(prevalence: float) -> float:
-    """Round exported prevalence so it cannot be inverted to an exact event count."""
-    if prevalence is None or (isinstance(prevalence, float) and math.isnan(prevalence)):
-        return float("nan")
-    return round(float(prevalence), PREVALENCE_DECIMALS)
+def n_band(n: int) -> str:
+    """Coarse size signal for a suppressed cell, replacing its exact count."""
+    floor = min_cell_size()
+    return f"<{floor}" if n < floor else f">={floor}"
+
+
+def round_prevalence(prevalence: float | None) -> float | None:
+    """Quantise exported prevalence so at least two integer counts are consistent.
+
+    Returns None — never NaN — for an undefined value, so the exported artifact stays
+    valid JSON under a strict parser (`allow_nan=False`). See `prevalence_step` for why
+    the step is what it is.
+    """
+    if prevalence is None:
+        return None
+    value = float(prevalence)
+    if math.isnan(value) or math.isinf(value):
+        return None
+    step = prevalence_step()
+    return round(round(value / step) * step, 6)
 
 
 def curves_releasable(n: int) -> bool:
     """Whether a cell of this size may release its DCA / calibration curves."""
-    return n >= CURVE_RELEASE_MIN
+    return n >= curve_release_min()
 
 
 def apply_complementary_suppression(cells: dict[str, dict]) -> dict[str, dict]:
@@ -245,7 +288,13 @@ def apply_complementary_suppression(cells: dict[str, dict]) -> dict[str, dict]:
     exactly one cell in an attribute is suppressed, the next-smallest releasable cell is
     suppressed alongside it so at least two unknowns remain.
 
-    Operates on already-status-tagged cells and returns a new mapping.
+    Cross-ATTRIBUTE differencing is handled structurally rather than arithmetically: the
+    schema refuses joint/crosstab subgroup keys (`_CROSSTAB_MARKERS`), so marginals over
+    the same rows never combine into a joint cell. Two attributes' marginals alone do not
+    determine any joint count.
+
+    Operates on already-status-tagged cells and returns a new mapping. Suppressed cells
+    lose their exact `n` and keep only a band.
     """
     out = {k: dict(v) for k, v in cells.items()}
     suppressed = [k for k, v in out.items() if v.get("status") in NON_EVALUABLE_STATUSES]
@@ -256,8 +305,12 @@ def apply_complementary_suppression(cells: dict[str, dict]) -> dict[str, dict]:
             "status": SMALL_CELL_SUPPRESSED,
             "reason": "complementary suppression: a single suppressed sibling would be "
                       "recoverable by differencing against the attribute total",
-            "n": out[victim].get("n"),
+            "n_band": n_band(out[victim].get("n", 0)),
         }
+    # Strip exact counts from every suppressed cell (finding #3).
+    for key, cell in out.items():
+        if cell.get("status") in NON_EVALUABLE_STATUSES and "n" in cell:
+            cell["n_band"] = n_band(cell.pop("n"))
     return out
 
 
@@ -270,7 +323,9 @@ def _looks_like_path(value: object) -> bool:
     return any(marker in value for marker in _PATH_MARKERS)
 
 
-def _check_key(key: str, allowed: frozenset[str], where: str) -> None:
+def _check_key(key: object, allowed: frozenset[str], where: str) -> None:
+    if not isinstance(key, str):
+        raise DisclosureError(f"{where}: key {key!r} is not a string")
     if key not in allowed:
         raise DisclosureError(
             f"{where}: field {key!r} is not in the allow-list. Add it to "
@@ -282,26 +337,67 @@ def _check_key(key: str, allowed: frozenset[str], where: str) -> None:
             raise DisclosureError(f"{where}: field {key!r} matches prohibited pattern {banned!r}")
 
 
-# Opaque fields whose bytes are not human-meaningful and may legitimately contain
-# characters the path heuristic would flag (base64 padding, slashes).
-_OPAQUE_FIELDS = frozenset({"signature"})
+def _check_dynamic_key(key: object, where: str) -> None:
+    """Validate an allow-list-exempt key: an outcome, attribute, or category name."""
+    if not isinstance(key, str) or not key:
+        raise DisclosureError(f"{where}: key {key!r} must be a non-empty string")
+    lowered = key.lower()
+    for banned in PROHIBITED_SUBSTRINGS:
+        if banned in lowered:
+            raise DisclosureError(f"{where}: key {key!r} matches prohibited pattern {banned!r}")
+    if _looks_like_path(key):
+        raise DisclosureError(f"{where}: key {key!r} looks like a path")
 
 
-def _check_value(key: str, value: object, where: str) -> None:
-    if key in _OPAQUE_FIELDS:
+def _check_value(key: str, value: object, where: str, _depth: int = 0) -> None:
+    """Recursively validate an exported value.
+
+    Scalars, and every scalar reachable inside a list or mapping. The previous version
+    inspected only top-level strings, so identifiers, paths, or row-level records placed
+    inside `curves`, `intervals`, `measurement_density`, or `status_counts` travelled
+    untouched (review finding #20).
+    """
+    if _depth > 6:
+        raise DisclosureError(f"{where}: value of {key!r} nests deeper than the export contract allows")
+
+    if isinstance(value, dict):
+        for sub_key, sub_value in value.items():
+            _check_dynamic_key(sub_key, f"{where}.{key}")
+            _check_value(str(sub_key), sub_value, f"{where}.{key}", _depth + 1)
         return
+    if isinstance(value, (list, tuple)):
+        if len(value) > 512:
+            raise DisclosureError(
+                f"{where}: {key!r} has {len(value)} elements; an array that long is a "
+                "row-level export, not an aggregate"
+            )
+        for item in value:
+            _check_value(key, item, where, _depth + 1)
+        return
+    if isinstance(value, bool) or value is None:
+        return
+    if isinstance(value, (int, float)):
+        if isinstance(value, float) and (math.isnan(value) or math.isinf(value)):
+            raise DisclosureError(
+                f"{where}: {key!r} is {value!r}. Non-finite floats serialize as bare "
+                "NaN/Infinity, which is not valid JSON and cannot be verified by a "
+                "non-Python consumer. Emit null instead."
+            )
+        return
+    if not isinstance(value, str):
+        raise DisclosureError(f"{where}: {key!r} has unsupported type {type(value).__name__}")
+
     if _looks_like_path(value):
         raise DisclosureError(
             f"{where}: value of {key!r} looks like a local filesystem path ({value!r}); "
             "site directory layout must not leave the node"
         )
-    if isinstance(value, str):
-        lowered = value.lower()
-        for banned in PROHIBITED_SUBSTRINGS:
-            if banned in lowered:
-                raise DisclosureError(
-                    f"{where}: value of {key!r} contains prohibited content {banned!r}"
-                )
+    lowered = value.lower()
+    for banned in PROHIBITED_SUBSTRINGS:
+        if banned in lowered:
+            raise DisclosureError(
+                f"{where}: value of {key!r} contains prohibited content {banned!r}"
+            )
 
 
 def _validate_label_validity(block: object, outcome: str) -> None:
@@ -312,8 +408,9 @@ def _validate_label_validity(block: object, outcome: str) -> None:
             "label-validity diagnostics is non-evaluable: nothing in the payload could "
             "contradict a plausible AUROC computed from mis-mapped labels."
         )
-    for key in block:
+    for key, value in block.items():
         _check_key(key, LABEL_VALIDITY_FIELDS, where)
+        _check_value(key, value, where)
     missing = REQUIRED_LABEL_VALIDITY_FIELDS - set(block)
     if missing:
         raise DisclosureError(f"{where}: missing required fields {sorted(missing)}")
@@ -330,10 +427,65 @@ def _validate_label_validity(block: object, outcome: str) -> None:
             f"{where}.status_counts: must account for all seven U1 outcome states; "
             f"missing {missing_states}"
         )
+    # Exact small counts are as disclosive as an exact small cell (finding #15).
+    floor = min_cell_size()
+    for state, count in counts.items():
+        if isinstance(count, int) and 0 < count < floor:
+            raise DisclosureError(
+                f"{where}.status_counts.{state}: exact count {count} is below the "
+                f"suppression floor ({floor}). Export a band such as '<{floor}', not the "
+                "count itself."
+            )
+
+
+def _validate_cell(cell: object, where: str) -> None:
+    if not isinstance(cell, dict):
+        raise DisclosureError(f"{where}: must be a mapping")
+    for key, value in cell.items():
+        _check_key(key, CELL_FIELDS, where)
+        _check_value(key, value, where)
+    status = cell.get("status")
+    if status not in OUTCOME_STATUSES:
+        raise DisclosureError(f"{where}.status: {status!r} is not a recognised status")
+    if status != EVALUABLE:
+        if "n" in cell:
+            raise DisclosureError(
+                f"{where}: suppressed cell carries an exact n. The count is what "
+                "suppression exists to hide; export n_band instead."
+            )
+        return
+    _enforce_suppression(cell, where)
+
+
+def _enforce_suppression(block: dict, where: str) -> None:
+    """Re-derive suppression at the gate and reject anything that would not survive it.
+
+    This is the boundary's own check, not a restatement of the producer's. Computing
+    suppression in `subgroup_panel` and `evaluate_site` and then trusting the result here
+    meant any other assembly route could export an unsuppressed cell through a gate
+    documented as fail-closed (review finding #5).
+    """
+    n = block.get("n")
+    if not isinstance(n, int):
+        raise DisclosureError(
+            f"{where}: an evaluable cell must carry an integer n so the gate can verify "
+            f"suppression; got {n!r}"
+        )
+    prevalence = block.get("prevalence")
+    if prevalence is None:
+        raise DisclosureError(f"{where}: an evaluable cell must carry prevalence")
+    n_positive = round(n * float(prevalence))
+    status, reason = suppress_cell(n, n_positive)
+    if status != EVALUABLE:
+        raise DisclosureError(
+            f"{where}: cell is marked evaluable but would be suppressed ({status}: "
+            f"{reason}). n={n}, implied positive count={n_positive}."
+        )
 
 
 def _validate_outcome(name: str, block: object) -> None:
     where = f"outcomes.{name}"
+    _check_dynamic_key(name, "outcomes")
     if not isinstance(block, dict):
         raise DisclosureError(f"{where}: must be a mapping")
     for key in block:
@@ -347,14 +499,16 @@ def _validate_outcome(name: str, block: object) -> None:
         raise DisclosureError(
             f"{where}.status: {status!r} is not one of {sorted(OUTCOME_STATUSES)}"
         )
+    if "reason" in block:
+        _check_value("reason", block["reason"], where)
 
     _validate_label_validity(block["label_validity"], name)
 
     if status != EVALUABLE:
-        if "metrics" in block:
+        if "metrics" in block or "curves" in block:
             raise DisclosureError(
-                f"{where}: status is {status!r} but a metrics block is present. A "
-                "non-evaluable outcome must not carry numbers that read as scores."
+                f"{where}: status is {status!r} but a metrics or curves block is present. "
+                "A non-evaluable outcome must not carry numbers that read as scores."
             )
         return
 
@@ -365,45 +519,64 @@ def _validate_outcome(name: str, block: object) -> None:
         _check_key(key, METRIC_FIELDS, f"{where}.metrics")
         _check_value(key, value, f"{where}.metrics")
 
-    n = metrics.get("n")
-    if isinstance(n, int) and "curves" in block and not curves_releasable(n):
-        raise DisclosureError(
-            f"{where}.curves: cell of n={n} is below the curve-release minimum "
-            f"({CURVE_RELEASE_MIN}). A released DCA curve is 50 equations in TP and FP; "
-            "with n and prevalence also released they invert to per-patient counts."
-        )
+    _enforce_suppression(metrics, f"{where}.metrics")
+
     if "curves" in block:
+        # Fail CLOSED: an absent or non-integer n must block curve release, not skip the
+        # check. The guard used to sit on the wrong side of the condition (finding #6).
+        n = metrics.get("n")
+        if not isinstance(n, int) or not curves_releasable(n):
+            raise DisclosureError(
+                f"{where}.curves: cell of n={n!r} may not release curves (minimum "
+                f"{curve_release_min()}). A 50-point DCA curve is 50 equations in TP and "
+                "FP; with n and prevalence also released they invert to per-patient counts."
+            )
         if not isinstance(block["curves"], dict):
             raise DisclosureError(f"{where}.curves: must be a mapping")
-        for key in block["curves"]:
+        for key, value in block["curves"].items():
             _check_key(key, CURVE_FIELDS, f"{where}.curves")
+            _check_value(key, value, f"{where}.curves")
+
+    if "intervals" in block:
+        _check_value("intervals", block["intervals"], where)
 
     for attr, cells in (block.get("subgroups") or {}).items():
+        _check_dynamic_key(attr, f"{where}.subgroups")
+        if any(marker in str(attr).lower() for marker in _CROSSTAB_MARKERS):
+            raise DisclosureError(
+                f"{where}.subgroups.{attr}: joint/crosstab subgroups may not be exported. "
+                "Marginals over the same rows do not determine a joint count; a released "
+                "joint cell does."
+            )
         if not isinstance(cells, dict):
             raise DisclosureError(f"{where}.subgroups.{attr}: must be a mapping")
         for cat, cell in cells.items():
-            cell_where = f"{where}.subgroups.{attr}.{cat}"
-            if not isinstance(cell, dict):
-                raise DisclosureError(f"{cell_where}: must be a mapping")
-            for key, value in cell.items():
-                _check_key(key, CELL_FIELDS, cell_where)
-                _check_value(key, value, cell_where)
+            _check_dynamic_key(cat, f"{where}.subgroups.{attr}")
+            _validate_cell(cell, f"{where}.subgroups.{attr}.{cat}")
 
 
 def validate_export(payload: dict) -> dict:
     """Validate an aggregate artifact before it is written. Returns it unchanged.
 
-    This is the writer-side gate. `clif_forest_plot` runs the same allow-list at read
-    time, but a site that never ships the wheel still exports through here, so the
-    check has to exist on both sides of the boundary.
+    The writer-side gate. `clif_forest_plot` runs the same allow-list at read time, but a
+    site that never ships the wheel still exports through here, so the check has to exist
+    on both sides of the boundary.
     """
     if not isinstance(payload, dict):
         raise DisclosureError("export payload must be a mapping")
 
     for key, value in payload.items():
         _check_key(key, ENVELOPE_FIELDS, "envelope")
-        if key != "outcomes":
-            _check_value(key, value, "envelope")
+        if key == "outcomes":
+            continue
+        if key == "signature":
+            if not isinstance(value, str) or not _SIGNATURE_RE.match(value):
+                raise DisclosureError(
+                    "envelope.signature: must be 64 lowercase hex characters "
+                    "(HMAC-SHA256). Checked by format rather than exempted from checking."
+                )
+            continue
+        _check_value(key, value, "envelope")
 
     missing = REQUIRED_ENVELOPE_FIELDS - set(payload)
     if missing:
@@ -418,6 +591,11 @@ def validate_export(payload: dict) -> dict:
             f"envelope.partition_role: {payload['partition_role']!r} is not one of "
             f"{sorted(PARTITION_ROLES)}"
         )
+    if payload["disclosure_status"] not in DISCLOSURE_STATUSES:
+        raise DisclosureError(
+            f"envelope.disclosure_status: {payload['disclosure_status']!r} is not one of "
+            f"{sorted(DISCLOSURE_STATUSES)}"
+        )
 
     outcomes = payload["outcomes"]
     if not isinstance(outcomes, dict):
@@ -428,61 +606,30 @@ def validate_export(payload: dict) -> dict:
     return payload
 
 
-# ---------------------------------------------------------------- log sanitization
-class SanitizingFilter:
-    """Redact prohibited content from log records before they reach any sink.
-
-    `configs/artifact_policy.yaml` declares `operational_logs.prohibited_content`
-    (identifiers, patient_rows, local_source_paths, free_text) but nothing in the
-    codebase referenced it, so the policy was a document rather than a control.
-
-    Stripping a field from the exported JSON does not stop the leak on its own: the
-    validator printed the site's data path and per-outcome counts to stdout, so a
-    returned console log carried what the JSON no longer did. This filter is what makes
-    the log sink obey the same rule as the artifact.
-    """
-
-    def filter(self, record) -> bool:  # logging.Filter protocol
-        try:
-            message = record.getMessage()
-        except Exception:
-            return True
-        record.msg = redact(message)
-        record.args = ()
-        return True
-
-
-def redact(text: str) -> str:
-    """Replace path-shaped tokens and prohibited identifiers in a log line."""
-    out = []
-    for token in str(text).split():
-        stripped = token.strip("'\"(),;")
-        lowered = stripped.lower()
-        if _looks_like_path(stripped) and len(stripped) > 1:
-            out.append("<redacted:path>")
-            continue
-        if any(banned in lowered for banned in PROHIBITED_SUBSTRINGS):
-            out.append("<redacted>")
-            continue
-        out.append(token)
-    return " ".join(out)
-
-
-def install_log_sanitizer(logger) -> None:
-    """Attach the sanitizing filter to a logger and every handler it owns."""
-    filt = SanitizingFilter()
-    logger.addFilter(filt)
-    for handler in logger.handlers:
-        handler.addFilter(filt)
-
-
 def non_evaluable(status: str, reason: str, label_validity: dict) -> dict:
     """Build a per-outcome block for an outcome that could not be scored.
 
-    Explicit constructor so the failure path is as easy to emit as the success path —
-    an evaluator that has to hand-assemble a status block is an evaluator that will
-    return a fabricated metric instead.
+    Explicit constructor so the failure path is as easy to emit as the success path — an
+    evaluator that has to hand-assemble a status block is one that will return a
+    fabricated metric instead.
     """
     if status not in NON_EVALUABLE_STATUSES:
         raise DisclosureError(f"{status!r} is not a non-evaluable status")
     return {"status": status, "reason": reason, "label_validity": label_validity}
+
+
+def banded_status_counts(counts: dict[str, int]) -> dict[str, object]:
+    """Replace exact small state counts with a band before export (finding #15)."""
+    floor = min_cell_size()
+    return {
+        state: (f"<{floor}" if isinstance(c, int) and 0 < c < floor else c)
+        for state, c in counts.items()
+    }
+
+
+# Backwards-compatible re-exports: log sanitization moved to its own module (finding #34).
+from src.eval.log_sanitizer import (  # noqa: E402,F401
+    SanitizingFilter,
+    install_log_sanitizer,
+    redact,
+)

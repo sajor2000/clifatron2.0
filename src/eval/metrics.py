@@ -155,7 +155,54 @@ def _defined_prediction_mask(*arrays: np.ndarray) -> np.ndarray:
     return mask
 
 
-def fit_temperature(cal_logits: np.ndarray, cal_labels: np.ndarray) -> float:
+def _row_fingerprint(logits: np.ndarray, labels: np.ndarray) -> frozenset:
+    """Per-row hashes identifying the exact rows a calibrator saw.
+
+    Used to detect a calibrator fitted on rows it is later asked to score. Cheap and
+    order-independent; collisions would have to be exact float+label duplicates, which
+    are already indistinguishable rows for this purpose.
+    """
+    z = np.asarray(logits, dtype=float).ravel()
+    y = np.asarray(labels).astype(int).ravel()
+    return frozenset(hash((float(a), int(b))) for a, b in zip(z, y))
+
+
+class Calibrator:
+    """A fitted temperature plus the identity of the rows it was fitted on (U5 #19).
+
+    Inverting `full_panel`'s default made fitting-on-evaluated-labels inconvenient; it
+    did not make it impossible. A caller could still write
+    `fit_temperature(test_logits, test_labels)` and pass the scalar straight back into
+    `full_panel` on those same rows, reproducing D4 exactly without ever naming
+    `unsafe_fit_on_eval_labels`. Carrying the fit rows' fingerprint lets `full_panel`
+    refuse that at the point of use, which is the only place it can be caught.
+    """
+
+    __slots__ = ("temperature", "_fit_rows")
+
+    def __init__(self, temperature: float, fit_rows: frozenset):
+        self.temperature = float(temperature)
+        self._fit_rows = fit_rows
+
+    def applies_to(self, logits: np.ndarray, labels: np.ndarray) -> None:
+        """Raise when the rows about to be scored overlap the rows this was fitted on."""
+        overlap = self._fit_rows & _row_fingerprint(logits, labels)
+        if overlap:
+            raise ValueError(
+                f"this calibrator was fitted on {len(overlap)} of the rows it is now being "
+                "applied to. Calibration must be fitted on a partition disjoint from the "
+                "one being scored -- that is the whole of D4. Fit on the calibration "
+                "partition, or name unsafe_fit_on_eval_labels=True if this is a synthetic test."
+            )
+
+    def __float__(self) -> float:
+        return self.temperature
+
+    def __repr__(self) -> str:
+        return f"Calibrator(temperature={self.temperature:.4f}, fit_rows={len(self._fit_rows)})"
+
+
+def fit_temperature(cal_logits: np.ndarray, cal_labels: np.ndarray) -> "Calibrator":
     """Fit a calibration temperature on a CALIBRATION partition (U5 D4).
 
     The two-argument signature is the control. There is no single-array form of this
@@ -171,7 +218,8 @@ def fit_temperature(cal_logits: np.ndarray, cal_labels: np.ndarray) -> float:
     `scikit-learn>=1.5` pin to `>=1.8` (`FrozenEstimator` needs `>=1.6`). Recorded
     deliberately: the pin is unchanged and this code depends on nothing above 1.5.
 
-    Apply the returned T via `full_panel(..., temperature=T)`.
+    Apply the returned calibrator via `full_panel(..., temperature=cal)`. It carries the
+    identity of the rows it saw, so applying it to those same rows raises.
     """
     cal_labels = np.asarray(cal_labels).astype(int)
     if len(np.unique(cal_labels)) < 2:
@@ -179,7 +227,8 @@ def fit_temperature(cal_logits: np.ndarray, cal_labels: np.ndarray) -> float:
             "calibration partition is single-class; a temperature fitted on it is "
             "meaningless. Report the outcome as non-evaluable instead."
         )
-    return temperature_scale(cal_logits, cal_labels)
+    return Calibrator(temperature_scale(cal_logits, cal_labels),
+                      _row_fingerprint(cal_logits, cal_labels))
 
 
 def temperature_scale(logits: np.ndarray, labels: np.ndarray) -> float:
@@ -305,6 +354,8 @@ def full_panel(p: np.ndarray, y: np.ndarray, logits: np.ndarray | None = None,
     if unsafe_fit_on_eval_labels and logits is not None and len(np.unique(y)) > 1:
         T = temperature_scale(logits, y)
     elif temperature is not None:
+        if isinstance(temperature, Calibrator):
+            temperature.applies_to(logits, y)
         T = float(temperature)
     if T != 1.0 and logits is not None:
         p = _sigmoid(_clamp_saturated_logits(logits) / T)
@@ -350,6 +401,8 @@ def subgroup_panel(p: np.ndarray, y: np.ndarray, groups: dict[str, np.ndarray]) 
             n_pos = int(y[m].sum())
             status, reason = _schema.suppress_cell(n, n_pos)
             if status != _schema.EVALUABLE:
+                # Exact n is stripped by apply_complementary_suppression below; it is
+                # carried this far only so the smallest-sibling tie-break can see it.
                 cells[str(cat)] = {"status": status, "reason": reason, "n": n}
                 continue
             cell = score(p[m], y[m])
@@ -377,7 +430,7 @@ def net_benefit_releasable(p: np.ndarray, y: np.ndarray, thresholds=None) -> dic
     for site-local analysis that is not exported.
     """
     y = np.asarray(y).astype(int)
-    if len(y) < _schema.CURVE_RELEASE_MIN:
+    if len(y) < _schema.curve_release_min():
         return None
     return net_benefit(p, y, thresholds=thresholds)
 

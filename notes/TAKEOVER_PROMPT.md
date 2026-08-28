@@ -39,7 +39,13 @@ for arm in clifatron_clinical_bins global_deciles deciles_plus_soft continuous_f
 done
 
 # Federation validation
-python -m src.eval.clif_validate --checkpoint <ckpt> --data /path/to/clif_parquet --site-name "SiteName"
+python -m src.eval.clif_validate \
+      --checkpoint <ckpt> \
+      --data /path/to/clif_parquet \
+      --episode-artifact /path/to/episodes.parquet \
+      --site-id SITE-07 \
+      --release-id 2026-08-28-site07-v0 \
+      --signing-key-file /secure/site07.key
 python -m src.eval.clif_forest_plot --results results/SiteA.json results/SiteB.json
 
 # Compare

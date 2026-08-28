@@ -25,7 +25,7 @@ def _label_validity():
     }
 
 
-def _report(site="SITE-01", version="v0", outcomes=None):
+def _report(site="SITE-01", version="v0", outcomes=None, release=None):
     return {
         "schema_version": S.METRIC_SCHEMA_VERSION,
         "metric_version": "1.0.0",
@@ -37,7 +37,8 @@ def _report(site="SITE-01", version="v0", outcomes=None):
         "site_id": site,
         "site_role": "development",
         "partition_role": "test",
-        "disclosure_status": "reviewed",
+        "disclosure_status": "reviewed_approved",
+        "release_id": release or f"rel-{site}-{version}",
         "outcomes": outcomes if outcomes is not None else {
             "map_below_65_48h": {
                 "status": S.EVALUABLE,
@@ -138,8 +139,8 @@ class DisclosureLedgerTest(unittest.TestCase):
     def test_subgroup_cells_get_their_own_ledger_records(self):
         report = _report()
         report["outcomes"]["map_below_65_48h"]["subgroups"] = {
-            "sex": {"F": {"status": S.EVALUABLE, "n": 200},
-                    "M": {"status": S.INSUFFICIENT_N, "n": 4}}
+            "sex": {"F": {"status": S.EVALUABLE, "n": 200, "prevalence": 0.2},
+                    "M": {"status": S.INSUFFICIENT_N, "n_band": "<10"}}
         }
         cells = {e["cell"] for e in A.ledger_entries(report)}
         self.assertTrue(any("sex|F" in c for c in cells))
@@ -178,7 +179,7 @@ class DisclosureLedgerTest(unittest.TestCase):
 
             second = _report(version="v1")
             second["outcomes"]["map_below_65_48h"]["subgroups"] = {
-                "sex": {"M": {"status": S.INSUFFICIENT_N, "n": 5}}}
+                "sex": {"M": {"status": S.INSUFFICIENT_N, "n": 4}}}
             A.check_cross_release_differencing(second, ledger)
 
     def test_a_different_site_is_not_confused_with_the_suppressed_one(self):

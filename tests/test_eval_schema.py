@@ -36,7 +36,8 @@ def _envelope(**overrides):
         "site_id": "SITE-01",
         "site_role": "development",
         "partition_role": "test",
-        "disclosure_status": "reviewed",
+        "disclosure_status": "reviewed_approved",
+        "release_id": "rel-001",
         "outcomes": {},
     }
     payload.update(overrides)
@@ -60,11 +61,11 @@ class PolicyConstantsTest(unittest.TestCase):
         Two thresholds in one codebase is how a suppression rule silently stops
         applying -- which is what subgroup_panel's hard-coded 30 was.
         """
-        self.assertEqual(S.MIN_CELL_SIZE, 10)
-        self.assertEqual(S.load_min_cell_size(), S.MIN_CELL_SIZE)
+        self.assertEqual(S.min_cell_size(), 10)
+        self.assertEqual(S.load_min_cell_size(), S.min_cell_size())
 
     def test_curve_release_minimum_is_materially_larger_than_the_cell_minimum(self):
-        self.assertGreater(S.CURVE_RELEASE_MIN, S.MIN_CELL_SIZE)
+        self.assertGreater(S.curve_release_min(), S.min_cell_size())
 
     def test_missing_policy_key_fails_closed_rather_than_defaulting(self):
         import tempfile
@@ -78,7 +79,7 @@ class PolicyConstantsTest(unittest.TestCase):
 
 class SuppressionTest(unittest.TestCase):
     def test_denominator_below_threshold_is_suppressed(self):
-        status, _ = S.suppress_cell(n=S.MIN_CELL_SIZE - 1, n_positive=3)
+        status, _ = S.suppress_cell(n=S.min_cell_size() - 1, n_positive=3)
         self.assertEqual(status, S.INSUFFICIENT_N)
 
     def test_numerator_below_threshold_is_suppressed_even_when_n_clears(self):
@@ -101,11 +102,40 @@ class SuppressionTest(unittest.TestCase):
         self.assertEqual(status, S.EVALUABLE)
         self.assertIsNone(reason)
 
-    def test_exported_prevalence_cannot_be_inverted_to_an_exact_event_count(self):
-        # 1/12 at full precision names the positive count exactly.
-        self.assertNotAlmostEqual(S.round_prevalence(1 / 12), 1 / 12, places=4)
-        rounded = S.round_prevalence(1 / 12)
-        self.assertNotEqual(rounded * 12, 1.0)
+    def test_recovering_the_count_from_a_released_cell_identifies_no_individual(self):
+        """The property the disclosure argument actually rests on.
+
+        This replaces `assertNotEqual(rounded * 12, 1.0)` -- a tautology that held for
+        any rounding and established nothing, which is exactly how a false claim about
+        2-decimal rounding shipped unchallenged.
+
+        The honest claim is NOT that prevalence is unrecoverable. Assume an attacker
+        recovers the positive count exactly from n and prevalence. `suppress_cell`
+        guarantees that count is at least MIN_CELL_SIZE, and so is the negative count,
+        so what they learn describes a group, never a patient. Asserted exhaustively
+        across every cell shape the gate will release.
+        """
+        floor = S.min_cell_size()
+        for n in range(1, 121):
+            for pos in range(0, n + 1):
+                if S.suppress_cell(n, pos)[0] != S.EVALUABLE:
+                    continue
+                self.assertGreaterEqual(pos, floor, f"released n={n} pos={pos}")
+                self.assertGreaterEqual(n - pos, floor, f"released n={n} pos={pos}")
+
+    def test_prevalence_quantisation_reduces_precision(self):
+        """Defence in depth only -- deliberately NOT asserted as ambiguity, because it
+        is not ambiguity. See prevalence_step's docstring."""
+        step = S.prevalence_step()
+        for raw in (1 / 3, 0.1234567, 0.98765):
+            exported = S.round_prevalence(raw)
+            self.assertAlmostEqual(exported / step, round(exported / step), places=6)
+
+    def test_round_prevalence_returns_none_not_nan(self):
+        """NaN serializes as bare NaN, which is not valid JSON and cannot be verified
+        by a non-Python consumer."""
+        self.assertIsNone(S.round_prevalence(float("nan")))
+        self.assertIsNone(S.round_prevalence(None))
 
 
 class ComplementarySuppressionTest(unittest.TestCase):
@@ -122,6 +152,10 @@ class ComplementarySuppressionTest(unittest.TestCase):
         self.assertEqual(len(suppressed), 2, "a single suppressed cell is recoverable")
         self.assertIn("c", suppressed)
         self.assertIn("b", suppressed, "the smallest releasable sibling is suppressed too")
+        for key in suppressed:
+            self.assertNotIn("n", out[key],
+                             "a suppressed cell must not carry the count it is hiding")
+            self.assertIn("n_band", out[key])
 
     def test_two_already_suppressed_cells_need_no_third(self):
         cells = {
@@ -243,21 +277,21 @@ class CurveResolutionTest(unittest.TestCase):
     def test_small_cell_may_not_release_its_dca_curve(self):
         """NB(pt) = TP/N - (FP/N)(pt/(1-pt)) over 50 thresholds, with n and prevalence
         also released, is 50 equations that invert to per-patient TP/FP counts."""
-        n = S.CURVE_RELEASE_MIN - 1
+        n = S.curve_release_min() - 1
         payload = _envelope(outcomes={"o": _evaluable_outcome(
             n=n, curves={"dca_thresholds": [0.1], "dca_model": [0.02]})})
         with self.assertRaises(S.DisclosureError) as ctx:
             S.validate_export(payload)
-        self.assertIn("curve-release minimum", str(ctx.exception))
+        self.assertIn("may not release curves", str(ctx.exception))
 
     def test_large_cell_may_release_its_curves(self):
         payload = _envelope(outcomes={"o": _evaluable_outcome(
-            n=S.CURVE_RELEASE_MIN, curves={"dca_thresholds": [0.1], "dca_model": [0.02]})})
+            n=S.curve_release_min(), curves={"dca_thresholds": [0.1], "dca_model": [0.02]})})
         S.validate_export(payload)
 
     def test_curves_releasable_tracks_the_threshold(self):
-        self.assertFalse(S.curves_releasable(S.CURVE_RELEASE_MIN - 1))
-        self.assertTrue(S.curves_releasable(S.CURVE_RELEASE_MIN))
+        self.assertFalse(S.curves_releasable(S.curve_release_min() - 1))
+        self.assertTrue(S.curves_releasable(S.curve_release_min()))
 
 
 if __name__ == "__main__":

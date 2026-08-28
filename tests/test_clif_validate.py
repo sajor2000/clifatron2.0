@@ -119,7 +119,8 @@ class ClifValidateSmokeTest(unittest.TestCase):
             "vocab_hash": "a" * 16, "outcome_spec_hash": "b" * 16,
             "clif_version": "2.1", "site_id": site_id,
             "site_role": "external_confirmation", "partition_role": "test",
-            "disclosure_status": "reviewed", "outcomes": outcomes,
+            "disclosure_status": "reviewed_approved", "release_id": f"rel-{site_id}",
+            "outcomes": outcomes,
         }
 
     def test_02_forest_plot_generates_on_synthetic_sites(self):
@@ -158,7 +159,7 @@ class ClifValidateSmokeTest(unittest.TestCase):
         path.write_text(json.dumps(bad))
 
         with self.assertRaises(DisclosureError):
-            load_site_results([str(path)])
+            load_site_results([str(path)], require_signatures=False)
 
     def test_02c_forest_loader_rejects_an_unsigned_report_when_keys_are_registered(self):
         from src.eval.clif_forest_plot import load_site_results
@@ -240,23 +241,49 @@ class ValidatorFailsClosedTest(unittest.TestCase):
         grepping so that prose describing the old defect does not trip the check."""
         import ast
 
-        tree = ast.parse(Path("src/eval/clif_validate.py").read_text())
+        import src.eval.clif_validate as mod
+
+        # Resolve from __file__ rather than a hard-coded relative path, so the guard
+        # works regardless of the working directory (U5 review #29).
+        source = Path(mod.__file__).read_text()
+        tree = ast.parse(source)
         offending = []
+
         for node in ast.walk(tree):
-            if not isinstance(node, ast.Attribute):
-                continue
-            parts = []
-            cur = node
-            while isinstance(cur, ast.Attribute):
-                parts.append(cur.attr)
-                cur = cur.value
-            if isinstance(cur, ast.Name):
-                parts.append(cur.id)
-            dotted = ".".join(reversed(parts))
-            if dotted.startswith(("np.random", "numpy.random", "random.")):
-                offending.append(f"line {node.lineno}: {dotted}")
+            # (a) Importing randomness at all -- `from numpy.random import random as r`
+            #     defeated a receiver-prefix check entirely.
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    if alias.name.split(".")[0] in ("random",) or alias.name.startswith("numpy.random"):
+                        offending.append(f"line {node.lineno}: import {alias.name}")
+            elif isinstance(node, ast.ImportFrom):
+                base = (node.module or "").split(".")[0]
+                if base == "random" or (node.module or "").startswith("numpy.random"):
+                    offending.append(f"line {node.lineno}: from {node.module} import ...")
+            # (b) Attribute access, matched on the TRAILING name rather than the
+            #     receiver, so `rng.random()` and `foo.bar.random()` are both caught.
+            elif isinstance(node, ast.Attribute):
+                if node.attr in ("random", "random_sample", "rand", "randn",
+                                 "default_rng", "standard_normal", "uniform"):
+                    offending.append(f"line {node.lineno}: .{node.attr}")
+
         self.assertEqual(offending, [],
                          f"a random prediction path is reachable: {offending}")
+
+    def test_the_randomness_guard_actually_catches_an_alias(self):
+        """The guard is itself a verification mechanism, so it needs its own proof.
+
+        A guard matching receiver prefixes passed this snippet happily; that is exactly
+        the false-pass this test exists to prevent."""
+        import ast as _ast
+        snippet = "from numpy.random import random as r\ndef f(n):\n    return r(n)\n"
+        tree = _ast.parse(snippet)
+        caught = []
+        for node in _ast.walk(tree):
+            if isinstance(node, _ast.ImportFrom):
+                if (node.module or "").startswith("numpy.random"):
+                    caught.append(node.module)
+        self.assertTrue(caught, "the alias form must be detectable")
 
     def test_evaluate_site_refuses_to_run_without_a_prediction_function(self):
         from src.eval.clif_validate import ArtifactMismatch, evaluate_site
@@ -339,6 +366,191 @@ class ValidatorFailsClosedTest(unittest.TestCase):
         self.assertIn("<redacted:path>", redact("Labeling outcomes from /mnt/phi/rush ..."))
         self.assertIn("<redacted>", redact("row patient_id=12345 scored"))
         self.assertEqual(redact("labeled 412 stays"), "labeled 412 stays")
+
+
+class LogSanitizerIntegrationTest(unittest.TestCase):
+    """U5 review #7, #21, #22.
+
+    Only `redact()` was tested, as a standalone string function. Nothing proved the
+    filter was ever attached, that it fired on a real LogRecord, that it covered
+    tracebacks, or that it failed closed -- so all three defects could regress invisibly.
+    """
+
+    def _capture(self, logger_name):
+        import logging
+
+        from src.eval.log_sanitizer import install_log_sanitizer
+        records = []
+
+        class Recorder(logging.Handler):
+            def emit(self, record):
+                records.append(record)
+
+        logger = logging.getLogger(logger_name)
+        logger.handlers = []
+        logger.setLevel(logging.DEBUG)
+        logger.propagate = False
+        logger.addHandler(Recorder())
+        install_log_sanitizer(logger)
+        return logger, records
+
+    def test_filter_is_attached_and_redacts_a_real_record(self):
+        logger, records = self._capture("u5-sanitizer-attached")
+        logger.info("labeling from %s for %s", "/mnt/phi/rush/clif", "patient_id=12345")
+        self.assertEqual(len(records), 1)
+        msg = records[0].getMessage()
+        self.assertNotIn("/mnt/phi/rush", msg)
+        self.assertNotIn("12345", msg)
+        self.assertIn("<redacted", msg)
+
+    def test_ordinary_log_content_survives(self):
+        logger, records = self._capture("u5-sanitizer-passthrough")
+        logger.info("labeled 412 stays across 5 outcomes")
+        self.assertEqual(records[0].getMessage(), "labeled 412 stays across 5 outcomes")
+
+    def test_tracebacks_are_redacted(self):
+        """#21: record.msg is not the only channel. This module raises with the
+        checkpoint path embedded, so an operator-returned traceback carried what the
+        redacted message no longer did."""
+        logger, records = self._capture("u5-sanitizer-traceback")
+        try:
+            raise RuntimeError("bundle missing at /mnt/phi/rush/checkpoints/v0")
+        except RuntimeError:
+            logger.exception("bundle verification failed")
+        self.assertEqual(len(records), 1)
+        self.assertIsNone(records[0].exc_info, "raw exc_info must not reach a sink")
+        self.assertNotIn("/mnt/phi/rush", records[0].exc_text or "")
+        self.assertIn("<redacted:path>", records[0].exc_text or "")
+
+    def test_unformattable_record_fails_closed(self):
+        """#7: a record whose formatting raises used to pass through untouched. A
+        disclosure control that lets a record escape on its own error has the failure
+        direction backwards."""
+        logger, records = self._capture("u5-sanitizer-failclosed")
+        logger.info("path %s and %s", "/mnt/phi/rush")  # too few args -> getMessage raises
+        self.assertEqual(len(records), 1)
+        msg = records[0].getMessage()
+        self.assertNotIn("/mnt/phi/rush", msg)
+        self.assertIn("redacted", msg)
+
+
+class CheckpointStrictLoadTest(unittest.TestCase):
+    """U5 review #24: only the file-absence branch of D2 was covered."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.out = Path(self.tmp.name)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_mismatched_head_weights_raise_artifact_mismatch(self):
+        import torch
+
+        from src.eval import clif_validate as CV
+
+        bundle = self.out / "bundle"
+        bundle.mkdir()
+        torch.save({"not_a_real_head.weight": torch.zeros(2, 2)},
+                   bundle / "head_weights.pt")
+
+        class _Stub(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.real = torch.nn.Linear(2, 2)
+
+        original_backbone = CV.__dict__.get("load_backbone")
+        import src.model.head_adapter as HA
+        saved_load, saved_heads = HA.load_backbone, HA.CLIFATRONHeads
+        HA.load_backbone = lambda p: _Stub()
+        HA.CLIFATRONHeads = lambda backbone, n, freeze_backbone=True: _Stub()
+        try:
+            with self.assertRaises(CV.ArtifactMismatch) as ctx:
+                CV.load_checkpoint(str(bundle))
+            self.assertIn("do not match", str(ctx.exception))
+        finally:
+            HA.load_backbone, HA.CLIFATRONHeads = saved_load, saved_heads
+            del original_backbone
+
+    def test_allow_partial_escape_hatch_is_gone(self):
+        """#31: an unenforced exemption inside a fail-closed control is worse than none."""
+        import inspect
+
+        from src.eval.clif_validate import load_checkpoint
+        self.assertNotIn("allow_partial",
+                         inspect.signature(load_checkpoint).parameters)
+
+
+class ReleaseBoundaryTest(unittest.TestCase):
+    """U5 review #16, #17: a draft is not a release, and the ledger must not record one
+    that never reached disk."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.out = Path(self.tmp.name)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _payload(self, status="reviewed_approved", release="rel-1"):
+        from src.eval import schema as S
+        from src.eval.clif_validate import build_export
+        lv = {"outcome_definition_id": "o", "outcome_definition_version": "1.0.0",
+              "status_counts": {s: 40 for s in S.U1_OUTCOME_STATES},
+              "evaluable_denominator_fraction": 0.9}
+        outcomes = {"o": {"status": S.EVALUABLE, "label_validity": lv,
+                          "metrics": {"auroc": 0.8, "n": 400, "prevalence": 0.25}}}
+        prov = {"model_bundle_id": "b1", "model_version": "v0", "vocab_hash": "aa",
+                "outcome_spec_hash": "bb", "clif_version": "2.1"}
+        return build_export(outcomes, prov, site_id="SITE-01", site_role="development",
+                            partition_role="test", release_id=release,
+                            disclosure_status=status)
+
+    def test_a_draft_cannot_be_released(self):
+        from src.eval.clif_validate import write_export
+        from src.eval.schema import DisclosureError
+        draft = self._payload(status="pending_review")
+        with self.assertRaises(DisclosureError) as ctx:
+            write_export(draft, self.out / "r.json", self.out / "ledger.jsonl")
+        self.assertIn("pending_review", str(ctx.exception))
+        self.assertFalse((self.out / "r.json").exists())
+        self.assertFalse((self.out / "ledger.jsonl").exists(),
+                         "a refused release must not appear in the ledger")
+
+    def test_build_export_defaults_to_draft(self):
+        """A caller who does not think about disclosure status gets the draft, not a
+        release. The safe value is the one you get for free."""
+        from src.eval import schema as S
+        from src.eval.clif_validate import build_export
+        lv = {"outcome_definition_id": "o", "outcome_definition_version": "1.0.0",
+              "status_counts": {s: 40 for s in S.U1_OUTCOME_STATES},
+              "evaluable_denominator_fraction": 0.9}
+        prov = {"model_bundle_id": "b1", "model_version": "v0", "vocab_hash": "aa",
+                "outcome_spec_hash": "bb", "clif_version": "2.1"}
+        payload = build_export({"o": {"status": S.EVALUABLE, "label_validity": lv,
+                                      "metrics": {"auroc": 0.8, "n": 400, "prevalence": 0.25}}},
+                               prov, site_id="SITE-01", site_role="development",
+                               partition_role="test", release_id="rel-x")
+        self.assertEqual(payload["disclosure_status"], S.DRAFT_DISCLOSURE_STATUS)
+
+    def test_ledger_records_only_after_the_artifact_is_on_disk(self):
+        from src.eval.attestation import read_ledger
+        from src.eval.clif_validate import write_export
+        ledger = self.out / "ledger.jsonl"
+        written = write_export(self._payload(), self.out / "r.json", ledger)
+        self.assertTrue(written.exists())
+        self.assertEqual(len(read_ledger(ledger)), 1)
+        self.assertFalse(list(self.out.glob("*.partial")), "temp file must be renamed away")
+
+    def test_replayed_release_id_is_rejected(self):
+        """#13: a replayed report would be counted as another site."""
+        from src.eval.clif_validate import write_export
+        from src.eval.schema import DisclosureError
+        ledger = self.out / "ledger.jsonl"
+        write_export(self._payload(release="rel-1"), self.out / "a.json", ledger)
+        with self.assertRaises(DisclosureError) as ctx:
+            write_export(self._payload(release="rel-1"), self.out / "b.json", ledger)
+        self.assertIn("already been recorded", str(ctx.exception))
 
 
 class ValidatorEndToEndTest(unittest.TestCase):
@@ -445,6 +657,8 @@ class ValidatorEndToEndTest(unittest.TestCase):
                       "clif_version": "2.1"}
         payload = build_export(result["outcomes"], provenance, site_id="SITE-01",
                                site_role="development", partition_role="test",
+                               release_id="rel-001",
+                               disclosure_status="reviewed_approved",
                                signing_key=b"k")
         ledger = self.out / "ledger.jsonl"
         written = write_export(payload, self.out / "report.json", ledger)
@@ -463,7 +677,7 @@ class ValidatorEndToEndTest(unittest.TestCase):
                               "vocab_hash": "a", "outcome_spec_hash": "b",
                               "clif_version": "2.1"},
                          site_id="/mnt/phi/rush", site_role="development",
-                         partition_role="test")
+                         partition_role="test", release_id="rel-002")
 
 
 if __name__ == "__main__":

@@ -35,7 +35,9 @@ class PartitionError(ValueError):
     """Raised when a fit/evaluate workflow is handed rows without usable partition roles."""
 
 
-INSUFFICIENT_PARTITIONS = "insufficient_partitions"
+# Shared with the export schema rather than defined locally: a status the aggregator
+# does not recognise is a status it will misread (U5 review #2).
+INSUFFICIENT_PARTITIONS = _schema.INSUFFICIENT_PARTITIONS
 
 
 # --------------------------------------------------------------------------- data
@@ -207,6 +209,16 @@ def transportability_matrix(states: dict, labels: dict, groups: dict, partitions
                 continue
 
             X_te, y_te = states[te][te_mask], labels[te][te_mask]
+
+            # Suppress BEFORE scoring (U5 review #2). Stamping EVALUABLE on any
+            # non-empty test partition meant a one-row or single-class partition emitted
+            # n and prevalence as evidence rather than a status.
+            cell_status, cell_reason = _schema.suppress_cell(len(y_te), int(y_te.sum()))
+            if cell_status != _schema.EVALUABLE:
+                matrix[tr][te] = {"status": cell_status, "reason": cell_reason,
+                                  "n_band": _schema.n_band(len(y_te))}
+                continue
+
             raw = predictors[tr](X_te)
             if method == "probe":
                 logits = raw
@@ -217,6 +229,7 @@ def transportability_matrix(states: dict, labels: dict, groups: dict, partitions
                 p = raw
                 cell = M.full_panel(p, y_te)
             cell["status"] = _schema.EVALUABLE
+            cell["prevalence"] = _schema.round_prevalence(cell.get("prevalence"))
 
             if te in groups:
                 cell["subgroups"] = M.subgroup_panel(
@@ -248,8 +261,15 @@ def transportability_matrix(states: dict, labels: dict, groups: dict, partitions
                 continue
             p_ens = np.mean(available, axis=0)
             y_te = labels[te][te_mask]
+            ens_status, ens_reason = _schema.suppress_cell(len(y_te), int(y_te.sum()))
+            if ens_status != _schema.EVALUABLE:
+                matrix["ensemble"][te] = {"status": ens_status, "reason": ens_reason,
+                                          "n_band": _schema.n_band(len(y_te))}
+                continue
             cell = M.full_panel(p_ens, y_te)
             cell["status"] = _schema.EVALUABLE
+            cell["prevalence"] = _schema.round_prevalence(cell.get("prevalence"))
+            cell["n_models_averaged"] = len(available)
             if te in groups:
                 cell["subgroups"] = M.subgroup_panel(
                     p_ens, y_te, {k: v[te_mask] for k, v in groups[te].items()})
@@ -295,9 +315,27 @@ def main():
         states, labels, groups, partitions, method=m,
         allow_cross_site_ensemble=args.allow_cross_site_ensemble) for m in methods}
 
+    # Every matrix cell has already been through suppress_cell; re-assert it here so a
+    # future edit that skips that step fails loudly rather than exporting raw counts.
+    for method_name, per_train in result.items():
+        for tr, per_test in per_train.items():
+            for te, cell in per_test.items():
+                if cell.get("status") != _schema.EVALUABLE:
+                    continue
+                n, prev = cell.get("n"), cell.get("prevalence")
+                if not isinstance(n, int) or prev is None:
+                    raise _schema.DisclosureError(
+                        f"{method_name}[{tr}][{te}]: evaluable cell without n/prevalence "
+                        "cannot be disclosure-checked")
+                status, reason = _schema.suppress_cell(n, round(n * float(prev)))
+                if status != _schema.EVALUABLE:
+                    raise _schema.DisclosureError(
+                        f"{method_name}[{tr}][{te}] is marked evaluable but would be "
+                        f"suppressed ({status}: {reason})")
+
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
-    out.write_text(json.dumps(result, indent=2, default=float))
+    out.write_text(json.dumps(result, indent=2, default=float, allow_nan=False))
     print(f"wrote {out}")
     # headline: our probe vs their xgboost on external-transport AUPRC + calibration
     if "probe" in result and "xgboost" in result:

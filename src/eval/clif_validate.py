@@ -15,7 +15,9 @@ Usage (at each external CLIF site):
         --data /path/to/local_clif_parquet/ \
         --episode-artifact /path/to/episodes.parquet \
         --site-id SITE-07 \
-        --out results/site_07.json
+        --release-id 2026-08-28-site07-v0 \
+        --signing-key-file /secure/site07.key \
+        --out output/final_no_phi/site_07.json
 
 `--site-id` is an OPAQUE identifier, not a hospital name and not a path: the site
 identifier travels in the exported artifact, so it must not carry anything that
@@ -52,7 +54,7 @@ class ArtifactMismatch(RuntimeError):
     """
 
 
-def load_checkpoint(path: str, *, allow_partial: bool = False):
+def load_checkpoint(path: str):
     """Load frozen CLIFATRON checkpoint with our heads attached. Fails closed (U5 D2).
 
     The checkpoint directory must contain:
@@ -66,8 +68,11 @@ def load_checkpoint(path: str, *, allow_partial: bool = False):
     heads produced an untrained-head model that still emitted a full metric panel. A
     site cannot tell that report from a real one.
 
-    `allow_partial=True` exists only for a run whose report is explicitly marked
-    non-evaluable; it never reaches an exported artifact.
+    There is deliberately no `allow_partial` escape hatch (U5 review #31). One existed,
+    with a docstring promising a partial load "never reaches an exported artifact" and
+    nothing whatsoever enforcing that -- no caller, no CLI flag, no coupling to outcome
+    status. An unenforced exemption inside a fail-closed control is worse than none: it
+    reads as a considered safety valve while behaving as an open door.
     """
     import torch
     from src.model.head_adapter import CLIFATRONHeads, load_backbone
@@ -90,7 +95,7 @@ def load_checkpoint(path: str, *, allow_partial: bool = False):
 
     state = torch.load(head_path, map_location=device, weights_only=True)
     try:
-        model.load_state_dict(state, strict=not allow_partial)
+        model.load_state_dict(state, strict=True)
     except RuntimeError as exc:
         raise ArtifactMismatch(
             f"head weights do not match the model definition: {exc}. A partial load "
@@ -214,7 +219,10 @@ def _label_validity_block(labels_df, name: str, spec_version: str) -> dict:
     return {
         "outcome_definition_id": name,
         "outcome_definition_version": spec_version,
-        "status_counts": counts,
+        # Banded, not exact (U5 review #15). A suppressed outcome used to ship exact
+        # positive/negative/censored counts through the very block added to close the
+        # validity channel, so counts below the floor left the hospital anyway.
+        "status_counts": _schema.banded_status_counts(counts),
         "evaluable_denominator_fraction": round(evaluable / total, 3),
     }
 
@@ -330,7 +338,9 @@ def evaluate_site(checkpoint_path: str, data_path: str, episode_artifact: str,
 
 
 def build_export(outcomes: dict, provenance: dict, *, site_id: str, site_role: str,
-                 partition_role: str, signing_key: bytes | None = None) -> dict:
+                 partition_role: str, release_id: str,
+                 disclosure_status: str = _schema.DRAFT_DISCLOSURE_STATUS,
+                 signing_key: bytes | None = None) -> dict:
     """Assemble, validate, and optionally sign the artifact that leaves the site.
 
     Validation runs HERE, at the writer. `clif_forest_plot` runs the same allow-list at
@@ -344,7 +354,13 @@ def build_export(outcomes: dict, provenance: dict, *, site_id: str, site_role: s
         "site_id": site_id,
         "site_role": site_role,
         "partition_role": partition_role,
-        "disclosure_status": "pending_review",
+        # Defaults to the DRAFT status. `write_export` refuses to release a draft, so
+        # crossing the boundary requires someone to make and record a disclosure
+        # decision rather than inheriting a decorative default (U5 review #16).
+        "disclosure_status": disclosure_status,
+        # Unique per release, so a replayed report cannot be counted as another site
+        # (U5 review #13).
+        "release_id": release_id,
         "generated_by": "clif_validate",
         "outcomes": outcomes,
         **provenance,
@@ -356,17 +372,37 @@ def build_export(outcomes: dict, provenance: dict, *, site_id: str, site_role: s
 
 
 def write_export(payload: dict, out_path: str | Path, ledger_path: str | Path) -> Path:
-    """Run the cross-release differencing check, append to the ledger, then write.
+    """Check, write, then record. Refuses to release a draft.
 
-    Order matters: the check reads the ledger BEFORE this release is appended to it,
-    and the artifact is only written once both have passed. A release that would expose
-    a previously suppressed cell never reaches disk.
+    **A draft is not a release (U5 review #16).** `build_export` produces
+    `pending_review`, and this function refuses it, so the release boundary cannot be
+    crossed without a recorded disclosure decision. The status was previously written to
+    disk verbatim, which made it decorative.
+
+    **Write before ledger (U5 review #17).** The differencing check still reads the
+    ledger first, but the artifact is durably in place before the ledger records it.
     """
+    status = payload.get("disclosure_status")
+    if status not in _schema.RELEASABLE_DISCLOSURE_STATUSES:
+        raise _schema.DisclosureError(
+            f"refusing to release an artifact with disclosure_status {status!r}. Only "
+            f"{sorted(_schema.RELEASABLE_DISCLOSURE_STATUSES)} may leave the site. A "
+            "draft is reviewed and re-stamped by whoever owns the disclosure decision."
+        )
+
     _attest.check_cross_release_differencing(payload, ledger_path)
-    _attest.append_to_ledger(payload, ledger_path)
+
+    # Write the artifact FIRST, via a temp file and an atomic rename (U5 review #17).
+    # Appending to the ledger first meant a failed write left the ledger claiming a
+    # release that never happened -- and the next genuine release of that cell was then
+    # blocked on a phantom prior one.
     out = Path(out_path)
     out.parent.mkdir(parents=True, exist_ok=True)
-    out.write_text(json.dumps(payload, indent=2, sort_keys=True, default=str))
+    tmp = out.with_suffix(out.suffix + ".partial")
+    tmp.write_text(json.dumps(payload, indent=2, sort_keys=True, allow_nan=False))
+    tmp.replace(out)
+
+    _attest.append_to_ledger(payload, ledger_path)
     return out
 
 
@@ -381,9 +417,18 @@ def main():
     ap.add_argument("--site-role", default="development", choices=sorted(_schema.SITE_ROLES))
     ap.add_argument("--partition-role", default="test",
                     choices=sorted(_schema.PARTITION_ROLES))
-    ap.add_argument("--out", default="results/validation.json")
-    ap.add_argument("--ledger", default="results/disclosure_ledger.jsonl")
-    ap.add_argument("--access-log", default="results/access_log.jsonl")
+    # Defaults inside the directories configs/artifact_policy.yaml actually declares
+    # (U5 review #18). `results/` was unclassified, so a default run wrote
+    # disclosure-relevant files somewhere with no retention or export rules.
+    ap.add_argument("--out", default="output/final_no_phi/validation.json")
+    ap.add_argument("--ledger", default="output/intermediate_phi/disclosure_ledger.jsonl")
+    ap.add_argument("--access-log", default="output/intermediate_phi/access_log.jsonl")
+    ap.add_argument("--release-id", required=True,
+                    help="unique identifier for THIS release. Replaying one is rejected, "
+                         "so a duplicated report cannot be counted as another site.")
+    ap.add_argument("--signing-key-file", default=None,
+                    help="file holding this site's hex shared secret. Without it the "
+                         "report is unsigned and the aggregator will refuse it.")
     args = ap.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(message)s")
@@ -435,8 +480,11 @@ def main():
     result = evaluate_site(args.checkpoint, args.data, args.episode_artifact,
                            outcome_cfgs, predict_fn=predict_fn)
 
+    signing_key = (bytes.fromhex(Path(args.signing_key_file).read_text().strip())
+                   if args.signing_key_file else None)
     payload = build_export(result["outcomes"], provenance, site_id=args.site_id,
-                           site_role=args.site_role, partition_role=args.partition_role)
+                           site_role=args.site_role, partition_role=args.partition_role,
+                           release_id=args.release_id, signing_key=signing_key)
     out = write_export(payload, args.out, args.ledger)
     _attest.record_access(args.access_log, model_version=provenance["model_version"],
                           actor_role="site_operator", artifact_id=out.name, action="export")

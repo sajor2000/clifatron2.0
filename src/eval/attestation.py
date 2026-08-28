@@ -28,16 +28,43 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import os
 from pathlib import Path
 
 from src.eval.schema import (
     EVALUABLE,
-    MIN_CELL_SIZE,
     NON_EVALUABLE_STATUSES,
     DisclosureError,
+    min_cell_size,
 )
 
 _SIGNATURE_FIELD = "signature"
+
+# Environment variable naming the file that holds the access-log chain key. The key
+# itself is never stored in the repo. An unkeyed SHA-256 chain is only tamper-EVIDENT
+# against an editor who cannot recompute it; anyone with write access to the log could
+# rewrite entries and re-chain them (U5 review #10). Keying it closes that.
+_CHAIN_KEY_ENV = "CLIF_ACCESS_LOG_KEY_FILE"
+_DEV_CHAIN_KEY = b"clif-access-log-unconfigured-development-key"
+
+
+def _chain_key() -> bytes:
+    """Key for the access-log HMAC chain.
+
+    Falls back to a well-known development key when unconfigured, so tests and dry runs
+    work. That fallback is NOT a security control: a site running for real must set
+    CLIF_ACCESS_LOG_KEY_FILE, and U11 owns provisioning it alongside the release trust
+    root. Documented here rather than silently pretending the chain is protected.
+    """
+    key_file = os.environ.get(_CHAIN_KEY_ENV)
+    if key_file:
+        return Path(key_file).read_bytes().strip()
+    return _DEV_CHAIN_KEY
+
+
+def _head_path(log_path: Path) -> Path:
+    """Sidecar anchor naming the chain's expected terminal record."""
+    return log_path.with_suffix(log_path.suffix + ".head")
 
 
 class AuthenticationError(ValueError):
@@ -53,7 +80,22 @@ def canonical_bytes(payload: dict) -> bytes:
     excluded — a signature cannot cover itself.
     """
     body = {k: v for k, v in payload.items() if k != _SIGNATURE_FIELD}
-    return json.dumps(body, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
+    # `allow_nan=False` and no `default=` (U5 review #27). Bare NaN/Infinity is invalid
+    # JSON that no non-Python consumer can verify, and `default=str` silently stringified
+    # unserializable values straight into the signed bytes -- authenticating something
+    # nobody could reproduce. Both now raise instead.
+    try:
+        return json.dumps(body, sort_keys=True, separators=(",", ":"),
+                          allow_nan=False).encode("utf-8")
+    except ValueError as exc:
+        raise AuthenticationError(
+            f"payload is not strictly serializable and cannot be signed: {exc}. "
+            "Non-finite floats must be emitted as null before signing."
+        ) from exc
+    except TypeError as exc:
+        raise AuthenticationError(
+            f"payload contains a non-JSON value and cannot be signed: {exc}"
+        ) from exc
 
 
 def sign_report(payload: dict, key: bytes) -> dict:
@@ -70,6 +112,12 @@ def verify_report(payload: dict, key: bytes) -> dict:
     Fails closed on an absent signature as well as a wrong one: an unsigned report is
     not "unverified but probably fine", it is a report whose origin nobody can attest.
     """
+    if not key:
+        raise AuthenticationError(
+            "refusing to verify with an empty key. An aggregator that loaded a missing "
+            "secret as b'' would verify anything signed with b'' -- the asymmetry with "
+            "sign_report's guard silently disabled authentication."
+        )
     if _SIGNATURE_FIELD not in payload:
         raise AuthenticationError(
             "site report carries no signature; an unauthenticated report cannot enter "
@@ -95,50 +143,99 @@ def record_access(log_path: str | Path, *, model_version: str, actor_role: str,
     """
     path = Path(log_path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    prev = "0" * 64
+    prev, seq = "0" * 64, 0
     if path.exists():
         lines = [ln for ln in path.read_text().splitlines() if ln.strip()]
         if lines:
-            prev = json.loads(lines[-1])["chain"]
+            try:
+                last = json.loads(lines[-1])
+                prev, seq = last["chain"], int(last["seq"]) + 1
+            except (json.JSONDecodeError, KeyError, ValueError, TypeError) as exc:
+                # An interrupted write leaves a partial last line. Crashing with a raw
+                # JSONDecodeError on every subsequent run bricks the audit trail behind
+                # an unreadable error (U5 review #9); name the cause instead.
+                raise AuthenticationError(
+                    f"access log at {path.name} is corrupt at its final record ({exc}). "
+                    "A write was interrupted. Do not append to it: preserve it for audit "
+                    "and start a new log with a recorded reason."
+                ) from exc
     entry = {
+        "seq": seq,
         "model_version": model_version,
         "actor_role": actor_role,
         "artifact_id": artifact_id,
         "action": action,
         "prev": prev,
     }
-    entry["chain"] = hashlib.sha256(
-        (prev + json.dumps(entry, sort_keys=True, separators=(",", ":"))).encode("utf-8")
+    entry["chain"] = hmac.new(
+        _chain_key(),
+        (prev + json.dumps(entry, sort_keys=True, separators=(",", ":"))).encode("utf-8"),
+        hashlib.sha256,
     ).hexdigest()
     with path.open("a") as fh:
         fh.write(json.dumps(entry, sort_keys=True, separators=(",", ":")) + "\n")
+    # Head anchor, written outside the log. Truncating or deleting the log no longer
+    # produces a self-consistent shorter chain, because the head still names the record
+    # count and terminal hash it must end at (U5 review #10).
+    _head_path(path).write_text(json.dumps({"seq": seq, "chain": entry["chain"]},
+                                           sort_keys=True, separators=(",", ":")))
 
 
 def verify_access_log(log_path: str | Path) -> bool:
     """Return True when the access log's hash chain is intact."""
     path = Path(log_path)
+    head_path = _head_path(path)
+
     if not path.exists():
-        return True
-    prev = "0" * 64
+        # FAIL CLOSED. Returning True for an absent log meant deleting the audit trail
+        # was indistinguishable from never having written one (U5 review #10). An absent
+        # log is only intact if no head anchor claims otherwise.
+        return not head_path.exists()
+
+    prev, expected_seq = "0" * 64, 0
+    last_chain, last_seq = prev, -1
     for line in path.read_text().splitlines():
         if not line.strip():
             continue
-        entry = json.loads(line)
-        if entry["prev"] != prev:
+        try:
+            entry = json.loads(line)
+        except json.JSONDecodeError:
             return False
-        chain = entry.pop("chain")
-        recomputed = hashlib.sha256(
-            (entry["prev"] + json.dumps(entry, sort_keys=True, separators=(",", ":"))).encode("utf-8")
+        if entry.get("prev") != prev or int(entry.get("seq", -1)) != expected_seq:
+            return False
+        chain = entry.pop("chain", None)
+        recomputed = hmac.new(
+            _chain_key(),
+            (entry["prev"] + json.dumps(entry, sort_keys=True, separators=(",", ":"))).encode("utf-8"),
+            hashlib.sha256,
         ).hexdigest()
         if chain != recomputed:
             return False
-        prev = chain
+        prev, last_chain, last_seq = chain, chain, expected_seq
+        expected_seq += 1
+
+    if head_path.exists():
+        try:
+            head = json.loads(head_path.read_text())
+        except json.JSONDecodeError:
+            return False
+        # Tail truncation produces a valid prefix; only the anchor catches it.
+        if head.get("chain") != last_chain or int(head.get("seq", -1)) != last_seq:
+            return False
     return True
 
 
 # ---------------------------------------------------------------- disclosure ledger
 def _cell_key(site_id: str, outcome: str, attribute: str, category: str) -> str:
     return f"{site_id}|{outcome}|{attribute}|{category}"
+
+
+def _cell_n(block: dict) -> int | None:
+    """The count a ledger entry records, whether the cell was released or suppressed."""
+    metrics = block.get("metrics") or {}
+    if "n" in metrics:
+        return metrics["n"]
+    return block.get("n")
 
 
 def ledger_entries(payload: dict) -> list[dict]:
@@ -149,20 +246,23 @@ def ledger_entries(payload: dict) -> list[dict]:
     """
     site = payload["site_id"]
     version = payload["model_version"]
+    release = payload.get("release_id")
+    spec = payload.get("outcome_spec_hash")
     out: list[dict] = []
     for outcome, block in (payload.get("outcomes") or {}).items():
-        metrics = block.get("metrics") or {}
         out.append({
-            "site_id": site, "model_version": version, "outcome": outcome,
+            "site_id": site, "model_version": version, "release_id": release,
+            "outcome_spec_hash": spec, "outcome": outcome,
             "cell": _cell_key(site, outcome, "_overall", "_all"),
-            "n": metrics.get("n"), "status": block.get("status"),
+            "n": _cell_n(block), "status": block.get("status"),
         })
         for attr, cells in (block.get("subgroups") or {}).items():
             for cat, cell in cells.items():
                 out.append({
-                    "site_id": site, "model_version": version, "outcome": outcome,
+                    "site_id": site, "model_version": version, "release_id": release,
+                    "outcome_spec_hash": spec, "outcome": outcome,
                     "cell": _cell_key(site, outcome, attr, cat),
-                    "n": cell.get("n"), "status": cell.get("status"),
+                    "n": _cell_n(cell), "status": cell.get("status"),
                 })
     return out
 
@@ -183,20 +283,67 @@ def check_cross_release_differencing(payload: dict, ledger_path: str | Path) -> 
     that only ever looks at the current report cannot see this.
     """
     prior = read_ledger(ledger_path)
-    suppressed_before = {
-        e["cell"] for e in prior
-        if e.get("status") in NON_EVALUABLE_STATUSES
-    }
-    if not suppressed_before:
+    if not prior:
         return
-    for entry in ledger_entries(payload):
-        if entry["cell"] in suppressed_before and entry.get("status") == EVALUABLE:
+
+    # Latest prior state per cell, and the set of release IDs already seen.
+    prior_by_cell: dict[str, dict] = {}
+    for e in prior:
+        prior_by_cell[e["cell"]] = e
+    seen_releases = {e.get("release_id") for e in prior if e.get("release_id")}
+
+    current = ledger_entries(payload)
+
+    # #13: a replayed release must not be re-counted into the aggregate.
+    release = payload.get("release_id")
+    if release and release in seen_releases:
+        raise DisclosureError(
+            f"release_id {release!r} has already been recorded in this ledger. A "
+            "replayed report would be counted as an additional site, biasing the "
+            "cross-site aggregate."
+        )
+
+    floor = min_cell_size()
+    for entry in current:
+        before = prior_by_cell.get(entry["cell"])
+        if before is None:
+            continue
+        was_suppressed = before.get("status") in NON_EVALUABLE_STATUSES
+
+        # The original check: suppressed -> released.
+        if was_suppressed and entry.get("status") == EVALUABLE:
             raise DisclosureError(
                 f"cell {entry['cell']!r} was suppressed in a prior release and would be "
                 f"released now (model_version {entry['model_version']!r}). Differencing "
                 "the two releases recovers the suppressed value. Keep it suppressed, or "
                 "obtain a documented disclosure-review exception."
             )
+
+        # #11: a still-suppressed cell whose recorded n moves between releases leaks the
+        # delta. Two suppressed observations of the same cell at n=4 and n=9 bound the
+        # membership change to five patients; enough such deltas reconstruct the cell.
+        if was_suppressed and entry.get("status") in NON_EVALUABLE_STATUSES:
+            n_before, n_now = before.get("n"), entry.get("n")
+            if (isinstance(n_before, int) and isinstance(n_now, int)
+                    and n_before != n_now and abs(n_now - n_before) < floor):
+                raise DisclosureError(
+                    f"cell {entry['cell']!r} is suppressed in both releases but its "
+                    f"recorded size moved from {n_before} to {n_now}. A delta smaller "
+                    f"than {floor} discloses the membership change. Hold the cohort "
+                    "fixed across releases, or obtain a disclosure-review exception."
+                )
+
+        # #11: a released cell whose n shrinks while siblings stay released leaks the
+        # difference against the earlier total.
+        if (not was_suppressed and entry.get("status") == EVALUABLE):
+            n_before, n_now = before.get("n"), entry.get("n")
+            if (isinstance(n_before, int) and isinstance(n_now, int)
+                    and 0 < abs(n_now - n_before) < floor):
+                raise DisclosureError(
+                    f"cell {entry['cell']!r} changed size from {n_before} to {n_now} "
+                    f"across releases, a delta below {floor}. The difference identifies "
+                    "the patients who entered or left the cell."
+                )
 
 
 def append_to_ledger(payload: dict, ledger_path: str | Path) -> None:
@@ -209,7 +356,7 @@ def append_to_ledger(payload: dict, ledger_path: str | Path) -> None:
 
 
 __all__ = [
-    "AuthenticationError", "MIN_CELL_SIZE",
+    "AuthenticationError",
     "canonical_bytes", "sign_report", "verify_report",
     "record_access", "verify_access_log",
     "ledger_entries", "read_ledger", "check_cross_release_differencing", "append_to_ledger",
