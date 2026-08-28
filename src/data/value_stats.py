@@ -161,19 +161,24 @@ def load_value_stats(
     """Load a value-stats artifact, verifying vocabulary identity when available.
 
     Accepts both the schema-2 self-describing format and the legacy bare
-    `{token_id: [center, scale]}` map. If `expected_vocab_hash` is given and the
-    artifact carries a `vocab_hash`, a mismatch raises (stale / wrong-vocabulary
-    file). A schema-2 artifact whose `vocab_hash` is null is treated as unbound."""
+    `{token_id: [center, scale]}` map. If `expected_vocab_hash` is given, the
+    artifact must be schema-2 and carry a matching `vocab_hash`; otherwise token
+    ids could be interpreted against an unrelated vocabulary."""
     blob = json.loads(Path(path).read_text())
     if isinstance(blob, dict) and "stats" in blob:  # schema-2 self-describing
         stored = blob.get("vocab_hash")
-        if expected_vocab_hash is not None and stored is not None and stored != expected_vocab_hash:
-            raise ValueError(
-                f"value-stats vocabulary hash mismatch: artifact {stored[:12]}… != "
-                f"expected {expected_vocab_hash[:12]}… (stale or cross-vocabulary stats)"
-            )
+        if expected_vocab_hash is not None:
+            if stored is None:
+                raise ValueError("value-stats artifact is unbound; expected a vocab_hash")
+            if stored != expected_vocab_hash:
+                raise ValueError(
+                    f"value-stats vocabulary hash mismatch: artifact {stored[:12]}… != "
+                    f"expected {expected_vocab_hash[:12]}… (stale or cross-vocabulary stats)"
+                )
         raw = blob["stats"]
     else:  # legacy bare map — no identity to verify
+        if expected_vocab_hash is not None:
+            raise ValueError("legacy value-stats map cannot be verified against a vocabulary")
         raw = blob
     return {int(k): (float(v[0]), float(v[1])) for k, v in raw.items()}
 

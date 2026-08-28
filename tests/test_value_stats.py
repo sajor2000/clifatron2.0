@@ -129,6 +129,24 @@ class ValueStatsTest(unittest.TestCase):
             reloaded = load_value_stats(p)
             self.assertEqual(reloaded[10], (1.2, 0.5))
 
+    def test_legacy_bare_map_rejected_when_vocab_hash_expected(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "legacy.json"
+            p.write_text(json.dumps({"10": [1.2, 0.5]}))
+            with self.assertRaisesRegex(ValueError, "legacy value-stats map cannot be verified"):
+                load_value_stats(p, expected_vocab_hash="abcd" * 16)
+
+    def test_unbound_schema2_rejected_when_vocab_hash_expected(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "unbound.json"
+            p.write_text(json.dumps({
+                "schema": 2,
+                "vocab_hash": None,
+                "stats": {"10": [1.2, 0.5]},
+            }))
+            with self.assertRaisesRegex(ValueError, "unbound"):
+                load_value_stats(p, expected_vocab_hash="abcd" * 16)
+
     def test_vocab_hash_binding_and_mismatch_detection(self):
         tokens, values = _multi_magnitude_data(n=100)
         stats = compute_value_stats(tokens, values, min_count=20)
