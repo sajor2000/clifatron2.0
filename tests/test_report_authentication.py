@@ -241,6 +241,52 @@ class DisclosureLedgerTest(unittest.TestCase):
             with self.assertRaises(DisclosureError):
                 A.check_cross_release_differencing(other, ledger)
 
+    def test_an_unconfirmed_intent_cannot_mask_a_confirmed_suppression(self):
+        """Greptile PR #4, round 5 -- a disclosure path introduced in round 4.
+
+        Round 4 kept only the newest record per cell, so a later unconfirmed EVALUABLE
+        intent overwrote an earlier confirmed SUPPRESSED one, and the next release read
+        the cell as previously released and exposed it. Suppression is sticky now."""
+        with tempfile.TemporaryDirectory() as td:
+            ledger = Path(td) / "ledger.jsonl"
+
+            # 1. A confirmed release suppresses the cell.
+            first = _report(version="v0", release="rel-A")
+            first["outcomes"]["map_below_65_48h"]["subgroups"] = {
+                "sex": {"M": {"status": S.INSUFFICIENT_N, "n": 4}}}
+            A.append_to_ledger(first, ledger)
+            A.confirm_publication(first, ledger)
+
+            # 2. A later attempt would release it, but crashes before confirmation.
+            attempt = _report(version="v1", release="rel-B")
+            attempt["outcomes"]["map_below_65_48h"]["subgroups"] = {
+                "sex": {"M": {"status": S.EVALUABLE, "n": 60}}}
+            A.append_to_ledger(attempt, ledger)   # never confirmed
+
+            # 3. A third release must STILL see the confirmed suppression.
+            third = _report(version="v2", release="rel-C")
+            third["outcomes"]["map_below_65_48h"]["subgroups"] = {
+                "sex": {"M": {"status": S.EVALUABLE, "n": 60}}}
+            with self.assertRaises(DisclosureError) as ctx:
+                A.check_cross_release_differencing(third, ledger)
+            self.assertIn("suppressed in a prior release", str(ctx.exception))
+
+    def test_a_retry_with_a_changed_count_is_not_stranded(self):
+        """Greptile PR #4, round 5. The replay gate allowed the retry while the delta
+        check rejected it, so the release could never complete under its original id."""
+        with tempfile.TemporaryDirectory() as td:
+            ledger = Path(td) / "ledger.jsonl"
+            attempt = _report(release="rel-A")
+            attempt["outcomes"]["map_below_65_48h"]["subgroups"] = {
+                "sex": {"M": {"status": S.INSUFFICIENT_N, "n": 4}}}
+            A.append_to_ledger(attempt, ledger)   # published, then crashed
+
+            # Same release id, count moved while the cohort settled. Must be retryable.
+            retry = _report(release="rel-A")
+            retry["outcomes"]["map_below_65_48h"]["subgroups"] = {
+                "sex": {"M": {"status": S.INSUFFICIENT_N, "n": 6}}}
+            A.check_cross_release_differencing(retry, ledger)
+
     def test_reconcile_names_published_but_unconfirmed_releases(self):
         """The one remaining crash window is recoverable rather than silent."""
         with tempfile.TemporaryDirectory() as td:

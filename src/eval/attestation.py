@@ -311,32 +311,39 @@ def check_cross_release_differencing(payload: dict, ledger_path: str | Path) -> 
     if not prior:
         return
 
-    # Two DIFFERENT questions, and round 3 wrongly answered both with "confirmed only"
-    # (Greptile PR #4, round 4):
+    # Three questions, and each earlier round answered a different pair of them with one
+    # rule. They are separated explicitly here (Greptile PR #4, rounds 3-5):
     #
-    #   "may this release id be reused?"      -> only a CONFIRMED release blocks, so a
-    #                                            crashed attempt stays retryable
-    #   "might this cell already be public?"  -> an UNCONFIRMED entry must still count,
-    #                                            because the crash window sits between
-    #                                            publication and confirmation. During it
-    #                                            the artifact is visible while its record
-    #                                            is unconfirmed, and ignoring it let a
-    #                                            later report release a cell that was
-    #                                            already published as suppressed.
+    #   "may this release id be reused?"        -> CONFIRMED releases only, so a crashed
+    #                                              attempt stays retryable.
+    #   "might this cell already be public?"    -> ANY record, confirmed or not. The crash
+    #                                              window sits between publication and
+    #                                              confirmation, so an unconfirmed entry
+    #                                              may well be visible.
+    #   "how big was this cell when published?" -> CONFIRMED records only. An unconfirmed
+    #                                              size was never public, so comparing
+    #                                              against it invents a delta.
     #
-    # Conflating them inverted the fail-safe direction: it turned a blocked release into a
-    # possible disclosure. Differencing now assumes an unconfirmed entry MIGHT be public.
+    # And suppression is STICKY. Round four kept only the newest record per cell, so a
+    # later unconfirmed *evaluable* intent overwrote an earlier confirmed *suppressed*
+    # one, and the next release read the cell as previously released and exposed it --
+    # the exact leak the ledger exists to prevent. A cell suppressed in any
+    # possibly-public release stays protected regardless of what came after it.
     live = confirmed_releases(ledger_path)
-    prior_by_cell: dict[str, dict] = {}
-    for e in prior:
-        if "confirm_release_id" in e:
-            continue
-        prior_by_cell[e["cell"]] = e          # confirmed or not -- assume it may be public
-    seen_releases = set(live)                 # replay gate: confirmed only
+    records = [e for e in prior if "confirm_release_id" not in e]
+
+    ever_suppressed = {e["cell"] for e in records
+                       if e.get("status") in NON_EVALUABLE_STATUSES}
+    confirmed_by_cell: dict[str, dict] = {}
+    for e in records:
+        if e.get("release_id") in live:
+            confirmed_by_cell[e["cell"]] = e
+    seen_releases = set(live)
 
     current = ledger_entries(payload)
 
-    # #13: a replayed release must not be re-counted into the aggregate.
+    # Replay gate: only a CONFIRMED release blocks reuse of its id, so a crashed attempt
+    # can be retried (Greptile PR #4, round 3).
     release = payload.get("release_id")
     if release and release in seen_releases:
         raise DisclosureError(
@@ -348,19 +355,25 @@ def check_cross_release_differencing(payload: dict, ledger_path: str | Path) -> 
 
     floor = min_cell_size()
     for entry in current:
-        before = prior_by_cell.get(entry["cell"])
-        if before is None:
+        cell = entry["cell"]
+
+        # Sticky suppression, checked against every possibly-public record.
+        if cell in ever_suppressed and entry.get("status") == EVALUABLE:
+            raise DisclosureError(
+                f"cell {cell!r} was suppressed in a prior release and would be released "
+                f"now (model_version {entry['model_version']!r}). Differencing the two "
+                "releases recovers the suppressed value. Keep it suppressed, or obtain a "
+                "documented disclosure-review exception."
+            )
+
+        # Size comparisons run against CONFIRMED history only, and never against the
+        # release being retried -- a retry of the same id under a changed count used to
+        # be rejected here even though the replay gate had allowed it, stranding the
+        # release permanently (Greptile PR #4, round 5).
+        before = confirmed_by_cell.get(cell)
+        if before is None or before.get("release_id") == entry.get("release_id"):
             continue
         was_suppressed = before.get("status") in NON_EVALUABLE_STATUSES
-
-        # The original check: suppressed -> released.
-        if was_suppressed and entry.get("status") == EVALUABLE:
-            raise DisclosureError(
-                f"cell {entry['cell']!r} was suppressed in a prior release and would be "
-                f"released now (model_version {entry['model_version']!r}). Differencing "
-                "the two releases recovers the suppressed value. Keep it suppressed, or "
-                "obtain a documented disclosure-review exception."
-            )
 
         # #11: a still-suppressed cell whose recorded n moves between releases leaks the
         # delta. Two suppressed observations of the same cell at n=4 and n=9 bound the
@@ -370,7 +383,7 @@ def check_cross_release_differencing(payload: dict, ledger_path: str | Path) -> 
             if (isinstance(n_before, int) and isinstance(n_now, int)
                     and n_before != n_now and abs(n_now - n_before) < floor):
                 raise DisclosureError(
-                    f"cell {entry['cell']!r} is suppressed in both releases but its "
+                    f"cell {cell!r} is suppressed in both releases but its "
                     f"recorded size moved from {n_before} to {n_now}. A delta smaller "
                     f"than {floor} discloses the membership change. Hold the cohort "
                     "fixed across releases, or obtain a disclosure-review exception."
@@ -383,7 +396,7 @@ def check_cross_release_differencing(payload: dict, ledger_path: str | Path) -> 
             if (isinstance(n_before, int) and isinstance(n_now, int)
                     and 0 < abs(n_now - n_before) < floor):
                 raise DisclosureError(
-                    f"cell {entry['cell']!r} changed size from {n_before} to {n_now} "
+                    f"cell {cell!r} changed size from {n_before} to {n_now} "
                     f"across releases, a delta below {floor}. The difference identifies "
                     "the patients who entered or left the cell."
                 )
