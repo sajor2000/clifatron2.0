@@ -1,9 +1,24 @@
 # Deep Research Synthesis — Compact Multimodal ICU Foundation Model on Federated CLIF
 
+> **⚠️ PRE-PIVOT DOCUMENT — evidence base is current; the design spec in §2–§7 is SUPERSEDED.**
+> This synthesis was written **before** the 2026-08-27 decision to build ON CLIFATRON
+> (see `notes/INTEGRATION.md`) and before the two focused 2026-preprint threads
+> (tokenization a76bb9 / architecture aeb4d2). Its **literature/evidence** remains the
+> reference of record, but several **design decisions here are now overridden**. Where this
+> file disagrees with `MEMORY.md`, **`MEMORY.md` wins.** Specifically superseded:
+> - **Embeddings:** this file says *tied* (§2, §7) → **now UNTIED** (+4–7% AUPRC, widens under federation).
+> - **Context:** this file says *4096 primary* (§2) → **now 8192 primary** (match CLIFATRON trunk); 4096 = ablation.
+> - **Trunk:** this file says *from-scratch flat Llama-style decoder is primary* (§2, §6 "Track A") →
+>   **now attach heads to CLIFATRON's Qwen2 backbone** as the primary path; from-scratch is an ablation arm.
+> - **Sites:** this file frames *2 sites (Rush + MIMIC)* → **now 3 dev sites (MIMIC + Rush + UChicago)** + federated external validation.
+>
+> The finalized, current spec lives in `MEMORY.md` ("Design spec — REVISED") and `notes/NEXT_STEPS.md` §2.
+
 Five parallel research threads (2026-08-27): landscape/novelty, tokenization/architecture,
 pretraining objectives/multi-task, multimodal fusion, benchmarks/fairness/assets. This
-file is the decision record: what the literature says, what we adopt, and the finalized
-design spec. Line-cited primary-source detail is in `notes/METHODS.md`.
+file is the **evidence record**: what the literature says. The **adopted design spec** it
+originally proposed has been partly superseded — see the banner above and defer to `MEMORY.md`.
+Line-cited primary-source detail is in `notes/METHODS.md`.
 
 ---
 
@@ -53,13 +68,16 @@ decoders trained on **MIMIC-IV-Ext-CLIF**, the single most direct evidence for o
 | Code+value token | split: `C::concept` + `V::concept::bin` (2 tokens) | **FUSED single token** `concept=bin` | Biggest single win: mortality 0.891→0.915 |
 | Value binning | deciles | **deciles** (keep) | Best default in ablation |
 | Position | continuous-time Δt-ALiBi | **admission-relative RoPE, 1-min-resolution IDs** | ≥ inserted time tokens, ~11% shorter sequences |
-| Context | 512 events | **4096 tokens** | Covers >99.95% of first-24h stays |
-| Backbone | dual-level (intra-event pool + inter-event) | **flat Llama-style causal decoder** | Fused tokens make a flat stream sufficient; simpler, faster |
+| Context | 512 events | ~~4096~~ → **8192 tokens** (match CLIFATRON trunk; 4096 = ablation) | Covers >99.95% of first-24h stays; long ctx more robust to copy-forward |
+| Backbone | dual-level (intra-event pool + inter-event) | ~~flat Llama-style causal decoder (from scratch)~~ → **CLIFATRON Qwen2 backbone** (from-scratch flat decoder = ablation arm) | Objective, not backbone, is the lever (ORA); attach to consortium checkpoint |
 | Units | (unspecified) | **normalize units before binning** | CLIF remap is free but units are not harmonized |
 | Ordering | (unspecified) | **`storetime`/availability, not `charttime`** | No lookahead on when a value was actually knowable |
 
-**Revised trunk:** Llama-style — dim 512, ~8 layers, 8 heads, SwiGLU, RMSNorm, RoPE, tied
-input/output embeddings, ~30M params, context 4096, bf16.
+**Revised trunk (SUPERSEDED — see banner):** ~~Llama-style — dim 512, ~8 layers, 8 heads,
+SwiGLU, RMSNorm, RoPE, tied input/output embeddings, ~30M params, context 4096, bf16.~~
+**CURRENT:** attach heads to CLIFATRON's **Qwen2** backbone (same family: RoPE/SwiGLU/RMSNorm),
+**UNTIED** embeddings, context **8192**; d512×8L×8H flat from-scratch decoder retained only as
+an ablation arm (4096 = its ablation context). See `MEMORY.md`.
 
 *Note on the marked-TTE tension:* fused token is the **input** representation; the
 continuous value is still predicted as a **target** by the value-regression head (§3).
@@ -178,22 +196,31 @@ on ≥1 unseen site (we have Rush + MIMIC-IV-Ext-CLIF). Path to prospective/sile
 free-text NER). GatorTron only relevant if/when we add the notes modality (it's a text
 encoder). CLIF→OMOP is less mature than CLIF→MEDS — treat as secondary.
 
-**Two build tracks (both, as the user requested):**
-- **Track A (from scratch):** pretrain our ~30M CLIF-native trunk on the L40s. Primary paper.
-- **Track B (fine-tune ICareFM):** request ICareFM weights under DUA; fine-tune on CLIF as a
-  head-to-head. Start the DUA request now (long lead time).
+**Build tracks (SUPERSEDED ordering — see banner):** the pivot to build ON CLIFATRON
+(`notes/INTEGRATION.md`) makes **attach-heads-to-CLIFATRON the primary track**, not from-scratch.
+- **PRIMARY — build on CLIFATRON:** attach our survival/threshold heads to the consortium's
+  released CLIFATRON Qwen2 checkpoint (frozen-probe → joint fine-tune). This is "Method 3", the
+  smallest publishable unit, and the paper's spine.
+- **Ablation — from scratch:** pretrain our ~30M CLIF-native trunk on the L40s; kept as the
+  from-scratch arm of the finetune-vs-scratch ablation, ~~not the primary paper~~.
+- **Optional — fine-tune ICareFM (DUA-gated):** request ICareFM weights; fine-tune on CLIF as a
+  head-to-head comparator. Long lead time.
 
 ---
 
-## 7. Finalized design spec (locked)
+## 7. Finalized design spec (SUPERSEDED — current spec is in MEMORY.md + NEXT_STEPS.md §2)
+
+> The spec below is the **pre-pivot** version. Corrected values inline; authoritative copy in `MEMORY.md`.
 
 **Data:** CLIF 2.1 → fused-decile tokens (`concept=bin`), unit-normalized, `storetime`
-ordering, per-site shards, vocab frozen on MIMIC & applied to Rush (no raw pooling).
-Context 4096 tokens. Notes (v2) injected as frozen BioClinical-ModernBERT event tokens,
+ordering, per-site shards, vocab frozen on a reference site & applied identically across the
+**3 dev sites (MIMIC + Rush + UChicago)** — no raw pooling. Context **8192** tokens
+(~~4096~~; 4096 = ablation). Notes (v2) injected as frozen BioClinical-ModernBERT event tokens,
 pre-anchor only.
 
-**Trunk:** Llama-style causal decoder — dim 512, ~8 layers, 8 heads, SwiGLU, RMSNorm, RoPE
-(admission-relative, 1-min IDs), tied embeddings, ~30M params, bf16, `torch.compile`.
+**Trunk:** **CLIFATRON Qwen2 backbone** (primary) — RoPE/SwiGLU/RMSNorm, **UNTIED** embeddings,
+~30M-neighborhood, bf16. From-scratch flat Llama-style decoder (d512×8L×8H, admission-relative
+1-min RoPE) retained as the **ablation arm only** (~~tied embeddings~~ → untied there too).
 
 **Heads / objectives:** threshold-hazard (ICareFM, primary) + competing-risk CIF (SurvivEHR)
 + **value regression (ORA mark, NEW-enabled)** + low-weight next-event. Uncertainty +

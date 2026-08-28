@@ -4,11 +4,15 @@ Use the CE DataScience plugin for all work. Clone and enter the repo, then `uv s
 
 ## Environment
 - Repo: `sajor2000/clifatron2.0` (private, SSH: `git@github.com:sajor2000/clifatron2.0.git`)
-- Branch: `fix/step1-config-code-reconciliation` (15 commits, Steps 1-6)
+- Branch: `main` (20 commits; Steps 1–6 merged + data-onboarding fixes)
 - Dev: Mac Studio (M4 Max, 64GB, MPS) — smoke-test only
-- Training: 2× L40 Linux box (48GB each, no NVLink, bf16, DDP via torchrun)
-- Data: `~/Data/clif-source/` (CLIF 2.1 parquet — Rush + MIMIC, 546K stays, 111M events)
+- Training: 2× L40 Linux box `rudu-hpcg004` (48GB each, no NVLink, bf16, DDP via torchrun)
+- Data (as staged on L40 box, 2026-08-27): `~/Data/clif-source/CLIF_MIMIC/` — **MIMIC-IV-Ext-CLIF 2.1
+  ONLY** (16 tables, **546,028 stays, ~134M events**). Rush + UChicago are dev-cohort sites but are
+  **NOT staged on this box yet**. Override the data dir with `CLIF_DATA_DIR=<path>`.
 - Package: `uv` only — never pip into shared interpreter
+- **Known box issue:** `nvidia-smi` fails with a driver/library version mismatch (NVML 580.173 vs
+  kernel 580.159) — torch CUDA still allocates, but reboot before long multi-GPU runs.
 
 ## What's Built (Steps 1-6)
 - Untied next-event projection with tie_weights flag
@@ -48,7 +52,12 @@ python -m src.eval.ablation_compare --results results/ablation
 3. Pre-anchor notes only (leakage rule)
 4. No data leaves its node — external validation returns aggregate-only
 
-## Current Status
-- Working tree: clean, pushed
-- Tests: 35 pass on MPS (M4 Max, 64GB)
-- PR pending: `gh auth login -h github.com` needed on Mac Studio (code: 444F-B135 at https://github.com/login/device)
+## Current Status (2026-08-27, L40 box)
+- Working tree: clean, pushed to `main`.
+- Tests: **42 pass** on the L40 box with real MIMIC data staged (`CLIF_DATA_DIR=~/Data/clif-source/CLIF_MIMIC`);
+  4 skip cleanly when no CLIF data is present. Env set up via `uv sync` (torch 2.13.0+cu130, CUDA available).
+- Data-onboarding fixes landed: tokenizer sample-limit (`limit_stays`) so smoke tests don't grind the full
+  546k-stay dataset; uniform soft-bin width; metrics-panel hardened vs non-finite logits.
+- **Blockers for real training:** (1) no CLIFATRON checkpoint staged yet (needed for Method-3 wedge);
+  (2) Rush + UChicago data not on this box; (3) value-regression head loss is unnormalized/huge — needs
+  per-concept value scaling before Step-3 joint pretraining.
