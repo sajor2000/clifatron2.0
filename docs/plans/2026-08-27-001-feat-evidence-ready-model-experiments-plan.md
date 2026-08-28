@@ -3,7 +3,8 @@ title: "feat: Establish evidence-ready CLIFATRON model experiments"
 type: feat
 status: active
 date: 2026-08-27
-deepened: 2026-08-27
+deepened: 2026-08-28
+landed: U1, U2, U3, U4, value-stats follow-up
 ---
 
 # feat: Establish evidence-ready CLIFATRON model experiments
@@ -14,6 +15,46 @@ Establish a leakage-safe, resumable training and evaluation baseline, then use o
 
 ---
 
+## Execution Status
+
+Updated 2026-08-28 against `main` at `0d3eae0`. Working tree clean. The plan holds U1-U10; U1-U4
+and the value-statistics follow-up have landed via PR #2 and PR #3. Progress is derived from git,
+not stored here — this section is orientation, not state.
+
+| Unit | Status | Evidence |
+|---|---|---|
+| U1. Cohort, anchor, splits, artifact policy | Landed | `configs/cohort.yaml`, `configs/artifact_policy.yaml`, `src/data/cohort.py`, `src/data/splits.py`, `src/eval/clif_auto_labeler.py` |
+| U2. Dataset, targets, collator, document isolation | Landed | `src/data/dataset.py`, `src/data/collate.py`, `src/data/targets.py`, packed-dataset changes under `external/clifatron/AR/qwen2/` |
+| U3. Objective semantics | Landed | `src/model/heads.py`, `tests/test_cr_invariants.py` |
+| U4. Training engine, checkpoints, manifest | Landed | `src/train/engine.py`, `src/train/checkpoint.py`, `src/train/manifest.py`, `src/train/pretrain.py` |
+| Value-statistics follow-up | Landed | `src/data/value_stats.py`, `tests/test_value_stats.py` |
+| **U4 follow-up: hardware + resume verification** | **Unowned — blocks U6** | Owns `tests/test_checkpoint.py` (absent), a resume-*equivalence* test, and a two-process DDP smoke test. Completion artifact for P5-P7. |
+| **U2 follow-up: block-diagonal/varlen attention** | **Unowned — blocks U8** | Qwen2/Qwen3 varlen path. U8's entry gate qualifies packed attention that nothing builds. |
+| U5. Evaluation, calibration, validation gate | **Next** | Targets confirmed absent; nine defects catalogued in U5 below |
+| U9. Validator core | Blocked on U5 | `clif-validate/` does not exist |
+| U11. Release-trust machinery | Blocked on U9 | Split out of the original U9 on 2026-08-28 |
+| U12. v0 real-site federation proof | Blocked on U9, U11 | Added 2026-08-28; also blocked on external-site onboarding |
+| U6, U7, U8 | Blocked on U5, U9, U12 | See per-unit entry gates; U7 additionally conditional on U12's coverage findings |
+| U10. Release milestone | Gated milestone | Moved out of Implementation Units 2026-08-28; re-planned after selection |
+
+Verification at handoff: `uv run --with pytest pytest tests/ -q` passed with `108 passed, 3 skipped`
+on the U1-U4 feature branch, and value-stats focused tests passed on the follow-up branch.
+
+Two caveats carried forward from the handoff, both still open:
+
+- Real site data still needs `ce-data-qa` before any outcome prevalence, unit mapping, storetime
+  field, or follow-up assumption can be relied on.
+- Block-diagonal/varlen attention for Qwen2/Qwen3 training is not implemented. Multi-document
+  packed rows are deliberately rejected in dense training paths until it is.
+- **"Landed" means code merged, not verification complete.** U4 is the case that separates them:
+  its own Verification calls for a 2 x L40 qualification report, one-batch overfit, resume
+  equivalence, and DDP coverage, and none of those have run. `tests/test_checkpoint.py` does not
+  exist, and `tests/test_train_engine.py`'s only resume test asserts that ledger counters advanced
+  rather than equivalence to an uninterrupted run. Those obligations reappear below as blocking
+  preconditions P5-P7 with no unit chartered to satisfy them, which is why the follow-up rows above
+  are called out as unowned.
+
+---
 ## Problem Frame
 
 The repository already contains tokenizers, model heads, ablation configurations, and evaluation scaffolds, but the principal training entry points stop before loading data or updating the model. Labels needed by the TTE heads are synthesized in tests rather than built from an eligibility and censoring contract. The external validator can emit production-shaped metrics from random predictions, and the current competing-risk parameterization can produce invalid event-free probabilities when cause-specific sigmoid hazards sum above one.
@@ -72,7 +113,37 @@ No inspectable patient dataset is committed to the repository. Real-data column 
 - Do not add note modality work to these experiments; notes require a separate leakage and availability-time contract.
 - Do not treat external validation sites as iterative development sets.
 - Do not claim PORTER-style open-vocabulary output generation; the proposed arm evaluates portable input representations.
+- **Do not make a first-mover claim (retired 2026-08-28).** The CLIF v3.0 multimodal window this plan's framing depended on has passed. The contribution rests on CLIF-native execution, openly released validation tooling, and real-federation deployment — none of which requires being first. `AGENTS.md` and `MEMORY.md` still carry the first-mover language and need updating to match.
 - Do not claim an institutional training-diversity effect from independently trained site models or ensembles; under the current privacy boundary that estimand is not identifiable.
+
+### Gated Milestones
+
+**U10. Qualify and release the selected model bundle.** Moved out of Implementation Units on
+2026-08-28: it carried Files, Test scenarios, and Verification blocks while its own prose said the
+file list was not a task list. Its subject — the selected model family — is an output of U6/U7/U8
+that does not exist, so it has entry criteria rather than steps. It keeps its U-ID and its node in
+the dependency diagram, and is **re-planned as its own document once selection completes.**
+
+Entry criteria:
+
+- U8 and U11 complete, and a model family has actually been *selected* under U5's frozen selection
+  rule. Until that selection exists, U10 has no subject.
+- Governance sign-off: technical, privacy, clinical/statistical, and site governance.
+- Memorization, membership-inference, and extraction-risk tests re-run against the finally selected
+  bundle and passing approved thresholds (first run happens at U6/U12, not here).
+- Cumulative disclosure ledger current — maintained continuously from U5 onward, verified here.
+
+Release contract the eventual bundle must satisfy:
+
+- Replace the synthetic bundle with the selected frozen model, trained heads, exact representation
+  family, and frozen analysis/outcome manifests, without altering U11's qualified runtime contract.
+- Minimize exported artifacts; require governance/reviewer sign-off.
+- Sign the complete release manifest; authenticate site-generated reports.
+- Predeclare terminal pass/fail actions. A revised model reusing a prior confirmation site is
+  labeled transport evaluation and requires a genuinely unused site or prospective cohort for a new
+  confirmation claim.
+- Untouched confirmation results cannot be opened until the signed bundle and analysis version are
+  final.
 
 ### Deferred to Follow-Up Work
 
@@ -87,15 +158,55 @@ No inspectable patient dataset is committed to the repository. Real-data column 
 
 ### Relevant Code and Patterns
 
-- `src/data/tokenize.py` produces patient-level event shards but currently measures `pos_min` from the first observed event and does not construct observation/future windows or model targets.
-- `src/train/joint_pretrain.py`, `src/train/run_arm.py`, `src/train/pretrain.py`, and `src/train/run_tokenization_ablation.py` construct models and optimizers but stop before a real data or update loop.
-- `src/model/head_adapter.py` is the primary integration seam for CLIFATRON checkpoints; `src/model/encoder.py` remains the from-scratch ablation path.
-- `src/model/heads.py` already exposes tied and untied next-event projections, threshold hazards, value regression, and competing risks, making config-driven comparisons preferable to parallel implementations.
-- `tests/test_smoke_arms.py` demonstrates expected batch fields but manufactures CR and threshold labels; it is a useful shape test, not evidence that supervision is correct.
-- `src/eval/method3.py` and `src/eval/metrics.py` establish the comparison and metric surfaces, but currently fit/evaluate on unsplit site arrays and recalibrate on evaluated labels.
-- `src/eval/clif_validate.py` and `src/eval/clif_auto_labeler.py` establish the model-to-data boundary but currently permit missing head weights, random predictions, overlapping outcome windows, and null-to-negative labels.
-- Upstream sequence packing patterns live in `external/clifatron/AR/qwen2/data/packed_dataset.py` and `external/clifatron/AR/qwen2/scripts/pack_sequences.py`; patient/document boundaries must be preserved for TTE targets.
+Rewritten 2026-08-28 to describe the post-U1-U4 codebase rather than the pre-implementation one.
 
+**Landed contracts to build on (do not re-derive):**
+
+- `src/data/cohort.py` and `src/data/splits.py` own the ICU hour-24 anchor, pre-anchor feature
+  windows, the seven outcome states, and patient/grouped splits that keep linked encounters
+  together. U5's partition roles read from these artifacts.
+- `src/data/value_stats.py` is the reference implementation of fail-closed artifact verification:
+  value-stats bind to an exact vocabulary hash, schema-2 artifacts with `vocab_hash: null` are
+  rejected, and legacy bare maps are accepted only when no expected hash is supplied. U5's
+  checkpoint/target-map/outcome-spec compatibility checks should mirror this shape.
+- `src/data/collate.py` emits `document_ids`, `segment_map`, FlashAttention-compatible cumulative
+  lengths, and per-anchor labels; dense `CLIFEncoder` training fails closed on multi-document
+  packed rows rather than leaking across documents.
+- `src/model/heads.py` carries the normalized `(K causes + no event)` competing-risk head, masked
+  `next_event_loss()`, `ValueRegressionHead.loss_aligned()`, and `ThresholdHazardHead.loss()` with
+  observed-window censoring. `NextEventHead.tie_weights` remains the mechanism for U6's tying
+  ablation — do not add parallel head classes.
+- `src/train/engine.py` counts explicit optimizer updates (not epochs), honors `max_updates`,
+  scales partial final gradient-accumulation steps, and carries ledger counters across resume.
+- `src/train/pretrain.py` fails closed without value stats or supervised TTE outcomes; `--dry-run`
+  normalizes tokenizer rows for plumbing checks only.
+
+**Surfaces U5 must repair (verified defects catalogued in U5's table):**
+
+- `src/eval/clif_validate.py` still supplies `np.random.random` predictions at two call sites,
+  loads checkpoints with `strict=False`, and writes the site's local path into the exported JSON.
+- `src/eval/metrics.py` fits temperature on evaluated labels by default in `full_panel`, and
+  `subgroup_panel` silently drops `n < 30` cells with no status and no complementary suppression.
+  Its NaN handling and CR calibration functions are current, correct behavior to preserve.
+- `src/eval/method3.py` fits probes/XGBoost per site on unsplit arrays, scores the `tr == te`
+  diagonal on its own fit rows, fits LPE on the labels it scores, and ships a cross-site ensemble
+  row that presupposes an unapproved derived-model exchange.
+- `src/eval/clif_forest_plot.py` loads site JSON with no schema check and promotes every
+  unrecognized key to an outcome.
+- No small-cell suppression exists anywhere in `src/` or `tests/` — `grep` for
+  `suppress|small_cell|min_n|MIN_CELL` returns nothing.
+
+**Downstream surfaces for U6-U8:**
+
+- `src/model/head_adapter.py` is the CLIFATRON checkpoint integration seam; `src/model/encoder.py`
+  remains the from-scratch path. `src/train/run_arm.py` and `src/train/run_tokenization_ablation.py`
+  exist as arm runners.
+- `src/data/tokenize_textcode.py` and `configs/tokenization_ablation.yaml` already exist, so U7
+  modifies rather than creates them; `src/model/event_embeddings.py` does not exist yet.
+- `configs/architecture_ablation.yaml` (U6) and `configs/experiment_matrix.yaml` (U8) do not exist.
+- `clif-validate/` does not exist; U9 is greenfield.
+- Upstream sequence packing lives in `external/clifatron/AR/qwen2/data/packed_dataset.py` and
+  `external/clifatron/AR/qwen2/scripts/pack_sequences.py`.
 ### Institutional Learnings
 
 - `MEMORY.md` and `notes/NEXT_STEPS.md` are authoritative over the pre-pivot architecture in `notes/RESEARCH.md`.
@@ -127,6 +238,15 @@ No inspectable patient dataset is committed to the repository. Real-data column 
 - **Separate scaling estimands:** Fixed-data exposure isolates capacity while allowing compute to vary; fixed-compute comparisons estimate performance under a resource budget while allowing token exposure to vary. Site-local ensemble benefit is separate and is not interpreted as institutional training diversity.
 - **Direct horizons before recursive rollout training:** Add direct multi-horizon supervision and IEC evaluation first. Recursive generation is reported as trajectory plausibility because SurvivEHR explicitly does not treat later rollouts as calibrated risk.
 - **Model-to-data remains the federation contract:** Federated optimization is not an incremental extension; exchanging gradients or updates changes governance, privacy, orchestration, and failure handling.
+- **Calibration is opt-in, not default:** `full_panel`'s `recalibrate=True` default is the mechanism
+  by which every calibration and utility number gets fitted on its own test labels. Fitting must
+  become a two-partition call a caller names explicitly. A safe default beats a documented caveat.
+- **Suppression is a status, not a filter:** a cell below threshold is reported as
+  `small_cell_suppressed`, never silently omitted. Silent omission is what makes complementary
+  differencing possible, and it also hides the difference between "too small" and "not evaluated".
+- **Selection precedes packaging:** U10 is a gated milestone with entry criteria rather than a task
+  list, because its subject — the selected model family — is an output of U6/U7/U8. Planning it in
+  file-level detail today would encode a choice the evidence has not made.
 
 ---
 
@@ -167,13 +287,17 @@ flowchart TB
   U2 --> U4[U4 Training runtime]
   U3 --> U4
   U4 --> U5[U5 Evaluation and validation gate]
-  U5 --> U9[U9 Validator prototype]
-  U9 --> U6[U6 Core architecture ablations]
-  U9 --> U7[U7 PORTER portability arm]
-  U9 --> U8[U8 Scaling, label, and horizon studies]
-  U6 --> U8
+  U5 --> U9[U9 Validator core]
+  U9 --> U11[U11 Release-trust machinery]
+  U9 --> U12[U12 v0 real-site federation proof]
+  U11 --> U12
+  U12 --> U6[U6 Core architecture ablations]
+  U12 --> U7[U7 PORTER portability arm]
+  U6 --> U8[U8 Scaling, label, horizon, generalization]
+  U9 --> U8
   U7 -. optional PORTER inclusion .-> U8
-  U8 --> U10[U10 Final bundle qualification]
+  U8 --> U10[U10 Release milestone - re-planned after selection]
+  U11 --> U10
 ```
 
 ### U1. Version the cohort, anchor, split, and outcome contract
@@ -183,6 +307,8 @@ flowchart TB
 **Requirements:** R1, R2, R3, R4, R5, R10, R14, R15, R16
 
 **Dependencies:** Governed site data and a `ce-data-qa` column profile for each development site.
+
+**Status:** Landed via PR #2 / PR #3 as of `main` @ `0d3eae0`. The file list below records work already done, not work to do.
 
 **Files:**
 - Create: `configs/cohort.yaml`
@@ -243,6 +369,8 @@ flowchart TB
 
 **Dependencies:** U1
 
+**Status:** Landed via PR #2 / PR #3 as of `main` @ `0d3eae0`. The file list below records work already done, not work to do.
+
 **Files:**
 - Create: `src/data/dataset.py`
 - Create: `src/data/collate.py`
@@ -265,7 +393,7 @@ flowchart TB
 - Emit threshold at-risk and censor-time fields that distinguish observed non-crossing through horizon, right censoring before horizon, not ascertainable, unsupported target, and prevalence at the anchor.
 - Pad sequences and soft assignments, emit explicit attention/target masks and anchor indices, and seed threshold sampling from sample ID, epoch, and run seed.
 - Keep workers CPU-only and make the collator top-level/picklable; device transfer remains the trainer's responsibility.
-- Use a variable-length FlashAttention-compatible causal path driven by cumulative document lengths for Qwen2/GPT2 adapters; prohibit dense `[batch, heads, length, length]` isolation masks and require a tested fallback that preserves isolation for data-free CPU checks.
+- Use a variable-length FlashAttention-compatible causal path driven by cumulative document lengths for Qwen2/GPT2 adapters; prohibit dense `[batch, heads, length, length]` isolation masks and require a tested fallback that preserves isolation for data-free CPU checks. **Deferred out of U2's landed scope — see the U4/U2 follow-up row in Execution Status.** U2 shipped the fail-closed rejection of multi-document packed rows instead; the varlen path itself is unbuilt and U8's entry gate depends on qualifying it.
 
 **Patterns to follow:**
 - Packed dataset and sequence assembly in `external/clifatron/AR/qwen2/data/packed_dataset.py` and `external/clifatron/AR/qwen2/scripts/pack_sequences.py`.
@@ -294,6 +422,8 @@ flowchart TB
 **Requirements:** R3, R4, R7, R9
 
 **Dependencies:** U1, U2
+
+**Status:** Landed via PR #2 / PR #3 as of `main` @ `0d3eae0`. The file list below records work already done, not work to do.
 
 **Files:**
 - Modify: `src/model/heads.py`
@@ -336,6 +466,8 @@ flowchart TB
 **Requirements:** R6, R8, R9, R17
 
 **Dependencies:** U2, U3
+
+**Status:** Landed via PR #2 / PR #3 as of `main` @ `0d3eae0`. The file list below records work already done, not work to do.
 
 **Files:**
 - Create: `src/train/engine.py`
@@ -384,7 +516,29 @@ flowchart TB
 
 **Requirements:** R4, R10, R11, R12, R13, R14, R15, R16
 
-**Dependencies:** U1, U2, U3, U4
+**Dependencies:** U1, U2, U3, U4 — all landed. U5 is the immediate next coding target; do not begin U6-U10 until U5 passes review.
+
+**Status:** Not started. Confirmed absent on `main` at `0d3eae0` (2026-08-28): `src/eval/schema.py`, `tests/test_eval_splits.py`, `tests/test_eval_metrics.py`.
+
+#### Confirmed defects
+
+Verified by reading `main` at `0d3eae0` on 2026-08-28. These are the concrete targets — U5 is done when each is closed and covered by a test that fails against the current code. D1-D9 were catalogued in the deepening pass; D10-D11 were found during document review and verified the same way.
+
+| # | Location | Defect | Req |
+|---|---|---|---|
+| D1 | `src/eval/clif_validate.py:120,126` | `np.random.random(...)` supplies predictions, and `full_panel` then emits benchmark-shaped AUROC/ECE/Brier from noise. Two call sites, not one. | R11 |
+| D2 | `src/eval/clif_validate.py:53` | Checkpoint loads with `strict=False`; missing or partial head weights pass silently into a success-shaped report. | R11 |
+| D3 | `src/eval/clif_validate.py:114` | `results["site"] = str(data_path)` writes the site's local filesystem path into the exported aggregate JSON. | R14 |
+| D4 | `src/eval/metrics.py:231-232` | `full_panel(..., recalibrate=True)` fits `temperature_scale(logits, y)` on the same `y` it then scores, so calibration slope, ECE, ICI, Brier and DCA are all fitted on their own test labels. The leak is the **default** argument, not an unusual call. | R10 |
+| D5 | `src/eval/metrics.py:264` | `subgroup_panel` silently drops cells with `n < 30` — no status emitted, and no complementary suppression, so a dropped cell is recoverable by differencing its siblings against the reported total. The threshold also disagrees with the `n < 10` baseline rule with no documented reason. | R12, R14 |
+| D6 | `src/eval/method3.py:116,120-124` | `transportability_matrix` fits one predictor per site on `states[s], labels[s]`, then scores `matrix[tr][te]` **including the `tr == te` diagonal** — fit and evaluation on identical rows. `full_panel(recalibrate=True)` re-fits temperature on `labels[te]` on top of that. | R10 |
+| D7 | `src/eval/method3.py:132-133` | `local_patient_equivalence` is fit on `states[te], labels[te]` — the same test labels it is scoring against. | R10 |
+| D8 | `src/eval/method3.py:138-145` | The `matrix["ensemble"]` row averages site-local model predictions across sites, presupposing a cross-site derived-model exchange that Scope Boundaries and `AGENTS.md` both list as unapproved. | R14, Scope |
+| D9 | `src/eval/clif_forest_plot.py:24-28,33-37` | `load_site_results` is a bare `json.loads` with no schema check, and `build_forest_table` treats every key except three literals as an outcome. This is an accept-anything loader where an allow-list is required. | R12, R14 |
+| D10 | `src/eval/clif_validate.py:103` | `auto_label(data_path, outcome_names)` is called against U1's landed signature `auto_label(data_dir, episode_artifact, outcomes=None, ...)`, so the outcome-name list is consumed as the `episode_artifact` path and the validator raises before it ever reaches inference. No test exercises `evaluate_site`, so the suite does not catch it. Closing it requires an `--episode-artifact` CLI argument threaded through `evaluate_site`. | R11 |
+| D11 | `src/eval/matrix.py:26` | `ensemble_mean()` is a **second**, independent cross-site ensembling entry point. Gating or deleting only `method3`'s `matrix["ensemble"]` row (D8) leaves the unapproved exchange shipped and callable. `matrix.py` also re-exports `full_panel` as "the stable import surface", so D4's split breaks every consumer of that surface unless it is updated in the same change. | R14, Scope |
+
+**Do not regress:** `full_panel`'s NaN handling (`nan_policy`, `n_dropped_nan`, saturated-logit clamping — landed in `79684c5`) and the existing `cr_d_calibration` / `aj_k_calibration` implementations. Both are current behavior U5 builds on, not behavior it replaces.
 
 **Files:**
 - Create: `src/eval/schema.py`
@@ -394,47 +548,109 @@ flowchart TB
 - Modify: `src/eval/method3.py`
 - Modify: `src/eval/clif_validate.py`
 - Modify: `src/eval/clif_forest_plot.py`
+- Modify: `src/eval/matrix.py` (re-export surface breaks on the D4 split; owns the second ensemble entry point, D11)
+- Modify: `src/eval/clif_auto_labeler.py` (read-side surface for D10's episode-artifact threading)
 - Modify: `tests/test_clif_validate.py`
+- Modify: `tests/test_smoke_arms.py` (third `full_panel` caller; breaks on the D4 split)
+- Create: `tests/test_report_authentication.py`
 
 **Approach:**
-- Require explicit fit, validation/model-selection, calibration, and final-test partitions for probes, XGBoost, temperature fitting, LPE, and model evaluation.
-- Enforce sealed-result access: analysis code and selection rules are frozen before final internal test or external confirmation artifacts are opened, and accesses are logged by model version.
-- Add real batch inference and strict artifact compatibility checks; missing or partial heads, placeholders, and hash mismatches terminate without writing a success-shaped report.
+- Require explicit fit, validation/model-selection, calibration, and final-test partitions for probes, XGBoost, temperature fitting, LPE, and model evaluation. Partition role comes from the U1 split artifact rather than being inferred from array shape.
+- Invert the calibration default (D4). Split `full_panel` into an uncalibrated scorer and an explicit two-argument calibration API that fits on calibration logits/labels and applies to disjoint test logits. Keep a single-array helper for synthetic tests, but make fitting-on-evaluated-labels something a caller must name, not something it gets by default.
+  - Reference shape: scikit-learn's own prefit-calibration pattern is `CalibratedClassifierCV(FrozenEstimator(base))` fitted on the calibration split, and its documentation states the invariant explicitly — *"The user has to take care manually that data for model fitting and calibration are disjoint."* Disjointness is the caller's responsibility, which is exactly why it must be a named argument here rather than a default. Mirror that shape even where the hand-rolled LBFGS `temperature_scale` is retained.
+  - Version note: `CalibratedClassifierCV(method="temperature")` exists only from scikit-learn 1.8, and `FrozenEstimator` from 1.6. `pyproject.toml` pins `scikit-learn>=1.5`. Adopting the library-native path requires raising that floor; keeping the hand-rolled implementation does not. Decide which, and record it — do not silently depend on a version the pin does not guarantee.
+- Close the `method3` leaks together (D6, D7): the diagonal is a fit-on-self cell and must either consume a within-site held-out partition or return `insufficient_partitions`. LPE needs its own fit partition.
+- Treat D8 as a governance decision, not a code cleanup: either gate the ensemble row behind an explicit approved-exchange flag that defaults off, or remove it. It cannot stay on by default while cross-site derived-model exchange is unapproved. **Apply the same disposition to `matrix.ensemble_mean` (D11)** — closing one entry point and leaving the other is not a fix.
+- Add real batch inference and strict artifact compatibility checks; missing or partial heads, placeholders, and hash mismatches terminate without writing a success-shaped report. `strict=False` loading is permitted only when the report is explicitly marked non-evaluable.
+  - Assemble inference from the surfaces that already exist rather than inventing an integration: `src/data/tokenize.py::tokenize_site` output loaded through `src/data/dataset.py::ModelDataset` / `make_dataloader`, fed to the already-written but never-called `clif_validate.zero_shot_predictions`. `method3.load_site` gains a required `partition_col` sourced from the U1 split artifact, since `--site NAME=PATH` parquets do not carry one today.
+  - Exercise this on synthetic fixtures only. U5 stays data-free and exempt from the real-training preconditions; wiring the path is in scope, running it on governed site data is not.
+- Define an allow-listed result schema in `src/eval/schema.py` carrying model bundle identifiers, vocabulary hash, outcome-spec hash, CLIF version, site role, partition role, metric version, outcome status, and disclosure status. Statuses must distinguish `evaluable`, `unsupported_at_site`, `single_class`, `insufficient_n`, `small_cell_suppressed`, `artifact_mismatch`, and `runtime_failure`.
+- **Carry per-outcome label-validity diagnostics in that same schema.** The allow-list closes the disclosure hole (D9) but, as first drafted, closed the validity channel with it: every enumerated field is a model or provenance identifier, so a site whose auto-derived labels are wrong — a mis-mapped unit, a differently-coded mCIDE concept, an outcome ascertained on a systematically different subset — returns a plausible AUROC that nothing in the payload can contradict. Require, per outcome and subject to the same suppression rules: outcome-definition id and version, per-status counts across the seven outcome states, evaluable-denominator fraction, and a post-anchor measurement-density summary. A report missing this block is rejected as non-evaluable rather than accepted. This is TRIPOD+AI's participants/outcome/missing-data reporting applied to the federated case (Collins et al., *BMJ* 2024;385:e078378, doi:10.1136/bmj-2023-078378).
+- Validate at the **writer**, not only the reader. The forest-plot allow-list (D9) runs at load time, but MIMIC, Rush, and UChicago export through the in-repo `clif_validate.py` path rather than the U9 wheel — so the sites holding real PHI currently pass through only a named-field deny-list. Run every exported artifact through `src/eval/schema.py` before it is written and fail closed on any unrecognized key; keep the deny-list as an additional check.
+- Make suppression a status rather than a silent drop (D5), apply the landed `minimum_cell_size: 10`, and suppress complementary cells where a hidden value is recoverable by differencing.
+- Suppress on the **numerator too, not only the denominator**. Every panel currently emits exact `n` and `prevalence` at full precision (`src/eval/metrics.py::score`), so `n x prevalence` recovers the exact positive count — a cell of n=12 at prevalence 0.0833 identifies one outcome-positive patient while clearing every size threshold. Apply the same threshold to positive and negative counts, and round exported `prevalence` to a precision that cannot reconstruct an exact event count.
+- Bound the **resolution** of released continuous outputs, not just cell size. A reported small cell still discloses through its own curves: `net_benefit` returns 50 threshold points where NB(pt) = TP/N - (FP/N)(pt/(1-pt)), so with N and prevalence also released those 50 equations recover exact TP/FP counts at 50 cut-points. Declare a curve-release minimum materially larger than 10, below which a cell reports scalar summaries only and its DCA curve, per-bin calibration histogram, and CR D-calibration bins are suppressed entirely.
+- Strip local paths from exported artifacts (D3) and replace the free-form forest-plot loader with the allow-listed schema (D9).
 - Complete the shared panel with recalibrated and unrecalibrated discrimination/calibration, DCA/net benefit, CR-specific scores/plots, confidence intervals, and well-defined IEC.
 - Predeclare each DCA outcome's decision-maker, decision time, candidate action, comparator policy, and clinically defensible threshold range; otherwise label net benefit exploratory rather than demonstrated utility.
 - Replace current CR calibration stand-ins with implementations validated against the selected method's censoring assumptions and simulated known distributions.
-- Define an allow-listed result schema, suppress small and complementary cells, remove local paths, and report unsupported outcomes as statuses rather than fabricated metrics.
+- Bootstrap or interval estimates run locally and return only aggregate intervals; too-few-samples or single-class outcomes report non-evaluable rather than fabricating intervals.
+- **Create the cumulative disclosure ledger here, not at U10.** U10's entry gate requires a ledger "current across all prior aggregate releases", but the first release boundary opens in U5 and U6/U7/U8 emit repeated releases over the same cohorts at the same sites — a ledger reconstructed afterward from surviving artifacts is precisely the failure the risk row names. The aggregate writer appends every released artifact (site, model version, outcome, cell definitions, reported n, suppression statuses, release timestamp) to an append-only ledger, and the cross-release differencing check reads it. U6, U7, and U8 record a ledger entry as part of their Verification; U10 then *verifies* a ledger that has been maintained rather than assuming one exists.
+- **Mechanize log and exception sanitization.** Stripping `results["site"]` (D3) does not stop the leak: `src/eval/clif_validate.py:101` prints the data path and line 130 prints per-outcome n and prevalence to stdout, so a returned console log carries what the JSON no longer does. The landed `configs/artifact_policy.yaml` `operational_logs.prohibited_content` list is referenced by nothing in `src/` or `tests/`. Enforce it on every site-side stdout/stderr and log sink, replace the path-printing statements, and test that an injected identifier or local path never reaches a log record or traceback. Note also that `clif_validate.py:159` prints "No raw data, labels, or gradients have left the node." unconditionally — including on runs that failed or wrote a path-bearing artifact.
 - Run each site locally and combine only approved result artifacts; do not load all site-level rows into one central process.
 - Define external estimands as site-specific and meta-analytic, including weighting, heterogeneity, and suppression-induced missingness. Do not describe averages of local AUPRC, calibration, or DCA as pooled patient-level metrics.
 - Define paired patient-level resampling, seed aggregation, site-level synthesis, multiplicity handling, and the minimum site count for heterogeneity claims.
-- Freeze the experiment matrix, primary endpoints, clinical-utility gates, seed count, selection rule, calibration method, failure handling, analysis code, pilot-derived cell budget, and resource/futility rules before U6/U7/U8.
-- Define releaser, site operator, execution-host, transfer-channel, and aggregator trust roles, including report authentication, unsealing authorization, separation of duties, revocation, tamper-evident access logs, and compromise handling.
+- Enforce sealed-result access: analysis code and selection rules are frozen before final internal test or external confirmation artifacts are opened, and accesses are logged by model version.
+- Freeze what is knowable before any arm runs: primary endpoints, clinical-utility gates, seed count, selection rule, calibration method, failure handling, analysis code, and resource/futility rules. Freeze the *rule* that derives the cell budget (power/precision target, minimum evaluable n per cell, futility criterion) rather than a number — U5 is data-free and no pilot has run, so a "pilot-derived cell budget" frozen here would be invented and then quietly relaxed, which is the retroactive protocol change the freeze exists to prevent. Matrix contents and cell counts are instantiated at the U6 exit review under this frozen rule and logged as a protocol amendment before the first comparison arm.
+- **Freeze both branches of the selection rule, not one.** U6 declares cross-site transport metrics as co-primary, but the derived-model transfer approval that legalizes transport evaluation is only pursued later. If it is denied, the frozen rule becomes unexecutable and the team is forced into the exact post-hoc change this freeze forbids. Declare a transport-primary rule conditional on the approval being in hand at freeze time, and a same-site-primary rule with transport reported as descriptive if it is not.
+- **Own the site-to-aggregator direction of the trust model (decided 2026-08-28).** U5 builds the aggregate writer, so report authentication and the tamper-evident access log belong here: site-operator and aggregator roles, signing of site-generated reports, and unsealing access logged by model version. Add `tests/test_report_authentication.py` asserting that an unsigned or altered site report is rejected. The releaser-to-site direction — release signing, trust root, revocation, anti-rollback, key custody — is **U11's**. Splitting by direction is what closes the gap where site reports were unauthenticated until U10.
 
-**Execution note:** Characterize current metric outputs, then add failure tests before replacing placeholder behavior.
+**Decisions this unit must settle:**
+- **Suppression threshold — already settled, apply it.** `configs/artifact_policy.yaml:36` landed in U1 with `minimum_cell_size: 10`, asserted by `tests/test_artifact_policy.py:53`. That is the repo-wide rule; `subgroup_panel`'s hard-coded `30` is the outlier and is replaced. Source the value from the landed policy as a single constant rather than re-deciding it — two thresholds in one codebase is how a suppression rule silently stops applying.
+- **Ensemble row disposition.** Gate-off-by-default or delete (D8). Leaving it enabled ships an unapproved exchange.
+
+**Execution note:** Characterize current metric outputs first, then write the failure tests, then replace placeholder behavior. Every defect in the table above should have a test that fails against `0d3eae0` before its fix lands — that is the proof the fix is real rather than cosmetic.
 
 **Patterns to follow:**
 - Probability-in/scalar-out metric functions in `src/eval/metrics.py`.
+- Fail-closed artifact verification already established in `src/data/value_stats.py` (vocab-hash binding, schema-2 rejection) — the same shape of check applies to checkpoint, target-map, and outcome-spec compatibility here.
 - Aggregate result and plotting surfaces in `src/eval/clif_validate.py` and `src/eval/clif_forest_plot.py`.
 
 **Test scenarios:**
 - Happy path: held-out predictions generate discrimination, calibration, DCA, uncertainty intervals, and provenance without patient-level fields.
-- Edge case: a single-class or too-small outcome returns an explicit non-evaluable/suppressed status.
-- Edge case: calibration fitted on its dedicated partition changes calibration outputs but cannot change the fixed test labels or discrimination ordering.
-- Error path: absent head weights, wrong vocabulary/target hash, random/placeholder prediction provider, unsupported CLIF version, or missing outcome definition fails closed.
-- Error path: aggregate output containing identifiers, local paths, patient-level predictions, or recoverable small cells is rejected.
+- Happy path: temperature fitted on the calibration partition and applied to a disjoint test partition changes calibration outputs while leaving test-set discrimination ordering unchanged.
+- Edge case: a single-class or too-small outcome returns an explicit non-evaluable/suppressed status instead of a fabricated AUROC/AUPRC.
+- Edge case: a suppressed subgroup cell cannot be recovered by differencing its sibling cells against the reported total.
+- Edge case: calibration fitted on its dedicated partition cannot change the fixed test labels or discrimination ordering.
+- Error path: production validator path cannot produce a random prediction — the `np.random` call sites are gone and a test asserts no RNG-sourced prediction provider is reachable.
+- Error path: absent head weights, `strict=False` load in a production path, wrong vocabulary/target hash, unsupported CLIF version, or missing outcome definition fails closed.
+- Error path: aggregate output containing `patient_id`, `hospitalization_id`, `hosp_id`, `sequence`, `token`, `pos_min`, local data paths, row-level predictions, labels, or timestamps is rejected.
+- Error path: `method3` refuses unsplit site arrays for fit/evaluate workflows, and the `tr == te` diagonal cannot fit and score on the same rows.
+- Error path: the forest-plot loader rejects a site JSON carrying an unrecognized field rather than promoting it to an outcome.
+- Error path: an exported artifact carrying an unrecognized field is rejected at **write** time, not only at load time.
+- Error path: no ensemble cell is produced by default — neither `method3`'s `matrix["ensemble"]` row nor `matrix.ensemble_mean` — unless an explicit approved-exchange flag is set (D8, D11).
+- Error path: `evaluate_site` runs end-to-end on synthetic CLIF fixtures with an explicit episode artifact; the pre-fix signature mismatch raises (D10).
+- Edge case: a cell that clears the size threshold but whose positive count falls below it is suppressed, and exported `prevalence` precision cannot reconstruct an exact event count.
+- Edge case: a cell below the curve-release minimum reports scalar summaries only — its DCA curve, calibration histogram, and CR D-calibration bins are absent and cannot be inverted to per-patient TP/FP counts.
+- Error path: a site report missing the per-outcome label-validity block is rejected as non-evaluable.
+- Error path: an injected identifier or local path never reaches a log record, stdout line, or traceback.
+- Integration: every released artifact appends a cumulative-disclosure-ledger entry, and a second release that would disclose a suppressed cell by differencing against the first is blocked.
 - Integration: a synthetic normalized CR distribution passes known IEC/calibration cases, while deliberately miscalibrated distributions are detected.
+- Integration: a clean site process produces an aggregate artifact that a separate aggregator consumes without access to site rows.
 
 **Verification:**
-- No production path in `src/eval/clif_validate.py` calls a random prediction generator.
+- No production path in `src/eval/clif_validate.py` reaches a random prediction generator.
 - A clean site process can produce an aggregate artifact that a separate aggregator consumes without access to site rows.
-
+- Every defect D1-D11 has a test that fails against `0d3eae0` and passes after the fix.
+- Plus the shared per-unit review gates.
 ### U6. Add the tied/untied and separate/joint objective ablations
 
 **Goal:** Run the two lowest-cost architecture tests under one fixed cohort, compute, and evaluation contract.
 
 **Requirements:** R7, R9, R10, R12
 
-**Dependencies:** U5, U9
+**Dependencies:** U5, U9, U12
+
+**Entry gate — do not start until all hold:**
+- U5 merged with no residual P0/P1 review findings; every U5 defect D1-D9 closed.
+- U9 validator core qualified on a synthetic bundle, and **U12's v0 real-site proof complete** — the federation evidence lands before the expensive method arms, not after them.
+- U5's frozen protocol is in effect: primary endpoints, selection rule, calibration method, seed
+  count, analysis code, and the cell-budget derivation rule all frozen before the first arm runs.
+  Matrix contents and cell counts are instantiated at this unit's exit review under that rule and
+  logged as a protocol amendment.
+- **The derived-model transfer approval defined in U9 is obtained and recorded.** U6 declares
+  cross-site transport metrics as co-primary, and that approval is what legalizes moving
+  PHI-derived weights between MIMIC, Rush, and UChicago. Without it, U6 runs as a same-site study
+  and transport performance is reported as descriptive only — it cannot enter the selection rule.
+  This gate is the enforcement point; the requirement is currently stated only in a U9 Approach
+  bullet and is not a U9 exit criterion.
+- **Memorization, membership-inference, and extraction-risk thresholds are approved and the first
+  test run has passed on the U6 baseline checkpoint.** These are currently U10 entry criteria, but
+  U6 is where PHI-derived weights first cross an institutional boundary, and testing after the
+  transfer gives governance no way to undo an exposure it then discovers. U10 re-runs them against
+  the finally selected bundle.
+- The **real-training preconditions** below are satisfied — this is the first unit that triggers a
+  real run.
 
 **Files:**
 - Create: `configs/architecture_ablation.yaml`
@@ -445,7 +661,8 @@ flowchart TB
 - Modify: `src/eval/ablation_compare.py`
 
 **Approach:**
-- Compare tied and untied output embeddings at fixed data, tokens, updates, seeds, and base architecture; add a parameter-matched tied control so extra capacity is not mistaken for untying benefit.
+- **Name the representation/backbone family on every arm.** Each arm is either checkpoint-attached Qwen2 or from-scratch ~30M, and the distinction is load-bearing: output-embedding tying and model size are undefined on a pinned checkpoint whose embeddings and width are fixed, so those factors are only meaningful on the from-scratch family. Without the column, U6 and U8 silently require from-scratch pretraining runs the plan never names, sizes, or budgets — and the two families' compute costs differ by orders of magnitude on 2 x L40. Note that this plan's System-Wide Impact calls the CLIFATRON backbone an "unchanged invariant" while `MEMORY.md` locks the from-scratch Qwen3 decoder as the primary-paper headline; reconcile the two before the matrix is frozen.
+- Compare tied and untied output embeddings at fixed data, tokens, updates, seeds, and base architecture; add a parameter-matched tied control so extra capacity is not mistaken for untying benefit. **Kept at full strength deliberately (decided 2026-08-28):** untied is a locked project default, and scoping this to a single confirmatory arm was considered and rejected — the locked-decisions rule is to measure rather than assert, and a default that is asserted rather than measured is exactly what this arm exists to prevent. The L40 cost on the path to U8 is accepted.
 - Compare separate threshold/CR heads with a joint event-time representation that retains valid normalized CR likelihood and the threshold query interface.
 - Use identical model-selection rules and at least repeated seeds; record failed runs rather than silently replacing them.
 - Declare reusable development-site transport AUPRC, calibration, and net benefit at prespecified thresholds as co-primary comparison dimensions, with NTP loss, CR proper scores, parameter count, runtime, and memory as secondary dimensions. Untouched confirmation sites cannot drive selection.
@@ -470,7 +687,21 @@ flowchart TB
 
 **Requirements:** R5, R9, R10, R12
 
-**Dependencies:** U5, U9; may proceed in parallel with U6.
+**Dependencies:** U5, U9, U12; may proceed in parallel with U6.
+
+**Entry gate — do not start until all hold:**
+- Same U5 / U9 / U12 / frozen-protocol gates as U6, plus the real-training preconditions below, plus the same derived-model transfer approval and pre-transfer memorization/extraction-risk gates U6 carries.
+- **U12's v0 run has surfaced actual cross-site vocabulary coverage loss (decided 2026-08-28).** U7
+  is deferred behind the v0 real-site result rather than run on principle. The federation contract
+  applies one frozen mCIDE vocabulary identically at every site, so the mismatch U7 tests may not
+  arise in the deployment being validated — and frozen mCIDE ships either way. If v0 shows real
+  coverage loss, U7 has a concrete decision to inform and proceeds. If it does not, record that and
+  drop the arm rather than running it because the literature invites it. This also defers the
+  long-lead mCIDE description licensing dependency until it is known to be needed.
+- An authoritative mCIDE description release is acquired, checksummed, and approved for
+  redistribution, **or** a checked-in synthetic fixture is clearly marked non-study. Synthetic
+  descriptions must be replaced before any evidence-producing run — a synthetic-fixture run is a
+  plumbing check, never a result.
 
 **Files:**
 - Create: `src/model/event_embeddings.py`
@@ -510,13 +741,28 @@ flowchart TB
 
 **Requirements:** R9, R10, R12, R13, R14, R15, R17
 
-**Dependencies:** U5, U6; U7 for inclusion of the PORTER arm.
+**Dependencies:** U5, U6, U9; U7 for inclusion of the PORTER arm.
+
+**Entry gate — do not start until all hold:**
+- U5 and U6 complete; U7 complete only if the PORTER arm is being included.
+- Real-training preconditions below satisfied, plus U4's L40 qualification (R17): data loading,
+  packed attention, memory, throughput, checkpoint overhead, and DDP efficiency measured on
+  2 x L40 before the matrix launches.
+
+> **Gated content.** The three substudies (capacity/data scaling, label efficiency, multi-horizon)
+> are independently stoppable and are specified here at protocol level. Concrete cell counts, model
+> sizes, and token budgets are **not knowable until U6 reports** — they are set from U6's measured
+> resource envelope and the pilot-derived cell budget frozen in U5, not chosen now. Treat the file
+> list below as the orchestration surface; treat the matrix contents as a decision deferred to the
+> U6 exit review.
 
 **Files:**
 - Create: `configs/experiment_matrix.yaml`
 - Create: `src/train/run_experiment_matrix.py`
 - Create: `src/eval/label_efficiency.py`
 - Create: `src/eval/multistep.py`
+- Create: `src/eval/generalization.py` (held-out thresholds and alternate anchors)
+- Create: `tests/test_generalization.py`
 - Create: `tests/test_experiment_matrix.py`
 - Create: `tests/test_label_efficiency.py`
 - Create: `tests/test_multistep.py`
@@ -531,6 +777,7 @@ flowchart TB
 - Build label-efficiency curves from paired, nested patient-grouped samples shared across methods, fixed temporal/external test sets, and both total-label and positive-label axes. Count labels used for fitting, model selection, hyperparameter choice, and calibration.
 - Evaluate direct horizons and teacher-forced event steps separately from recursive rollouts. Report IEC for ranking, plus event-set, timing, calibration, and trajectory-distribution measures appropriate to each mode.
 - Use physiologic event targets only. Calibrated anchor-time risk uses no post-anchor context; teacher-forced analyses that condition on future treatments are labeled conditional trajectory analyses and never scored as calibrated baseline risk.
+- **Add a threshold-and-anchor generalization substudy (decided 2026-08-28).** The objective's selling point is threshold-conditioned, any-time risk, but all evaluation happens at hour 24 against the three thresholds hard-coded into `configs/cohort.yaml` and therefore into the training labels — so every current success criterion can pass while the central claim stays unevidenced. Evaluate the frozen model at **held-out query thresholds not among those three** and at **at least one additional anchor time**, reported as a separate estimand from the primary hour-24 panel. This substudy is not independently stoppable: it carries the evidence the threshold-conditioned novelty claim rests on, so it stops last, not first.
 - Execute capacity/data scaling, label efficiency, and multi-horizon forecasting as independently stoppable substudies over the shared frozen protocol; one study's delay does not block completed studies.
 
 **Patterns to follow:**
@@ -550,79 +797,159 @@ flowchart TB
 - Every result row traces to model, data, split, vocabulary, outcome, source checkpoint, code, environment, and seed manifests.
 - Conclusions distinguish fixed-data capacity, fixed-compute performance, data-volume scaling, label efficiency, and forecast-depth degradation; institutional training-diversity and cross-site ensemble effects remain explicitly unidentified.
 
-### U9. Prototype and qualify the standalone site validator
+### U9. Build and qualify the standalone validator core
 
-**Goal:** Prove the install, governance, trust, and synthetic execution workflow before cross-site experiments depend on it.
+**Goal:** Prove schema-shared, offline, disclosure-controlled synthetic execution — the part U6/U7 actually depend on — without waiting on the release-trust machinery.
 
-**Requirements:** R5, R11, R12, R14, R15, R16
+**Requirements:** R5, R11, R12, R14, R16
 
 **Dependencies:** U5
 
+**Entry gate — do not start until all hold:**
+- U5 merged with no residual P0/P1 findings. U9 consumes U5's allow-listed result schema; building
+  it first would fork the schema into two implementations.
+- No real-training preconditions apply — U9 is synthetic-bundle-only and packages no trained weights.
+
+> **Split from the original U9 (decided 2026-08-28).** Release-trust machinery — wheelhouse, SBOM,
+> signing, out-of-band trust root, revocation, anti-rollback, platform qualification — moved to
+> **U11**, which gates only U10. U9 keeps what U6/U7 genuinely consume, so an approval delay on a
+> distribution package no longer stalls the experimental program.
+
 **Files:**
 - Create: `clif-validate/pyproject.toml`
-- Create: `clif-validate/src/clif_validate/`
-- Create: `clif-validate/tests/test_clean_install.py`
+- Create: `clif-validate/src/clif_validate/__init__.py`
+- Create: `clif-validate/src/clif_validate/bundle.py` (manifest parse, compatibility hashes)
+- Create: `clif-validate/src/clif_validate/inference.py` (offline CPU scoring)
+- Create: `clif-validate/src/clif_validate/report.py` (allow-listed schema emission)
+- Create: `clif-validate/src/clif_validate/cli.py`
 - Create: `clif-validate/tests/test_bundle_compatibility.py`
 - Create: `clif-validate/tests/test_disclosure.py`
-- Create: `clif-validate/uv.lock`
-- Create: `clif-validate/SBOM.json`
 - Modify: `website/docs/federated-validation.md`
-- Modify: `README.md`
 
 **Approach:**
 - Assemble a synthetic versioned bundle with checkpoint-pinned representation artifacts, outcome specification, target map, and compatibility hashes.
-- Produce a validator wheel, pinned CPU dependency lock, supported-platform wheelhouse, SBOM, and signed release manifest for offline, no-telemetry execution. Verify signatures against an out-of-band trust root and define revocation/anti-rollback behavior.
+- **State the sharing mechanism, or the fork happens anyway.** U9's entry gate exists to stop the result schema being implemented twice, and its integration test demands the standalone package and the in-repo evaluator produce equivalent aggregate results — but a wheel installed in a clean offline environment cannot `import src.eval`. `src/eval/metrics.py` and `src/eval/schema.py` are the single implementation, vendored into the wheel by a checked-in sync step whose hash is asserted by `clif-validate/tests/test_bundle_compatibility.py`, so the equivalence test compares one implementation running in two environments rather than two implementations agreeing by luck. (`src/eval/matrix.py` already asserts this intent in its docstring with no code path that makes it true.)
+- **Open release is a deliverable, not a side effect (decided 2026-08-28).** The package, its source, and its bundle-compatibility contract are published publicly with **no DUA and no per-site approval required to obtain them**. Trained-weight bundles remain governed and signed (U11/U10). This is the split that makes the differentiator against DUA-gated ICareFM real: anyone can inspect and run the validation tooling, which is a claim the project can actually keep. Reconcile U11's trust-root and revocation design against public availability of the package itself.
 - Classify raw inputs, episode artifacts, labels, predictions, caches, logs, checkpoints, weights, and aggregate outputs by storage, access, retention, exportability, and deletion requirements.
-- Obtain workflow approval before distributing a synthetic bundle; no trained-weight, model-update, or ensemble exchange is implied by prototype qualification.
-- Define and obtain a separate derived-model transfer approval for reusable development-site transport evaluation before U6/U7. If approval is absent, those units remain same-site studies and cannot use transport performance for selection.
-- Target Linux x86_64 with Python 3.11 as the initial offline platform. Carry signed minimum-version and revocation metadata through the same controlled offline channel and persist the trusted release state locally; other platforms require separate qualification.
+- **Define and obtain the derived-model transfer approval** for reusable development-site transport evaluation. This is a **U9 exit criterion**, not an Approach aspiration — U6 and U7 gate on it. If it is absent, U6/U7 run as same-site studies and transport performance cannot enter the selection rule.
 - Produce qualification and failure reports in the allow-listed schema without source paths, identifiers, or recoverable small cells.
 
 **Patterns to follow:**
 - Site-local execution and aggregate output intent in `src/eval/clif_validate.py`.
-- Package/dependency conventions in `pyproject.toml`, narrowed for the standalone artifact.
+- Fail-closed artifact verification in `src/data/value_stats.py`.
 
 **Test scenarios:**
-- Happy path: a clean CPU-only environment installs the package offline, validates a compatible bundle, and emits an aggregate report from synthetic CLIF fixtures.
+- Happy path: a clean CPU-only environment installs the package and emits an aggregate report from synthetic CLIF fixtures.
 - Edge case: an unsupported outcome or small subgroup is represented by a non-evaluable/suppressed status without complementary disclosure.
-- Error path: missing weights, incompatible artifact family, invalid signature, revoked/rolled-back version, hash mismatch, prohibited network access, or unexpected output field fails closed.
+- Error path: missing weights, incompatible artifact family, hash mismatch, prohibited network access, or unexpected output field fails closed.
 - Integration: the external package and in-repo evaluator produce equivalent aggregate results for the same synthetic fixture and frozen bundle.
 
 **Verification:**
-- A clean-machine qualification run requires no development-site assets, network access, training dependencies, or patient-level export.
-- Governance reviewers can audit a complete artifact lifecycle and bundle manifest before site distribution.
+- A clean-machine run requires no development-site assets, network access, training dependencies, or patient-level export.
+- The derived-model transfer approval is obtained and recorded, or its absence is recorded and U6/U7's same-site branch is the one that runs.
+- The package and bundle contract are publicly obtainable.
 
-### U10. Qualify and release the selected model bundle
+### U11. Qualify the release-trust and distribution machinery
 
-**Goal:** Package the selected frozen model only after experiment completion and pass the derived-artifact release gate before untouched external confirmation.
+**Goal:** Make signed, revocable, offline distribution auditable before any real bundle ships — without gating the experiments on it.
 
-**Requirements:** R5, R11, R12, R14, R15, R16
+**Requirements:** R5, R14, R15, R16
 
-**Dependencies:** U8, U9; adopted outputs from U6/U7.
+**Dependencies:** U9
+
+**Entry gate — do not start until all hold:**
+- U9 validator core qualified on a synthetic bundle.
+- Workflow approval obtained before distributing even a synthetic bundle.
+- No real-training preconditions apply; U11 packages no trained weights.
 
 **Files:**
-- Create: `clif-validate/tests/test_release_bundle.py`
-- Modify: `clif-validate/src/clif_validate/`
+- Create: `clif-validate/src/clif_validate/trust.py` (signature verification, trust root, revocation, anti-rollback state)
+- Create: `clif-validate/tests/test_clean_install.py`
+- Create: `clif-validate/uv.lock`
+- Create: `clif-validate/SBOM.json`
+- Create: `configs/trust_roles.yaml`
 - Modify: `website/docs/federated-validation.md`
 - Modify: `README.md`
 
 **Approach:**
-- Replace the synthetic bundle with the selected frozen model, trained heads, exact representation family, and frozen analysis/outcome manifests without altering the qualified runtime contract.
-- Run memorization, membership-inference, and extraction-risk tests with approved quantitative thresholds; minimize exported artifacts and require governance/reviewer sign-off.
-- Sign the complete release manifest and authenticate site-generated reports; maintain a cumulative disclosure ledger across model versions and aggregate releases.
-- Predeclare terminal pass/fail actions. A revised model reusing a prior confirmation site is labeled transport evaluation and requires a genuinely unused site or prospective cohort for a new confirmation claim.
-
-**Patterns to follow:**
-- Qualified packaging, compatibility, disclosure, and trust controls from U9.
+- Produce a validator wheel, pinned CPU dependency lock, supported-platform wheelhouse, SBOM, and signed release manifest for offline, no-telemetry execution. Verify signatures against an out-of-band trust root and define revocation/anti-rollback behavior.
+- **Own the releaser-to-site direction of the trust model (decided 2026-08-28).** Releaser, transfer-channel, and execution-host roles; release signing key custody, rotation, and revocation; unsealing authorization; separation of duties; compromise handling. The site-to-aggregator direction — report authentication and the tamper-evident access log — stays in U5, which builds the aggregate writer. Splitting by direction is what closes the gap where site reports were unauthenticated until U10.
+- Target Linux x86_64 with Python 3.11 as the initial offline platform. Carry signed minimum-version and revocation metadata through the same controlled offline channel and persist the trusted release state locally; other platforms require separate qualification.
+- Reconcile the signed, revocable distribution channel with U9's public package release: the *package* is open, the *bundles* are signed and governed.
 
 **Test scenarios:**
-- Happy path: the selected bundle reproduces in-repo synthetic results in a clean offline environment and emits an authenticated aggregate report.
-- Edge case: a new report is safe alone but would disclose a suppressed cell by differencing against prior releases, so cumulative disclosure review blocks it.
-- Error path: privacy-test threshold failure, absent governance signature, stale/revoked bundle, or altered analysis manifest blocks release.
+- Happy path: a clean CPU-only environment installs the package offline from the wheelhouse and validates a signed synthetic bundle.
+- Error path: invalid signature, revoked or rolled-back version, or an untrusted release root fails closed.
+- Error path: any network or telemetry attempt during validation fails closed.
 
 **Verification:**
-- External distribution occurs only after technical, privacy, clinical/statistical, and governance sign-off against the frozen model family and protocol.
-- Untouched confirmation results cannot be opened until the signed bundle and analysis version are final.
+- Governance reviewers can audit a complete artifact lifecycle and bundle manifest before site distribution.
+- Release-signing key custody, rotation, and revocation are documented and testable.
+
+### U12. Run the v0 real-site federation proof
+
+**Goal:** Produce the project's central evidence — that one small model travels to another hospital and returns disclosure-controlled aggregate metrics — before the expensive method arms, not after them.
+
+**Requirements:** R11, R12, R14, R15
+
+**Dependencies:** U9; U11 for the signed channel.
+
+**Entry gate — do not start until all hold:**
+- U9 and U11 complete.
+- One external CLIF consortium site recruited, DUA/IRB executed, and a site operator identified
+  (see the onboarding workstream in Dependencies).
+- **Governance approval for a pre-selection bundle.** This is the open risk: nobody has yet asked
+  whether site governance will accept a v0 bundle built on the U5-qualified baseline rather than a
+  post-selection release. Ask early — the answer determines whether this unit is possible at all.
+- Memorization, membership-inference, and extraction-risk thresholds approved and first test run
+  passed, since this is the first time PHI-derived weights leave an institution.
+
+> **Added 2026-08-28.** Without this unit, nine of ten units could complete with zero evidence for
+> "one small model, many hospitals," and a U8 futility stop would kill the federation result as
+> collateral. Freezing the U5-qualified baseline as bundle v0 converts the thesis from a promise
+> into an early result and makes U10 a rehearsed repeat rather than a first attempt.
+
+**Approach:**
+- Freeze the U5-qualified baseline as **bundle v0** — a real but explicitly non-final model, versioned and signed through U11's channel. v0 is a workflow and transportability probe, not a selection input: its results cannot drive U6/U7/U8 model selection, and saying so in the frozen protocol is what keeps the confirmation sites sealed.
+- Run end-to-end at the external site under existing disclosure controls: site operator installs, validates bundle compatibility, executes locally, returns only allow-listed aggregate artifacts, and appends to the cumulative disclosure ledger.
+- Report what the run proves and what it does not: install and governance workflow, artifact compatibility, disclosure control, and one site's transport performance for a non-final model. It is not a confirmation result.
+- Feed the coverage findings forward: if v0 surfaces real cross-site vocabulary coverage loss, U7 has a concrete decision to inform; if it does not, U7's premise is weakened (see U7's entry gate).
+
+**Test scenarios:**
+- Happy path: the external site returns a schema-valid aggregate artifact with no patient-level fields, no local paths, and a ledger entry.
+- Error path: a bundle/vocabulary/outcome-spec mismatch at the external site fails closed rather than producing metrics.
+- Edge case: outcomes unsupported at that site return explicit non-evaluable statuses rather than being silently omitted.
+
+**Verification:**
+- A site operator who is not a project member completes the run from published documentation alone.
+- The returned artifact passes the same disclosure tests as the synthetic case.
+- v0 results are recorded as workflow evidence and are excluded from every selection rule.
+
+---
+
+## Decisions Resolved 2026-08-28
+
+Ten questions raised by document review, settled in session. Recorded so the reasoning survives and
+so a later reader can tell what was chosen from what was merely inherited.
+
+| # | Question | Decision |
+|---|---|---|
+| 1 | Is real-site proof correctly placed behind U8? | **No.** New **U12** freezes the U5-qualified baseline as bundle v0 and runs it end-to-end at one real external site, before U6/U7. Open risk: governance has not been asked whether it will accept a pre-selection bundle. |
+| 2 | Should U9 gate U6/U7? | **Split U9.** U9 keeps the validator core (schema, synthetic execution, disclosure tests, transfer approval) and gates U6/U7/U12. New **U11** holds release-trust machinery and gates only U10. |
+| 3 | Does U10 belong in Implementation Units? | **No.** Moved to **Gated Milestones** under Scope Boundaries with entry criteria and a release contract; re-planned as its own document once selection completes. Keeps its U-ID and diagram node. |
+| 4 | Is the first-mover claim still live? | **No — retired.** The CLIF v3.0 window has passed. The contribution rests on CLIF-native execution, open tooling, and real-federation deployment. **Requires edits to `AGENTS.md` and `MEMORY.md`, which are outside this plan.** |
+| 5 | Who onboards external sites? | **A prerequisite workstream starting in parallel with U5** — see Dependencies. Owner still unnamed; that is the first thing to fix. |
+| 6 | Is `clif-validate` actually released openly? | **Open package, governed weights.** Package, source, and bundle-compatibility contract are public with no DUA or per-site approval; trained-weight bundles stay signed and governed. This is the differentiator the project can actually keep. |
+| 7 | Should U6 still test tied vs. untied? | **Yes, at full strength.** Scoping to a single confirmatory arm was considered and rejected: the locked-decisions rule is to measure rather than assert. L40 cost accepted. |
+| 8 | What decision does U7 change? | **Deferred behind U12's v0 result.** If v0 surfaces real cross-site coverage loss, U7 proceeds with a concrete decision to inform; if not, record that and drop the arm. Defers the mCIDE licensing dependency too. |
+| 9 | Can a single-anchor evaluation evidence the threshold-conditioned claim? | **No.** U8 gains a threshold-and-anchor generalization substudy at held-out thresholds and a second anchor, reported as a separate estimand — and it is the one substudy that is *not* independently stoppable. |
+| 10 | Where do the trust roles live? | **Split by direction.** Site→aggregator report authentication in U5 (which builds the writer); releaser→site distribution trust in U11. Closes the gap where site reports were unauthenticated until U10. |
+
+Still unanswered, and worth chasing early: whether site governance accepts a pre-selection v0 bundle
+(gates U12, and therefore U6/U7); who owns site onboarding; where release-signing keys live and who
+may invoke them; whether "transport" moves weights to data or data to weights; who operates the
+aggregator; and whether the disclosure ledger is per-site or global — a per-site ledger cannot
+detect cross-site differencing.
 
 ---
 
@@ -635,7 +962,10 @@ flowchart TB
 - External validation refuses incomplete artifacts and emits only allow-listed, disclosure-controlled aggregate results.
 - Each experiment comparison demonstrates that all non-target factors are held fixed or explicitly reports the mismatch.
 - Final reports include uncertainty and all predeclared outcomes/seeds, including failed or non-evaluable runs.
-- The operational prototype is exercised by an external-site operator on synthetic data before model selection; final confirmation covers at least two prespecified physiologic outcomes at one untouched external site, and any "multi-hospital" claim requires at least two independent external sites.
+- The `clif-validate` package, its source, and its bundle-compatibility contract are publicly obtainable with no DUA and no per-site approval. This is the stated differentiator against DUA-gated comparators; if it does not ship openly, the differentiator does not exist.
+- The v0 real-site federation proof (U12) completes at one external site before U6 launches, returning a schema-valid, disclosure-controlled aggregate artifact — and its results appear in no selection rule.
+- The threshold-and-anchor generalization substudy reports discrimination and calibration at held-out query thresholds and at least one non-hour-24 anchor. The threshold-conditioned novelty claim is gated on this result, not on hour-24 discrimination.
+- The operational prototype is exercised by an external-site operator on synthetic data before model selection. **Final confirmation covers at least two prespecified physiologic outcomes at one untouched external site — that is the minimum for a confirmation claim. A "multi-hospital" claim additionally requires at least two independent external sites, and the plan currently funds one; treat the multi-hospital claim as unfunded until a second confirmation site is onboarded.**
 - The selected model stays within the measured 2 x L40 training envelope and requires no local model fitting at confirmation sites.
 
 ---
@@ -644,15 +974,15 @@ flowchart TB
 
 ### Phase 1: Evidence-safe baseline
 
-Complete U1 through U5 and the U9 validator prototype. Do not launch expensive architecture or scaling runs until reference-site data QA, leakage/censoring tests, probability invariants, one-batch overfit, resume equivalence, real held-out inference, and synthetic external-operator qualification pass.
+Complete U1 through U5, the U9 validator core, U11's release-trust machinery, and the **U12 v0 real-site federation proof**. Do not launch expensive architecture or scaling runs until reference-site data QA, leakage/censoring tests, probability invariants, one-batch overfit, resume equivalence, real held-out inference, synthetic external-operator qualification, and the v0 run all pass. The thesis evidence lands in this phase, not the last one.
 
 ### Phase 2: Focused architecture and portability tests
 
-Run U6 and U7 from the same frozen cohort and evaluation contract. Use these results to select, not retroactively justify, a default representation and head topology; U5's frozen protocol governs both.
+Run U6 from the same frozen cohort and evaluation contract. U7 runs only if U12's v0 result surfaced real cross-site vocabulary coverage loss. Use these results to select, not retroactively justify, a default representation and head topology; U5's frozen protocol governs both.
 
 ### Phase 3: Scaling and forecasting evidence
 
-Run U8 only for configurations governed by U5's pre-experiment frozen protocol. After selection, lock the model and bundle versions without changing that protocol, then complete U10 before opening sealed external-confirmation results.
+Run U8 only for configurations governed by U5's pre-experiment frozen protocol; matrix contents are instantiated at the U6 exit review and logged as a protocol amendment. The threshold-and-anchor generalization substudy stops last. After selection, lock the model and bundle versions without changing that protocol, then re-plan and complete the U10 release milestone before opening sealed external-confirmation results.
 
 ---
 
@@ -670,13 +1000,59 @@ Run U8 only for configurations governed by U5's pre-experiment frozen protocol. 
 
 ## Dependencies / Prerequisites
 
-- Run `ce-data-qa` at the designated reference site before U1-U5 or model training. Gate each additional development or confirmation site's use on its own QA profile rather than blocking the baseline globally. Capture exact columns/types, episode grain, keys, timestamps/timezones, missingness, duplicates, ranges, units, prevalence, follow-up, and provenance.
 - Obtain and hash the actual CLIFATRON checkpoint, tokenizer/vocabulary, packed-sequence schema, and source training-site declaration.
 - Approve physiologic outcome definitions, censoring rules, first-episode policy, and small-cell disclosure threshold with clinical/statistical and site-governance reviewers.
 - Reserve immutable calibration, internal test, and untouched external confirmation partitions before exploratory comparisons.
 - Pin the tested PyTorch/CUDA environment from `uv.lock`; record any divergence between the declared `torch>=2.4` floor and the resolved training environment.
 - Acquire and approve the authoritative mCIDE description release, redistribution terms, mapping contract, and checksum before U7.
-- Resolve any GPU driver/NVML mismatch and verify `nvidia-smi`, two-rank NCCL, bf16, and telemetry before U4's L40 qualification.
+
+### External-site onboarding workstream (starts in parallel with U5)
+
+Decided 2026-08-28. The longest-lead item on the critical path, and until now owned by nobody. It
+costs no GPU time and gates U12, so it starts now rather than being discovered at release time.
+
+| Item | Completion artifact | Gates |
+|---|---|---|
+| Consortium site recruitment | At least one external CLIF site committed for the v0 run; a second identified for confirmation | U12 |
+| Per-site DUA / IRB execution | Executed agreement per site | U12 |
+| Site-operator identification | A named non-project person who will run the validator | U12, and U9's "operator completes the run from published documentation alone" verification |
+| Pre-selection bundle governance ruling | Written answer on whether a v0 (non-final) bundle may run at an external site | U12 entry gate — **ask first; a "no" changes the plan's shape** |
+| Derived-model transfer approval | Approval or recorded denial | U6, U7 |
+
+**Owner: unassigned.** Naming one is the first action item out of this plan; every row above is a
+calendar-time dependency that no amount of engineering throughput can compress.
+
+### Real-training preconditions (blocking)
+
+Referenced by the entry gates on U6, U7, and U8. **No real training run starts until every item
+holds.** These are blocking gates, not a checklist to work around — each one corresponds to a way a
+run can look successful while optimizing the wrong task.
+
+| # | Precondition | Why it blocks |
+|---|---|---|
+| P1 | `ce-data-qa` has profiled the site data — exact columns/types, episode grain, keys, timestamps/timezones, missingness, duplicates, ranges, units, prevalence, follow-up, provenance. Each additional development or confirmation site is gated on its own profile rather than blocking the baseline globally | Outcome prevalence, unit mapping, storetime field, and follow-up assumptions are unverified until it runs; every downstream label depends on them |
+| P2 | Value statistics generated and bound to the exact vocabulary hash | `src/train/pretrain.py` already fails closed without them; an unbound artifact silently mis-scales the value head |
+| P3 | Outcome artifacts exist and contain supervised TTE labels | Absent supervision makes TTE losses a no-op or false-negative signal rather than an error |
+| P4 | L40 driver/NVML status healthy — `nvidia-smi`, two-rank NCCL, bf16, telemetry verified | A driver mismatch surfaces as a silent throughput or precision problem mid-run |
+| P5 | One-batch overfit passes on the L40 box | Proves the loss actually drives the parameters it claims to |
+| P6 | Checkpoint/resume equivalence passes | Proves the ledger, RNG, and sampler state contracts from U4 hold in practice |
+| P7 | DDP smoke test passes | Proves the distributed path matches the single-device path before spending the matrix budget |
+
+U5 and U9 are exempt: U5 is data-free evaluation repair, and U9 is synthetic-bundle-only. Neither
+may produce real-data output during tests. U10 packages an already-trained selected model and
+starts no new training run, so P1-P7 do not re-apply to it; its own governance and privacy-threshold
+gates apply instead.
+
+### Per-unit review gates
+
+Every unit carries the same exit criteria, applied before it is considered done:
+
+- Focused unit tests pass.
+- Full data-free suite passes.
+- `git diff --check` passes.
+- Code review leaves no residual P0/P1 findings.
+- No real-data output is produced during tests.
+
 
 ---
 
@@ -701,6 +1077,15 @@ Run U8 only for configurations governed by U5's pre-experiment frozen protocol. 
 | Informative measurement makes unobserved physiology look event-free | High | High | Outcome-specific ascertainment rules, measurement-density diagnostics, and sensitivity analyses |
 | Repeated aggregate releases defeat small-cell suppression | Medium | High | Stable cohort rules, cumulative disclosure ledger, and cross-release differencing checks |
 | Logs or crash reports capture identifiers or rows | Medium | High | Allow-listed structured logging, sanitized exceptions, protected sinks, retention controls, and PHI-injection tests |
+| Calibration re-leaks after U5 because fitting on evaluated labels stays the default | Medium | High | Make the two-partition calibration call the only non-test path; add a test that fails if a production caller fits on its own test labels |
+| Silent cell dropping is mistaken for suppression, enabling complementary differencing | High | High | Report `small_cell_suppressed` as an explicit status and test that siblings plus total cannot recover a hidden cell |
+| U10 is executed as a task list before a model family is actually selected | Medium | High | Keep U10 a gated milestone; re-plan it only after U6/U7/U8 selection completes under the frozen rule |
+| Synthetic mCIDE descriptions leak into an evidence-producing U7 run | Medium | High | Mark fixture descriptions non-study, and gate the arm on an authoritative checksummed release |
+| A reported cell discloses through `n x prevalence` or its own DCA/calibration curves despite clearing the size threshold | High | High | Suppress on numerator as well as denominator, round exported prevalence, and set a curve-release minimum above the cell threshold |
+| A site's auto-derived labels are wrong and nothing in the aggregate payload can reveal it | High | High | Per-outcome label-validity block in the result schema (TRIPOD+AI participants/outcome/missing-data reporting); reject reports that omit it |
+| P5-P7 and the varlen path gate U6/U8 but no unit is chartered to build them | High | High | Named U2/U4 follow-up rows in Execution Status with explicit completion artifacts |
+| Weights cross an institutional boundary in U6 before memorization/extraction risk is measured | Medium | High | Move first memorization/MIA/extraction test and threshold approval to U6's entry gate; U10 re-runs against the selected bundle |
+| The frozen selection rule becomes unexecutable because the transfer approval is denied after the freeze | Medium | High | Freeze both branches (transport-primary conditional on approval, same-site-primary otherwise) |
 
 ---
 
@@ -724,6 +1109,8 @@ Run U8 only for configurations governed by U5's pre-experiment frozen protocol. 
 - `website/docs/objectives-training.md`
 - `website/docs/federated-validation.md`
 - `website/docs/ablations.md`
+- TRIPOD+AI (Collins GS, Moons KGM, Dhiman P, et al.), *BMJ* 2024;385:e078378 — https://doi.org/10.1136/bmj-2023-078378 (PMID 38626948). The 27-item checklist behind the label-validity reporting block required in U5's result schema.
+- scikit-learn probability calibration — https://scikit-learn.org/stable/modules/generated/sklearn.calibration.CalibratedClassifierCV.html. Source of U5's prefit-calibration reference shape (`FrozenEstimator` wrapping, `method="temperature"` from 1.8) and of the explicit caveat that keeping fitting and calibration data disjoint is the caller's responsibility.
 - SurvivEHR: https://doi.org/10.1038/s41746-026-02709-z
 - PORTER: https://arxiv.org/abs/2606.24102
 - Clin-JEPA: https://arxiv.org/abs/2605.10840

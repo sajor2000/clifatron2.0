@@ -26,12 +26,22 @@ full **TRIPOD+AI** calibration / decision-curve / fairness eval panel.
 
 **IS:** the first **open, CLIF-native** ICU foundation model with a **threshold-TTE objective**
 validated by **model-to-data across real CLIF-consortium hospitals**. Novelty = integration +
-CLIF-native first-mover + real-federation deployment.
+CLIF-native execution + real-federation deployment.
+
+> **First-mover framing retired 2026-08-28.** The ~July 2026 CLIF v3.0 multimodal window this
+> framing depended on has passed, so urgency is no longer an argument and no gate should be
+> justified by it. The *priority* claim above — first **open**, CLIF-native, threshold-TTE,
+> real-federation — stands on its own and is unaffected.
 
 **IS NOT:** a new method. The 2026 literature already owns every method piece — ORA
 (marked-TTE), ICareFM (threshold-directional dual-zero-shot, but on *ricu*, DUA-gated), SurvivEHR
 (competing-risk), Elemento (no-data-sharing ensembling). **Do not claim method invention.** The
 open, deployable, CLIF-native execution is the defensible contribution.
+
+**"Open" means: the package, its source, and its bundle-compatibility contract are publicly
+obtainable with no DUA and no per-site approval. Trained-weight bundles remain signed and governed.**
+That split is what keeps the ICareFM contrast honest — the tooling is inspectable and runnable by
+anyone, which is the claim the project can actually keep.
 
 The `clif-validate/` open shippable package is the headline artifact that distinguishes us from
 DUA-gated ICareFM — treat it as a deliverable, not plumbing.
