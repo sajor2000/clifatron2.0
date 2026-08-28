@@ -150,6 +150,14 @@ def _restore_rng_states(rng_states) -> None:
             torch.cuda.set_rng_state(torch.tensor(value, dtype=torch.uint8), local)
 
 
+def _scale_grads(model, denom: int) -> None:
+    if denom <= 1:
+        return
+    for param in model.parameters():
+        if param.grad is not None:
+            param.grad.div_(denom)
+
+
 def _train_one_epoch(
     model, dl, opt, scheduler, epoch, tcfg: TrainConfig, dev, *, rank,
     max_updates: int | None = None,
@@ -166,15 +174,17 @@ def _train_one_epoch(
 
         with torch.autocast("cuda" if torch.cuda.is_available() else "cpu", dtype=torch.bfloat16):
             losses = model(batch)
-            loss = losses["total"] / tcfg.grad_accum
+            loss = losses["total"]
 
         loss.backward()
         micro += 1
         samples_seen += batch["input_ids"].size(0)
-        tokens_seen += (batch.get("attention_mask", batch["input_ids"] > 0).sum().item())
-        ntp_tokens += (batch.get("ntp_mask", 0).sum().item()) if "ntp_mask" in batch else tokens_seen
+        batch_tokens = int(batch.get("attention_mask", batch["input_ids"] > 0).sum().item())
+        tokens_seen += batch_tokens
+        ntp_tokens += int(batch["ntp_mask"].sum().item()) if "ntp_mask" in batch else batch_tokens
 
         if micro % tcfg.grad_accum == 0:
+            _scale_grads(model, tcfg.grad_accum)
             if tcfg.grad_clip:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), tcfg.grad_clip)
             opt.step()
@@ -187,6 +197,8 @@ def _train_one_epoch(
 
     # Final partial accumulation
     if micro % tcfg.grad_accum != 0 and (max_updates is None or updates < max_updates):
+        partial = micro % tcfg.grad_accum
+        _scale_grads(model, partial)
         if tcfg.grad_clip:
             torch.nn.utils.clip_grad_norm_(model.parameters(), tcfg.grad_clip)
         opt.step()
@@ -225,7 +237,10 @@ def train(model, train_dl, val_dl, opt, scheduler, tcfg: TrainConfig, dev, *,
 
     tcfg.ckpt_dir.mkdir(parents=True, exist_ok=True)
 
-    total_sm, total_tok, total_ntp = 0, 0, 0
+    previous_ledger = loaded.get("manifest", {}).get("ledger", {}) if resume_ckpt is not None else {}
+    total_sm = int(previous_ledger.get("samples_seen", 0))
+    total_tok = int(previous_ledger.get("tokens_seen", 0))
+    total_ntp = int(previous_ledger.get("ntp_eligible_tokens", 0))
     global_step = start_step
     next_val_step = ((global_step // tcfg.val_every) + 1) * tcfg.val_every
     next_ckpt_step = ((global_step // tcfg.ckpt_every) + 1) * tcfg.ckpt_every
@@ -283,6 +298,7 @@ def train(model, train_dl, val_dl, opt, scheduler, tcfg: TrainConfig, dev, *,
             while next_ckpt_step <= global_step:
                 next_ckpt_step += tcfg.ckpt_every
 
+    manifest.record_ledger(total_sm, total_tok, total_ntp, global_step)
     return model, manifest
 
 

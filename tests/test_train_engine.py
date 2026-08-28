@@ -85,6 +85,59 @@ class TestTrainingEngine(unittest.TestCase):
         self.assertEqual(sm, 5, "all 5 samples should be counted")
         self.assertEqual(updates, 2, "one full and one partial accumulation should step")
 
+    def test_missing_ntp_mask_counts_batch_tokens_not_cumulative_tokens(self):
+        class TokenDS(torch.utils.data.Dataset):
+            def __len__(self):
+                return 2
+            def __getitem__(self, i):
+                return {"input_ids": torch.ones(3, dtype=torch.long), "attention_mask": torch.ones(3)}
+
+        dl = torch.utils.data.DataLoader(TokenDS(), batch_size=1, shuffle=False)
+        model = TinyModel()
+        opt = torch.optim.SGD(model.parameters(), lr=0.01)
+        scheduler = torch.optim.lr_scheduler.StepLR(opt, 1000)
+        _, _, tokens, ntp_tokens, _ = _train_one_epoch(
+            model, dl, opt, scheduler, 0, self.tcfg, self.dev, rank=0
+        )
+        self.assertEqual(tokens, 6)
+        self.assertEqual(ntp_tokens, 6)
+
+    def test_partial_accumulation_uses_actual_microbatch_count(self):
+        class ConstantLossModel(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.w = torch.nn.Parameter(torch.tensor(1.0))
+            def forward(self, batch):
+                loss = self.w * batch["input_ids"].float().mean()
+                return {"total": loss}
+
+        class TwoMicrobatchDS(torch.utils.data.Dataset):
+            def __len__(self):
+                return 2
+            def __getitem__(self, i):
+                return {"input_ids": torch.ones(1, dtype=torch.long), "attention_mask": torch.ones(1)}
+
+        cfg = TrainConfig({}, {
+            "batch": {"per_gpu": 1, "grad_accum": 4},
+            "runtime": {"ckpt_dir": tempfile.mkdtemp(), "ckpt_every": 99},
+            "schedule": {"warmup_steps": 1, "total_steps": 1},
+            "optimizer": {"grad_clip": None},
+        }, {"compile": False}, total_steps=1)
+        model = ConstantLossModel()
+        opt = torch.optim.SGD(model.parameters(), lr=1.0)
+        scheduler = torch.optim.lr_scheduler.StepLR(opt, 1000)
+        _train_one_epoch(
+            model,
+            torch.utils.data.DataLoader(TwoMicrobatchDS(), batch_size=1, shuffle=False),
+            opt,
+            scheduler,
+            0,
+            cfg,
+            self.dev,
+            rank=0,
+        )
+        self.assertAlmostEqual(float(model.w.detach()), 0.0, places=5)
+
     def test_train_one_epoch_stops_at_max_updates(self):
         class ManyBatchDS(torch.utils.data.Dataset):
             def __len__(self):
@@ -296,6 +349,44 @@ class TestTrainingEngine(unittest.TestCase):
         }, {"compile": False}, total_steps=1)
         train(model, dl, None, opt, scheduler, cfg, self.dev)
         self.assertEqual(ds.epoch, 0)
+
+    def test_resume_carries_forward_manifest_ledger_counters(self):
+        class OneBatchDS(torch.utils.data.Dataset):
+            def __len__(self):
+                return 1
+            def __getitem__(self, i):
+                return {"input_ids": torch.ones(2, dtype=torch.long), "attention_mask": torch.ones(2)}
+
+        from src.train.engine import train
+        ckpt_dir = Path(tempfile.mkdtemp())
+        model = TinyModel()
+        opt = torch.optim.SGD(model.parameters(), lr=0.01)
+        scheduler = torch.optim.lr_scheduler.StepLR(opt, 1000)
+        manifest = Manifest("test", {}, seed=42, ckpt_dir=str(ckpt_dir))
+        manifest.record_ledger(samples=10, tokens=20, ntp_tokens=12, optimizer_step=3)
+        ckpt = ckpt_dir / "resume.pt"
+        save_checkpoint(ckpt, model=model, optimizer=opt, scheduler=scheduler, epoch=3, step=3, manifest=manifest)
+
+        cfg = TrainConfig({}, {
+            "batch": {"per_gpu": 1, "grad_accum": 1},
+            "runtime": {"ckpt_dir": str(ckpt_dir), "ckpt_every": 99},
+            "schedule": {"warmup_steps": 1, "total_steps": 4},
+            "optimizer": {"grad_clip": 1.0},
+        }, {"compile": False}, total_steps=4)
+        resumed_model = TinyModel()
+        resumed_opt = torch.optim.SGD(resumed_model.parameters(), lr=0.01)
+        resumed_scheduler = torch.optim.lr_scheduler.StepLR(resumed_opt, 1000)
+        _, resumed_manifest = train(
+            resumed_model,
+            torch.utils.data.DataLoader(OneBatchDS(), batch_size=1, shuffle=False),
+            None,
+            resumed_opt,
+            resumed_scheduler,
+            cfg,
+            self.dev,
+            resume_ckpt=ckpt,
+        )
+        self.assertGreaterEqual(resumed_manifest.ledger.get("samples_seen", 0), 10)
 
 
 if __name__ == "__main__":
