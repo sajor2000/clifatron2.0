@@ -112,6 +112,63 @@ clinical bins are NOT how you achieve it. CORRECTED tokenization decision:
    Compute = 3 tiers: MacBook (dev, MPS), 2× L40 Linux box (default training, DDP), and Azure hourly GPU
    (burst) — Azure ONLY inside a BAA/DUA-covered lab tenant (never an ad-hoc personal sub for real PHI).
 
+## LOCKED DECISIONS (2026-08-27, grounded in 2026 literature via Paperclip) — do not re-litigate
+These resolve every open design question as of this date. Change only with new evidence.
+
+**A. Novelty & positioning (LOCKED)**
+- A1. **Our novelty is CLIF-native + open-weights + real model-to-data federation — NOT a new method.**
+  The 2026 literature owns every *method* piece: ORA (arXiv:2602.00541) owns marked-TTE; ICareFM
+  (medRxiv 2025.07.25.25331635) owns threshold-directional dual-zero-shot BUT on **ricu, not CLIF**, and
+  its **weights are DUA-gated**; SurvivEHR owns competing-risk (UK primary care, not ICU); EveryQuery/ETHOS
+  own query-conditioned zero-shot; Elemento owns no-data-sharing ensembling (on MIMIC partitions, not real
+  hospitals). **Unclaimed = the first OPEN, CLIF-native ICU FM with a threshold-TTE objective validated by
+  model-to-data across REAL CLIF-consortium hospitals.** Novelty = integration + first-mover + deployment,
+  which is the stronger axis for a Nature-Medicine clinical framing. Do NOT claim method invention.
+- A2. The `clif-validate/` open shippable package is the deliverable that distinguishes us from DUA-gated
+  ICareFM — treat it as a headline artifact, not plumbing.
+
+**B. Backbone & pretraining (LOCKED)**
+- B1. Backbone = Qwen-family transformer; it is a **footnote, not novelty** (ORA: objective>backbone,
+  within-noise at ~30M/8k). Do not spend novelty budget here.
+- B2. **From-scratch path → Qwen3 architecture** (free QK-Norm training stability; `Qwen3Config`/`Qwen3ForCausalLM`
+  confirmed present in transformers 5.16.1). **Attach/wedge path → Qwen2** (must match CLIFATRON's checkpoint).
+  Keep a Qwen2-arch from-scratch arm too → "Qwen2 vs Qwen3" becomes one MEASURED ablation row, not an assertion.
+- B3/B4. **PRIMARY PAPER = from-scratch Qwen3-arch decoder + objective D (marked-TTE), ~30M, fully ours,
+  no upstream dependency.** Run it as a LADDER: (1) frozen-probe Method-3 wedge on a CLIFATRON Qwen2 ckpt
+  (cheap, de-risks the objective, first result) → (2) from-scratch Qwen3 pretrain (novel headline) →
+  (3) the two together ARE the finetune-vs-scratch ablation.
+
+**C. Size coherence (LOCKED)**
+- C1. Our own model genuinely targets **~30M** (d512×8L×8H ≈ 30–37M) — that is the compact/one-node thesis.
+  When we attach to CLIFATRON's **Qwen2-0.5B** for the wedge, state explicitly it is a LARGER comparator,
+  not our compact claim. Never imply the 0.5B is "our ~30M model." (Fixes the 16× coherence gap.)
+
+**D. Objective (LOCKED — where the novelty lives)**
+- D1. Loss weights CR 1.0 · threshold 1.0 · value 0.5 · NTP 0.2 (in code). D2. NTP→TTE curriculum
+  (15% warmup / 5% transition). D3. **BLOCKER: value-head loss is unnormalized (val≈46000 on real MIMIC) —
+  MUST add per-concept value scaling before any real pretraining run.**
+
+**E. Tokenization (LOCKED)**
+- E1. Fused `code=bin`, frozen population deciles, soft discretization, forced clinical-threshold edges,
+  storetime ordering, untied embeddings, 8192 context (settled; see reconciled RESEARCH.md/NEXT_STEPS.md §2).
+- E2. **TextCode / language-grounded arm ELEVATED from future-work to a real transfer-robustness arm.**
+  PORTER (arXiv:2606.24102, 2026): frozen-vocab models drop ~69% of events on cross-site transfer;
+  language-grounded recovers 97.1% AUROC without vocab mapping. Frozen mCIDE stays PRIMARY (turnkey, matches
+  CLIFATRON); TextCode is the ablation that shows whether language-grounding buys cross-site robustness — the
+  one 2026 result that helps OUR federation metric.
+
+**F. Federation (LOCKED)**
+- F1. Model-to-data, aggregate + subgroup metrics only, nothing raw leaves a node (settled).
+- F2. "Label-free" refers to the MODEL only — evaluation auto-derives ground-truth labels locally; those
+  derived labels are a **validity dependency** (noisy phenotypes, vary by site coding) — audit + report
+  each outcome's label definition and provenance per site.
+- F3. **Add a small-cell suppression rule** (e.g. suppress subgroup metrics with n<10) before shipping.
+
+**G. Practical blockers (not design decisions — must clear before real runs)**
+- G1. Locate a CLIFATRON checkpoint (needed for the Method-3 wedge). G2. Rush + UChicago data not staged
+  on the L40 box (only MIMIC: 546,028 stays / ~134M events) — the 3-site claim needs them. G3. Verify
+  `head_adapter.anchor_state` against a real checkpoint on transformers v5 (output_hidden_states API drift).
+
 ## HANDOFF → notes/NEXT_STEPS.md (2026-08-27)
 Full agent-handoff written: finalized token+arch decisions (with the 2026 evidence tables + citations
 from research threads a76bb9/aeb4d2), ordered file-level next steps (config↔code reconcile → run Method-3
