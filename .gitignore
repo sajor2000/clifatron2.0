@@ -32,3 +32,8 @@ config/credentials.json
 .DS_Store
 .idea/
 .vscode/
+
+# local tooling / binaries (per-machine, do not commit)
+.agents/
+bin/
+docusaurus-dev.log
