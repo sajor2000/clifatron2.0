@@ -311,16 +311,28 @@ def check_cross_release_differencing(payload: dict, ledger_path: str | Path) -> 
     if not prior:
         return
 
-    # Only CONFIRMED releases count. An entry whose artifact never became visible cannot
-    # have been differenced against, and treating it as a prior release would strand the
-    # release id after a transient failure (Greptile PR #4, round 3).
+    # Two DIFFERENT questions, and round 3 wrongly answered both with "confirmed only"
+    # (Greptile PR #4, round 4):
+    #
+    #   "may this release id be reused?"      -> only a CONFIRMED release blocks, so a
+    #                                            crashed attempt stays retryable
+    #   "might this cell already be public?"  -> an UNCONFIRMED entry must still count,
+    #                                            because the crash window sits between
+    #                                            publication and confirmation. During it
+    #                                            the artifact is visible while its record
+    #                                            is unconfirmed, and ignoring it let a
+    #                                            later report release a cell that was
+    #                                            already published as suppressed.
+    #
+    # Conflating them inverted the fail-safe direction: it turned a blocked release into a
+    # possible disclosure. Differencing now assumes an unconfirmed entry MIGHT be public.
     live = confirmed_releases(ledger_path)
     prior_by_cell: dict[str, dict] = {}
     for e in prior:
-        if "confirm_release_id" in e or e.get("release_id") not in live:
+        if "confirm_release_id" in e:
             continue
-        prior_by_cell[e["cell"]] = e
-    seen_releases = set(live)
+        prior_by_cell[e["cell"]] = e          # confirmed or not -- assume it may be public
+    seen_releases = set(live)                 # replay gate: confirmed only
 
     current = ledger_entries(payload)
 

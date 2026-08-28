@@ -212,11 +212,34 @@ class DisclosureLedgerTest(unittest.TestCase):
             # Same release id retries cleanly.
             A.check_cross_release_differencing(attempt, ledger)
 
-            # And the unconfirmed cell does not gate a later, different release.
+            # But it DOES still protect the cell: the crash window sits between
+            # publication and confirmation, so an unconfirmed entry might already be
+            # public and must be assumed so (Greptile PR #4, round 4).
             later = _report(version="v1", release="rel-B")
             later["outcomes"]["map_below_65_48h"]["subgroups"] = {
                 "sex": {"M": {"status": S.EVALUABLE, "n": 60}}}
-            A.check_cross_release_differencing(later, ledger)
+            with self.assertRaises(DisclosureError):
+                A.check_cross_release_differencing(later, ledger)
+
+    def test_retryability_and_cell_protection_are_separate_questions(self):
+        """Round 3 answered both with "confirmed only", which inverted the fail-safe
+        direction: a blocked release became a possible disclosure."""
+        with tempfile.TemporaryDirectory() as td:
+            ledger = Path(td) / "ledger.jsonl"
+            attempt = _report(release="rel-A")
+            attempt["outcomes"]["map_below_65_48h"]["subgroups"] = {
+                "sex": {"M": {"status": S.INSUFFICIENT_N, "n": 4}}}
+            A.append_to_ledger(attempt, ledger)      # published, then crashed
+
+            # Retry of the SAME release id: allowed.
+            A.check_cross_release_differencing(attempt, ledger)
+
+            # A DIFFERENT release un-suppressing that cell: refused.
+            other = _report(release="rel-B")
+            other["outcomes"]["map_below_65_48h"]["subgroups"] = {
+                "sex": {"M": {"status": S.EVALUABLE, "n": 60}}}
+            with self.assertRaises(DisclosureError):
+                A.check_cross_release_differencing(other, ledger)
 
     def test_reconcile_names_published_but_unconfirmed_releases(self):
         """The one remaining crash window is recoverable rather than silent."""
