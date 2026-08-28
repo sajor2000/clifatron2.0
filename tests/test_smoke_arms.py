@@ -202,6 +202,16 @@ def _read_shards():
 
 
 def _make_batch(shards: list, vocab_size: int):
+    from src.data.targets import TargetBuilder
+
+    builder = TargetBuilder(
+        vocab_size=vocab_size,
+        n_time_bins=48,
+        horizon_hours=48,
+        value_stats={},
+        run_seed=42,
+    )
+
     max_len = max(s["n_events"] for s in shards)
 
     token = torch.zeros((len(shards), max_len), dtype=torch.long)
@@ -210,6 +220,19 @@ def _make_batch(shards: list, vocab_size: int):
     pos_min = torch.zeros((len(shards), max_len), dtype=torch.long)
     val = torch.zeros((len(shards), max_len))
     val_mask = torch.zeros((len(shards), max_len))
+    ntp_target = torch.zeros((len(shards), max_len), dtype=torch.long)
+    ntp_mask = torch.zeros((len(shards), max_len), dtype=torch.bool)
+    value_target = torch.zeros((len(shards), max_len))
+    value_mask_t = torch.zeros((len(shards), max_len), dtype=torch.bool)
+
+    n_targets = 10
+    th_target = torch.zeros(len(shards), dtype=torch.long)
+    th_tau = torch.zeros(len(shards), dtype=torch.long)
+    th_dir = torch.zeros(len(shards), dtype=torch.long)
+    th_crossed = torch.zeros(len(shards), dtype=torch.long)
+    cr_type = torch.zeros(len(shards), dtype=torch.long)
+    cr_bin = torch.zeros(len(shards), dtype=torch.long)
+    last_idx = torch.zeros(len(shards), dtype=torch.long)
 
     for i, s in enumerate(shards):
         n = s["n_events"]
@@ -224,7 +247,50 @@ def _make_batch(shards: list, vocab_size: int):
         val[i, :n] = torch.tensor(np.nan_to_num(_val))
         val_mask[i, :n] = torch.tensor(mask.astype(float))
 
-    n_targets = 10
+        episode = {
+            "episode_key": f"smoke-stay-{i}",
+            "token": [int(v) for v in s["token"][:n]],
+            "pos_min": [int(v) for v in s["pos_min"][:n]],
+            "value": _val.tolist(),
+            "target_eligible": [True] * n,
+            "anchor_idx": n - 1,
+            "anchor_min": n,
+            "outcomes": [
+                {
+                    "target_idx": 0,
+                    "status": "censored",
+                    "time_from_anchor_hours": 48.0,
+                    "threshold_bin": 2,
+                    "direction": "below",
+                }
+            ],
+        }
+        built = builder.build(episode)
+        ntp_target[i, :n] = torch.tensor(built["ntp_target"], dtype=torch.long)
+        ntp_mask[i, :n] = torch.tensor(built["ntp_mask"], dtype=torch.bool)
+        value_target[i, :n] = torch.tensor(built["value_target"])
+        value_mask_t[i, :n] = torch.tensor(built["value_mask"], dtype=torch.bool)
+        for label in built["outcome_labels"]:
+            if label["tte_mask"]:
+                cr_type[i] = label["event_cause"]
+                cr_bin[i] = (
+                    label["observed_bins"] if label.get("censored", False)
+                    else label["event_bin"]
+                )
+                break
+        query = built["threshold_query"]
+        if query is not None:
+            th_target[i] = query["target_idx"]
+            th_tau[i] = query["threshold_bin"]
+            th_dir[i] = query["direction"]
+            th_crossed[i] = query["threshold_crossed_bin"]
+        else:
+            th_target[i] = 0
+            th_tau[i] = 2
+            th_dir[i] = 0
+            th_crossed[i] = -1
+        last_idx[i] = n - 1
+
     batch = {
         "token": token,
         "soft_token": soft_token,
@@ -232,17 +298,17 @@ def _make_batch(shards: list, vocab_size: int):
         "pos_min": pos_min,
         "value": val,
         "val_mask": val_mask,
-        "last_idx": torch.tensor([s["n_events"] - 1 for s in shards]),
-        "cr_type": torch.randint(0, n_targets, (len(shards),)),
-        "cr_bin": torch.randint(0, 16, (len(shards),)),
-        "th_target": torch.randint(0, n_targets, (len(shards),)),
-        "th_tau": torch.randint(1, 10, (len(shards),)),
-        "th_dir": torch.randint(0, 2, (len(shards),)),
-        "th_crossed": torch.where(
-            torch.rand(len(shards)) > 0.7,
-            torch.randint(1, 48, (len(shards),)),
-            -torch.ones(len(shards), dtype=torch.long),
-        ),
+        "ntp_target": ntp_target,
+        "ntp_mask": ntp_mask,
+        "value_target": value_target,
+        "value_mask": value_mask_t,
+        "last_idx": last_idx,
+        "cr_type": cr_type,
+        "cr_bin": cr_bin,
+        "th_target": th_target,
+        "th_tau": th_tau,
+        "th_dir": th_dir,
+        "th_crossed": th_crossed,
     }
     return batch
 

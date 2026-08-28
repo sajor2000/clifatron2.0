@@ -20,6 +20,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 from pathlib import Path
 
@@ -28,7 +29,64 @@ import numpy as np
 import polars as pl
 import yaml
 
+from src.data.cohort import (
+    QualificationError,
+    validate_artifact_destination,
+    validate_episode_artifact,
+)
+from src.data.splits import fit_partition
+
 SPECIAL = {"<pad>": 0, "<bos>": 1, "<eos>": 2}
+ROOT = Path(__file__).parents[2]
+
+
+def _json_sha256(value: object) -> str:
+    payload = json.dumps(value, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(payload.encode()).hexdigest()
+
+
+def validate_vocabulary_artifact(
+    blob: dict,
+    cfg: dict,
+    policy: dict,
+    *,
+    expected_family: str = "experimental_representation",
+) -> tuple[dict, dict, dict]:
+    """Validate imported vocabulary content and its original compatibility record."""
+    if not isinstance(blob.get("vocab"), dict) or not isinstance(blob.get("edges"), dict):
+        raise QualificationError("vocabulary artifact must contain vocab and edges mappings")
+    manifest = blob.get("manifest")
+    if not isinstance(manifest, dict):
+        raise QualificationError("vocabulary artifact is missing its manifest")
+    if manifest.get("artifact_family") != expected_family:
+        raise QualificationError("incompatible vocabulary artifact family")
+    if manifest.get("clif_version") != cfg["schema_version"]:
+        raise QualificationError("vocabulary CLIF version is incompatible")
+    if manifest.get("mcide_version") != cfg["mcide_version"]:
+        raise QualificationError("vocabulary mCIDE version is incompatible")
+    family = policy.get("compatibility_manifests", {}).get(expected_family)
+    if family is None:
+        raise QualificationError("artifact policy does not define the vocabulary family")
+    hashes = manifest.get("hashes")
+    if not isinstance(hashes, dict):
+        raise QualificationError("vocabulary manifest is missing compatibility hashes")
+    missing = sorted(set(family["required_hashes"]) - set(hashes))
+    if missing:
+        raise QualificationError(f"vocabulary manifest is missing hashes: {', '.join(missing)}")
+    if any(not isinstance(value, str) or len(value) != 64 for value in hashes.values()):
+        raise QualificationError("vocabulary manifest contains an invalid SHA-256 hash")
+    if hashes["vocabulary"] != _json_sha256(blob["vocab"]):
+        raise QualificationError("vocabulary hash mismatch")
+    if hashes["numeric_edges"] != _json_sha256(blob["edges"]):
+        raise QualificationError("numeric-edge hash mismatch")
+    if hashes["clif_version"] != _json_sha256(cfg["schema_version"]):
+        raise QualificationError("CLIF-version compatibility hash mismatch")
+    if hashes.get("target_map") != _json_sha256(cfg["target_concepts"]):
+        raise QualificationError("target-map compatibility hash mismatch")
+    cohort_cfg = yaml.safe_load((ROOT / cfg["cohort_contract"]).read_text())
+    if hashes.get("outcome_spec") != _json_sha256(cohort_cfg["outcomes"]):
+        raise QualificationError("outcome-spec compatibility hash mismatch")
+    return blob["vocab"], blob["edges"], manifest
 
 
 def _read_table(con, base: Path, spec: dict,
@@ -43,11 +101,11 @@ def _read_table(con, base: Path, spec: dict,
         print(f"  [skip] {fp.name} not found")
         return pl.DataFrame(
             schema={
-                "hosp_id": pl.Utf8,
-                "dttm": pl.Datetime,
-                "concept": pl.Utf8,
+                "hosp_id": pl.String,
+                "dttm": pl.Datetime("us", "UTC"),
+                "concept": pl.String,
                 "value": pl.Float64,
-                "unit": pl.Utf8,
+                "unit": pl.String,
             }
         )
     val = spec.get("value_col")
@@ -92,6 +150,55 @@ def validate_units(events: pl.DataFrame, cfg: dict) -> None:
         return
 
 
+def restrict_to_observation_window(
+    events: pl.DataFrame,
+    episodes: pl.DataFrame,
+    treatment_sources: set[str] | None = None,
+) -> pl.DataFrame:
+    """Join canonical episodes and retain only anchor-available ICU events."""
+    validate_episode_artifact(episodes)
+    if events.schema.get("hosp_id") != pl.String:
+        raise QualificationError("events.hosp_id must be a string identifier")
+    if events["hosp_id"].has_nulls():
+        raise QualificationError("events.hosp_id contains null identifiers")
+    for frame, name, column in [
+        (events, "events", "dttm"),
+        (episodes, "episodes", "icu_admit_dttm"),
+        (episodes, "episodes", "anchor_dttm"),
+    ]:
+        dtype = frame.schema[column]
+        if not isinstance(dtype, pl.Datetime) or dtype.time_zone != "UTC":
+            raise QualificationError(f"{name}.{column} must be timezone-aware UTC")
+
+    observed = (
+        events.join(
+            episodes.select(
+                "hospitalization_id",
+                "icu_admit_dttm",
+                "anchor_dttm",
+                "eligible",
+                "partition",
+            ),
+            left_on="hosp_id",
+            right_on="hospitalization_id",
+            how="inner",
+        )
+        .filter(
+            pl.col("eligible")
+            & (pl.col("dttm") >= pl.col("icu_admit_dttm"))
+            & (pl.col("dttm") <= pl.col("anchor_dttm"))
+        )
+        .with_columns(
+            (
+                (pl.col("dttm") - pl.col("icu_admit_dttm")).dt.total_minutes()
+            ).cast(pl.Int64).alias("pos_min"),
+            (~pl.col("source").is_in(sorted(treatment_sources or set())))
+            .alias("target_eligible"),
+        )
+    )
+    return observed
+
+
 def build_value_bins(events: pl.DataFrame, n_bins: int,
                      forced_edges: dict[str, list[float]] | None = None) -> dict[str, list[float]]:
     """Per-concept quantile edges with clinical cutpoints replacing nearest edges.
@@ -112,13 +219,12 @@ def build_value_bins(events: pl.DataFrame, n_bins: int,
             raise ValueError(f"{concept} contains non-finite values; filter before binning")
 
         qs = np.linspace(0, 1, n_bins + 1)[1:-1]
-        concept_edges = sorted(set(float(vals.quantile(q)) for q in qs))
-        lo, hi = float(vals.min()), float(vals.max())
+        concept_edges = sorted({float(vals.quantile(q)) for q in qs})
 
-        pinned = sorted(set(
+        pinned = sorted({
             float(edge) for edge in forced_edges.get(concept, [])
             if np.isfinite(float(edge))
-        ))
+        })
         if len(pinned) > n_bins - 1:
             raise ValueError(
                 f"{concept} has {len(pinned)} forced edges but only {n_bins - 1} boundaries"
@@ -210,7 +316,7 @@ def _soft_bins(value: float | None, concept: str, edges: dict[str, list[float]],
 
     width = 2 * half + 1
     padded_bins = [hard_bin] * width
-    padded_weights = [1.0] + [0.0] * (width - 1)
+    padded_weights = [0.0] * width
     for idx, weight in zip(candidates, weights):
         slot = int(idx) - (hard_bin - half)
         if 0 <= slot < width:
@@ -235,8 +341,18 @@ def _check_single_hospital(con, base: Path) -> None:
 
 
 def tokenize_site(cfg: dict, site: str, base: Path, out: Path,
-                  vocab: dict | None, edges: dict | None,
-                  limit_stays: int | None = None):
+                   vocab: dict | None, edges: dict | None,
+                   limit_stays: int | None = None,
+                   episodes: pl.DataFrame | None = None,
+                   vocab_manifest: dict | None = None,
+                   artifact_policy: dict | None = None):
+    policy = artifact_policy or yaml.safe_load((ROOT / cfg["artifact_policy"]).read_text())
+    events_path = out / "events.parquet"
+    validate_artifact_destination(events_path, "patient_level_phi", policy)
+    if vocab is not None:
+        vocab, edges, vocab_manifest = validate_vocabulary_artifact(
+            {"vocab": vocab, "edges": edges, "manifest": vocab_manifest}, cfg, policy
+        )
     con = duckdb.connect()
     keep_ids = None
     if limit_stays is not None:
@@ -256,8 +372,17 @@ def tokenize_site(cfg: dict, site: str, base: Path, out: Path,
         if len(df):
             df = df.with_columns(source=pl.lit(name))
             frames.append(df)
+    if not frames:
+        raise QualificationError("no configured CLIF event tables were found")
     events = pl.concat(frames, how="vertical_relaxed").sort(["hosp_id", "dttm"])
     validate_units(events, cfg)
+
+    if episodes is None:
+        raise QualificationError("a canonical episode/split artifact is required")
+    treatment_sources = {
+        name for name, spec in cfg["tables"].items() if spec.get("input_only")
+    }
+    events = restrict_to_observation_window(events, episodes, treatment_sources)
 
     # Guard: verify single-hospital consistency for reference-site vocab.
     # hospital_id is a CLIF 2.1 column that distinguishes hospitals within
@@ -275,18 +400,46 @@ def tokenize_site(cfg: dict, site: str, base: Path, out: Path,
                 f"Only {build_from!r} may build the frozen vocabulary."
             )
         bin_cfg = cfg["value_binning"]
-        edges = build_value_bins(events, bin_cfg["n_bins"], bin_cfg.get("forced_edges"))
-        vocab = build_vocab(events, edges)
+        fit_events = fit_partition(events, bin_cfg.get("fit_partition", "train"))
+        edges = build_value_bins(fit_events, bin_cfg["n_bins"], bin_cfg.get("forced_edges"))
+        vocab = build_vocab(fit_events, edges)
+        cohort_cfg = yaml.safe_load((ROOT / cfg["cohort_contract"]).read_text())
+        split_hashes = episodes["split_sha256"].drop_nulls().unique().to_list()
+        if len(split_hashes) != 1:
+            raise QualificationError("episode artifact must contain one split hash")
+        hashes = {
+            "training_split": split_hashes[0],
+            "vocabulary": _json_sha256(vocab),
+            "numeric_edges": _json_sha256(edges),
+            "target_map": _json_sha256(cfg["target_concepts"]),
+            "outcome_spec": _json_sha256(cohort_cfg["outcomes"]),
+            "clif_version": _json_sha256(cfg["schema_version"]),
+        }
+        vocab_manifest = {
+            "artifact_family": "experimental_representation",
+            "clif_version": cfg["schema_version"],
+            "mcide_version": cfg["mcide_version"],
+            "hashes": hashes,
+            "provenance": {
+                "source_site": site,
+                "fit_partition": cfg["value_binning"].get("fit_partition", "train"),
+                "cohort_contract_version": episodes["cohort_contract_version"].item(0),
+            },
+        }
         print(f"  built vocab: {len(vocab):,} tokens, {len(edges):,} numeric concepts")
+    elif vocab_manifest is None:
+        raise QualificationError("an imported vocabulary requires a validated manifest")
 
-    # map each event to (fused token, admission-relative minutes, raw value)
+    # Map each event using positions derived from canonical ICU admission.
     def encode(group: pl.DataFrame) -> pl.DataFrame:
-        dt = group["dttm"].to_numpy()
-        pos_min = (dt - dt[0]).astype("timedelta64[s]").astype(np.int64) // 60  # since admission
         token, soft_token, soft_weight, valnum = [], [], [], []
         bin_cfg = cfg["value_binning"]
         for c, v in zip(group["concept"], group["value"]):
             v_for_bin = float(v) if v is not None and np.isfinite(v) else None
+            if v_for_bin is None and c in edges:
+                # Missing numeric measurements are not physiologic low-bin events.
+                # They are skipped rather than converted to bin 0.
+                continue
             b = _bin_of(v_for_bin, c, edges)
             if b is None:
                 key = fused_token(c, None)
@@ -321,19 +474,23 @@ def tokenize_site(cfg: dict, site: str, base: Path, out: Path,
             "token": [token],
             "soft_token": [soft_token],
             "soft_weight": [soft_weight],
-            "pos_min": [pos_min.tolist()],
+            "pos_min": [group["pos_min"].to_list()],
             "value": [valnum],
+            "target_eligible": [group["target_eligible"].to_list()],
+            "partition": group["partition"][0],
             "n_events": len(token),
         })
 
     shards = events.group_by("hosp_id", maintain_order=True).map_groups(encode)
     out.mkdir(parents=True, exist_ok=True)
-    shards.write_parquet(out / "events.parquet")
+    shards.write_parquet(events_path)
     # DATA-CLASSIFICATION: PHI — contains hosp_id + per-stay token sequences + timing.
     # Do not export off-node. For external validation, use clif_validate.py which
     # returns only aggregate metrics. See NEXT_STEPS.md §6 rule 4.
     if edges is not None:
-        (out / "vocab.json").write_text(json.dumps({"vocab": vocab, "edges": edges}))
+        (out / "vocab.json").write_text(
+            json.dumps({"vocab": vocab, "edges": edges, "manifest": vocab_manifest})
+        )
     print(f"  wrote {out/'events.parquet'} ({len(shards):,} stays)")
     return vocab, edges
 
@@ -346,14 +503,17 @@ def main():
     ap.add_argument("--config", default="configs/data.yaml")
     ap.add_argument("--build-vocab", action="store_true")
     ap.add_argument("--vocab", help="path to an existing vocab.json to reuse")
+    ap.add_argument("--episodes", required=True,
+                    help="canonical local episode/split parquet from configs/cohort.yaml")
     ap.add_argument("--dry-run", action="store_true")
     args = ap.parse_args()
 
     cfg = yaml.safe_load(Path(args.config).read_text())
-    vocab, edges = None, None
+    policy = yaml.safe_load((ROOT / cfg["artifact_policy"]).read_text())
+    vocab, edges, vocab_manifest = None, None, None
     if args.vocab:
         blob = json.loads(Path(args.vocab).read_text())
-        vocab, edges = blob["vocab"], blob["edges"]
+        vocab, edges, vocab_manifest = validate_vocabulary_artifact(blob, cfg, policy)
     elif not args.build_vocab:
         raise SystemExit("pass --build-vocab (first site) or --vocab PATH (later sites)")
 
@@ -364,7 +524,18 @@ def main():
             print(f"{name}: {len(df):,} events, concepts={df['concept'].n_unique() if len(df) else 0}")
         return
 
-    tokenize_site(cfg, args.site, Path(args.indir), Path(args.out), vocab, edges)
+    episodes = pl.read_parquet(args.episodes)
+    tokenize_site(
+        cfg,
+        args.site,
+        Path(args.indir),
+        Path(args.out),
+        vocab,
+        edges,
+        episodes=episodes,
+        vocab_manifest=vocab_manifest,
+        artifact_policy=policy,
+    )
 
 
 if __name__ == "__main__":

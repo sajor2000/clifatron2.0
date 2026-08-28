@@ -4,12 +4,10 @@
 # treatments are INPUTS ONLY (never targets) -> see notes/METHODS.md rule 1.
 
 schema_version: "2.1.0"
-
-anchor:
-  # cohort anchor = first ICU admission; obs window then prediction window
-  icu_location_category: "icu"          # clif_adt.location_category
-  obs_hours: 24                          # features/context up to hour 24
-  horizon_hours: 48                      # ICareFM uses 48h hazard horizon
+mcide_version: "2.1.0"
+cohort_contract: "configs/cohort.yaml"
+artifact_policy: "configs/artifact_policy.yaml"
+episode_artifact: "output/intermediate_phi/episodes.parquet"
 
 tables:
   vitals:
@@ -28,6 +26,7 @@ tables:
     availability_col: "recorded_dttm"
     concept_col: "device_category"       # imv, nippv, high_flow, ...
     value_col: null                      # categorical event
+    input_only: true
   meds:                                   # INPUT ONLY (not a target)
     file: "clif_medication_admin_continuous"
     availability_col: "admin_dttm"
@@ -40,6 +39,7 @@ tables:
     availability_col: "in_dttm"
     concept_col: "location_category"
     value_col: null
+    input_only: true
 
 # Target measurement concepts (K hazard heads, ICareFM-style). Treatments excluded.
 target_concepts:
@@ -79,6 +79,7 @@ value_binning:
   scheme: "decile"                        # {decile | clinical_segment(CLIFATRON ablation arm) | continuous_fused(McCann ablation)}
   n_bins: 10                              # per-concept deciles -> fused value-bin tokens
   build_from_site: "mimic"                # freeze bin EDGES on reference site, apply identically to all sites
+  fit_partition: "train"                  # never fit vocabulary/edges on validation, calibration, or test
   # SOFT DISCRETIZATION (Lee's one encoder that WINS on the dangerous tails we care about: severe
   # hypokalemia/hypernatremia/hypotension/CRRT/K-extremes). Spread mass to adjacent bins. This is how
   # we honor "most sensitive where it's most dangerous for the patient" WITHOUT hard clinical bins.

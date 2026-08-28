@@ -24,18 +24,38 @@ runtime:
   ckpt_dir: "checkpoints"
   # trunk saved separately from heads so probes/finetune reuse it
 
+data_contract:
+  cohort: "configs/cohort.yaml"
+  artifact_policy: "configs/artifact_policy.yaml"
+  split_seed: 42
+  partitions:
+    train: 0.60
+    validation: 0.15
+    calibration: 0.10
+    internal_test: 0.15
+  required_partitions: [train, validation, calibration, internal_test]
+  artifact_fit_partition: train
+  sealed_partitions: [internal_test, external_confirmation]
+  sealed_access_log: "output/intermediate_phi/sealed_access.parquet"
+  role_permissions:
+    train: [fit_model, fit_vocabulary, fit_numeric_edges, fit_target_map]
+    validation: [model_selection]
+    calibration: [fit_calibration]
+    internal_test: [final_evaluation_once_frozen]
+    transport: [development_site_evaluation]
+    external_confirmation: [confirmation_once_frozen]
+  site_roles:
+    development: [mimic, rush, uchicago]
+    external_confirmation: []
+  compatibility_families: [clifatron_checkpoint, experimental_representation]
+
 finetune:
   freeze_trunk: true
   tasks:                # K supervised task heads (all CLIF-derivable)
-    - in_hospital_mortality
-    - new_imv_24h
-    - new_vasopressor_24h
-    - aki_kdigo_48h
-    - new_rrt_48h
-    - sepsis_48h
-    - resp_failure_48h
-  zero_shot_holdout:    # answered via threshold_hazard head, NO trained head
-    - delirium
+    - map_below_65_48h
+    - lactate_above_4_48h
+    - spo2_below_88_48h
+  zero_shot_holdout: []
   lr: 1.0e-3
   epochs: 20
 

@@ -1,24 +1,20 @@
-"""Smoke test for clif-validate/ federation package on MPS.
+"""Synthetic smoke tests for the site-local validation surfaces.
 
-Tests the auto-labeler on real CLIF data, the forest-plot generator,
+Tests the auto-labeler on synthetic CLIF data, the forest-plot generator,
 and validates that aggregate-only output contains no raw patient rows.
 """
 
 import json
-import os
 import tempfile
 import unittest
+from datetime import UTC, datetime
 from pathlib import Path
 
-# CLIF source parquet lives per-machine (git-ignored); override with CLIF_DATA_DIR.
-CLIF_DATA = Path(
-    os.environ.get("CLIF_DATA_DIR", "~/Data/clif-source")
-).expanduser().resolve()
-CLIF_AVAILABLE = CLIF_DATA.is_dir() and any(CLIF_DATA.glob("*.parquet"))
-_SKIP_REASON = (
-    f"CLIF source parquet not found at {CLIF_DATA} "
-    "(set CLIF_DATA_DIR to a directory of CLIF 2.1 *.parquet to enable)"
-)
+import polars as pl
+
+from src.data.cohort import build_cohort
+from src.data.splits import content_manifest
+from src.eval.clif_auto_labeler import auto_label
 
 
 class ClifValidateSmokeTest(unittest.TestCase):
@@ -31,21 +27,67 @@ class ClifValidateSmokeTest(unittest.TestCase):
     def tearDownClass(cls):
         cls.tmp.cleanup()
 
-    @unittest.skipUnless(CLIF_AVAILABLE, _SKIP_REASON)
-    def test_01_auto_labeler_runs_on_real_clif_data(self):
-        """Auto-labeler produces a labels.parquet with expected columns."""
-        from src.eval.clif_auto_labeler import auto_label
-        import polars as pl
+    def test_01_auto_labeler_preserves_unsupported_state(self):
+        """A missing synthetic outcome table is unsupported, never negative."""
+        base = self.out / "synthetic_clif"
+        base.mkdir()
+        start = datetime(2026, 1, 1, tzinfo=UTC)
+        pl.DataFrame(
+            {
+                "hospitalization_id": ["synthetic-stay"],
+                "patient_id": ["synthetic-patient"],
+                "hospitalization_joined_id": ["synthetic-chain"],
+                "admission_dttm": [start],
+                "discharge_dttm": [datetime(2026, 1, 5, tzinfo=UTC)],
+                "age_at_admission": [50],
+                "discharge_category": ["Home"],
+                "hospital_id": ["synthetic-site"],
+            }
+        ).write_parquet(base / "clif_hospitalization.parquet")
+        pl.DataFrame(
+            {
+                "hospitalization_id": ["synthetic-stay"],
+                "in_dttm": [start],
+                "out_dttm": [datetime(2026, 1, 4, tzinfo=UTC)],
+                "location_category": ["icu"],
+            }
+        ).write_parquet(base / "clif_adt.parquet")
 
-        labels = auto_label(str(CLIF_DATA), [
-            "in_hospital_mortality",
-            "new_vasopressor_24h",
-        ])
+        hospitalization = pl.read_parquet(base / "clif_hospitalization.parquet")
+        adt = pl.read_parquet(base / "clif_adt.parquet")
+        config = {
+            "anchor_hours": 24,
+            "prediction_horizon_hours": 48,
+            "minimum_age": 18,
+            "icu_location_category": "icu",
+        }
+        episodes = build_cohort(hospitalization, adt, config).with_columns(
+            pl.lit("train").alias("partition"),
+        )
+        split_hash = content_manifest(
+            episodes, columns=["hospitalization_id", "patient_id", "partition"]
+        )["sha256"]
+        episode_hash = content_manifest(
+            episodes, columns=["hospitalization_id", "patient_id", "eligible", "partition"]
+        )["sha256"]
+        episodes = episodes.with_columns(
+            pl.lit("1.0.0").alias("cohort_contract_version"),
+            pl.lit(split_hash).alias("split_sha256"),
+            pl.lit(episode_hash).alias("episode_sha256"),
+            pl.lit("{}").alias("source_provenance_json"),
+        )
+        episode_path = base / "episodes.parquet"
+        episodes.write_parquet(episode_path)
+        (base / "clif_hospitalization.parquet").unlink()
+        (base / "clif_adt.parquet").unlink()
+
+        labels = auto_label(str(base), episode_path, ["map_below_65_48h"])
 
         self.assertIn("hospitalization_id", labels.columns)
-        self.assertIn("in_hospital_mortality", labels.columns)
-        self.assertIn("new_vasopressor_24h", labels.columns)
-        self.assertGreater(len(labels), 0)
+        self.assertIn("map_below_65_48h_status", labels.columns)
+        self.assertEqual(labels["partition"].item(), "train")
+        self.assertEqual(labels["map_below_65_48h_status"].item(), "unsupported_at_site")
+        self.assertIsNone(labels["map_below_65_48h"].item())
 
         lbl_path = self.out / "test_labels.parquet"
         labels.write_parquet(lbl_path)
@@ -53,18 +95,10 @@ class ClifValidateSmokeTest(unittest.TestCase):
         reloaded = pl.read_parquet(lbl_path)
         self.assertEqual(len(reloaded), len(labels))
 
-        print(f"  labeled {len(labels):,} stays")
-        for col in labels.columns:
-            if col != "hospitalization_id":
-                try:
-                    n = labels[col].sum()
-                    print(f"    {col}: {n:,} positive ({n/len(labels)*100:.1f}%)")
-                except Exception:
-                    print(f"    {col}: non-numeric column")
 
     def test_02_forest_plot_generates_on_synthetic_sites(self):
         """Forest-plot data is valid JSON with expected structure."""
-        from src.eval.clif_forest_plot import load_site_results, forest_plot_data
+        from src.eval.clif_forest_plot import forest_plot_data
 
         results = [
             {
