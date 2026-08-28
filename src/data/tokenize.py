@@ -31,8 +31,13 @@ import yaml
 SPECIAL = {"<pad>": 0, "<bos>": 1, "<eos>": 2}
 
 
-def _read_table(con, base: Path, spec: dict) -> pl.DataFrame:
-    """Melt one CLIF table to long events ordered by its availability timestamp."""
+def _read_table(con, base: Path, spec: dict,
+                keep_ids: list | None = None) -> pl.DataFrame:
+    """Melt one CLIF table to long events ordered by its availability timestamp.
+
+    If `keep_ids` is given, only rows for those hospitalization_ids are read
+    (pushed into the SQL WHERE so the 45M+ row tables are filtered on scan, not
+    after loading). Used to tokenize a small sample fast for smoke tests / dev."""
     fp = base / f"{spec['file']}.parquet"
     if not fp.exists():
         print(f"  [skip] {fp.name} not found")
@@ -50,6 +55,10 @@ def _read_table(con, base: Path, spec: dict) -> pl.DataFrame:
     unit = spec.get("unit_col")
     unit_sql = f"CAST({unit} AS VARCHAR)" if unit else "CAST('' AS VARCHAR)"
     time_col = spec["availability_col"]
+    id_filter = ""
+    if keep_ids is not None:
+        id_list = ", ".join(f"'{i}'" for i in keep_ids)
+        id_filter = f"AND CAST(hospitalization_id AS VARCHAR) IN ({id_list})"
     q = f"""
         SELECT hospitalization_id       AS hosp_id,
                {time_col}                AS dttm,
@@ -59,6 +68,7 @@ def _read_table(con, base: Path, spec: dict) -> pl.DataFrame:
         FROM read_parquet('{fp}')
         WHERE {spec['concept_col']} IS NOT NULL
           AND {time_col} IS NOT NULL
+          {id_filter}
     """
     return con.execute(q).pl()
 
@@ -162,13 +172,23 @@ def _soft_bins(value: float | None, concept: str, edges: dict[str, list[float]],
                kernel_bins: int) -> list[tuple[int | None, float]]:
     """Return fixed-width (2*kernel_bins+1) assignments so every event produces
     a uniform-length list for the [B,T,K] dense tensor the encoder expects."""
+    fixed_width = 2 * max(kernel_bins, 0) + 1
+
+    def _uniform(bin_idx, w=1.0):
+        """Pad a single assignment to `fixed_width` so every event yields a
+        uniform-length list for the [B,T,K] dense tensor the encoder expects.
+        Non-numeric events (hard_bin is None) and edgeless concepts land here."""
+        bins = [bin_idx] * fixed_width
+        weights = [w] + [0.0] * (fixed_width - 1)
+        return list(zip(bins, weights))
+
     hard_bin = _bin_of(value, concept, edges)
     if hard_bin is None or kernel_bins <= 0:
-        return [(hard_bin, 1.0)]
+        return _uniform(hard_bin)
 
     boundaries = edges[concept]
     if len(boundaries) < 2:
-        return [(hard_bin, 1.0)]
+        return _uniform(hard_bin)
 
     lower = boundaries[hard_bin - 1] if hard_bin else None
     upper = boundaries[hard_bin] if hard_bin < len(boundaries) else None
@@ -215,11 +235,24 @@ def _check_single_hospital(con, base: Path) -> None:
 
 
 def tokenize_site(cfg: dict, site: str, base: Path, out: Path,
-                  vocab: dict | None, edges: dict | None):
+                  vocab: dict | None, edges: dict | None,
+                  limit_stays: int | None = None):
     con = duckdb.connect()
+    keep_ids = None
+    if limit_stays is not None:
+        hosp_spec = cfg["tables"].get("adt") or next(iter(cfg["tables"].values()))
+        hosp_fp = base / f"{hosp_spec['file']}.parquet"
+        keep_ids = [
+            str(r[0]) for r in con.execute(
+                "SELECT DISTINCT hospitalization_id "
+                f"FROM read_parquet('{hosp_fp}') "
+                f"WHERE hospitalization_id IS NOT NULL LIMIT {int(limit_stays)}"
+            ).fetchall()
+        ]
+        print(f"  limiting to {len(keep_ids):,} stays (sample mode)")
     frames = []
     for name, spec in cfg["tables"].items():
-        df = _read_table(con, base, spec)
+        df = _read_table(con, base, spec, keep_ids=keep_ids)
         if len(df):
             df = df.with_columns(source=pl.lit(name))
             frames.append(df)

@@ -70,7 +70,7 @@ class SmokeTest(unittest.TestCase):
         from src.data.tokenize import tokenize_site
 
         tokenize_site(cls.cfg, "mimic", CLIF_DATA, cls.out_dir,
-                      vocab=None, edges=None)
+                      vocab=None, edges=None, limit_stays=N_STAYS * 3)
 
         blob = json.loads((cls.out_dir / "vocab.json").read_text())
         cls.vocab = blob["vocab"]
