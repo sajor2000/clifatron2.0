@@ -430,6 +430,19 @@ def confirmed_releases(ledger_path: str | Path) -> set:
             if "confirm_release_id" in e}
 
 
+def unconfirmed_releases(ledger_path: str | Path) -> set:
+    """Release ids recorded as intent but never confirmed as published.
+
+    Each is either a crashed attempt that never published (inert) or one that published
+    and crashed before confirming (needs confirming). The ledger alone cannot tell them
+    apart -- that requires knowing what is actually visible -- which is why
+    `write_export` refuses to proceed until a caller classifies them.
+    """
+    recorded = {e.get("release_id") for e in read_ledger(ledger_path)
+                if "confirm_release_id" not in e and e.get("release_id")}
+    return recorded - confirmed_releases(ledger_path)
+
+
 def reconcile_ledger(ledger_path: str | Path, published_release_ids: set) -> list[str]:
     """Release ids that were published but never confirmed, and need a confirmation.
 
@@ -461,6 +474,7 @@ def append_to_ledger(payload: dict, ledger_path: str | Path) -> None:
 
 __all__ = [
     "AuthenticationError", "confirm_publication", "confirmed_releases", "reconcile_ledger",
+    "unconfirmed_releases",
     "canonical_bytes", "sign_report", "verify_report",
     "record_access", "verify_access_log",
     "ledger_entries", "read_ledger", "check_cross_release_differencing", "append_to_ledger",

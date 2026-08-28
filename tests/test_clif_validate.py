@@ -616,6 +616,45 @@ class ReleaseBoundaryTest(unittest.TestCase):
             write_export(self._payload(), self.out / "r.json", self.out / "ledger.jsonl")
         self.assertTrue(synced, "ledger append must reach stable storage before publishing")
 
+    def test_export_refuses_to_run_with_unclassified_residue(self):
+        """Greptile PR #4 follow-up: reconciliation was documented, not enforced. A
+        docstring saying an operator "should" reconcile is not a control."""
+        from src.eval.clif_validate import write_export
+        from src.eval.schema import DisclosureError
+        ledger = self.out / "ledger.jsonl"
+
+        # An earlier attempt crashed after recording intent.
+        from src.eval.attestation import append_to_ledger
+        append_to_ledger(self._payload(release="rel-old"), ledger)
+
+        with self.assertRaises(DisclosureError) as ctx:
+            write_export(self._payload(release="rel-new"), self.out / "r.json", ledger)
+        self.assertIn("rel-old", str(ctx.exception))
+
+    def test_published_but_unconfirmed_residue_must_be_confirmed_first(self):
+        from src.eval.clif_validate import write_export
+        from src.eval.schema import DisclosureError
+        from src.eval.attestation import append_to_ledger
+        ledger = self.out / "ledger.jsonl"
+        append_to_ledger(self._payload(release="rel-old"), ledger)
+
+        # The operator reports rel-old IS visible -> it must be confirmed, not ignored.
+        with self.assertRaises(DisclosureError) as ctx:
+            write_export(self._payload(release="rel-new"), self.out / "r.json", ledger,
+                         published_release_ids={"rel-old"})
+        self.assertIn("published but unconfirmed", str(ctx.exception))
+
+    def test_genuinely_unpublished_residue_is_inert(self):
+        from src.eval.attestation import append_to_ledger
+        from src.eval.clif_validate import write_export
+        ledger = self.out / "ledger.jsonl"
+        append_to_ledger(self._payload(release="rel-old"), ledger)
+
+        # rel-old never became visible -> inert, export proceeds.
+        written = write_export(self._payload(release="rel-new"), self.out / "r.json",
+                               ledger, published_release_ids=set())
+        self.assertTrue(written.exists())
+
     def test_replayed_release_id_is_rejected(self):
         """#13: a replayed report would be counted as another site."""
         from src.eval.clif_validate import write_export

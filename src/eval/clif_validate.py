@@ -371,7 +371,8 @@ def build_export(outcomes: dict, provenance: dict, *, site_id: str, site_role: s
     return payload
 
 
-def write_export(payload: dict, out_path: str | Path, ledger_path: str | Path) -> Path:
+def write_export(payload: dict, out_path: str | Path, ledger_path: str | Path,
+                 published_release_ids: set | None = None) -> Path:
     """Check, write, then record. Refuses to release a draft.
 
     **A draft is not a release (U5 review #16).** `build_export` produces
@@ -397,6 +398,30 @@ def write_export(payload: dict, out_path: str | Path, ledger_path: str | Path) -
     an entry for something unpublished, which over-records: it can only block a future
     release, never permit a disclosure. Both failure directions are conservative.
     """
+    # Reconciliation is ENFORCED, not documented (Greptile PR #4, follow-up on #6).
+    # A crash between publication and confirmation leaves a visible artifact whose ledger
+    # record is unconfirmed. Saying in a docstring that an operator "should" reconcile
+    # before the next export is not a control: nothing stopped the next export from
+    # running against an incomplete history. This gate does.
+    residue = _attest.unconfirmed_releases(ledger_path) - {payload.get("release_id")}
+    if residue:
+        if published_release_ids is None:
+            raise _schema.DisclosureError(
+                f"the ledger holds unconfirmed releases {sorted(residue)} from an earlier "
+                "attempt. Each either published and needs confirming, or never published "
+                "and is inert -- and this process cannot tell which. Pass "
+                "published_release_ids={...} listing what is actually visible on the "
+                "export volume so the residue can be classified."
+            )
+        unresolved = _attest.reconcile_ledger(ledger_path, published_release_ids)
+        if unresolved:
+            raise _schema.DisclosureError(
+                f"releases {unresolved} are published but unconfirmed. Confirm them with "
+                "attestation.confirm_publication before exporting again -- until then the "
+                "next release would be checked against a history missing artifacts that "
+                "are already visible."
+            )
+
     status = payload.get("disclosure_status")
     if status not in _schema.RELEASABLE_DISCLOSURE_STATUSES:
         raise _schema.DisclosureError(
