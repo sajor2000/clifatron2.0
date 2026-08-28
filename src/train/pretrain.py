@@ -183,7 +183,15 @@ def main():
     if is_main:
         print(f"params: {count_params(model)/1e6:.1f}M")
 
-    value_stats = _load_value_stats(args.value_stats)
+    # Bind value-stats to the data's vocabulary so a stale / cross-vocabulary stats
+    # file is rejected rather than silently applying unrelated centers/scales.
+    expected_vocab_hash = None
+    vocab_path = Path(args.data) / "vocab.json"
+    if vocab_path.exists():
+        from src.data.value_stats import vocab_hash
+        vblob = json.loads(vocab_path.read_text())
+        expected_vocab_hash = vocab_hash(vblob.get("vocab", vblob))
+    value_stats = _load_value_stats(args.value_stats, expected_vocab_hash=expected_vocab_hash)
     data_path = Path(args.data) / "events.parquet"
     records = _load_decile_records(data_path, drop_values_without_stats=args.dry_run and not value_stats)
     if not args.dry_run and not value_stats and _has_numeric_values(records):
