@@ -192,7 +192,8 @@ def transportability_matrix(states: dict, labels: dict, groups: dict, partitions
         cal_mask = _role_mask(partitions[s], "calibration")
         if method == "probe" and cal_mask.sum() > 0 and len(np.unique(labels[s][cal_mask])) > 1:
             cal_logits = predictors[s](states[s][cal_mask])
-            calibrations[s] = M.fit_temperature(cal_logits, labels[s][cal_mask])
+            calibrations[s] = M.fit_temperature(cal_logits, labels[s][cal_mask],
+                                               partition=f"{s}:calibration")
 
     matrix, probs_on = {}, {t: {} for t in sites}
     for tr in sites:
@@ -224,7 +225,8 @@ def transportability_matrix(states: dict, labels: dict, groups: dict, partitions
                 logits = raw
                 p = 1.0 / (1.0 + np.exp(-raw))
                 cell = M.full_panel(p, y_te, logits=logits,
-                                    temperature=calibrations.get(tr))
+                                    temperature=calibrations.get(tr),
+                                    partition=f"{te}:test")
             else:
                 p = raw
                 cell = M.full_panel(p, y_te)

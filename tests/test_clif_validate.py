@@ -542,6 +542,39 @@ class ReleaseBoundaryTest(unittest.TestCase):
         self.assertEqual(len(read_ledger(ledger)), 1)
         self.assertFalse(list(self.out.glob("*.partial")), "temp file must be renamed away")
 
+    def test_a_failed_ledger_append_leaves_nothing_published(self):
+        """Greptile PR #4: rename-then-append could publish a report the ledger never
+        recorded, so a later differencing check would miss a real prior release."""
+        from unittest import mock
+
+        from src.eval.clif_validate import write_export
+        out = self.out / "r.json"
+        with mock.patch("src.eval.attestation.append_to_ledger",
+                        side_effect=OSError("ledger volume full")):
+            with self.assertRaises(OSError):
+                write_export(self._payload(), out, self.out / "ledger.jsonl")
+        self.assertFalse(out.exists(), "a report the ledger never recorded must not publish")
+        self.assertFalse(list(self.out.glob("*.partial")), "temp file must be cleaned up")
+
+    def test_ledger_entry_precedes_publication(self):
+        """The artifact becomes visible only after its ledger record exists."""
+        from unittest import mock
+
+        from src.eval.attestation import append_to_ledger as real_append
+        from src.eval.clif_validate import write_export
+        out = self.out / "r.json"
+        seen = {}
+
+        def spy(payload, ledger_path):
+            seen["published_at_append_time"] = out.exists()
+            return real_append(payload, ledger_path)
+
+        with mock.patch("src.eval.attestation.append_to_ledger", side_effect=spy):
+            write_export(self._payload(), out, self.out / "ledger.jsonl")
+        self.assertFalse(seen["published_at_append_time"],
+                         "artifact was visible before the ledger recorded it")
+        self.assertTrue(out.exists())
+
     def test_replayed_release_id_is_rejected(self):
         """#13: a replayed report would be counted as another site."""
         from src.eval.clif_validate import write_export

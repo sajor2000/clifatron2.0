@@ -97,6 +97,31 @@ class CalibrationPartitionTest(unittest.TestCase):
             M.full_panel(M._sigmoid(logits), y, logits=logits, temperature=leaked)
         self.assertIn("disjoint", str(ctx.exception))
 
+    def test_disjoint_rows_sharing_values_are_not_falsely_rejected(self):
+        """Greptile PR #4. `_clamp_saturated_logits` maps every saturated logit to the
+        SAME bound, so two confident predictions sharing a label collide by construction
+        -- and a single collision used to reject a genuinely disjoint split."""
+        cal_logits = np.array([np.inf, np.inf, -np.inf, 0.3, 0.7, -0.2])
+        cal_y = np.array([1, 1, 0, 1, 0, 1])
+        test_logits = np.array([np.inf, -np.inf, 0.9, -0.9])
+        test_y = np.array([1, 0, 1, 0])
+        cal = M.fit_temperature(cal_logits, cal_y)
+        M.full_panel(M._sigmoid(test_logits), test_y, logits=test_logits, temperature=cal)
+
+    def test_declared_partitions_are_the_exact_check(self):
+        """Naming the partition removes the heuristic entirely: no false positives,
+        no false negatives."""
+        logits, y = _separable(n=200, seed=21)
+        cal = M.fit_temperature(logits, y, partition="SITE-01:calibration")
+        with self.assertRaises(ValueError) as ctx:
+            M.full_panel(M._sigmoid(logits), y, logits=logits, temperature=cal,
+                         partition="SITE-01:calibration")
+        self.assertIn("SITE-01:calibration", str(ctx.exception))
+        # A different partition is accepted even though the ROWS are identical --
+        # the declaration is authoritative over the values.
+        M.full_panel(M._sigmoid(logits), y, logits=logits, temperature=cal,
+                     partition="SITE-01:test")
+
     def test_calibrator_applies_cleanly_to_disjoint_rows(self):
         logits, y = _separable(n=800, seed=10)
         cal = M.fit_temperature(logits[:400], y[:400])

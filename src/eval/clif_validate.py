@@ -379,8 +379,23 @@ def write_export(payload: dict, out_path: str | Path, ledger_path: str | Path) -
     crossed without a recorded disclosure decision. The status was previously written to
     disk verbatim, which made it decorative.
 
-    **Write before ledger (U5 review #17).** The differencing check still reads the
-    ledger first, but the artifact is durably in place before the ledger records it.
+    **Ordering (U5 review #17, then Greptile PR #4).** Three steps, and the order is the
+    whole point:
+
+        1. write the payload to a `.partial` path -- durable, but NOT the artifact
+        2. append to the ledger
+        3. atomically rename `.partial` into place -- this is what publishes it
+
+    The original order appended to the ledger first, so a failed write left a phantom
+    release blocking the next genuine one. Simply inverting that traded the phantom for
+    its mirror: rename-then-append can publish a report the ledger never records, and a
+    later differencing check would then miss a real prior release -- the exact failure
+    the ledger exists to prevent.
+
+    Writing to a side path first gets both. If the ledger append fails, the artifact was
+    never published and the temp file is removed. If the rename fails, the ledger holds
+    an entry for something unpublished, which over-records: it can only block a future
+    release, never permit a disclosure. Both failure directions are conservative.
     """
     status = payload.get("disclosure_status")
     if status not in _schema.RELEASABLE_DISCLOSURE_STATUSES:
@@ -392,17 +407,22 @@ def write_export(payload: dict, out_path: str | Path, ledger_path: str | Path) -
 
     _attest.check_cross_release_differencing(payload, ledger_path)
 
-    # Write the artifact FIRST, via a temp file and an atomic rename (U5 review #17).
-    # Appending to the ledger first meant a failed write left the ledger claiming a
-    # release that never happened -- and the next genuine release of that cell was then
-    # blocked on a phantom prior one.
     out = Path(out_path)
     out.parent.mkdir(parents=True, exist_ok=True)
     tmp = out.with_suffix(out.suffix + ".partial")
-    tmp.write_text(json.dumps(payload, indent=2, sort_keys=True, allow_nan=False))
-    tmp.replace(out)
 
-    _attest.append_to_ledger(payload, ledger_path)
+    # 1. Durable, but not yet the artifact. Nothing reads a .partial path.
+    tmp.write_text(json.dumps(payload, indent=2, sort_keys=True, allow_nan=False))
+
+    # 2. Record it. If this raises, the release never becomes visible.
+    try:
+        _attest.append_to_ledger(payload, ledger_path)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
+
+    # 3. Publish. Atomic, so no reader ever sees a partial artifact.
+    tmp.replace(out)
     return out
 
 
