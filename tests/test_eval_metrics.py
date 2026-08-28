@@ -44,7 +44,7 @@ class CalibrationPartitionTest(unittest.TestCase):
         """Calibration is fitted on one partition and applied to another. The signature
         itself is the control: there is no way to call it with a single array."""
         cal_logits, cal_y = _separable(seed=1)
-        cal = M.fit_temperature(cal_logits, cal_y)
+        cal = M.fit_temperature(cal_logits, cal_y, partition="S:calibration")
         self.assertIsInstance(cal, M.Calibrator)
         self.assertGreater(float(cal), 0.0)
 
@@ -53,9 +53,10 @@ class CalibrationPartitionTest(unittest.TestCase):
         cal_logits, cal_y = logits[:400], y[:400]
         test_logits, test_y = logits[400:], y[400:]
 
-        T = M.fit_temperature(cal_logits, cal_y)
+        T = M.fit_temperature(cal_logits, cal_y, partition="S:calibration")
         uncal = M.full_panel(M._sigmoid(test_logits), test_y, logits=test_logits)
-        cal = M.full_panel(M._sigmoid(test_logits), test_y, logits=test_logits, temperature=T)
+        cal = M.full_panel(M._sigmoid(test_logits), test_y, logits=test_logits,
+                           temperature=T, partition="S:test")
 
         self.assertEqual(cal["temperature"], float(T))
         self.assertAlmostEqual(uncal["auroc"], cal["auroc"], places=10,
@@ -87,49 +88,73 @@ class CalibrationPartitionTest(unittest.TestCase):
             M.full_panel(M._sigmoid(logits), y, logits=logits, temperature=1.5,
                          unsafe_fit_on_eval_labels=True)
 
-    def test_calibrator_refuses_to_be_applied_to_the_rows_it_was_fitted_on(self):
+    def test_calibrator_refuses_to_be_applied_to_its_own_partition(self):
         """Review finding #19. Inverting the default made the leak inconvenient, not
-        impossible: a caller could fit on the test rows and pass the scalar straight
-        back. The calibrator now carries the identity of the rows it saw."""
+        impossible: a caller could fit on the test rows and pass the scalar straight back."""
         logits, y = _separable(n=300, seed=9)
-        leaked = M.fit_temperature(logits, y)
+        leaked = M.fit_temperature(logits, y, partition="S:test")
         with self.assertRaises(ValueError) as ctx:
-            M.full_panel(M._sigmoid(logits), y, logits=logits, temperature=leaked)
+            M.full_panel(M._sigmoid(logits), y, logits=logits, temperature=leaked,
+                         partition="S:test")
         self.assertIn("disjoint", str(ctx.exception))
 
-    def test_disjoint_rows_sharing_values_are_not_falsely_rejected(self):
-        """Greptile PR #4. `_clamp_saturated_logits` maps every saturated logit to the
-        SAME bound, so two confident predictions sharing a label collide by construction
-        -- and a single collision used to reject a genuinely disjoint split."""
+    def test_applying_a_calibrator_without_naming_the_partition_is_refused(self):
+        """Greptile PR #4, round 2. Identity cannot be inferred from values -- in either
+        direction -- so a calibrator that cannot verify disjointness says so instead of
+        guessing. A control that guesses is worse than one that asks."""
+        logits, y = _separable(n=200, seed=12)
+        cal = M.fit_temperature(logits, y, partition="S:calibration")
+        with self.assertRaises(ValueError) as ctx:
+            M.full_panel(M._sigmoid(logits), y, logits=logits, temperature=cal)
+        self.assertIn("were not named", str(ctx.exception))
+
+    def test_fit_temperature_requires_a_partition_name(self):
+        logits, y = _separable(n=100, seed=13)
+        with self.assertRaises(TypeError):
+            M.fit_temperature(logits, y)
+        with self.assertRaises(ValueError):
+            M.fit_temperature(logits, y, partition="")
+
+    def test_identical_values_across_partitions_are_accepted(self):
+        """A value check false-REJECTS here. Every saturated logit clamps to one bound,
+        so confident predictions sharing a label collide by construction, and a small
+        disjoint scoring set can consist entirely of colliding values."""
         cal_logits = np.array([np.inf, np.inf, -np.inf, 0.3, 0.7, -0.2])
         cal_y = np.array([1, 1, 0, 1, 0, 1])
-        test_logits = np.array([np.inf, -np.inf, 0.9, -0.9])
-        test_y = np.array([1, 0, 1, 0])
-        cal = M.fit_temperature(cal_logits, cal_y)
-        M.full_panel(M._sigmoid(test_logits), test_y, logits=test_logits, temperature=cal)
+        test_logits = np.array([np.inf, -np.inf])   # every value also in the cal set
+        test_y = np.array([1, 0])
+        cal = M.fit_temperature(cal_logits, cal_y, partition="S:calibration")
+        M.full_panel(M._sigmoid(test_logits), test_y, logits=test_logits,
+                     temperature=cal, partition="S:test")
 
-    def test_declared_partitions_are_the_exact_check(self):
-        """Naming the partition removes the heuristic entirely: no false positives,
-        no false negatives."""
+    def test_a_diluted_reuse_is_still_caught(self):
+        """A value check false-ACCEPTS here: genuinely reused calibration rows diluted by
+        unrelated scored rows fall under any proportional threshold. Declaration does not
+        care about the mix."""
+        logits, y = _separable(n=400, seed=22)
+        cal = M.fit_temperature(logits[:20], y[:20], partition="S:calibration")
+        with self.assertRaises(ValueError):
+            M.full_panel(M._sigmoid(logits), y, logits=logits, temperature=cal,
+                         partition="S:calibration")
+
+    def test_declaration_is_authoritative_over_values(self):
         logits, y = _separable(n=200, seed=21)
         cal = M.fit_temperature(logits, y, partition="SITE-01:calibration")
-        with self.assertRaises(ValueError) as ctx:
-            M.full_panel(M._sigmoid(logits), y, logits=logits, temperature=cal,
-                         partition="SITE-01:calibration")
-        self.assertIn("SITE-01:calibration", str(ctx.exception))
-        # A different partition is accepted even though the ROWS are identical --
-        # the declaration is authoritative over the values.
+        # Identical ROWS, different declared partition -> accepted. The declaration is
+        # the contract; the values are not evidence either way.
         M.full_panel(M._sigmoid(logits), y, logits=logits, temperature=cal,
                      partition="SITE-01:test")
 
     def test_calibrator_applies_cleanly_to_disjoint_rows(self):
         logits, y = _separable(n=800, seed=10)
-        cal = M.fit_temperature(logits[:400], y[:400])
-        M.full_panel(M._sigmoid(logits[400:]), y[400:], logits=logits[400:], temperature=cal)
+        cal = M.fit_temperature(logits[:400], y[:400], partition="S:calibration")
+        M.full_panel(M._sigmoid(logits[400:]), y[400:], logits=logits[400:],
+                     temperature=cal, partition="S:test")
 
     def test_fit_temperature_refuses_a_single_class_calibration_partition(self):
         with self.assertRaises(ValueError):
-            M.fit_temperature(np.array([0.2, 0.4, 0.6]), np.array([1, 1, 1]))
+            M.fit_temperature(np.array([0.2, 0.4, 0.6]), np.array([1, 1, 1]),
+                              partition="S:calibration")
 
     def test_nan_handling_survives_the_split(self):
         """Regression guard: NaN policy landed in 79684c5 and must not be lost."""

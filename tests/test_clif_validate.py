@@ -575,6 +575,25 @@ class ReleaseBoundaryTest(unittest.TestCase):
                          "artifact was visible before the ledger recorded it")
         self.assertTrue(out.exists())
 
+    def test_ledger_entry_is_durable_before_publication(self):
+        """Greptile PR #4, round 2: a buffered write is not a record. A crash between the
+        append and the rename would leave the report published with its ledger entry
+        still in the page cache."""
+        import os
+        from unittest import mock
+
+        from src.eval.clif_validate import write_export
+        synced = []
+        real_fsync = os.fsync
+
+        def spy(fd):
+            synced.append(fd)
+            return real_fsync(fd)
+
+        with mock.patch("os.fsync", side_effect=spy):
+            write_export(self._payload(), self.out / "r.json", self.out / "ledger.jsonl")
+        self.assertTrue(synced, "ledger append must reach stable storage before publishing")
+
     def test_replayed_release_id_is_rejected(self):
         """#13: a replayed report would be counted as another site."""
         from src.eval.clif_validate import write_export

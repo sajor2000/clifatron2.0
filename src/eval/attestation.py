@@ -62,6 +62,31 @@ def _chain_key() -> bytes:
     return _DEV_CHAIN_KEY
 
 
+def _durably_append(path: Path, line: str) -> None:
+    """Append a line and return only once it is on stable storage.
+
+    A buffered write is not a record. `write_export` publishes the artifact immediately
+    after the ledger append, so a crash between the two used to leave the report published
+    with its ledger entry still in the OS page cache -- and a later differencing check
+    would then miss a real prior release.
+
+    fsync on the file makes the bytes durable; fsync on the parent directory makes the
+    entry durable when the file was newly created. Both are needed for the guarantee to
+    hold across a power loss, not just a process kill.
+    """
+    existed = path.exists()
+    with path.open("a") as fh:
+        fh.write(line)
+        fh.flush()
+        os.fsync(fh.fileno())
+    if not existed:
+        dir_fd = os.open(str(path.parent), os.O_RDONLY)
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
+
+
 def _head_path(log_path: Path) -> Path:
     """Sidecar anchor naming the chain's expected terminal record."""
     return log_path.with_suffix(log_path.suffix + ".head")
@@ -172,13 +197,13 @@ def record_access(log_path: str | Path, *, model_version: str, actor_role: str,
         (prev + json.dumps(entry, sort_keys=True, separators=(",", ":"))).encode("utf-8"),
         hashlib.sha256,
     ).hexdigest()
-    with path.open("a") as fh:
-        fh.write(json.dumps(entry, sort_keys=True, separators=(",", ":")) + "\n")
+    _durably_append(path, json.dumps(entry, sort_keys=True, separators=(",", ":")) + "\n")
     # Head anchor, written outside the log. Truncating or deleting the log no longer
     # produces a self-consistent shorter chain, because the head still names the record
     # count and terminal hash it must end at (U5 review #10).
-    _head_path(path).write_text(json.dumps({"seq": seq, "chain": entry["chain"]},
-                                           sort_keys=True, separators=(",", ":")))
+    head = _head_path(path)
+    head.write_text(json.dumps({"seq": seq, "chain": entry["chain"]},
+                               sort_keys=True, separators=(",", ":")))
 
 
 def verify_access_log(log_path: str | Path) -> bool:
@@ -350,9 +375,14 @@ def append_to_ledger(payload: dict, ledger_path: str | Path) -> None:
     """Append this export's records to the append-only ledger."""
     path = Path(ledger_path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a") as fh:
-        for entry in ledger_entries(payload):
-            fh.write(json.dumps(entry, sort_keys=True, separators=(",", ":")) + "\n")
+    lines = "".join(
+        json.dumps(entry, sort_keys=True, separators=(",", ":")) + "\n"
+        for entry in ledger_entries(payload)
+    )
+    # Durable before returning (Greptile PR #4). write_export publishes the artifact as
+    # soon as this returns, so an entry sitting in the page cache is an entry that a
+    # crash erases while the report stays published.
+    _durably_append(path, lines)
 
 
 __all__ = [

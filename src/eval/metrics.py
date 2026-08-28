@@ -155,105 +155,69 @@ def _defined_prediction_mask(*arrays: np.ndarray) -> np.ndarray:
     return mask
 
 
-# A value fingerprint can only ever be a heuristic, so it fires on near-total overlap
-# rather than on any single collision. Genuine reuse of a partition scores 1.0; two
-# disjoint partitions that happen to share rows score far below this.
-_REUSE_OVERLAP_THRESHOLD = 0.99
-
-
-def _row_fingerprint(logits: np.ndarray, labels: np.ndarray) -> tuple[int, ...]:
-    """Per-row value hashes for the rows a calibrator saw.
-
-    **This is a heuristic, and the docstring here used to claim otherwise.** It said
-    collisions "would have to be exact float+label duplicates, which are already
-    indistinguishable rows for this purpose" -- which was wrong twice over. Distinct
-    patients are not indistinguishable just because two floats match, and the collision
-    is not rare: `_clamp_saturated_logits` maps every saturated logit to the SAME bound,
-    so any two confident predictions sharing a label collide by construction. A single
-    collision used to falsely reject a genuinely disjoint calibration/test split.
-
-    Returned as a sorted tuple (a multiset, not a set) so overlap can be measured as a
-    proportion rather than tested for non-emptiness.
-    """
-    z = np.asarray(logits, dtype=float).ravel()
-    y = np.asarray(labels).astype(int).ravel()
-    return tuple(sorted(hash((float(a), int(b))) for a, b in zip(z, y)))
-
-
 class Calibrator:
-    """A fitted temperature plus the identity of the rows it was fitted on (U5 #19).
+    """A fitted temperature plus the identity of the partition it was fitted on (U5 #19).
 
-    Inverting `full_panel`'s default made fitting-on-evaluated-labels inconvenient; it
-    did not make it impossible. A caller could still write
+    Inverting `full_panel`'s default made fitting-on-evaluated-labels inconvenient; it did
+    not make it impossible. A caller could still write
     `fit_temperature(test_logits, test_labels)` and pass the scalar straight back into
-    `full_panel` on those same rows, reproducing D4 exactly without ever naming
-    `unsafe_fit_on_eval_labels`. Carrying the fit rows' fingerprint lets `full_panel`
-    refuse that at the point of use, which is the only place it can be caught.
+    `full_panel` on those same rows, reproducing D4 exactly without naming
+    `unsafe_fit_on_eval_labels`. Disjointness has to be checked at the point of use.
+
+    **Identity is DECLARED, never inferred from values.** Two earlier attempts fingerprinted
+    the rows themselves -- first rejecting on any single value collision, then on a
+    proportion of collisions. Both were wrong, and wrong in both directions, because a
+    value fingerprint cannot tell identity from equality:
+
+      - False reject: `_clamp_saturated_logits` maps every saturated logit to one bound, so
+        confident predictions sharing a label collide by construction. A small disjoint
+        scoring partition whose values all appear in the calibration set scores 1.0.
+      - False accept: genuinely reused calibration rows diluted by enough unrelated scored
+        rows fall under any threshold, and the leak passes.
+
+    No threshold fixes that -- it is the wrong instrument. So the partition name is now
+    required on both sides, and a calibrator that cannot verify disjointness says so rather
+    than guessing. Partition names come from the U1 split artifact, which is where the
+    train/validation/calibration/test roles are actually defined.
     """
 
-    __slots__ = ("temperature", "_fit_rows", "fit_partition")
+    __slots__ = ("temperature", "fit_partition")
 
-    def __init__(self, temperature: float, fit_rows: tuple[int, ...],
-                 fit_partition: str | None = None):
+    def __init__(self, temperature: float, fit_partition: str):
+        if not fit_partition:
+            raise ValueError(
+                "a calibrator must name the partition it was fitted on; disjointness "
+                "cannot be verified otherwise"
+            )
         self.temperature = float(temperature)
-        self._fit_rows = fit_rows
         self.fit_partition = fit_partition
 
-    def applies_to(self, logits: np.ndarray, labels: np.ndarray,
-                   partition: str | None = None) -> None:
-        """Raise when the rows about to be scored are the rows this was fitted on.
-
-        Two mechanisms, in order of authority:
-
-        1. **Declared partition identity.** When both the calibrator and the caller name
-           their partition, equality is exact -- no false positives, no false negatives.
-           This is the recommended path and mirrors the U1 split artifact, which is where
-           partition roles actually come from.
-        2. **Value overlap**, as a fallback when partitions are not declared. It fires
-           only on near-total overlap, because it cannot distinguish "the same rows" from
-           "different rows with equal values". Requiring a single collision made this
-           reject valid work: saturated logits all clamp to one bound, so two confident
-           predictions sharing a label always collide.
-        """
-        if self.fit_partition is not None and partition is not None:
-            if self.fit_partition == partition:
-                raise ValueError(
-                    f"this calibrator was fitted on partition {self.fit_partition!r} and is "
-                    f"being applied to it. Calibration must be fitted on a partition "
-                    "disjoint from the one being scored -- that is the whole of D4."
-                )
-            return
-
-        scored = _row_fingerprint(logits, labels)
-        if not scored:
-            return
-        fit_counts: dict[int, int] = {}
-        for h in self._fit_rows:
-            fit_counts[h] = fit_counts.get(h, 0) + 1
-        matched = 0
-        for h in scored:
-            if fit_counts.get(h, 0) > 0:
-                fit_counts[h] -= 1
-                matched += 1
-        fraction = matched / len(scored)
-        if fraction >= _REUSE_OVERLAP_THRESHOLD:
+    def applies_to(self, partition: str | None) -> None:
+        """Raise when the partition about to be scored is the one this was fitted on."""
+        if not partition:
             raise ValueError(
-                f"this calibrator was fitted on {fraction:.0%} of the rows it is now being "
-                "applied to. Calibration must be fitted on a partition disjoint from the "
-                "one being scored -- that is the whole of D4. Fit on the calibration "
-                "partition, pass explicit partition names for an exact check, or name "
-                "unsafe_fit_on_eval_labels=True if this is a synthetic test."
+                f"this calibrator was fitted on partition {self.fit_partition!r}, but the "
+                "rows being scored were not named. Pass full_panel(..., partition=...) so "
+                "disjointness can be checked -- it is not inferable from the values, and a "
+                "control that guesses is worse than one that asks."
+            )
+        if partition == self.fit_partition:
+            raise ValueError(
+                f"this calibrator was fitted on partition {partition!r} and is being applied "
+                "to it. Calibration must be fitted on a partition disjoint from the one "
+                "being scored -- that is the whole of D4. Fit on the calibration partition, "
+                "or name unsafe_fit_on_eval_labels=True if this is a synthetic test."
             )
 
     def __float__(self) -> float:
         return self.temperature
 
     def __repr__(self) -> str:
-        return f"Calibrator(temperature={self.temperature:.4f}, fit_rows={len(self._fit_rows)})"
+        return f"Calibrator(temperature={self.temperature:.4f}, fit_partition={self.fit_partition!r})"
 
 
 def fit_temperature(cal_logits: np.ndarray, cal_labels: np.ndarray,
-                    partition: str | None = None) -> "Calibrator":
+                    partition: str) -> "Calibrator":
     """Fit a calibration temperature on a CALIBRATION partition (U5 D4).
 
     The two-argument signature is the control. There is no single-array form of this
@@ -269,8 +233,9 @@ def fit_temperature(cal_logits: np.ndarray, cal_labels: np.ndarray,
     `scikit-learn>=1.5` pin to `>=1.8` (`FrozenEstimator` needs `>=1.6`). Recorded
     deliberately: the pin is unchanged and this code depends on nothing above 1.5.
 
-    Apply the returned calibrator via `full_panel(..., temperature=cal)`. It carries the
-    identity of the rows it saw, so applying it to those same rows raises.
+    `partition` names the rows being fitted (for example `"SITE-01:calibration"`) and is
+    REQUIRED. Apply the calibrator via `full_panel(..., temperature=cal, partition=...)`;
+    naming the same partition on both sides raises.
     """
     cal_labels = np.asarray(cal_labels).astype(int)
     if len(np.unique(cal_labels)) < 2:
@@ -278,9 +243,7 @@ def fit_temperature(cal_logits: np.ndarray, cal_labels: np.ndarray,
             "calibration partition is single-class; a temperature fitted on it is "
             "meaningless. Report the outcome as non-evaluable instead."
         )
-    return Calibrator(temperature_scale(cal_logits, cal_labels),
-                      _row_fingerprint(cal_logits, cal_labels),
-                      fit_partition=partition)
+    return Calibrator(temperature_scale(cal_logits, cal_labels), fit_partition=partition)
 
 
 def temperature_scale(logits: np.ndarray, labels: np.ndarray) -> float:
@@ -408,7 +371,7 @@ def full_panel(p: np.ndarray, y: np.ndarray, logits: np.ndarray | None = None,
         T = temperature_scale(logits, y)
     elif temperature is not None:
         if isinstance(temperature, Calibrator):
-            temperature.applies_to(logits, y, partition=partition)
+            temperature.applies_to(partition)
         T = float(temperature)
     if T != 1.0 and logits is not None:
         p = _sigmoid(_clamp_saturated_logits(logits) / T)
