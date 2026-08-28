@@ -26,6 +26,17 @@ def _logit(p: np.ndarray) -> np.ndarray:
     return np.log(p / (1 - p))
 
 
+def _sigmoid(z: np.ndarray) -> np.ndarray:
+    """Overflow-safe logistic sigmoid."""
+    z = np.asarray(z, dtype=np.float64)
+    out = np.empty_like(z)
+    pos = z >= 0
+    out[pos] = 1.0 / (1.0 + np.exp(-z[pos]))
+    ez = np.exp(z[~pos])
+    out[~pos] = ez / (1.0 + ez)
+    return out
+
+
 def _irls_logistic(X: np.ndarray, y: np.ndarray, offset: np.ndarray | None = None,
                    iters: int = 50) -> np.ndarray:
     """Newton/IRLS MLE for logistic regression (unregularized). Returns coefficients.
@@ -112,10 +123,20 @@ def net_benefit(p: np.ndarray, y: np.ndarray, thresholds=None) -> dict:
             "treat_all": np.asarray(treat_all), "treat_none": np.zeros_like(thresholds)}
 
 
+def _sanitize_logits(logits: np.ndarray) -> np.ndarray:
+    """Replace non-finite logits with a large finite magnitude so downstream
+    torch/sklearn ops never see inf/NaN. A real model can emit saturated logits
+    (p==0 or p==1); clamp them rather than crash the whole panel."""
+    z = np.asarray(logits, dtype=np.float64)
+    # |logit| of the clipped-prob bound _EPS is our natural finite ceiling.
+    bound = float(np.log((1 - _EPS) / _EPS))
+    return np.nan_to_num(z, nan=0.0, posinf=bound, neginf=-bound)
+
+
 def temperature_scale(logits: np.ndarray, labels: np.ndarray) -> float:
     """Cadence single-scalar temperature T* minimizing NLL (LBFGS). Divide logits by T*."""
     import torch
-    z = torch.tensor(np.asarray(logits), dtype=torch.float64)
+    z = torch.tensor(_sanitize_logits(logits), dtype=torch.float64)
     y = torch.tensor(np.asarray(labels), dtype=torch.float64)
     T = torch.ones(1, requires_grad=True, dtype=torch.float64)
     opt = torch.optim.LBFGS([T], lr=0.1, max_iter=60)
@@ -159,7 +180,8 @@ def full_panel(p: np.ndarray, y: np.ndarray, logits: np.ndarray | None = None,
     T = 1.0
     if recalibrate and logits is not None and len(np.unique(y)) > 1:
         T = temperature_scale(logits, y)
-        p = 1.0 / (1.0 + np.exp(-(np.asarray(logits) / T)))
+        p = _sigmoid(_sanitize_logits(logits) / T)
+    p = np.clip(np.nan_to_num(p, nan=0.5), 0.0, 1.0)
     out = score(p, y)
     if not np.isnan(out["auroc"]):
         slope, citl = calibration_slope_intercept(p, y)

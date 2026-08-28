@@ -5,11 +5,20 @@ and validates that aggregate-only output contains no raw patient rows.
 """
 
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
 
-CLIF_DATA = Path("~/Data/clif-source").expanduser().resolve()
+# CLIF source parquet lives per-machine (git-ignored); override with CLIF_DATA_DIR.
+CLIF_DATA = Path(
+    os.environ.get("CLIF_DATA_DIR", "~/Data/clif-source")
+).expanduser().resolve()
+CLIF_AVAILABLE = CLIF_DATA.is_dir() and any(CLIF_DATA.glob("*.parquet"))
+_SKIP_REASON = (
+    f"CLIF source parquet not found at {CLIF_DATA} "
+    "(set CLIF_DATA_DIR to a directory of CLIF 2.1 *.parquet to enable)"
+)
 
 
 class ClifValidateSmokeTest(unittest.TestCase):
@@ -22,6 +31,7 @@ class ClifValidateSmokeTest(unittest.TestCase):
     def tearDownClass(cls):
         cls.tmp.cleanup()
 
+    @unittest.skipUnless(CLIF_AVAILABLE, _SKIP_REASON)
     def test_01_auto_labeler_runs_on_real_clif_data(self):
         """Auto-labeler produces a labels.parquet with expected columns."""
         from src.eval.clif_auto_labeler import auto_label
