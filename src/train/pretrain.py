@@ -185,7 +185,11 @@ def main():
     data_path = Path(args.data) / "events.parquet"
     records = _load_decile_records(data_path, drop_values_without_stats=args.dry_run and not value_stats)
     if not args.dry_run and not value_stats and _has_numeric_values(records):
-        raise SystemExit("value-head normalization is required before real training; pass --value-stats")
+        raise SystemExit(
+            "value-head normalization is required before real training; pass --value-stats. "
+            "Generate it from the reference site: "
+            "`python -m src.data.value_stats --events <ref_events.parquet> --out value_stats.json`"
+        )
     if not args.dry_run and not _has_supervised_outcomes(records):
         raise SystemExit("TTE supervision is required before real pretraining; join cohort outcome artifacts first")
     target_builder = TargetBuilder(
