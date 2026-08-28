@@ -539,7 +539,10 @@ class ReleaseBoundaryTest(unittest.TestCase):
         ledger = self.out / "ledger.jsonl"
         written = write_export(self._payload(), self.out / "r.json", ledger)
         self.assertTrue(written.exists())
-        self.assertEqual(len(read_ledger(ledger)), 1)
+        entries = read_ledger(ledger)
+        # One cell record plus its publication confirmation.
+        self.assertEqual(len([e for e in entries if "cell" in e]), 1)
+        self.assertEqual(len([e for e in entries if "confirm_release_id" in e]), 1)
         self.assertFalse(list(self.out.glob("*.partial")), "temp file must be renamed away")
 
     def test_a_failed_ledger_append_leaves_nothing_published(self):
@@ -575,6 +578,25 @@ class ReleaseBoundaryTest(unittest.TestCase):
                          "artifact was visible before the ledger recorded it")
         self.assertTrue(out.exists())
 
+    def test_a_failed_publish_is_retryable_and_leaves_no_temp_file(self):
+        """Greptile PR #4, round 3: a transient rename failure must not strand the
+        release id or leave a partial file behind."""
+        from unittest import mock
+
+        from src.eval.clif_validate import write_export
+        out = self.out / "r.json"
+        ledger = self.out / "ledger.jsonl"
+
+        with mock.patch("pathlib.Path.replace", side_effect=OSError("volume detached")):
+            with self.assertRaises(OSError):
+                write_export(self._payload(release="rel-1"), out, ledger)
+        self.assertFalse(out.exists())
+        self.assertFalse(list(self.out.glob("*.partial")), "temp file must be cleaned up")
+
+        # The same release id retries cleanly -- the earlier entry is unconfirmed.
+        written = write_export(self._payload(release="rel-1"), out, ledger)
+        self.assertTrue(written.exists())
+
     def test_ledger_entry_is_durable_before_publication(self):
         """Greptile PR #4, round 2: a buffered write is not a record. A crash between the
         append and the rename would leave the report published with its ledger entry
@@ -602,7 +624,7 @@ class ReleaseBoundaryTest(unittest.TestCase):
         write_export(self._payload(release="rel-1"), self.out / "a.json", ledger)
         with self.assertRaises(DisclosureError) as ctx:
             write_export(self._payload(release="rel-1"), self.out / "b.json", ledger)
-        self.assertIn("already been recorded", str(ctx.exception))
+        self.assertIn("already been published", str(ctx.exception))
 
 
 class ValidatorEndToEndTest(unittest.TestCase):

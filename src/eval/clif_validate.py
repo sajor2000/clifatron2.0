@@ -414,15 +414,28 @@ def write_export(payload: dict, out_path: str | Path, ledger_path: str | Path) -
     # 1. Durable, but not yet the artifact. Nothing reads a .partial path.
     tmp.write_text(json.dumps(payload, indent=2, sort_keys=True, allow_nan=False))
 
-    # 2. Record it. If this raises, the release never becomes visible.
+    # 2. Record the INTENT to release, durably and unconfirmed. An unconfirmed entry
+    #    gates nothing, so a failure here or below leaves the release id retryable.
     try:
         _attest.append_to_ledger(payload, ledger_path)
     except BaseException:
         tmp.unlink(missing_ok=True)
         raise
 
-    # 3. Publish. Atomic, so no reader ever sees a partial artifact.
-    tmp.replace(out)
+    # 3. Publish. Atomic rename, so no reader ever sees a partial artifact. On failure the
+    #    temp file is removed and the unconfirmed ledger entry is left behind inert --
+    #    it blocks nothing, and the same release id can be retried.
+    try:
+        tmp.replace(out)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
+
+    # 4. Confirm. Only now does this count as a prior release for differencing and replay.
+    #    A crash between 3 and 4 is the one remaining window, and it is recoverable rather
+    #    than silent: `attestation.reconcile_ledger` names any published-but-unconfirmed
+    #    release so an operator can confirm it before the next export.
+    _attest.confirm_publication(payload, ledger_path)
     return out
 
 

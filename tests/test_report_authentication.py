@@ -161,6 +161,7 @@ class DisclosureLedgerTest(unittest.TestCase):
             first["outcomes"]["map_below_65_48h"]["subgroups"] = {
                 "sex": {"M": {"status": S.INSUFFICIENT_N, "n": 4}}}
             A.append_to_ledger(first, ledger)
+            A.confirm_publication(first, ledger)   # it was actually published
 
             second = _report(version="v1")
             second["outcomes"]["map_below_65_48h"]["subgroups"] = {
@@ -176,6 +177,7 @@ class DisclosureLedgerTest(unittest.TestCase):
             first["outcomes"]["map_below_65_48h"]["subgroups"] = {
                 "sex": {"M": {"status": S.INSUFFICIENT_N, "n": 4}}}
             A.append_to_ledger(first, ledger)
+            A.confirm_publication(first, ledger)
 
             second = _report(version="v1")
             second["outcomes"]["map_below_65_48h"]["subgroups"] = {
@@ -189,11 +191,41 @@ class DisclosureLedgerTest(unittest.TestCase):
             first["outcomes"]["map_below_65_48h"]["subgroups"] = {
                 "sex": {"M": {"status": S.INSUFFICIENT_N, "n": 4}}}
             A.append_to_ledger(first, ledger)
+            A.confirm_publication(first, ledger)
 
             other = _report(site="SITE-02")
             other["outcomes"]["map_below_65_48h"]["subgroups"] = {
                 "sex": {"M": {"status": S.EVALUABLE, "n": 60}}}
             A.check_cross_release_differencing(other, ledger)
+
+    def test_an_unconfirmed_entry_gates_nothing_and_is_retryable(self):
+        """Greptile PR #4, round 3. A release recorded but never published must not
+        strand its release id or block later releases -- nobody could have differenced
+        against an artifact that never became visible."""
+        with tempfile.TemporaryDirectory() as td:
+            ledger = Path(td) / "ledger.jsonl"
+            attempt = _report(version="v0", release="rel-A")
+            attempt["outcomes"]["map_below_65_48h"]["subgroups"] = {
+                "sex": {"M": {"status": S.INSUFFICIENT_N, "n": 4}}}
+            A.append_to_ledger(attempt, ledger)      # publication then failed
+
+            # Same release id retries cleanly.
+            A.check_cross_release_differencing(attempt, ledger)
+
+            # And the unconfirmed cell does not gate a later, different release.
+            later = _report(version="v1", release="rel-B")
+            later["outcomes"]["map_below_65_48h"]["subgroups"] = {
+                "sex": {"M": {"status": S.EVALUABLE, "n": 60}}}
+            A.check_cross_release_differencing(later, ledger)
+
+    def test_reconcile_names_published_but_unconfirmed_releases(self):
+        """The one remaining crash window is recoverable rather than silent."""
+        with tempfile.TemporaryDirectory() as td:
+            ledger = Path(td) / "ledger.jsonl"
+            A.append_to_ledger(_report(release="rel-A"), ledger)
+            self.assertEqual(A.reconcile_ledger(ledger, {"rel-A"}), ["rel-A"])
+            A.confirm_publication(_report(release="rel-A"), ledger)
+            self.assertEqual(A.reconcile_ledger(ledger, {"rel-A"}), [])
 
     def test_ledger_is_append_only_across_releases(self):
         with tempfile.TemporaryDirectory() as td:

@@ -311,11 +311,16 @@ def check_cross_release_differencing(payload: dict, ledger_path: str | Path) -> 
     if not prior:
         return
 
-    # Latest prior state per cell, and the set of release IDs already seen.
+    # Only CONFIRMED releases count. An entry whose artifact never became visible cannot
+    # have been differenced against, and treating it as a prior release would strand the
+    # release id after a transient failure (Greptile PR #4, round 3).
+    live = confirmed_releases(ledger_path)
     prior_by_cell: dict[str, dict] = {}
     for e in prior:
+        if "confirm_release_id" in e or e.get("release_id") not in live:
+            continue
         prior_by_cell[e["cell"]] = e
-    seen_releases = {e.get("release_id") for e in prior if e.get("release_id")}
+    seen_releases = set(live)
 
     current = ledger_entries(payload)
 
@@ -323,9 +328,10 @@ def check_cross_release_differencing(payload: dict, ledger_path: str | Path) -> 
     release = payload.get("release_id")
     if release and release in seen_releases:
         raise DisclosureError(
-            f"release_id {release!r} has already been recorded in this ledger. A "
-            "replayed report would be counted as an additional site, biasing the "
-            "cross-site aggregate."
+            f"release_id {release!r} has already been published and recorded. A replayed "
+            "report would be counted as an additional site, biasing the cross-site "
+            "aggregate. (An unconfirmed entry from a failed earlier attempt does not "
+            "trigger this -- that release id is safe to retry.)"
         )
 
     floor = min_cell_size()
@@ -371,12 +377,55 @@ def check_cross_release_differencing(payload: dict, ledger_path: str | Path) -> 
                 )
 
 
+def confirm_publication(payload: dict, ledger_path: str | Path) -> None:
+    """Mark a release's ledger entries as actually published.
+
+    Two durable resources -- the ledger and the artifact -- cannot be updated atomically
+    without a transaction, so every ordering has a crash window. Rather than pretend
+    otherwise, the ledger records intent first (`published: false`) and confirms after the
+    artifact is visible. That makes each window recoverable instead of terminal:
+
+      - crash before the artifact is published -> unconfirmed entries, which are inert:
+        they gate nothing and the release id can be retried
+      - crash after publication, before confirmation -> `reconcile_ledger` finds it
+
+    Only confirmed entries count as prior releases, because an artifact nobody could see
+    cannot have been differenced against.
+    """
+    release = payload.get("release_id")
+    if not release:
+        return
+    _durably_append(Path(ledger_path), json.dumps(
+        {"confirm_release_id": release}, sort_keys=True, separators=(",", ":")) + "\n")
+
+
+def confirmed_releases(ledger_path: str | Path) -> set:
+    """Release ids whose artifact is known to have been published."""
+    return {e["confirm_release_id"] for e in read_ledger(ledger_path)
+            if "confirm_release_id" in e}
+
+
+def reconcile_ledger(ledger_path: str | Path, published_release_ids: set) -> list[str]:
+    """Release ids that were published but never confirmed, and need a confirmation.
+
+    Run after a crash. `published_release_ids` comes from whatever the operator can see on
+    the export volume. Anything in that set without a confirmation record is the narrow
+    residue of a crash between publication and confirmation, and must be confirmed before
+    the next release so the differencing check counts it.
+    """
+    return sorted(published_release_ids - confirmed_releases(ledger_path))
+
+
 def append_to_ledger(payload: dict, ledger_path: str | Path) -> None:
-    """Append this export's records to the append-only ledger."""
+    """Record this export's intent to release. Not yet a published release.
+
+    Entries are written unconfirmed; `confirm_publication` marks them live once the
+    artifact is actually visible.
+    """
     path = Path(ledger_path)
     path.parent.mkdir(parents=True, exist_ok=True)
     lines = "".join(
-        json.dumps(entry, sort_keys=True, separators=(",", ":")) + "\n"
+        json.dumps({**entry, "published": False}, sort_keys=True, separators=(",", ":")) + "\n"
         for entry in ledger_entries(payload)
     )
     # Durable before returning (Greptile PR #4). write_export publishes the artifact as
@@ -386,7 +435,7 @@ def append_to_ledger(payload: dict, ledger_path: str | Path) -> None:
 
 
 __all__ = [
-    "AuthenticationError",
+    "AuthenticationError", "confirm_publication", "confirmed_releases", "reconcile_ledger",
     "canonical_bytes", "sign_report", "verify_report",
     "record_access", "verify_access_log",
     "ledger_entries", "read_ledger", "check_cross_release_differencing", "append_to_ledger",
