@@ -428,6 +428,54 @@ def validate_export(payload: dict) -> dict:
     return payload
 
 
+# ---------------------------------------------------------------- log sanitization
+class SanitizingFilter:
+    """Redact prohibited content from log records before they reach any sink.
+
+    `configs/artifact_policy.yaml` declares `operational_logs.prohibited_content`
+    (identifiers, patient_rows, local_source_paths, free_text) but nothing in the
+    codebase referenced it, so the policy was a document rather than a control.
+
+    Stripping a field from the exported JSON does not stop the leak on its own: the
+    validator printed the site's data path and per-outcome counts to stdout, so a
+    returned console log carried what the JSON no longer did. This filter is what makes
+    the log sink obey the same rule as the artifact.
+    """
+
+    def filter(self, record) -> bool:  # logging.Filter protocol
+        try:
+            message = record.getMessage()
+        except Exception:
+            return True
+        record.msg = redact(message)
+        record.args = ()
+        return True
+
+
+def redact(text: str) -> str:
+    """Replace path-shaped tokens and prohibited identifiers in a log line."""
+    out = []
+    for token in str(text).split():
+        stripped = token.strip("'\"(),;")
+        lowered = stripped.lower()
+        if _looks_like_path(stripped) and len(stripped) > 1:
+            out.append("<redacted:path>")
+            continue
+        if any(banned in lowered for banned in PROHIBITED_SUBSTRINGS):
+            out.append("<redacted>")
+            continue
+        out.append(token)
+    return " ".join(out)
+
+
+def install_log_sanitizer(logger) -> None:
+    """Attach the sanitizing filter to a logger and every handler it owns."""
+    filt = SanitizingFilter()
+    logger.addFilter(filt)
+    for handler in logger.handlers:
+        handler.addFilter(filt)
+
+
 def non_evaluable(status: str, reason: str, label_validity: dict) -> dict:
     """Build a per-outcome block for an outcome that could not be scored.
 
