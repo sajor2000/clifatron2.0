@@ -111,6 +111,43 @@ class DataFreeSmokeTest(unittest.TestCase):
             self.assertGreaterEqual(mix.w_ntp, 0)
             self.assertTrue(0 <= mix.w_cr <= 1)
 
+    def test_05b_nan_predictions_are_dropped_not_fabricated(self):
+        """NaN predictions must NOT be silently coerced to a neutral 0.5 and scored.
+
+        Regression guard (Greptile PR #1 P1): undefined model output is dropped and
+        counted, saturated ±inf predictions are kept, and an all-NaN vector yields NaN
+        metrics rather than fabricated ones."""
+        from src.eval import metrics as M
+
+        np.random.seed(1)
+        y = (np.random.random(200) > 0.7).astype(int)
+        p = np.clip(y.astype(float) + np.random.normal(0, 0.15, 200), 0, 1)
+
+        # (a) ±inf saturated logits are kept (clamped), nothing dropped
+        logits = M._logit(p)
+        logits[p == 0] = -np.inf
+        logits[p == 1] = np.inf
+        pan = M.full_panel(p.copy(), y, logits=logits.copy(), recalibrate=True)
+        self.assertEqual(pan["n_dropped_nan"], 0)
+
+        # (b) NaN predictions are dropped and counted, not fabricated to 0.5
+        p_nan = p.copy()
+        p_nan[:10] = np.nan
+        pan_nan = M.full_panel(p_nan, y.copy(), recalibrate=False)
+        self.assertEqual(pan_nan["n_dropped_nan"], 10)
+        self.assertEqual(pan_nan["n"], 190)
+
+        # (c) nan_policy='raise' fails loud
+        with self.assertRaises(ValueError):
+            M.full_panel(p_nan, y.copy(), recalibrate=False, nan_policy="raise")
+
+        # (d) all-NaN => NaN metrics, never fabricated
+        pan_all = M.full_panel(np.full(50, np.nan),
+                               (np.random.random(50) > 0.5).astype(int),
+                               recalibrate=False)
+        self.assertTrue(np.isnan(pan_all["auroc"]))
+        self.assertEqual(pan_all["n"], 0)
+
     def test_05_metrics_panel_on_quick_synthetic(self):
         """Metrics panel returns all expected keys on synthetic data."""
         from src.eval import metrics as M
