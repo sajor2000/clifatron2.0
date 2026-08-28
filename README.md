@@ -7,7 +7,9 @@ ICU model **transportable and clinically deployable**:
 
 - a **threshold-conditioned time-to-event** objective (ICareFM) + **competing-risk CIF** (SurvivEHR)
   + a **value-regression "mark"** head (ORA) — replacing pure next-token prediction, the weakest objective;
-- **zero-shot, label-free** survival/threshold heads → a new hospital needs no local labels or training;
+- **zero-shot, training-free** survival/threshold heads → a new hospital needs no local model training
+  and no manually-annotated labels to run the model (evaluation still auto-derives ground-truth labels
+  from that site's own CLIF fields — no data leaves the node);
 - **federated external validation** by *model-to-data*: ship a frozen model + turnkey eval, sites return
   only aggregate metrics — no raw data, labels, or gradients ever leave a node;
 - a full **TRIPOD+AI calibration / decision-curve / fairness** evaluation panel.

@@ -17,7 +17,8 @@ CLIFATRON 2.0 is a **methods-upgrade layer** on [CLIFATRON](https://github.com/C
 ~30M CLIF-native ICU foundation model, built by our lab's data scientist `vchaudha`, which **we
 control**). CLIFATRON already owns the "compact CLIF-native AR ICU FM" axis, so that is *not* our
 novelty. Our contribution is: (1) a **threshold-TTE + competing-risk + value-regression** objective
-replacing pure next-token prediction; (2) **zero-shot, label-free** survival heads; (3) **federated
+replacing pure next-token prediction; (2) **zero-shot, training-free** survival heads (no local model
+fitting; evaluation still auto-derives ground-truth labels locally — see §5 precision note); (3) **federated
 external validation by model-to-data** across the whole CLIF consortium; (4) a full **TRIPOD+AI**
 calibration / decision-curve / fairness eval panel. Thesis: *one small model → many outcomes → many
 hospitals → one node (2× L40, no cluster).*

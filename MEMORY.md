@@ -62,12 +62,20 @@ tokenETL eval script; each site runs it on its LOCAL CLIF tables and returns ONL
 metrics. No raw data, labels, or gradients ever leave any node. This IS the thesis
 ("one node → many hospitals") and the axis CLIFATRON (single-center) lacks.
 - **Why our objective (not CLIFATRON's) enables this:** threshold-hazard/competing-risk heads are
-  ZERO-SHOT → a new site needs NO local labels or training to get calibrated predictions. CLIFATRON's
-  pure-AR path needs per-task XGBoost-on-embeddings (local labels) or expensive MC rollout. The
-  shippable, label-free zero-shot model is the whole federated-validation argument.
-- **Labels computed locally:** restrict outcomes to those derivable from standard CLIF fields
-  (mortality, discharge disposition/home/LTACH, IMV on/off, hypoxia, organ-failure thresholds) so
-  each external site auto-labels from its own tables — no manual annotation.
+  ZERO-SHOT → a new site needs **no local model training and no manually-annotated labels** to get
+  calibrated predictions. CLIFATRON's pure-AR path needs per-task XGBoost-on-embeddings (which
+  requires local labels to *fit*) or expensive MC rollout. The shippable, **training-free** zero-shot
+  model is the federated-validation argument.
+  **PRECISION (do not overclaim):** "label-free" refers to the MODEL — it emits predictions with no
+  local fitting. **Computing the metrics (AUROC/AUPRC/ECE/calibration) still requires ground-truth
+  labels**, which each site auto-derives from its own CLIF tables (below). So the pipeline is
+  *no-local-training + no-manual-annotation*, NOT "no labels at all." The auto-labeler's definitions
+  are themselves a validity dependency — audit them per site.
+- **Labels auto-derived locally (for evaluation only):** restrict outcomes to those derivable from
+  standard CLIF fields (mortality, discharge disposition/home/LTACH, IMV on/off, hypoxia,
+  organ-failure thresholds) so each external site auto-labels from its own tables — no manual
+  annotation. These derived labels are noisy phenotypes that vary by site coding; report each
+  outcome's label definition + provenance alongside its metrics.
 - **Vocab:** CLIFATRON frozen mCIDE across ALL sites → turnkey everywhere, no refitting.
 - **Governance:** only aggregate + subgroup metrics return; fairness reported aggregate (ICareFM precedent).
 - **Internal eval (3 held sites):** 3×3 train-A/test-B matrix + adaptation ladder

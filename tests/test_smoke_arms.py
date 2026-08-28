@@ -7,6 +7,7 @@ import errors, and basic numerical issues before the L40 box runs.
 """
 
 import json
+import os
 import tempfile
 import unittest
 import warnings
@@ -16,7 +17,10 @@ import numpy as np
 import torch
 import yaml
 
-CLIF_DATA = Path("~/Data/clif-source").expanduser().resolve()
+# CLIF source parquet lives per-machine (git-ignored); override with CLIF_DATA_DIR.
+CLIF_DATA = Path(
+    os.environ.get("CLIF_DATA_DIR", "~/Data/clif-source")
+).expanduser().resolve()
 DATA_CFG = Path("configs/data.yaml")
 MODEL_CFG = Path("configs/model.yaml")
 ABL_CFG = Path("configs/ablation.yaml")
@@ -26,6 +30,19 @@ MAX_EVENTS_PER_STAY = 1024
 DEVICE = "mps" if torch.backends.mps.is_available() else "cpu"
 
 
+def _clif_data_available(base: Path) -> bool:
+    """True only when the CLIF source dir has at least one parquet to tokenize."""
+    return base.is_dir() and any(base.glob("*.parquet"))
+
+
+CLIF_AVAILABLE = _clif_data_available(CLIF_DATA)
+_SKIP_REASON = (
+    f"CLIF source parquet not found at {CLIF_DATA} "
+    "(set CLIF_DATA_DIR to a directory of CLIF 2.1 *.parquet to enable)"
+)
+
+
+@unittest.skipUnless(CLIF_AVAILABLE, _SKIP_REASON)
 class SmokeTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -53,7 +70,7 @@ class SmokeTest(unittest.TestCase):
         from src.data.tokenize import tokenize_site
 
         tokenize_site(cls.cfg, "mimic", CLIF_DATA, cls.out_dir,
-                      vocab=None, edges=None)
+                      vocab=None, edges=None, limit_stays=N_STAYS * 3)
 
         blob = json.loads((cls.out_dir / "vocab.json").read_text())
         cls.vocab = blob["vocab"]
@@ -77,6 +94,14 @@ class SmokeTest(unittest.TestCase):
         _run_arm("joint_finetune", self.mcfg, self.batch, self.vocab_size,
                  n_targets=10, freeze_trunk=False)
 
+
+class DataFreeSmokeTest(unittest.TestCase):
+    """Numeric/config smoke checks that need no CLIF source data.
+
+    Kept separate from SmokeTest so they still run on a box without staged
+    CLIF parquet (the arm-forward tests below require a real vocab).
+    """
+
     def test_04_curriculum_scheduler_phases(self):
         """All three curriculum phases produce valid Mix values."""
         from src.train.curriculum import curriculum_weights
@@ -86,6 +111,43 @@ class SmokeTest(unittest.TestCase):
             self.assertGreaterEqual(mix.w_ntp, 0)
             self.assertTrue(0 <= mix.w_cr <= 1)
 
+    def test_05b_nan_predictions_are_dropped_not_fabricated(self):
+        """NaN predictions must NOT be silently coerced to a neutral 0.5 and scored.
+
+        Regression guard (Greptile PR #1 P1): undefined model output is dropped and
+        counted, saturated ±inf predictions are kept, and an all-NaN vector yields NaN
+        metrics rather than fabricated ones."""
+        from src.eval import metrics as M
+
+        np.random.seed(1)
+        y = (np.random.random(200) > 0.7).astype(int)
+        p = np.clip(y.astype(float) + np.random.normal(0, 0.15, 200), 0, 1)
+
+        # (a) ±inf saturated logits are kept (clamped), nothing dropped
+        logits = M._logit(p)
+        logits[p == 0] = -np.inf
+        logits[p == 1] = np.inf
+        pan = M.full_panel(p.copy(), y, logits=logits.copy(), recalibrate=True)
+        self.assertEqual(pan["n_dropped_nan"], 0)
+
+        # (b) NaN predictions are dropped and counted, not fabricated to 0.5
+        p_nan = p.copy()
+        p_nan[:10] = np.nan
+        pan_nan = M.full_panel(p_nan, y.copy(), recalibrate=False)
+        self.assertEqual(pan_nan["n_dropped_nan"], 10)
+        self.assertEqual(pan_nan["n"], 190)
+
+        # (c) nan_policy='raise' fails loud
+        with self.assertRaises(ValueError):
+            M.full_panel(p_nan, y.copy(), recalibrate=False, nan_policy="raise")
+
+        # (d) all-NaN => NaN metrics, never fabricated
+        pan_all = M.full_panel(np.full(50, np.nan),
+                               (np.random.random(50) > 0.5).astype(int),
+                               recalibrate=False)
+        self.assertTrue(np.isnan(pan_all["auroc"]))
+        self.assertEqual(pan_all["n"], 0)
+
     def test_05_metrics_panel_on_quick_synthetic(self):
         """Metrics panel returns all expected keys on synthetic data."""
         from src.eval import metrics as M
@@ -93,7 +155,7 @@ class SmokeTest(unittest.TestCase):
         np.random.seed(42)
         y = (np.random.random(200) > 0.8).astype(int)
         p = np.clip(y.astype(float) + np.random.normal(0, 0.15, 200), 0, 1)
-        logits = np.log(p / (1 - p + 1e-7))
+        logits = M._logit(p)  # robust prob->logit (clips 0/1 to avoid ±inf)
 
         panel = M.full_panel(p, y, logits=logits, recalibrate=True)
         for key in ("auroc", "auprc", "ece", "brier", "calib_slope",

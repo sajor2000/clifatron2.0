@@ -1,7 +1,16 @@
 # Methods — copied recipe from 2025–26 preprints
 
+> **⚠️ PRE-PIVOT for the trunk choice.** The per-paper method recipes below (§1–§5) are current
+> and remain the source of truth for what each HEAD/objective implements. The **"Our synthesis"**
+> section originally proposed a HealthFormer dual-level trunk — that trunk choice is **SUPERSEDED**:
+> we now attach these heads to **CLIFATRON's flat Qwen2 backbone** (see `notes/INTEGRATION.md`,
+> `MEMORY.md`). The heads (ICareFM threshold-hazard, SurvivEHR competing-risk, ORA value-mark) are
+> unchanged; only the backbone they sit on changed. Where this file's synthesis disagrees with
+> `MEMORY.md`, `MEMORY.md` wins.
+
 Line-level citations from full text (Paperclip). This is the source of truth for
-what each module implements; when in doubt, match the paper.
+what each **head/objective** implements; when in doubt, match the paper. (For the **trunk**,
+defer to `MEMORY.md` — see banner.)
 
 ## 1. ICareFM — the core pretraining objective (COPY THIS)
 *Burger et al., "A Foundation Model for Intensive Care." medRxiv 2025.*
@@ -64,7 +73,9 @@ what each module implements; when in doubt, match the paper.
 - **Inference-time ensembling** (average predictions, no weight sharing) recovered **77%**
   of centralized AUPRC, **97–99%** of per-condition AUROC; helped **87%** of hospitals;
   lightest governance. **FedProx collapsed** — skip it.
-- Use this to frame Rush+MIMIC: ensemble the two site-local models at inference.
+- Use this to frame our **3 dev sites (MIMIC + Rush + UChicago)**: ensemble the site-local models
+  at inference (the "Ensemble column" of the 3×3 matrix), and extend the same inference-time-ensemble
+  logic to the wider CLIF federation. (Elemento's own study is 2-site; we apply its eval recipe at 3+.)
 
 ## 5. Cadence — small-model + reporting rigor (COPY THE RIGOR)
 *Rouhollahi & Nezami, medRxiv 2026.*
@@ -75,14 +86,16 @@ what each module implements; when in doubt, match the paper.
 
 ---
 
-## Our synthesis (what this repo builds)
-Trunk = HealthFormer dual-level encoder (intra-event attention-pool + inter-event causal
-transformer with Δt-ALiBi), ~30M params (ICareFM scale). Pretraining = **three heads**:
-(A) next-event type (SurvivEHR/HealthFormer), (B) competing-risk Δt CIF (SurvivEHR),
+## Our synthesis (what this repo builds) — trunk UPDATED post-pivot
+Trunk = ~~HealthFormer dual-level encoder~~ → **CLIFATRON's flat Qwen2 backbone** (RoPE/SwiGLU/
+RMSNorm, untied embeddings, 8192 ctx, ~30M-neighborhood; from-scratch flat decoder kept as an
+ablation arm). Attach **three-plus heads** to its hidden states:
+(A) low-weight next-event type (SurvivEHR/HealthFormer), (B) competing-risk Δt CIF (SurvivEHR),
 (C) **threshold-conditioned hazard over 48h with learned τ+direction embeddings (ICareFM)** —
-this last one is the zero-shot multi-prediction engine. Downstream = K frozen-trunk task heads.
-Two-site = inference-time ensemble (Elemento). Report = task×site matrix + LPE + temperature
-scaling + dual-sex/race slices (ICareFM + Cadence).
+the zero-shot multi-prediction engine — plus (D) **ORA value-regression "mark"** (enabled).
+Downstream = K frozen-trunk task heads. **3 dev sites (MIMIC + Rush + UChicago)** + inference-time
+ensemble across sites (Elemento) + model-to-data external validation on the wider CLIF federation.
+Report = task×site matrix + LPE + temperature scaling + dual-sex/race slices (ICareFM + Cadence).
 
 **Non-negotiables copied verbatim:**
 1. Treatments are inputs, NEVER prediction targets (ICareFM).

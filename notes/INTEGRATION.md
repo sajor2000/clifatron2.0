@@ -68,7 +68,9 @@ tasks → a clean, CLIF-native tokenization ablation nobody has published.
 - **External validation = model-to-data across ALL OTHER CLIF sites.** Ship a self-contained
   package: frozen checkpoint + clifpy/tokenETL eval script. Each site runs it on its LOCAL CLIF
   tables, auto-labels outcomes from standard CLIF fields, runs ZERO-SHOT threshold/CR heads
-  (no local training/labels needed), returns ONLY aggregate + subgroup metrics. Nothing raw leaves.
+  (no local model training and no manual annotation — the auto-derived labels are used only to
+  *score* the predictions, not to fit anything), returns ONLY aggregate + subgroup metrics.
+  Nothing raw leaves.
 - **Headline figure:** forest/box plot of AUROC/AUPRC/calibration across N external CLIF sites per
   outcome. This is the "one node → many hospitals" result and the axis CLIFATRON can't claim.
 - Restrict outcomes to CLIF-derivable labels (mortality, disposition/home/LTACH, IMV on/off,
