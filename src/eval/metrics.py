@@ -204,8 +204,8 @@ def cr_d_calibration(cif: np.ndarray, events: np.ndarray,
 
     Returns D-calib p-value (chi-squared) and per-bin histogram."""
     K = cif.shape[1]
-    probs = cif[np.arange(len(events)), events, event_times]
-    probs = probs[np.isfinite(probs) & (probs > 0) & (probs < 1)]
+    probs = cif[np.arange(len(events)), events, np.clip(event_times, 0, cif.shape[2] - 1)]
+    probs = probs[np.isfinite(probs)]
     if len(probs) < n_bins:
         return {"d_calib_p": float("nan"), "d_calib_bins": [], "n": 0}
 

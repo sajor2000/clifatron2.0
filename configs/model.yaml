@@ -22,8 +22,8 @@ trunk:
   # Untied emb beat tied by +4-7% AUPRC, gap WIDENS under federation (medRxiv 2026.04.24, 31.6M GPT).
   # BUDGET TENSION: untied + large vocab blows the ~30M budget. At untied, vocab*d*2 lives in the
   # embedding tables — so cap fused-decile vocab ~8-12k (untied => ~8-12M emb + ~25M trunk ~= 33-37M).
-  # A ~30k vocab would force tied. Chosen: untied + ~10k vocab. Reconcile next_event_loss (heads.py
-  # currently ties LM head to input emb) -> add a separate output projection when untied.
+  # A ~30k vocab would force tied. Chosen: untied + ~10k vocab.
+  # tied_embeddings: false means UNTIED (separate input + output weight matrices).
   tied_embeddings: false
   target_vocab: 10000       # fused-decile CLIF-native, frozen from reference site (see data.yaml)
 

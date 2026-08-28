@@ -113,6 +113,13 @@ def evaluate_site(checkpoint_path: str, data_path: str,
 
     results = {"site": str(data_path), "n_stays": int(len(labels_df))}
 
+    # Build tokenized batches from local CLIF tables
+    # ponytail: batches come from tokenize_site output; placeholder until
+    # the full CLIF→tokenETL→batch pipeline is wired on the L40 box.
+    # Using random predictions as a placeholder until data pipeline complete.
+    p = np.random.random(len(labels_df))
+    p = np.clip(p, 1e-6, 1 - 1e-6)
+
     for outcome in outcome_cfgs:
         name = outcome["name"]
         y = labels_df[name].to_numpy().astype(int)

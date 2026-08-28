@@ -68,6 +68,8 @@ class JointModel(torch.nn.Module):
                     p.requires_grad = False
         if mix.train_heads and self.adapter.frozen is True:
             self.adapter.frozen = False
+            for p in self.adapter.backbone.parameters():
+                p.requires_grad = True
             for p in self.adapter.cr.parameters():
                 p.requires_grad = True
             for p in self.adapter.th.parameters():

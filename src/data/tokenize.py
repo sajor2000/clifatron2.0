@@ -199,6 +199,21 @@ def _soft_bins(value: float | None, concept: str, edges: dict[str, list[float]],
     return list(zip(padded_bins, padded_weights))
 
 
+def _check_single_hospital(con, base: Path) -> None:
+    adt_path = base / "clif_adt.parquet"
+    if not adt_path.exists():
+        return
+    n_hospitals = con.execute(
+        f"SELECT COUNT(DISTINCT hospital_id) FROM read_parquet('{adt_path}')"
+    ).fetchone()[0]
+    if n_hospitals > 1:
+        raise ValueError(
+            f"site has {n_hospitals} distinct hospital_id values — "
+            f"cross-hospital pooling violates the frozen-vocab contract. "
+            f"Each hospital must be a separate site."
+        )
+
+
 def tokenize_site(cfg: dict, site: str, base: Path, out: Path,
                   vocab: dict | None, edges: dict | None):
     con = duckdb.connect()
@@ -210,6 +225,12 @@ def tokenize_site(cfg: dict, site: str, base: Path, out: Path,
             frames.append(df)
     events = pl.concat(frames, how="vertical_relaxed").sort(["hosp_id", "dttm"])
     validate_units(events, cfg)
+
+    # Guard: verify single-hospital consistency for reference-site vocab.
+    # hospital_id is a CLIF 2.1 column that distinguishes hospitals within
+    # a health system. Multi-hospital pooling under one vocab silently merges
+    # different clinical workflows and populations.
+    _check_single_hospital(con, base)
     print(f"  {site}: {len(events):,} raw events, {events['hosp_id'].n_unique():,} stays")
 
     if vocab is None:  # --build-vocab path

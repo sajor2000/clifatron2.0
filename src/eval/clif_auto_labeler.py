@@ -183,6 +183,7 @@ def label_resp_failure_48h(con, hospitalization_ids):
               ON rs.hospitalization_id = l.hospitalization_id
              AND ABS(EPOCH(rs.recorded_dttm - l.lab_result_dttm)) < 3600
             WHERE l.lab_category = 'po2_arterial'
+              AND l.reference_unit = 'mmHg'
               AND rs.fio2_set IS NOT NULL AND rs.fio2_set > 0
               AND l.lab_value_numeric IS NOT NULL
         )
