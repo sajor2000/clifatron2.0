@@ -132,6 +132,27 @@ class ThresholdHazardHead(nn.Module):
         )
         return -(surv_ll + event_ll).sum(-1).mean()
 
+    def predict_with_confidence(
+        self, h_last, target_idx, tau_bin, direction
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Selective prediction with uncertainty (arxiv:2603.02719).
+
+        Returns (failure_prob, confidence) at the full horizon.
+        confidence is derived from the variance of the cumulative hazard
+        across time bins. High variance → uncertain prediction → candidate
+        for deferral to human review.
+
+        The deferral threshold is set at calibration time and should be
+        tuned per-outcome on a held-out validation set.
+        """
+        cf = self.cumulative_failure(h_last, target_idx, tau_bin, direction)
+        f_horizon = cf[:, -1]
+        haz = self.hazard(h_last, target_idx, tau_bin, direction)
+        haz_var = haz * (1 - haz)
+        cum_uncertainty = torch.sqrt(haz_var.sum(dim=-1))
+        confidence = 1.0 - torch.tanh(cum_uncertainty)
+        return f_horizon, confidence
+
 
 def composite_or(*failure_probs: torch.Tensor) -> torch.Tensor:
     """Disjunction under conditional independence: P(any) = 1 - prod(1 - F_i)."""

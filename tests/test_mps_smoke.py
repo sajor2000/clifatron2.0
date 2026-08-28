@@ -96,6 +96,18 @@ class MPSSmokeTest(unittest.TestCase):
         self.assertGreater(grads, 0, "no gradients flowed in CLIFEncoder")
         print(f"  PASS ({grads} encoder params with gradients)")
 
+        # Selective prediction: confidence must be in [0,1]
+        f_horizon, confidence = th.predict_with_confidence(
+            h_last,
+            b["th_target"],
+            b["th_tau"],
+            b["th_dir"],
+        )
+        self.assertTrue((confidence >= 0).all() and (confidence <= 1).all())
+        self.assertEqual(f_horizon.shape, (self.batch_size,))
+        self.assertEqual(confidence.shape, (self.batch_size,))
+        print(f"  selective prediction: F_h={f_horizon.mean():.3f} conf={confidence.mean():.3f}")
+
     def test_02_tied_encoder_ablation(self):
         """CLIFEncoder with tied embeddings (ablation arm)."""
         from src.model.encoder import CLIFEncoder
