@@ -72,11 +72,13 @@ def _load_decile_records(path: Path, *, drop_values_without_stats: bool = False)
     return records
 
 
-def _load_value_stats(path: str | None) -> dict[int, tuple[float, float]]:
+def _load_value_stats(
+    path: str | None, *, expected_vocab_hash: str | None = None
+) -> dict[int, tuple[float, float]]:
     if path is None:
         return {}
-    blob = json.loads(Path(path).read_text())
-    return {int(k): (float(v[0]), float(v[1])) for k, v in blob.items()}
+    from src.data.value_stats import load_value_stats
+    return load_value_stats(path, expected_vocab_hash=expected_vocab_hash)
 
 
 def _has_numeric_values(records: list[dict]) -> bool:

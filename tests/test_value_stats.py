@@ -16,6 +16,8 @@ import numpy as np
 
 from src.data.value_stats import (
     compute_value_stats,
+    load_value_stats,
+    vocab_hash,
     write_value_stats,
 )
 
@@ -59,15 +61,16 @@ class ValueStatsTest(unittest.TestCase):
         self.assertGreater(np.mean(raw_sq), 1e6)      # unnormalized NLL driver is huge
         self.assertLess(np.mean(std_sq), 3.0)          # standardized NLL driver is O(1)
 
-    def test_min_count_filters_rare_tokens(self):
-        # token 10 appears 30x; token 99 appears 25x
-        tokens = [[10, 99]] * 25 + [[10]] * 5
-        values = [[1.0, 5.0]] * 25 + [[1.1]] * 5
-        stats = compute_value_stats(tokens, values, min_count=26)
-        self.assertNotIn(99, stats)   # 25 < 26 → dropped as too rare
-        self.assertIn(10, stats)      # 30 ≥ 26 → kept
-        stats_low = compute_value_stats(tokens, values, min_count=20)
-        self.assertIn(99, stats_low)  # 25 ≥ 20 → now kept
+    def test_rare_tokens_still_get_stats_coverage_contract(self):
+        """Rare numeric tokens must NOT be dropped — TargetBuilder aborts without them.
+        min_count only widens the fallback scale; every numeric token gets an entry."""
+        # token 10 appears 30x; token 99 appears only 3x (well under min_count)
+        tokens = [[10, 99]] * 3 + [[10]] * 27
+        values = [[1.0, 5.0]] * 3 + [[1.1]] * 27
+        stats = compute_value_stats(tokens, values, min_count=20)
+        self.assertIn(10, stats)
+        self.assertIn(99, stats)                 # rare, but still covered
+        self.assertGreater(stats[99][1], 0.0)    # positive fallback scale
 
     def test_categorical_tokens_without_values_are_omitted(self):
         tokens = [[10, 40, 40]] * 30
@@ -112,13 +115,33 @@ class ValueStatsTest(unittest.TestCase):
         stats = compute_value_stats(tokens, values, min_count=20)
         with tempfile.TemporaryDirectory() as d:
             path = write_value_stats(stats, Path(d) / "value_stats.json")
-            blob = json.loads(path.read_text())
-            # keys are string token ids, values are [center, scale]
-            reloaded = {int(k): (float(v[0]), float(v[1])) for k, v in blob.items()}
+            reloaded = load_value_stats(path)
             self.assertEqual(set(reloaded), set(stats))
             for tok in stats:
                 self.assertAlmostEqual(reloaded[tok][0], stats[tok][0], places=6)
                 self.assertAlmostEqual(reloaded[tok][1], stats[tok][1], places=6)
+
+    def test_legacy_bare_map_still_loads(self):
+        """Back-compat: a legacy {token_id: [center, scale]} file loads without identity."""
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "legacy.json"
+            p.write_text(json.dumps({"10": [1.2, 0.5], "20": [200.0, 60.0]}))
+            reloaded = load_value_stats(p)
+            self.assertEqual(reloaded[10], (1.2, 0.5))
+
+    def test_vocab_hash_binding_and_mismatch_detection(self):
+        tokens, values = _multi_magnitude_data(n=100)
+        stats = compute_value_stats(tokens, values, min_count=20)
+        vocab = {"map=0": 10, "platelets=0": 20, "lactate=0": 30}
+        vsha = vocab_hash(vocab)
+        with tempfile.TemporaryDirectory() as d:
+            p = write_value_stats(stats, Path(d) / "vs.json", vocab=vocab)
+            # correct hash loads fine
+            ok = load_value_stats(p, expected_vocab_hash=vsha)
+            self.assertEqual(set(ok), set(stats))
+            # a different vocab's hash is rejected (stale / cross-vocabulary artifact)
+            with self.assertRaises(ValueError):
+                load_value_stats(p, expected_vocab_hash="deadbeef" * 8)
 
     def test_stats_accepted_by_target_builder(self):
         """Frozen stats must satisfy TargetBuilder's value_stats contract end to end."""

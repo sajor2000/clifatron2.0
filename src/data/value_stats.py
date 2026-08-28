@@ -20,6 +20,7 @@ dangerous tails we most care about.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 from pathlib import Path
@@ -42,12 +43,16 @@ def compute_value_stats(
 ) -> dict[int, tuple[float, float]]:
     """Per-token (center, scale) from parallel token/value sequences.
 
-    Only numeric (non-null, finite) values contribute. A token that never carries a
-    finite value, or has fewer than `min_count` observations, is omitted — its events
-    are categorical (no value to normalize) or too rare to standardize stably.
+    COVERAGE CONTRACT: every token that carries at least one finite value gets stats.
+    `TargetBuilder` raises on any finite numeric target whose token lacks stats, so
+    silently dropping a rare-but-real numeric token would deterministically abort
+    pretraining. `min_count` therefore controls only the CENTER/SCALE ESTIMATOR, not
+    omission: below the threshold a token still gets stats, but with a robust
+    wider-fallback scale (never a missing entry). Only tokens that never carry a finite
+    value (purely categorical) are absent — they have nothing to normalize.
 
-    robust=True (default): center = median, scale = IQR / 1.349 (falls back to std
-    when the IQR is degenerate). robust=False: center = mean, scale = std.
+    robust=True (default): center = median, scale = IQR / 1.349 (falls back to std,
+    then to a fixed floor, when the IQR/std is degenerate). robust=False: mean / std.
     """
     if len(tokens_per_stay) != len(values_per_stay):
         raise ValueError("tokens_per_stay and values_per_stay must have equal length")
@@ -66,20 +71,26 @@ def compute_value_stats(
 
     stats: dict[int, tuple[float, float]] = {}
     for token_id, observed in buckets.items():
-        if len(observed) < min_count:
-            continue
         arr = np.asarray(observed, dtype=np.float64)
-        if robust:
+        # A token seen too few times for a stable robust estimate still gets stats
+        # (coverage contract) — we just widen the fallback so its NLL isn't overconfident.
+        under_min = len(observed) < min_count
+        if robust and not under_min:
             center = float(np.median(arr))
             q75, q25 = np.percentile(arr, [75, 25])
             scale = float((q75 - q25) / _IQR_TO_SIGMA)
             if not math.isfinite(scale) or scale <= _MIN_SCALE:
                 scale = float(np.std(arr))  # degenerate IQR (e.g. spiky discrete value)
         else:
+            # rare token, or mean/std mode: mean/std is the most stable on few points
             center = float(np.mean(arr))
             scale = float(np.std(arr))
+            if under_min:
+                # too few points to trust the spread → widen toward |center| so the
+                # Gaussian isn't overconfident on an under-observed concept
+                scale = max(scale, abs(center) * 0.5)
         if not math.isfinite(scale) or scale <= _MIN_SCALE:
-            scale = _MIN_SCALE  # constant-valued token: avoid a zero/negative scale
+            scale = max(abs(center) * 0.5, _MIN_SCALE)  # constant/degenerate token
         stats[token_id] = (center, scale)
     return stats
 
@@ -105,13 +116,66 @@ def compute_value_stats_from_events(
     return compute_value_stats(tokens, values, min_count=min_count, robust=robust)
 
 
-def write_value_stats(stats: dict[int, tuple[float, float]], out_path: str | Path) -> Path:
-    """Write the frozen stats as JSON `{token_id: [center, scale]}` for `--value-stats`."""
+def vocab_hash(vocab: dict) -> str:
+    """SHA-256 of the fused vocab (matches tokenize._json_sha256 canonicalization).
+
+    Binds a value-stats artifact to the exact vocabulary whose token ids give it
+    meaning, so a stale or cross-vocabulary file is rejected instead of silently
+    applying unrelated centers/scales."""
+    payload = json.dumps(vocab, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(payload.encode()).hexdigest()
+
+
+def write_value_stats(
+    stats: dict[int, tuple[float, float]],
+    out_path: str | Path,
+    *,
+    vocab: dict | None = None,
+    vocab_sha: str | None = None,
+    min_count: int = _MIN_COUNT,
+    robust: bool = True,
+) -> Path:
+    """Write frozen stats as a self-describing artifact bound to its vocabulary.
+
+    Format: `{"schema": 2, "vocab_hash": <sha256|null>, "min_count", "robust",
+    "stats": {token_id: [center, scale]}}`. Pass `vocab` (the fused vocab dict) or a
+    precomputed `vocab_sha` to bind the artifact; the loader verifies it."""
+    if vocab is not None and vocab_sha is None:
+        vocab_sha = vocab_hash(vocab)
     out = Path(out_path)
     out.parent.mkdir(parents=True, exist_ok=True)
-    blob = {str(tok): [center, scale] for tok, (center, scale) in sorted(stats.items())}
+    blob = {
+        "schema": 2,
+        "vocab_hash": vocab_sha,
+        "min_count": int(min_count),
+        "robust": bool(robust),
+        "stats": {str(tok): [center, scale] for tok, (center, scale) in sorted(stats.items())},
+    }
     out.write_text(json.dumps(blob, indent=2))
     return out
+
+
+def load_value_stats(
+    path: str | Path, *, expected_vocab_hash: str | None = None
+) -> dict[int, tuple[float, float]]:
+    """Load a value-stats artifact, verifying vocabulary identity when available.
+
+    Accepts both the schema-2 self-describing format and the legacy bare
+    `{token_id: [center, scale]}` map. If `expected_vocab_hash` is given and the
+    artifact carries a `vocab_hash`, a mismatch raises (stale / wrong-vocabulary
+    file). A schema-2 artifact whose `vocab_hash` is null is treated as unbound."""
+    blob = json.loads(Path(path).read_text())
+    if isinstance(blob, dict) and "stats" in blob:  # schema-2 self-describing
+        stored = blob.get("vocab_hash")
+        if expected_vocab_hash is not None and stored is not None and stored != expected_vocab_hash:
+            raise ValueError(
+                f"value-stats vocabulary hash mismatch: artifact {stored[:12]}… != "
+                f"expected {expected_vocab_hash[:12]}… (stale or cross-vocabulary stats)"
+            )
+        raw = blob["stats"]
+    else:  # legacy bare map — no identity to verify
+        raw = blob
+    return {int(k): (float(v[0]), float(v[1])) for k, v in raw.items()}
 
 
 def _main() -> None:
@@ -123,17 +187,35 @@ def _main() -> None:
     ap.add_argument("--events", required=True,
                     help="reference-site tokenized events.parquet (freeze stats here)")
     ap.add_argument("--out", required=True, help="output value_stats.json path")
+    ap.add_argument("--vocab", default=None,
+                    help="vocab.json to bind stats to (defaults to a sibling of --events)")
     ap.add_argument("--min-count", type=int, default=_MIN_COUNT,
-                    help="min observations per token to emit stats")
+                    help="observations below which a token uses a wider fallback scale "
+                         "(NOT a drop threshold — every numeric token still gets stats)")
     ap.add_argument("--mean-std", action="store_true",
                     help="use mean/std instead of robust median/IQR")
     args = ap.parse_args()
 
+    robust = not args.mean_std
     stats = compute_value_stats_from_events(
-        args.events, min_count=args.min_count, robust=not args.mean_std
+        args.events, min_count=args.min_count, robust=robust
     )
-    path = write_value_stats(stats, args.out)
-    print(f"wrote {len(stats):,} per-token value stats -> {path}")
+
+    # Bind to the fused vocabulary so a stale/cross-vocab artifact is detectable.
+    vocab_path = Path(args.vocab) if args.vocab else Path(args.events).with_name("vocab.json")
+    vsha = None
+    if vocab_path.exists():
+        blob = json.loads(vocab_path.read_text())
+        vocab = blob.get("vocab", blob)  # tolerate {"vocab":..} or a bare map
+        vsha = vocab_hash(vocab)
+    else:
+        print(f"warning: no vocab.json at {vocab_path} — artifact will be UNBOUND (no identity check)")
+
+    path = write_value_stats(
+        stats, args.out, vocab_sha=vsha, min_count=args.min_count, robust=robust
+    )
+    print(f"wrote {len(stats):,} per-token value stats -> {path}"
+          + (f" (vocab {vsha[:12]}…)" if vsha else " (unbound)"))
 
 
 if __name__ == "__main__":
