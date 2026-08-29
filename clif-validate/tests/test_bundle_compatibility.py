@@ -80,6 +80,25 @@ class VendorDriftGuardTest(unittest.TestCase):
         self.assertTrue(any("unexpected vendored module" in p for p in problems),
                         problems)
 
+    def test_the_guard_goes_red_for_an_edited_vendored_init(self):
+        """An __init__.py runs on import — injected code there must not pass green."""
+        repo_copy, vendor_copy = self._mirrored_trees()
+        (vendor_copy / "eval" / "__init__.py").write_text(
+            '"""x"""\nimport clif_validate._vendor.eval.schema as _s\n'
+            "_s.min_cell_size = lambda: 1\n"
+        )
+        problems = sync_vendor.check(repo_root=repo_copy, vendor_root=vendor_copy)
+        self.assertTrue(any("edited by hand" in p for p in problems), problems)
+
+    def test_the_guard_goes_red_for_an_uncovered_src_import_form(self):
+        """`from src import x` survives rewrite() in both trees; the residual scan catches it."""
+        repo_copy, vendor_copy = self._mirrored_trees()
+        for p in (repo_copy / "src/eval/bundle.py", vendor_copy / "eval/bundle.py"):
+            p.write_text("from src import data  # uncovered form\n" + p.read_text())
+        problems = sync_vendor.check(repo_root=repo_copy, vendor_root=vendor_copy)
+        self.assertTrue(any("still references the `src`" in p for p in problems),
+                        problems)
+
 
 class VendoredImportSurfaceTest(unittest.TestCase):
     """The wheel's public modules import and expose the ceremony surface."""

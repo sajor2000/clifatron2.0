@@ -15,6 +15,7 @@ import json
 import os
 import shutil
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -48,15 +49,45 @@ class _BundleFixtureCase(unittest.TestCase):
         cls._tmp = tempfile.TemporaryDirectory()
         cls.work = Path(cls._tmp.name)
         cls._old_cwd = os.getcwd()
+        # Force a non-UTC session timezone so the DuckDB UTC pin is actually exercised
+        # regardless of the host/CI timezone. Without this the "regression check" was a
+        # claim, not a control: on a UTC runner the pin in tokenize.py could be deleted
+        # and this suite would still pass (review finding). tzset() is POSIX-only, which
+        # matches the package's stated platform.
+        cls._old_tz = os.environ.get("TZ")
+        os.environ["TZ"] = "America/Chicago"
+        if hasattr(time, "tzset"):
+            time.tzset()
         os.chdir(cls.work)  # the artifact policy classifies shards relative to CWD
-        cls.site = cls.work / "site"
-        cls.episodes = build_synthetic_site(cls.site)
-        cls.bundle_dir = build_synthetic_bundle(cls.work / "bundle", cls.site,
-                                                cls.episodes)
+        # Build under try/except: build_synthetic_* is fallible, and a raise after the
+        # chdir would otherwise skip tearDownClass and leave the whole pytest session
+        # in a temp dir that TemporaryDirectory then deletes (review finding).
+        try:
+            cls.site = cls.work / "site"
+            cls.episodes = build_synthetic_site(cls.site)
+            cls.bundle_dir = build_synthetic_bundle(cls.work / "bundle", cls.site,
+                                                    cls.episodes)
+        except BaseException:
+            os.chdir(cls._old_cwd)
+            if cls._old_tz is None:
+                os.environ.pop("TZ", None)
+            else:
+                os.environ["TZ"] = cls._old_tz
+            if hasattr(time, "tzset"):
+                time.tzset()
+            _reset_policy_pin()
+            cls._tmp.cleanup()
+            raise
 
     @classmethod
     def tearDownClass(cls):
         os.chdir(cls._old_cwd)
+        if cls._old_tz is None:
+            os.environ.pop("TZ", None)
+        else:
+            os.environ["TZ"] = cls._old_tz
+        if hasattr(time, "tzset"):
+            time.tzset()
         _reset_policy_pin()
         cls._tmp.cleanup()
 
@@ -156,6 +187,105 @@ class BundleContractTest(_BundleFixtureCase):
         self.assertEqual(S.min_cell_size(), 17)
         self.assertEqual(S.curve_release_min(), 85)
 
+    def _reseal(self, d):
+        m = json.loads((d / BUNDLE_MANIFEST).read_text())
+        write_bundle_manifest(
+            d, model_bundle_id=m["model_bundle_id"], model_version=m["model_version"],
+            vocab_hash=m["vocab_hash"], outcome_spec_hash=m["outcome_spec_hash"],
+            clif_version=m["clif_version"], outcome_queries=m["outcome_queries"],
+        )
+
+    def test_a_nested_manifest_named_file_does_not_escape_the_envelope(self):
+        """An unlisted `sub/bundle_manifest.json` must be caught, not skipped by name."""
+        broken = self._mutable_copy("bundle_nested_manifest")
+        (broken / "sub").mkdir()
+        (broken / "sub" / BUNDLE_MANIFEST).write_text('{"evil": 1}')
+        with self.assertRaisesRegex(ArtifactMismatch, "does not cover"):
+            load_bundle(broken)
+
+    def test_a_symlink_in_the_bundle_is_refused(self):
+        """A symlink could point outside the bundle or hide files from the hash map."""
+        broken = self._mutable_copy("bundle_symlink")
+        (broken / "link.json").symlink_to(broken / "vocab.json")
+        with self.assertRaisesRegex(ArtifactMismatch, "symlink"):
+            load_bundle(broken)
+
+    def test_a_direction_outside_0_1_is_refused_at_load(self):
+        """direction indexes an Embedding(2); reject 2 at load, not deep in torch."""
+        broken = self._mutable_copy("bundle_dir2")
+        manifest = json.loads((broken / BUNDLE_MANIFEST).read_text())
+        manifest["outcome_queries"][SYNTHETIC_OUTCOME]["direction"] = 2
+        (broken / BUNDLE_MANIFEST).write_text(json.dumps(manifest))
+        with self.assertRaisesRegex(ArtifactMismatch, "direction must be 0"):
+            load_bundle(broken)
+
+    def test_a_sql_unsafe_column_name_is_refused(self):
+        """An untrusted table spec column that could break out of DuckDB SQL fails closed."""
+        import yaml
+
+        broken = self._mutable_copy("bundle_sqlcol")
+        dc = yaml.safe_load((broken / "data_config.yaml").read_text())
+        dc["tables"]["vitals"]["concept_col"] = "x FROM read_text('/etc/passwd') --"
+        (broken / "data_config.yaml").write_text(yaml.safe_dump(dc))
+        self._reseal(broken)
+        with self.assertRaisesRegex(ArtifactMismatch, "SQL identifier"):
+            load_bundle(broken)
+
+    def test_a_traversal_file_name_is_refused(self):
+        import yaml
+
+        broken = self._mutable_copy("bundle_traversal")
+        dc = yaml.safe_load((broken / "data_config.yaml").read_text())
+        dc["tables"]["vitals"]["file"] = "../../etc/passwd"
+        (broken / "data_config.yaml").write_text(yaml.safe_dump(dc))
+        self._reseal(broken)
+        with self.assertRaisesRegex(ArtifactMismatch, "unsafe file name"):
+            load_bundle(broken)
+
+    def test_a_mismatched_clif_version_is_refused(self):
+        """A data config whose CLIF version disagrees with the manifest must fail closed.
+
+        Two guards cover this in depth: validate_vocabulary_artifact checks the vocab
+        manifest's clif_version against the data config, and load_bundle's own
+        schema_version/clif_version cross-check backs it. This mutation trips the former
+        first (QualificationError); the point of the test is that a version mismatch is
+        refused, not which guard fires.
+        """
+        import yaml
+
+        from src.data.cohort import QualificationError
+
+        broken = self._mutable_copy("bundle_clifver")
+        dc = yaml.safe_load((broken / "data_config.yaml").read_text())
+        dc["schema_version"] = "3.0.0"  # manifest clif_version stays 2.1
+        (broken / "data_config.yaml").write_text(yaml.safe_dump(dc))
+        self._reseal(broken)
+        with self.assertRaises((ArtifactMismatch, QualificationError)):
+            load_bundle(broken)
+
+    def test_a_bundle_rejected_late_does_not_leave_its_policy_pinned(self):
+        """A bundle refused at an identity check must not lower the process floor."""
+        before = os.environ.get(S.POLICY_OVERRIDE_ENV)
+        broken = self._mutable_copy("bundle_pinreject")
+        pol = broken / "artifact_policy.yaml"
+        pol.write_text(pol.read_text().replace("minimum_cell_size: 10",
+                                               "minimum_cell_size: 1"))
+        # Re-seal the files map over the edited policy, then corrupt an IDENTITY field
+        # (vocab_hash) so load_bundle fails AFTER the policy would previously have pinned.
+        self._reseal(broken)
+        manifest = json.loads((broken / BUNDLE_MANIFEST).read_text())
+        manifest["vocab_hash"] = "0" * 64
+        (broken / BUNDLE_MANIFEST).write_text(json.dumps(manifest))
+        with self.assertRaises(ArtifactMismatch):
+            load_bundle(broken)
+        self.assertEqual(os.environ.get(S.POLICY_OVERRIDE_ENV), before)
+
+    def test_pin_policy_false_leaves_process_state_untouched(self):
+        """The opt-out branch a comparison/introspection caller uses."""
+        before = os.environ.get(S.POLICY_OVERRIDE_ENV)
+        load_bundle(self.bundle_dir, pin_policy=False)
+        self.assertEqual(os.environ.get(S.POLICY_OVERRIDE_ENV), before)
+
 
 class BundleInferenceTest(_BundleFixtureCase):
     """The wired path: bundle → tokenize → zero-shot inference → schema'd cell."""
@@ -216,10 +346,6 @@ class BundleInferenceTest(_BundleFixtureCase):
         self.assertTrue(np.isnan(probs[1, 0]))
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class RepoCliEndToEndTest(_BundleFixtureCase):
     """The repo CLI itself, driven end to end against the fixture bundle.
 
@@ -267,3 +393,7 @@ class RepoCliEndToEndTest(_BundleFixtureCase):
             attest.confirmed_releases(Path("output/intermediate_phi/repo_cli_ledger.jsonl")),
             {"rel-repo-cli"},
         )
+
+
+if __name__ == "__main__":
+    unittest.main()

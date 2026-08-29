@@ -37,6 +37,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -76,8 +77,24 @@ def hash_bundle_files(bundle_dir: str | Path) -> dict[str, str]:
     root = Path(bundle_dir)
     out: dict[str, str] = {}
     for p in sorted(root.rglob("*")):
-        if p.is_file() and p.name != BUNDLE_MANIFEST:
-            out[p.relative_to(root).as_posix()] = _sha256_file(p)
+        if not p.is_file():
+            continue
+        rel = p.relative_to(root).as_posix()
+        # Exclude only the TOP-LEVEL manifest — a name match at any depth
+        # (`subdir/bundle_manifest.json`) would let a nested file escape both
+        # this map and the unlisted-file check, defeating rule 1 (review finding).
+        if rel == BUNDLE_MANIFEST:
+            continue
+        # A symlink is not a bundle file: rglob does not descend a symlinked
+        # directory (so files under it would be unhashed AND unlisted), and a
+        # symlinked regular file could point outside the bundle. Refuse rather
+        # than hash through the link.
+        if p.is_symlink():
+            raise ArtifactMismatch(
+                f"bundle contains a symlink ({rel}); bundles must be plain files "
+                "so nothing escapes the integrity envelope through a link"
+            )
+        out[rel] = _sha256_file(p)
     return out
 
 
@@ -138,7 +155,70 @@ def _validated_outcome_queries(manifest: dict) -> dict[str, dict]:
                     f"outcome query {name!r} field {field!r} must be a non-negative "
                     f"integer, got {value!r}"
                 )
+        # `direction` indexes ThresholdHazardHead.dir_emb, an nn.Embedding(2), so
+        # {0, 1} is its entire domain. Reject anything else HERE, at load: a stray
+        # direction=2 otherwise passes the generic non-negative check and dies deep
+        # in torch ("index out of range in self") after tokenization has already
+        # run over PHI, with a confusing error and wasted work (review finding).
+        if q["direction"] not in (0, 1):
+            raise ArtifactMismatch(
+                f"outcome query {name!r} direction must be 0 (below) or 1 (above), "
+                f"got {q['direction']!r}"
+            )
     return queries
+
+
+# A SQL column identifier: a letter/underscore start, then word chars. No spaces,
+# quotes, parens, or punctuation that could break out of an identifier position.
+_SQL_IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+# A bundle table's parquet basename (tokenize appends ".parquet"): plain filename
+# characters only — no path separators, no "..", nothing that leaves the site dir.
+_TABLE_FILE_RE = re.compile(r"^[A-Za-z0-9._-]+$")
+
+# The table-spec fields tokenize._read_table interpolates into a DuckDB query string.
+# `value_col`/`unit_col` are optional; the rest are required when a table is declared.
+_REQUIRED_SPEC_IDENTIFIERS = ("concept_col", "availability_col")
+_OPTIONAL_SPEC_IDENTIFIERS = ("value_col", "unit_col")
+
+
+def _validate_data_config_identifiers(data_cfg: dict) -> None:
+    """Reject any bundle table spec whose column/file names could break out of SQL.
+
+    The bundle is untrusted input, and closing the D1 seam routes its `data_config`
+    straight into `tokenize._read_table`, which f-string-interpolates the column names
+    and the parquet basename into a DuckDB query with no quoting. An identifier like
+    `x FROM read_text('/etc/passwd') --` would otherwise be arbitrary SQL against an
+    engine that can read local files (review finding). Full releaser-signature trust is
+    U11; this is the cheap, in-scope defense that does not wait on it: every bundle
+    identifier must look like an identifier before it reaches a query string.
+    """
+    tables = data_cfg.get("tables")
+    if not isinstance(tables, dict) or not tables:
+        raise ArtifactMismatch("bundle data config declares no tables")
+    for name, spec in tables.items():
+        if not isinstance(spec, dict):
+            raise ArtifactMismatch(f"bundle table spec {name!r} is not a mapping")
+        file_stem = spec.get("file")
+        if not isinstance(file_stem, str) or not _TABLE_FILE_RE.match(file_stem):
+            raise ArtifactMismatch(
+                f"bundle table {name!r} declares an unsafe file name {file_stem!r}; "
+                "must be a bare parquet basename (no path separators or '..')"
+            )
+        for field in _REQUIRED_SPEC_IDENTIFIERS:
+            value = spec.get(field)
+            if not isinstance(value, str) or not _SQL_IDENT_RE.match(value):
+                raise ArtifactMismatch(
+                    f"bundle table {name!r} field {field!r}={value!r} is not a valid "
+                    "SQL identifier; refusing to interpolate it into a query"
+                )
+        for field in _OPTIONAL_SPEC_IDENTIFIERS:
+            value = spec.get(field)
+            if value is not None and (not isinstance(value, str)
+                                      or not _SQL_IDENT_RE.match(value)):
+                raise ArtifactMismatch(
+                    f"bundle table {name!r} field {field!r}={value!r} is not a valid "
+                    "SQL identifier; refusing to interpolate it into a query"
+                )
 
 
 def pin_bundle_policy(policy_path: str | Path) -> None:
@@ -171,10 +251,15 @@ class Bundle:
 def load_bundle(path: str | Path, *, pin_policy: bool = True) -> Bundle:
     """Verify and load a bundle, fail-closed at every step.
 
-    Order matters: file hashes are verified before any bundled file is parsed, the
-    policy is pinned before the vocabulary validation that reads it, and the
-    manifest's identity is cross-checked against the vocabulary's own manifest last —
-    after both have independently proven internally consistent.
+    Order matters, and every mutation of process state waits until AFTER the bundle
+    has fully proven out: file hashes are verified before any bundled file is parsed,
+    the data config's SQL-bound identifiers are validated before they can reach a
+    query, the manifest's identity is cross-checked against the vocabulary's own
+    manifest, and only then — with nothing left that can raise — is the policy pinned
+    process-wide. A bundle refused at any check must not leave its disclosure policy
+    governing the rest of the process (review finding: pin ran before the identity
+    cross-checks, so a rejected bundle carrying `minimum_cell_size: 1` still lowered
+    the floor for every later `min_cell_size()` call).
     """
     root = Path(path)
     manifest_path = root / BUNDLE_MANIFEST
@@ -190,12 +275,11 @@ def load_bundle(path: str | Path, *, pin_policy: bool = True) -> Bundle:
 
     policy_path = (root / "artifact_policy.yaml").resolve()
     policy = yaml.safe_load(policy_path.read_text())
-    if pin_policy:
-        pin_bundle_policy(policy_path)
 
     cohort_path = (root / "cohort.yaml").resolve()
     data_cfg_path = (root / "data_config.yaml").resolve()
     data_cfg = yaml.safe_load(data_cfg_path.read_text())
+    _validate_data_config_identifiers(data_cfg)
     # Rewrite the config-path fields to the bundled absolute files. tokenize.py
     # resolves them as `ROOT / cfg[...]`, and pathlib joins an absolute right-hand
     # side by discarding the left — so after this rewrite the repo-relative
@@ -230,6 +314,12 @@ def load_bundle(path: str | Path, *, pin_policy: bool = True) -> Bundle:
             f"match the bundled data config's schema_version "
             f"{data_cfg['schema_version']!r}"
         )
+
+    # Every check has passed; nothing below can raise. NOW pin the policy — see the
+    # ordering rationale in the docstring. validate_vocabulary_artifact above took the
+    # policy as an explicit dict, so nothing so far depended on the env pin.
+    if pin_policy:
+        pin_bundle_policy(policy_path)
 
     return Bundle(
         path=root,
