@@ -422,6 +422,14 @@ def write_export(payload: dict, out_path: str | Path, ledger_path: str | Path,
     # with different content confirms an identity that a different visible artifact
     # already carries. The id is classified like any other residue -- it may proceed only
     # when the inventory shows it never became visible.
+    # Everything from here to the confirmation runs under one lock, so a concurrent
+    # export cannot validate against the same pre-append snapshot (Greptile review 6).
+    with _attest.ledger_lock(ledger_path):
+        return _write_export_locked(payload, out_path, ledger_path, published_release_ids)
+
+
+def _write_export_locked(payload: dict, out_path: str | Path, ledger_path: str | Path,
+                         published_release_ids: set | None) -> Path:
     residue = _attest.unconfirmed_releases(ledger_path)
     if residue:
         if published_release_ids is None:

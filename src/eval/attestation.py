@@ -25,6 +25,8 @@ The ledger stores cell *definitions and sizes*, never cell contents.
 
 from __future__ import annotations
 
+import contextlib
+import fcntl
 import hashlib
 import hmac
 import json
@@ -97,6 +99,34 @@ def _durably_append(path: Path, line: str) -> None:
             os.fsync(dir_fd)
         finally:
             os.close(dir_fd)
+
+
+@contextlib.contextmanager
+def ledger_lock(ledger_path: str | Path):
+    """Serialize the whole check-append-publish-confirm sequence on one ledger.
+
+    The differencing check reads a snapshot and the intent append writes one; between
+    them another process can read the same snapshot (Greptile review 6). Two concurrent
+    exports then both pass -- one releasing a cell, one suppressing it -- and the
+    suppressed value is recoverable by differencing the pair. Each release is individually
+    compliant, which is the same shape as the cross-release attack, just at a smaller time
+    scale.
+
+    An advisory `flock` on a sidecar, held for the entire sequence rather than for each
+    file operation. Advisory locking is enough because every writer here goes through this
+    module; it is not a defence against a process that ignores it, and does not pretend to
+    be. Cross-host exports sharing a ledger over a network filesystem need a real
+    coordinator -- recorded as a limitation rather than papered over.
+    """
+    path = Path(ledger_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = path.with_suffix(path.suffix + ".lock")
+    with lock_path.open("w") as fh:
+        fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
 
 
 def _durably_write(path: Path, text: str) -> None:
@@ -530,7 +560,12 @@ def reconcile_ledger(ledger_path: str | Path, published_release_ids: set) -> lis
     residue of a crash between publication and confirmation, and must be confirmed before
     the next release so the differencing check counts it.
     """
-    return sorted(published_release_ids - confirmed_releases(ledger_path))
+    # Intersect with this ledger's own residue (Greptile review 6). Subtracting only the
+    # confirmed ids meant any id in the inventory that this ledger knows nothing about --
+    # stale, pre-ledger, another site's -- was reported as published-but-unconfirmed and
+    # blocked the next export on an artifact it could never confirm. Only an id this
+    # ledger recorded an intent for, and that the inventory says is visible, needs action.
+    return sorted(set(published_release_ids) & unconfirmed_releases(ledger_path))
 
 
 def append_to_ledger(payload: dict, ledger_path: str | Path) -> None:
@@ -553,7 +588,7 @@ def append_to_ledger(payload: dict, ledger_path: str | Path) -> None:
 
 __all__ = [
     "AuthenticationError", "confirm_publication", "confirmed_releases", "reconcile_ledger",
-    "preflight_access_log",
+    "preflight_access_log", "ledger_lock",
     "unconfirmed_releases",
     "canonical_bytes", "sign_report", "verify_report",
     "record_access", "verify_access_log",

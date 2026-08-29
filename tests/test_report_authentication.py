@@ -429,6 +429,43 @@ class DisclosureLedgerTest(unittest.TestCase):
             A.confirm_publication(_report(release="rel-A"), ledger)
             self.assertEqual(A.reconcile_ledger(ledger, {"rel-A"}), [])
 
+    def test_reconcile_ignores_ids_this_ledger_never_recorded(self):
+        """Greptile review 6. Subtracting only the confirmed ids meant any inventory entry
+        this ledger knows nothing about -- stale, pre-ledger, another site's -- was
+        reported as published-but-unconfirmed and blocked the next export on an artifact
+        it could never confirm."""
+        with tempfile.TemporaryDirectory() as td:
+            ledger = Path(td) / "ledger.jsonl"
+            A.append_to_ledger(_report(release="rel-mine"), ledger)
+
+            # The inventory carries an unrelated id alongside ours.
+            unresolved = A.reconcile_ledger(ledger, {"rel-mine", "rel-someone-elses"})
+            self.assertEqual(unresolved, ["rel-mine"])
+
+            # And an inventory of only unrelated ids resolves clean.
+            self.assertEqual(A.reconcile_ledger(ledger, {"rel-someone-elses"}), [])
+
+    def test_ledger_lock_is_exclusive(self):
+        """Greptile review 6, P1 security: the snapshot check and the intent append were
+        separate unlocked operations, so two concurrent exports could both validate
+        against the same prior state -- one releasing a cell, one suppressing it."""
+        import fcntl
+        with tempfile.TemporaryDirectory() as td:
+            ledger = Path(td) / "ledger.jsonl"
+            lock_path = Path(str(ledger) + ".lock")
+
+            with A.ledger_lock(ledger):
+                self.assertTrue(lock_path.exists())
+                # A second, independent open must not be able to take the lock.
+                with lock_path.open("w") as other:
+                    with self.assertRaises(BlockingIOError):
+                        fcntl.flock(other.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+            # Released on exit.
+            with lock_path.open("w") as after:
+                fcntl.flock(after.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                fcntl.flock(after.fileno(), fcntl.LOCK_UN)
+
     def test_ledger_is_append_only_across_releases(self):
         with tempfile.TemporaryDirectory() as td:
             ledger = Path(td) / "ledger.jsonl"
