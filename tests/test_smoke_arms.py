@@ -127,24 +127,24 @@ class DataFreeSmokeTest(unittest.TestCase):
         logits = M._logit(p)
         logits[p == 0] = -np.inf
         logits[p == 1] = np.inf
-        pan = M.full_panel(p.copy(), y, logits=logits.copy(), recalibrate=True)
+        pan = M.full_panel(p.copy(), y, logits=logits.copy(),
+                           unsafe_fit_on_eval_labels=True)
         self.assertEqual(pan["n_dropped_nan"], 0)
 
         # (b) NaN predictions are dropped and counted, not fabricated to 0.5
         p_nan = p.copy()
         p_nan[:10] = np.nan
-        pan_nan = M.full_panel(p_nan, y.copy(), recalibrate=False)
+        pan_nan = M.full_panel(p_nan, y.copy())
         self.assertEqual(pan_nan["n_dropped_nan"], 10)
         self.assertEqual(pan_nan["n"], 190)
 
         # (c) nan_policy='raise' fails loud
         with self.assertRaises(ValueError):
-            M.full_panel(p_nan, y.copy(), recalibrate=False, nan_policy="raise")
+            M.full_panel(p_nan, y.copy(), nan_policy="raise")
 
         # (d) all-NaN => NaN metrics, never fabricated
         pan_all = M.full_panel(np.full(50, np.nan),
-                               (np.random.random(50) > 0.5).astype(int),
-                               recalibrate=False)
+                               (np.random.random(50) > 0.5).astype(int))
         self.assertTrue(np.isnan(pan_all["auroc"]))
         self.assertEqual(pan_all["n"], 0)
 
@@ -157,7 +157,9 @@ class DataFreeSmokeTest(unittest.TestCase):
         p = np.clip(y.astype(float) + np.random.normal(0, 0.15, 200), 0, 1)
         logits = M._logit(p)  # robust prob->logit (clips 0/1 to avoid ±inf)
 
-        panel = M.full_panel(p, y, logits=logits, recalibrate=True)
+        # Synthetic single-array calibration: named explicitly, since U5 made
+        # fitting on evaluated labels something a caller has to ask for.
+        panel = M.full_panel(p, y, logits=logits, unsafe_fit_on_eval_labels=True)
         for key in ("auroc", "auprc", "ece", "brier", "calib_slope",
                      "calib_intercept", "ici", "temperature"):
             self.assertIn(key, panel, f"missing metric: {key}")

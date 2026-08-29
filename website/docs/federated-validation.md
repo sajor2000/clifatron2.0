@@ -158,7 +158,13 @@ Run:
 
 ```bash
 # at each external site (returns aggregate metrics only)
-python -m src.eval.clif_validate --checkpoint <ckpt> --data /path/to/clif_parquet --site-name "SiteName"
+python -m src.eval.clif_validate \
+      --checkpoint <ckpt> \
+      --data /path/to/clif_parquet \
+      --episode-artifact /path/to/episodes.parquet \
+      --site-id SITE-07 \
+      --release-id 2026-08-28-site07-v0 \
+      --signing-key-file /secure/site07.key
 # at the hub (metrics JSONs only)
 python -m src.eval.clif_forest_plot --results results/SiteA.json results/SiteB.json
 ```

@@ -45,8 +45,11 @@ Five-thread deep research + 2 focused 2026-preprint threads (tokenization a76bb9
 - **Eval:** CLIF→MEDS ETL (exists, consortium) → MEDS-Tab XGBoost baseline (mandatory) + MEDS-DEV;
   task×site matrix + adaptation ladder (as-is/recalibrate/finetune) + LPE; panel AUROC/AUPRC/ECE/
   Brier/calib-slope/ICI/DCA; TRIPOD+AI. Comparators: ICareFM (DUA), MOTOR+CLMBR-T (CLIF→OMOP→FEMR).
-- **Novelty:** 4-way intersection (CLIF-native × ICU structured+notes × ~30M × federated × threshold-TTE);
-  CLIF v3.0 multimodal ships ~July 2026 → first-mover window, move now.
+- **Novelty:** 4-way intersection (CLIF-native × ICU structured+notes × ~30M × federated × threshold-TTE).
+  **REVISED 2026-08-28:** the "CLIF v3.0 ships ~July 2026 → first-mover window, move now" timing argument is
+  RETIRED — that window has passed. Contribution rests on CLIF-native execution, openly released validation
+  tooling, and real-federation deployment; none requires being first. The empirical priority claim (first
+  OPEN CLIF-native ICU FM with threshold-TTE validated by real model-to-data) is unaffected and still stands.
 
 ## Method sources (see notes/METHODS.md for line-cited detail)
 - **ICareFM** (Burger/Rätsch, medRxiv 2025) — per-target hazard head, random τ, direction+threshold
@@ -122,10 +125,15 @@ These resolve every open design question as of this date. Change only with new e
   its **weights are DUA-gated**; SurvivEHR owns competing-risk (UK primary care, not ICU); EveryQuery/ETHOS
   own query-conditioned zero-shot; Elemento owns no-data-sharing ensembling (on MIMIC partitions, not real
   hospitals). **Unclaimed = the first OPEN, CLIF-native ICU FM with a threshold-TTE objective validated by
-  model-to-data across REAL CLIF-consortium hospitals.** Novelty = integration + first-mover + deployment,
+  model-to-data across REAL CLIF-consortium hospitals.** Novelty = integration + open tooling + deployment,
   which is the stronger axis for a Nature-Medicine clinical framing. Do NOT claim method invention.
+  (2026-08-28: "first-mover" replaced by "open tooling" as the middle pillar — the timing window closed; the
+  priority claim in bold above is retained.)
 - A2. The `clif-validate/` open shippable package is the deliverable that distinguishes us from DUA-gated
-  ICareFM — treat it as a headline artifact, not plumbing.
+  ICareFM — treat it as a headline artifact, not plumbing. **2026-08-28 — what "open" means:** the package,
+  its source, and its bundle-compatibility contract are publicly obtainable with NO DUA and NO per-site
+  approval; trained-weight bundles stay signed and governed. Without the first half the differentiator does
+  not exist, because a signed, approval-gated distribution channel is operationally what ICareFM already has.
 
 **B. Backbone & pretraining (LOCKED)**
 - B1. Backbone = Qwen-family transformer; it is a **footnote, not novelty** (ORA: objective>backbone,
