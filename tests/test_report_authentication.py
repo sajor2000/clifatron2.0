@@ -94,6 +94,47 @@ class ReportSigningTest(unittest.TestCase):
 
 
 class AccessLogTest(unittest.TestCase):
+    """The chain key is required, so every test provisions one (greploop review 4)."""
+
+    def setUp(self):
+        import os
+        self._keydir = tempfile.TemporaryDirectory()
+        keyfile = Path(self._keydir.name) / "chain.key"
+        keyfile.write_bytes(b"test-chain-key")
+        self._prev = os.environ.get("CLIF_ACCESS_LOG_KEY_FILE")
+        os.environ["CLIF_ACCESS_LOG_KEY_FILE"] = str(keyfile)
+
+    def tearDown(self):
+        import os
+        if self._prev is None:
+            os.environ.pop("CLIF_ACCESS_LOG_KEY_FILE", None)
+        else:
+            os.environ["CLIF_ACCESS_LOG_KEY_FILE"] = self._prev
+        self._keydir.cleanup()
+
+    def test_recording_without_a_provisioned_key_fails_closed(self):
+        """An unkeyed chain is forgeable by anyone who can write the file, so recording
+        into one would claim a guarantee it does not provide."""
+        import os
+        os.environ.pop("CLIF_ACCESS_LOG_KEY_FILE", None)
+        with tempfile.TemporaryDirectory() as td:
+            with self.assertRaises(A.AuthenticationError) as ctx:
+                A.record_access(Path(td) / "access.jsonl", model_version="v0",
+                                actor_role="site_operator", artifact_id="a1",
+                                action="export")
+            self.assertIn("CLIF_ACCESS_LOG_KEY_FILE", str(ctx.exception))
+
+    def test_an_empty_key_file_is_refused(self):
+        import os
+        with tempfile.TemporaryDirectory() as td:
+            empty = Path(td) / "empty.key"
+            empty.write_bytes(b"")
+            os.environ["CLIF_ACCESS_LOG_KEY_FILE"] = str(empty)
+            with self.assertRaises(A.AuthenticationError):
+                A.record_access(Path(td) / "access.jsonl", model_version="v0",
+                                actor_role="site_operator", artifact_id="a1",
+                                action="export")
+
     def test_accesses_are_recorded_and_the_chain_verifies(self):
         with tempfile.TemporaryDirectory() as td:
             log = Path(td) / "access.jsonl"

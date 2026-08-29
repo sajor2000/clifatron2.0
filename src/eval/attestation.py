@@ -45,21 +45,33 @@ _SIGNATURE_FIELD = "signature"
 # against an editor who cannot recompute it; anyone with write access to the log could
 # rewrite entries and re-chain them (U5 review #10). Keying it closes that.
 _CHAIN_KEY_ENV = "CLIF_ACCESS_LOG_KEY_FILE"
-_DEV_CHAIN_KEY = b"clif-access-log-unconfigured-development-key"
 
 
 def _chain_key() -> bytes:
-    """Key for the access-log HMAC chain.
+    """Key for the access-log HMAC chain. REQUIRED -- there is no fallback.
 
-    Falls back to a well-known development key when unconfigured, so tests and dry runs
-    work. That fallback is NOT a security control: a site running for real must set
-    CLIF_ACCESS_LOG_KEY_FILE, and U11 owns provisioning it alongside the release trust
-    root. Documented here rather than silently pretending the chain is protected.
+    There used to be a well-known development key here, with a docstring saying a real
+    site "must set CLIF_ACCESS_LOG_KEY_FILE" and nothing enforcing it (greploop review 4).
+    That is the same shape as two other defects in this unit: a requirement written in
+    prose beside a control that does not check it. Its effect was worse than no chain at
+    all -- the log advertised tamper-evidence while anyone with write access could rewrite
+    both the records and the anchor and re-sign them with a key published in this repo.
+
+    Unset or empty now raises. Tests and dry runs point the variable at a scratch key
+    file; that is one line, and it keeps the production path honest.
     """
     key_file = os.environ.get(_CHAIN_KEY_ENV)
-    if key_file:
-        return Path(key_file).read_bytes().strip()
-    return _DEV_CHAIN_KEY
+    if not key_file:
+        raise AuthenticationError(
+            f"{_CHAIN_KEY_ENV} is not set. The access log's tamper-evidence is an HMAC "
+            "chain, and an unkeyed chain is forgeable by anyone who can write the file -- "
+            "so recording into one would claim a guarantee it does not provide. Point "
+            f"{_CHAIN_KEY_ENV} at this site's secret before running."
+        )
+    key = Path(key_file).read_bytes().strip()
+    if not key:
+        raise AuthenticationError(f"{_CHAIN_KEY_ENV} points at an empty file ({key_file})")
+    return key
 
 
 def _durably_append(path: Path, line: str) -> None:

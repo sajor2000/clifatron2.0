@@ -17,6 +17,7 @@ Usage (at each external CLIF site):
         --site-id SITE-07 \
         --release-id 2026-08-28-site07-v0 \
         --signing-key-file /secure/site07.key \
+        --access-log-key-file /secure/site07-accesslog.key \
         --out output/final_no_phi/site_07.json
 
 `--site-id` is an OPAQUE identifier, not a hospital name and not a path: the site
@@ -505,10 +506,20 @@ def main():
     ap.add_argument("--release-id", required=True,
                     help="unique identifier for THIS release. Replaying one is rejected, "
                          "so a duplicated report cannot be counted as another site.")
+    ap.add_argument("--access-log-key-file", default=None,
+                    help="file holding this site's access-log chain secret. Required: "
+                         "the log's tamper-evidence is an HMAC chain, and an unkeyed "
+                         "chain is forgeable by anyone who can write the file.")
     ap.add_argument("--signing-key-file", default=None,
                     help="file holding this site's hex shared secret. Without it the "
                          "report is unsigned and the aggregator will refuse it.")
     args = ap.parse_args()
+
+    # Provision the access-log chain key before anything records into it. Passing the
+    # flag sets the variable attestation reads; without either, recording fails closed.
+    if args.access_log_key_file:
+        import os
+        os.environ["CLIF_ACCESS_LOG_KEY_FILE"] = args.access_log_key_file
 
     logging.basicConfig(level=logging.INFO, format="%(message)s")
     _schema.install_log_sanitizer(logging.getLogger())
