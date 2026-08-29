@@ -16,6 +16,8 @@ __pycache__/
 *.pyc
 .venv/
 uv.lock
+# clif-validate ships a committed, pinned lock for reproducible offline site installs.
+!clif-validate/uv.lock
 .ipynb_checkpoints/
 
 # experiment tracking
