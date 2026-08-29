@@ -29,6 +29,8 @@ from __future__ import annotations
 
 import fcntl
 import json
+import os
+import tempfile
 from pathlib import Path
 
 import yaml
@@ -112,7 +114,12 @@ def load_trust_roots(path: str | Path) -> dict:
             f"trust roles at {path} do not exist; refusing to verify against an absent "
             "trust root"
         )
-    doc = yaml.safe_load(root_path.read_text())
+    try:
+        doc = yaml.safe_load(root_path.read_text())
+    except yaml.YAMLError as exc:
+        # Malformed YAML raises YAMLError, which is not an ArtifactMismatch; keep it inside
+        # the TrustError contract so a corrupt trust root fails closed at the load boundary.
+        raise TrustError(f"trust roles at {path} are not valid YAML") from exc
     # A truthy non-mapping document (a bare scalar or sequence) has no .get; guard it so it
     # fails as TrustError rather than a bare AttributeError escaping the load boundary.
     if doc is not None and not isinstance(doc, dict):
@@ -300,9 +307,32 @@ def advance_rollback_floor(model_version: str, state_path: str | Path) -> None:
         try:
             floor = read_rollback_floor(path)  # re-read UNDER the lock
             if floor is None or _version_lt(floor, model_version):
-                path.write_text(json.dumps({"highest_trusted_version": str(model_version)}))
+                _atomic_write_json(path, {"highest_trusted_version": str(model_version)})
         finally:
             fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+
+
+def _atomic_write_json(path: Path, obj: dict) -> None:
+    """Write JSON via a temp file + fsync + atomic rename, never truncating the target.
+
+    `path.write_text` truncates then writes: a concurrent (unlocked) reader can see an empty
+    file and a crash mid-write can corrupt the state PERMANENTLY (every later load then fails
+    closed). A same-directory temp file replaced with os.replace is atomic on POSIX, so a
+    reader sees either the old or the new floor, never a torn one (CodeRabbit).
+    """
+    fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=".rollback-", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(obj, f)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except FileNotFoundError:
+            pass
+        raise
 
 
 __all__ = [

@@ -168,6 +168,15 @@ class TrustRootTest(unittest.TestCase):
             with self.assertRaises(trust.TrustError):
                 trust.load_trust_roots(path)
 
+    def test_malformed_yaml_fails_as_TrustError(self):
+        """Malformed YAML raises yaml.YAMLError, not ArtifactMismatch; load_trust_roots must
+        wrap it so a corrupt trust root fails closed at the load boundary (CodeRabbit)."""
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "broken.yaml"
+            path.write_text("release_signing: [unclosed\n")
+            with self.assertRaises(trust.TrustError):
+                trust.load_trust_roots(path)
+
     def test_a_numeric_key_id_is_refused(self):
         """`key_id: 2026` parses to int 2026, which would never match the manifest's string
         signed_by (silently un-revocable); require a non-empty string (CodeRabbit)."""
