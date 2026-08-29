@@ -21,6 +21,21 @@ artifacts is exactly the failure this exists to prevent, which is why it is crea
 here at the first release boundary and not at U10.
 
 The ledger stores cell *definitions and sizes*, never cell contents.
+
+**Three principles govern every write in this module** — named here because seven review
+rounds each rediscovered one of them piecemeal, and the next reader should not have to:
+
+  1. **Write-ahead.** Intent is recorded durably before the action it describes (ledger
+     intent before publication; access record before export). Over-recording is always
+     the safe direction: a record of something that never happened can only block or
+     over-claim scrutiny, never conceal.
+  2. **Confirmation follows visibility.** A record counts as a prior release only once
+     its artifact is known to have been visible. Retryability keys on confirmation;
+     cell protection does not (an unconfirmed record MIGHT be visible, so suppression
+     is sticky across all records).
+  3. **Verification precedes extension.** Nothing appends to a chain or ledger it has
+     not just verified, because an honest append onto a tampered tail launders the
+     tampering permanently.
 """
 
 from __future__ import annotations
@@ -231,20 +246,31 @@ def record_access(log_path: str | Path, *, model_version: str, actor_role: str,
     path = Path(log_path)
     path.parent.mkdir(parents=True, exist_ok=True)
 
-    # Verify BEFORE extending (greploop review 5). Deriving the new anchor from an
-    # unverified tail let a legitimate append launder a tampered log: truncate the log,
-    # delete the head, and the next honest record_access trusts the retained tail and
-    # writes a fresh anchor over it, after which verification passes and the deleted
-    # entries are gone for good. An append is a claim about the whole chain, so it has to
-    # check the whole chain.
-    if path.exists() and [ln for ln in path.read_text().splitlines() if ln.strip()]:
-        if not verify_access_log(path):
-            raise AuthenticationError(
-                f"access log at {path.name} does not verify; refusing to append. "
-                "Extending it would re-anchor whatever state it is in and destroy the "
-                "evidence of the discrepancy. Preserve this log for audit and start a "
-                "new one with a recorded reason."
-            )
+    # The whole read-verify-extend sequence runs under one lock, for the same reason
+    # write_export's does: two concurrent appends reading the same tail would write two
+    # records with the same seq and brick the chain.
+    with ledger_lock(path):
+        _record_access_locked(path, model_version=model_version, actor_role=actor_role,
+                              artifact_id=artifact_id, action=action)
+
+
+def _record_access_locked(path: Path, *, model_version: str, actor_role: str,
+                          artifact_id: str, action: str) -> None:
+    # Verify BEFORE extending (greploop review 5), and verify UNCONDITIONALLY (whole-file
+    # read, review 8). The previous guard skipped verification whenever the log file had
+    # no records -- but "no records" includes "the log was deleted while its head
+    # remained", and in that state a fresh append started a new chain at seq 0 and wrote
+    # a new head over the evidence. The one laundering path the review-5 fix left open
+    # was the most drastic one: delete everything except nothing. verify_access_log
+    # already returns False for a missing or empty log whose head still exists, so the
+    # fix is simply to always ask it.
+    if not verify_access_log(path):
+        raise AuthenticationError(
+            f"access log at {path.name} does not verify; refusing to append. "
+            "Extending it would re-anchor whatever state it is in and destroy the "
+            "evidence of the discrepancy. Preserve this log and its head for audit and "
+            "start a new log path with a recorded reason."
+        )
 
     prev, seq = "0" * 64, 0
     if path.exists():
@@ -300,7 +326,7 @@ def preflight_access_log(log_path: str | Path) -> None:
     """
     _chain_key()
     path = Path(log_path)
-    if path.exists() and [ln for ln in path.read_text().splitlines() if ln.strip()]:
+    with ledger_lock(path):
         if not verify_access_log(path):
             raise AuthenticationError(
                 f"access log at {path.name} does not verify. Refusing to export: the run "
@@ -320,11 +346,17 @@ def verify_access_log(log_path: str | Path) -> bool:
         # log is only intact if no head anchor claims otherwise.
         return not head_path.exists()
 
+    lines = [ln for ln in path.read_text().splitlines() if ln.strip()]
+    if not lines:
+        # Zero records is the same state as no file: intact only if no anchor claims
+        # otherwise. (An existing-but-empty file arises from a crash between the
+        # head-first write and the first append; the surviving head marks it.)
+        return not head_path.exists()
+
+    key = _chain_key()   # once, not per record
     prev, expected_seq = "0" * 64, 0
     last_chain, last_seq = prev, -1
-    for line in path.read_text().splitlines():
-        if not line.strip():
-            continue
+    for line in lines:
         try:
             entry = json.loads(line)
         except json.JSONDecodeError:
@@ -333,7 +365,7 @@ def verify_access_log(log_path: str | Path) -> bool:
             return False
         chain = entry.pop("chain", None)
         recomputed = hmac.new(
-            _chain_key(),
+            key,
             (entry["prev"] + json.dumps(entry, sort_keys=True, separators=(",", ":"))).encode("utf-8"),
             hashlib.sha256,
         ).hexdigest()
@@ -438,6 +470,15 @@ def check_cross_release_differencing(payload: dict, ledger_path: str | Path) -> 
     # one, and the next release read the cell as previously released and exposed it --
     # the exact leak the ledger exists to prevent. A cell suppressed in any
     # possibly-public release stays protected regardless of what came after it.
+    #
+    # DELIBERATE OVER-BLOCKING (whole-file review): stickiness also counts suppressed
+    # intents whose artifact provably never published. Releasing such a cell would in
+    # fact disclose nothing -- but distinguishing "never published" from "published,
+    # unconfirmed" requires trusting a caller-supplied inventory inside the disclosure
+    # decision itself, and every refinement of this function so far has traded a block
+    # for a leak. Over-blocking is the direction that cannot leak. The escape for a cell
+    # legitimately outgrowing an old failed suppression is the documented
+    # disclosure-review exception, not a code path.
     live = confirmed_releases(ledger_path)
     records = [e for e in prior if "confirm_release_id" not in e]
 
@@ -487,6 +528,10 @@ def check_cross_release_differencing(payload: dict, ledger_path: str | Path) -> 
         # #11: a still-suppressed cell whose recorded n moves between releases leaks the
         # delta. Two suppressed observations of the same cell at n=4 and n=9 bound the
         # membership change to five patients; enough such deltas reconstruct the cell.
+        # DEFENCE-IN-DEPTH: for schema-validated payloads this cannot fire, because the
+        # export gate strips exact n from suppressed cells (they carry n_band only, so
+        # _cell_n records None and the isinstance guard skips). It stays for callers
+        # that reach the ledger without the schema gate.
         if was_suppressed and entry.get("status") in NON_EVALUABLE_STATUSES:
             n_before, n_now = before.get("n"), entry.get("n")
             if (isinstance(n_before, int) and isinstance(n_now, int)

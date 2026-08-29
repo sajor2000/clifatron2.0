@@ -254,6 +254,34 @@ class AccessLogTest(unittest.TestCase):
             with self.assertRaises(A.AuthenticationError):
                 A.preflight_access_log(log)      # no key -> refuse before any work
 
+    def test_deleting_the_log_but_not_the_head_cannot_be_laundered_by_appending(self):
+        """Whole-file review (round 8). record_access skipped verification whenever the
+        log had no records -- and "no records" includes "the log was deleted while its
+        head remained". A fresh append then started a new chain at seq 0 and wrote a new
+        head over the evidence: the one laundering path the review-5 fix left open was
+        deleting everything."""
+        with tempfile.TemporaryDirectory() as td:
+            log = Path(td) / "access.jsonl"
+            for i in range(3):
+                A.record_access(log, model_version="v0", actor_role="aggregator",
+                                artifact_id=f"artifact-{i}", action="unseal")
+            log.unlink()   # the log vanishes; the head remains
+
+            self.assertFalse(A.verify_access_log(log))
+            with self.assertRaises(A.AuthenticationError) as ctx:
+                A.record_access(log, model_version="v0", actor_role="aggregator",
+                                artifact_id="artifact-3", action="unseal")
+            self.assertIn("refusing to append", str(ctx.exception))
+
+    def test_an_empty_log_with_a_surviving_head_fails_closed(self):
+        """The state a crash between head-write and first-append actually produces."""
+        with tempfile.TemporaryDirectory() as td:
+            log = Path(td) / "access.jsonl"
+            A.record_access(log, model_version="v0", actor_role="site_operator",
+                            artifact_id="a1", action="export")
+            log.write_text("")   # records gone, head remains
+            self.assertFalse(A.verify_access_log(log))
+
     def test_absent_log_is_trivially_intact(self):
         with tempfile.TemporaryDirectory() as td:
             self.assertTrue(A.verify_access_log(Path(td) / "nope.jsonl"))

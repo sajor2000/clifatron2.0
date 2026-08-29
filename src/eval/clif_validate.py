@@ -521,6 +521,14 @@ def main():
     ap.add_argument("--signing-key-file", default=None,
                     help="file holding this site's hex shared secret. Without it the "
                          "report is unsigned and the aggregator will refuse it.")
+    ap.add_argument("--approved", action="store_true",
+                    help="attest that the site's disclosure review approved this "
+                         "release. Without it the run writes a LOCAL DRAFT (unsigned, "
+                         "unledgered, not a release) and stops. With it the artifact is "
+                         "stamped reviewed_approved, signed, and released. NOTE: the "
+                         "approved run recomputes the report; approval-by-content-hash "
+                         "of a specific draft is U11's, so this flag assumes the "
+                         "pipeline is deterministic between review and release.")
     args = ap.parse_args()
 
     # Provision the access-log chain key before anything records into it. Passing the
@@ -584,14 +592,40 @@ def main():
     result = evaluate_site(args.checkpoint, args.data, args.episode_artifact,
                            outcome_cfgs, predict_fn=predict_fn)
 
+    # The draft/approve split, made real (whole-file review). As previously wired, main()
+    # built a DRAFT payload and handed it straight to write_export, which refuses drafts
+    # -- so the CLI could never complete an export, and there was no path that produced
+    # the draft for a reviewer either. The gate was a wall, not a workflow. Signing also
+    # happened over the draft status, so re-stamping to approved would have invalidated
+    # the signature; the approved run now stamps first and signs the final status.
+    if not args.approved:
+        draft = build_export(result["outcomes"], provenance, site_id=args.site_id,
+                             site_role=args.site_role, partition_role=args.partition_role,
+                             release_id=args.release_id)
+        draft_path = Path(str(args.out) + ".draft")
+        draft_path.parent.mkdir(parents=True, exist_ok=True)
+        draft_path.write_text(json.dumps(draft, indent=2, sort_keys=True, allow_nan=False))
+        _log.info("DRAFT written (not a release: unsigned, unledgered). Review it, then "
+                  "re-run with --approved to stamp, sign, and release.")
+        return
+
     signing_key = (bytes.fromhex(Path(args.signing_key_file).read_text().strip())
                    if args.signing_key_file else None)
     payload = build_export(result["outcomes"], provenance, site_id=args.site_id,
                            site_role=args.site_role, partition_role=args.partition_role,
-                           release_id=args.release_id, signing_key=signing_key)
-    out = write_export(payload, args.out, args.ledger)
+                           release_id=args.release_id,
+                           disclosure_status="reviewed_approved",
+                           signing_key=signing_key)
+
+    # WRITE-AHEAD (whole-file review, closing greploop review 5 for good): the access
+    # record precedes publication, like the ledger intent precedes it. Recording after
+    # meant any failure in the recording left a published artifact with no audit record
+    # -- under-recording, which conceals. Recording an attempt that then fails to publish
+    # merely over-records, which cannot conceal anything. Audit trails are write-ahead.
     _attest.record_access(args.access_log, model_version=provenance["model_version"],
-                          actor_role="site_operator", artifact_id=out.name, action="export")
+                          actor_role="site_operator", artifact_id=Path(args.out).name,
+                          action="export")
+    out = write_export(payload, args.out, args.ledger)
 
     # Reports what actually happened, not an unconditional reassurance. The previous
     # version printed "No raw data ... have left the node." on every run, including runs
