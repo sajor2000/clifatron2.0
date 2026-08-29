@@ -221,6 +221,61 @@ class SubgroupSuppressionTest(unittest.TestCase):
                 self.assertIn(key, S.CELL_FIELDS)
 
 
+class NanCohortConsistencyTest(unittest.TestCase):
+    """greploop review 1, P1: one report must describe one cohort.
+
+    `full_panel` drops undefined predictions internally; `net_benefit` does not. Handing
+    both the same un-narrowed array gives the scalar metrics and the decision curve
+    different denominators -- and in the curve, `NaN >= threshold` is False, so every
+    undefined row is silently counted as a negative decision. The caller must narrow
+    once, before either.
+    """
+
+    def _arrays(self, n=200, nan_every=5, seed=3):
+        rng = np.random.default_rng(seed)
+        y = rng.integers(0, 2, size=n)
+        p = rng.uniform(0.05, 0.95, size=n)
+        p[::nan_every] = np.nan
+        return p, y
+
+    def test_unnarrowed_arrays_give_the_curve_a_different_cohort(self):
+        """The bug this guards against, demonstrated rather than asserted in prose."""
+        p, y = self._arrays()
+        panel = M.full_panel(p, y)                      # drops NaN internally
+        curve_raw = M.net_benefit_releasable(p, y)      # does not
+
+        self.assertEqual(panel["n_dropped_nan"], 40)
+        self.assertEqual(panel["n"], 160)
+        self.assertIsNotNone(curve_raw)
+        # net_benefit divides by len(y), not by the defined count.
+        self.assertNotEqual(len(y), panel["n"],
+                            "raw arrays carry 200 rows while the panel scored 160")
+
+    def test_narrowing_once_makes_every_number_agree(self):
+        p, y = self._arrays()
+        defined = ~np.isnan(p)
+        p_n, y_n = p[defined], y[defined]
+
+        panel = M.full_panel(p_n, y_n)
+        curve = M.net_benefit_releasable(p_n, y_n)
+
+        self.assertEqual(panel["n_dropped_nan"], 0)
+        self.assertEqual(panel["n"], len(y_n))
+        self.assertIsNotNone(curve)
+        # treat_all is prevalence-based, so it pins the curve's cohort to the panel's.
+        self.assertAlmostEqual(float(curve["treat_all"][0]),
+                               y_n.mean() - (1 - y_n.mean()) * (0.01 / 0.99), places=9)
+
+    def test_nan_reads_as_a_negative_decision_in_the_curve(self):
+        """Why leaving NaN in is not merely a denominator problem: the comparison is False."""
+        p = np.array([np.nan, np.nan, 0.9, 0.9])
+        y = np.array([1, 1, 1, 0])
+        self.assertFalse(bool(np.nan >= 0.5), "NaN comparisons are False, not skipped")
+        curve = M.net_benefit(p, y, thresholds=np.array([0.5]))
+        # 2 of 4 rows are undefined and score as "do not treat", deflating TP.
+        self.assertLess(float(curve["model"][0]), 0.5)
+
+
 class NetBenefitResolutionTest(unittest.TestCase):
     def test_small_cell_gets_no_curve(self):
         rng = np.random.default_rng(0)

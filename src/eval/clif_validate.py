@@ -303,7 +303,19 @@ def evaluate_site(checkpoint_path: str, data_path: str, episode_artifact: str,
             continue
 
         p = probs[mask, k]
-        status, reason = _schema.suppress_cell(int(mask.sum()), int(y.sum()))
+
+        # Narrow to DEFINED predictions ONCE, before anything downstream uses them
+        # (review #25, re-found by greploop review 1 after an earlier edit was lost).
+        # full_panel drops NaN rows internally, so leaving the wider arrays in place gave
+        # three different cohorts one report: suppression decided on the pre-drop count,
+        # scalar metrics on the post-drop rows, and the DCA curve on the raw arrays --
+        # where NaN comparisons silently read as negative decisions. Saturated +/-inf is
+        # kept: it is a legitimate confident prediction, not an undefined one.
+        defined = ~np.isnan(p)
+        n_dropped = int((~defined).sum())
+        p, y = p[defined], y[defined]
+
+        status, reason = _schema.suppress_cell(int(len(y)), int(y.sum()))
         if status != _schema.EVALUABLE:
             outcomes[name] = _schema.non_evaluable(status, reason, validity)
             continue
@@ -319,7 +331,7 @@ def evaluate_site(checkpoint_path: str, data_path: str, episode_artifact: str,
                 "calib_slope": panel.get("calib_slope"),
                 "calib_intercept": panel.get("calib_intercept"),
                 "ici": panel.get("ici"), "temperature": panel.get("temperature"),
-                "n_dropped_nan": panel.get("n_dropped_nan", 0),
+                "n_dropped_nan": n_dropped,
             },
         }
         block["metrics"] = {k2: v for k2, v in block["metrics"].items() if v is not None}

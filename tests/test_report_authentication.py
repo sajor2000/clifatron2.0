@@ -121,6 +121,25 @@ class AccessLogTest(unittest.TestCase):
             log.write_text(log.read_text().replace("site_operator", "aggregator"))
             self.assertFalse(A.verify_access_log(log))
 
+    def test_deleting_the_head_anchor_does_not_launder_a_truncation(self):
+        """greploop review 1, P1 security. Checking the anchor only `if head.exists()`
+        handed the control back to the adversary it was built for: whoever can truncate
+        the log can also delete the sidecar."""
+        with tempfile.TemporaryDirectory() as td:
+            log = Path(td) / "access.jsonl"
+            for i in range(4):
+                A.record_access(log, model_version="v0", actor_role="aggregator",
+                                artifact_id=f"artifact-{i}", action="unseal")
+            self.assertTrue(A.verify_access_log(log))
+
+            # Truncate to a valid authenticated prefix, then remove the anchor.
+            lines = log.read_text().splitlines()
+            log.write_text("\n".join(lines[:2]) + "\n")
+            Path(str(log) + ".head").unlink()
+
+            self.assertFalse(A.verify_access_log(log),
+                             "a records-bearing log with no anchor is itself tampering")
+
     def test_absent_log_is_trivially_intact(self):
         with tempfile.TemporaryDirectory() as td:
             self.assertTrue(A.verify_access_log(Path(td) / "nope.jsonl"))

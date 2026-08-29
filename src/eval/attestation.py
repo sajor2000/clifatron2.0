@@ -239,14 +239,20 @@ def verify_access_log(log_path: str | Path) -> bool:
         prev, last_chain, last_seq = chain, chain, expected_seq
         expected_seq += 1
 
-    if head_path.exists():
-        try:
-            head = json.loads(head_path.read_text())
-        except json.JSONDecodeError:
-            return False
-        # Tail truncation produces a valid prefix; only the anchor catches it.
-        if head.get("chain") != last_chain or int(head.get("seq", -1)) != last_seq:
-            return False
+    # The anchor is REQUIRED whenever the log has records (greploop review 1). Checking
+    # it only `if head_path.exists()` handed the whole control back to the adversary it
+    # was built for: anyone who can truncate the log can also delete the sidecar, and the
+    # verifier would then accept the shortened prefix as intact. A log with records and
+    # no anchor is itself the tamper signal.
+    if not head_path.exists():
+        return False
+    try:
+        head = json.loads(head_path.read_text())
+    except json.JSONDecodeError:
+        return False
+    # Tail truncation produces a valid prefix; only the anchor catches it.
+    if head.get("chain") != last_chain or int(head.get("seq", -1)) != last_seq:
+        return False
     return True
 
 
