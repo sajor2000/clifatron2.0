@@ -513,7 +513,7 @@ class ResumeEquivalenceTest(unittest.TestCase):
             resumed_opt, resumed_sched = opt_b.state_dict(), sched_b.state_dict()
         straight_opt, straight_sched = opt_s.state_dict(), sched_s.state_dict()
 
-        for a, b in zip(straight, resumed):
+        for a, b in zip(straight, resumed, strict=True):  # strict: lengths must match
             self.assertTrue(torch.equal(a, b),
                             f"resume diverged from straight-through: max|d|={ (a-b).abs().max() }")
         self.assertTrue(_state_dicts_equal(straight_opt, resumed_opt),
@@ -573,7 +573,7 @@ class ResumeEquivalenceTest(unittest.TestCase):
             resumed = [p.detach().clone() for p in m_b.parameters()]
             resumed_opt, resumed_sched = o_b.state_dict(), s_b.state_dict()
 
-        for a, b in zip(straight, resumed):
+        for a, b in zip(straight, resumed, strict=True):  # strict: lengths must match
             self.assertTrue(torch.equal(a, b),
                             f"train() resume diverged: max|d|={ (a-b).abs().max() }")
         self.assertTrue(_state_dicts_equal(straight_opt, resumed_opt),
