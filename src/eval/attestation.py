@@ -200,6 +200,22 @@ def record_access(log_path: str | Path, *, model_version: str, actor_role: str,
     """
     path = Path(log_path)
     path.parent.mkdir(parents=True, exist_ok=True)
+
+    # Verify BEFORE extending (greploop review 5). Deriving the new anchor from an
+    # unverified tail let a legitimate append launder a tampered log: truncate the log,
+    # delete the head, and the next honest record_access trusts the retained tail and
+    # writes a fresh anchor over it, after which verification passes and the deleted
+    # entries are gone for good. An append is a claim about the whole chain, so it has to
+    # check the whole chain.
+    if path.exists() and [ln for ln in path.read_text().splitlines() if ln.strip()]:
+        if not verify_access_log(path):
+            raise AuthenticationError(
+                f"access log at {path.name} does not verify; refusing to append. "
+                "Extending it would re-anchor whatever state it is in and destroy the "
+                "evidence of the discrepancy. Preserve this log for audit and start a "
+                "new one with a recorded reason."
+            )
+
     prev, seq = "0" * 64, 0
     if path.exists():
         lines = [ln for ln in path.read_text().splitlines() if ln.strip()]
@@ -243,6 +259,24 @@ def record_access(log_path: str | Path, *, model_version: str, actor_role: str,
     _durably_write(head, json.dumps({"seq": seq, "chain": entry["chain"]},
                                     sort_keys=True, separators=(",", ":")))
     _durably_append(path, json.dumps(entry, sort_keys=True, separators=(",", ":")) + "\n")
+
+
+def preflight_access_log(log_path: str | Path) -> None:
+    """Check the audit trail can be written BEFORE doing anything that needs recording.
+
+    Raises when the chain key is absent or the existing log does not verify. Called at
+    the top of the export path so a run that cannot be logged fails before it publishes,
+    rather than leaving a visible artifact with no access record behind it.
+    """
+    _chain_key()
+    path = Path(log_path)
+    if path.exists() and [ln for ln in path.read_text().splitlines() if ln.strip()]:
+        if not verify_access_log(path):
+            raise AuthenticationError(
+                f"access log at {path.name} does not verify. Refusing to export: the run "
+                "would be unrecordable, and an export nobody can attest is worse than no "
+                "export."
+            )
 
 
 def verify_access_log(log_path: str | Path) -> bool:
@@ -519,6 +553,7 @@ def append_to_ledger(payload: dict, ledger_path: str | Path) -> None:
 
 __all__ = [
     "AuthenticationError", "confirm_publication", "confirmed_releases", "reconcile_ledger",
+    "preflight_access_log",
     "unconfirmed_releases",
     "canonical_bytes", "sign_report", "verify_report",
     "record_access", "verify_access_log",

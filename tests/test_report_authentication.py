@@ -222,6 +222,38 @@ class AccessLogTest(unittest.TestCase):
             self.assertFalse(A.verify_access_log(log),
                              "an anchor ahead of the log must fail closed")
 
+    def test_appending_to_a_tampered_log_is_refused(self):
+        """greploop review 5, P1 security. Deriving the new anchor from an unverified tail
+        let an honest append launder a truncation: cut the log, delete the head, and the
+        next legitimate record re-anchors the shortened history for good."""
+        with tempfile.TemporaryDirectory() as td:
+            log = Path(td) / "access.jsonl"
+            for i in range(4):
+                A.record_access(log, model_version="v0", actor_role="aggregator",
+                                artifact_id=f"artifact-{i}", action="unseal")
+
+            lines = log.read_text().splitlines()
+            log.write_text("\n".join(lines[:2]) + "\n")
+            Path(str(log) + ".head").unlink()
+
+            with self.assertRaises(A.AuthenticationError) as ctx:
+                A.record_access(log, model_version="v0", actor_role="aggregator",
+                                artifact_id="artifact-4", action="unseal")
+            self.assertIn("refusing to append", str(ctx.exception))
+
+    def test_preflight_refuses_an_unkeyed_or_broken_trail(self):
+        """An export that cannot be logged must not happen at all."""
+        import os
+        with tempfile.TemporaryDirectory() as td:
+            log = Path(td) / "access.jsonl"
+            A.record_access(log, model_version="v0", actor_role="site_operator",
+                            artifact_id="a1", action="export")
+            A.preflight_access_log(log)          # healthy trail passes
+
+            os.environ.pop("CLIF_ACCESS_LOG_KEY_FILE", None)
+            with self.assertRaises(A.AuthenticationError):
+                A.preflight_access_log(log)      # no key -> refuse before any work
+
     def test_absent_log_is_trivially_intact(self):
         with tempfile.TemporaryDirectory() as td:
             self.assertTrue(A.verify_access_log(Path(td) / "nope.jsonl"))

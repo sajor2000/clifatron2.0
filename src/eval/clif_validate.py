@@ -532,6 +532,12 @@ def main():
         {"name": "resp_failure_48h", "direction": "above"},
     ]
 
+    # Preflight the audit trail BEFORE any work (greploop review 5). Publishing first and
+    # recording afterward meant a missing key produced a RELEASED artifact with no access
+    # record -- the command failed, but only after the report was already visible. An
+    # export that cannot be logged must not happen at all.
+    _attest.preflight_access_log(args.access_log)
+
     provenance = verify_bundle_compatibility(args.checkpoint)
     model = load_checkpoint(args.checkpoint)
 
