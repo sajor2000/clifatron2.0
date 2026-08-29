@@ -32,7 +32,7 @@ sequencing (U12 gates U6/U7). Ask before U9 completes, not after.
 | U3. Objective semantics | Landed | `src/model/heads.py`, `tests/test_cr_invariants.py` |
 | U4. Training engine, checkpoints, manifest | Landed | `src/train/engine.py`, `src/train/checkpoint.py`, `src/train/manifest.py`, `src/train/pretrain.py` |
 | Value-statistics follow-up | Landed | `src/data/value_stats.py`, `tests/test_value_stats.py` |
-| **U4 follow-up: hardware + resume verification** | **Unowned — blocks U6** | Owns `tests/test_checkpoint.py` (absent), a resume-*equivalence* test, and a two-process DDP smoke test. Completion artifact for P5-P7. |
+| **U14. Resume-equivalence + DDP coverage** (was "U4 follow-up") | **Chartered — blocks U6** | Deepened 2026-08-29. Owns `tests/test_checkpoint.py` (absent), the resume-*equivalence* test, and a two-process gloo DDP sample-coverage test — the software half of P5-P7. The 2xL40 hardware report stays a pending real-hardware run. |
 | **U2 follow-up: block-diagonal/varlen attention** | **Unowned — blocks U8** | Qwen2/Qwen3 varlen path. U8's entry gate qualifies packed attention that nothing builds. |
 | U5. Evaluation, calibration, validation gate | Landed | PR #4 / `53e3c2c`; suite 266 passed, 3 skipped. Grew well beyond plan: `src/eval/schema.py`, `attestation.py`, `log_sanitizer.py` |
 | U9. Validator core | **Next** | `clif-validate/` does not exist; deepened 2026-08-29 with U5's execution-taught packaging facts |
@@ -970,6 +970,52 @@ read from the actual modules, not assumed.
 - A site operator who is not a project member completes the run from published documentation alone.
 - The returned artifact passes the same disclosure tests as the synthetic case.
 - v0 results are recorded as workflow evidence and are excluded from every selection rule.
+
+---
+
+### U14. Qualify resume-equivalence and DDP sample coverage (U4 follow-up)
+
+**Goal:** Turn U4's landed-but-unverified training claims — exact epoch-boundary resume and non-overlapping DDP sharding — into passing, data-free tests, so "U4 landed" stops meaning "code merged, verification pending" for the parts that do not need real hardware.
+
+**Requirements:** R8 (exact epoch-boundary resume; single-device and DDP), R17 (partial — the software half of the L40 qualification; the 2xL40 hardware report itself is out of scope here).
+
+**Dependencies:** U4 (landed). Blocks U6 (its entry gate cites P5-P7, satisfied in part by this unit).
+
+**Status:** Chartered 2026-08-29 (was the "U4 follow-up: hardware + resume verification" row). Independent of U9/U11/U12 and U13; branches off main.
+
+**Verified current state (re-verify cheaply):**
+- `src/train/engine.py::train` already captures RNG state on checkpoint (`torch.get_rng_state`, `_all_gather`, saved via `rng_states=`) and restores it on resume (`_restore_rng_states`), loads model/opt/scheduler, and resumes at the saved epoch/step. `src/train/checkpoint.py::save_checkpoint` is atomic (tmp file then rename).
+- `tests/test_train_engine.py` already covers one-batch overfit, checkpoint roundtrip, grad-accumulation normalization, and that resume carries forward the manifest ledger counters — but NOT that resumed training produces the SAME final parameters as training straight through, and NOT DDP sample coverage. `tests/test_checkpoint.py` does not exist.
+
+**Approach:**
+- **Resume-equivalence (the load-bearing test).** With a tiny model and a synthetic dataset on CPU under a fixed seed, train E epochs straight through to final parameters W_straight. Separately, train E1 epochs, checkpoint AT the epoch boundary, construct a fresh model/optimizer/scheduler, resume from that checkpoint, and train the remaining E-E1 epochs to W_resumed. Assert W_straight == W_resumed to a tight tolerance. This exercises the RNG-capture/restore + optimizer/scheduler-state round-trip end to end. Resume is only claimed exact at an epoch boundary (the DataLoader iterator state mid-epoch is not checkpointed), so the test checkpoints on the boundary — matching the claim, not overreaching it.
+- **Dedicated `tests/test_checkpoint.py`.** Atomic-write behaviour (a partial/interrupted save never leaves a half-written file in place of a good one); RNG-state round-trips through save/load unchanged; the manifest and epoch/step survive; a corrupt/absent checkpoint fails closed with a clear error rather than silently starting fresh.
+- **DDP sample-coverage smoke test.** Spawn two processes with the gloo backend on CPU (`torch.multiprocessing.spawn`, `init_process_group("gloo")`), each with a `DistributedSampler` over the same synthetic dataset; gather the sample indices each rank consumes in one epoch and assert their union is the whole dataset with NO overlap (each index seen exactly once), and that `set_epoch` reshuffles deterministically across epochs. This proves the "shards samples without overlap" claim without a GPU. Guard the whole test to skip cleanly if process spawning is unavailable in the sandbox, but never pass silently.
+- **Out of scope (hardware, not code):** the 2xL40 qualification REPORT (microbatch/accumulation by token load, DDP scaling efficiency, GPU idle time, peak memory, checkpoint overhead, projected matrix cost). Record it as a pending hardware run, exactly like the governance items — this unit closes the software-testable half of P5-P7.
+
+**Patterns to follow:**
+- `tests/test_train_engine.py` — TinyModel + synthetic Dataset fixtures, `TrainConfig` construction, and the existing checkpoint/resume test shape.
+- `src/train/checkpoint.py` (atomic save) and `src/train/engine.py::train` (resume path, RNG capture/restore) as the code under test.
+
+**Files:**
+- Create: `tests/test_checkpoint.py`
+- Modify: `tests/test_train_engine.py` (add the resume-equivalence and DDP sample-coverage tests, or a new `tests/test_ddp_coverage.py` if the spawn harness is cleaner isolated)
+- Modify (only if a real defect surfaces): `src/train/engine.py`, `src/train/checkpoint.py`
+
+**Execution note:** Characterization-plus-equivalence, not pure test-first — the engine already exists and is claimed correct. Write the resume-equivalence test to PROVE the claim; if it fails, the failure is a real resume bug to fix in engine.py/checkpoint.py, not a test to weaken.
+
+**Test scenarios:**
+- Resume-equivalence: straight-through E-epoch training and checkpoint-at-boundary-then-resume produce bit-identical (or atol-tight) final parameters, optimizer state, and scheduler state.
+- Checkpoint atomicity: an interrupted/failed write does not replace an existing good checkpoint (the tmp-then-rename contract).
+- RNG round-trip: `torch.get_rng_state()` after resume matches the straight-through run at the same step, so stochastic ops (dropout, sampling) continue identically.
+- Corrupt/absent checkpoint: `load_checkpoint` on a missing or truncated file fails closed with an actionable error, never a silent fresh start.
+- DDP sample coverage: two gloo ranks over N samples see a partition of [0, N) with no overlap and full coverage in one epoch; `set_epoch(e)` changes the shuffle deterministically between epochs.
+- DDP effective-batch semantics: the two-rank run's per-update sample count matches the declared effective batch (world_size x microbatch x grad_accum).
+- Edge: a dataset size not divisible by world size is handled per the sampler's documented padding/drop behaviour without double-counting a sample as a real update.
+
+**Verification:**
+- `uv run --with pytest pytest tests/test_checkpoint.py tests/test_train_engine.py -q` passes; the resume-equivalence and DDP-coverage tests are green on CPU with no GPU and no real data.
+- The 2xL40 qualification report is recorded as a pending hardware run (not produced by this unit); U6's entry gate can cite this unit for the software-verifiable half of P5-P7.
 
 ---
 
