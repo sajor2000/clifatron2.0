@@ -43,27 +43,57 @@ def flash_attention_available() -> bool:
     return True
 
 
+# Architectures whose FlashAttention-2 path derives document boundaries from
+# per-document-resetting `position_ids` ALONE — HF's packing-with-FA2 contract. A model
+# NOT on this list (notably Qwen3-Next, which needs explicit `cu_seq_lens_q` / `seq_idx`
+# boundary arguments) would silently attend across documents if handed only position
+# ids, so it must never take the position-ids-only path (CodeRabbit). Keyed on
+# `config.model_type`, the stable identifier HF exposes. GPT2 is deliberately absent:
+# it is the CPU-fallback backbone and is not an FA2 position-ids-packing architecture.
+_POSITION_ID_VARLEN_ARCHITECTURES = frozenset({"qwen2", "qwen3"})
+
+
 def _uses_flash_attention_2(backbone) -> bool:
     impl = getattr(getattr(backbone, "config", None), "_attn_implementation", None)
     return impl == "flash_attention_2"
 
 
+def _model_on_cuda(model) -> bool:
+    try:
+        return next(model.parameters()).is_cuda
+    except StopIteration:
+        return False
+
+
+def _architecture_isolates_from_position_ids(model) -> bool:
+    model_type = getattr(getattr(model, "config", None), "model_type", None)
+    return model_type in _POSITION_ID_VARLEN_ARCHITECTURES
+
+
 def training_isolation_active(model) -> bool:
     """Whether `model`'s attention actually isolates packed documents during training.
 
-    True only when the backbone runs FlashAttention-2 (which derives document
-    boundaries from per-document position ids) AND a CUDA device + `flash-attn` are
-    present. Eager/SDPA Qwen2 SFT has no document-isolation path that avoids a dense
-    `[batch, heads, len, len]` mask (prohibited), so a multi-document pack there WOULD
-    leak across documents and must stay rejected.
+    Requires ALL of: FlashAttention-2 selected (`_attn_implementation`), the model's
+    parameters actually on CUDA (not just the host having a GPU), `flash-attn`
+    importable, AND the architecture on the allow-list that isolates from
+    per-document position ids alone. The architecture gate is the load-bearing addition
+    (CodeRabbit): a Qwen3-Next backbone reports `flash_attention_2` yet needs explicit
+    `cu_seq_lens_q` / `seq_idx`, so the position-ids-only path would leak across
+    documents for it. Anything failing any clause routes to the isolated-by-
+    construction CPU fallback (or stays rejected) rather than an unproven FA2 path.
+
+    Eager/SDPA has no document-isolation path that avoids a dense `[batch, heads, len,
+    len]` mask (prohibited), so a multi-document pack there must stay rejected.
 
     This is the condition a training entry point MUST gate on before it accepts a
     multi-document pack. No caller wires it into training yet (train_sft.py still
     rejects multi-doc packs outright); that wiring — and the GPU qualification that
-    proves the FA2 path actually isolates — is U8's L40 packed-attention step. Until
-    then this is a tested predicate ready for that caller, not an active gate.
+    proves the FA2 path actually isolates — is U8's L40 packed-attention step.
     """
-    return _uses_flash_attention_2(model) and flash_attention_available()
+    return (_uses_flash_attention_2(model)
+            and _model_on_cuda(model)
+            and flash_attention_available()
+            and _architecture_isolates_from_position_ids(model))
 
 
 def validate_pack(cu_seqlens, total: int) -> list[int]:

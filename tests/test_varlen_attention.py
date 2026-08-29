@@ -188,6 +188,25 @@ class TrainingIsolationGateTest(unittest.TestCase):
         backbone = _tiny_backbone()  # GPT2, eager attention, no FA2
         self.assertFalse(training_isolation_active(backbone))
 
+    def test_an_unsupported_architecture_never_takes_the_position_id_path(self):
+        """Qwen3-Next reports flash_attention_2 but needs explicit boundary args."""
+        from src.model.varlen_attention import (
+            _architecture_isolates_from_position_ids,
+        )
+
+        class _Cfg:
+            def __init__(self, mt):
+                self.model_type = mt
+
+        class _M:
+            def __init__(self, mt):
+                self.config = _Cfg(mt)
+
+        self.assertTrue(_architecture_isolates_from_position_ids(_M("qwen2")))
+        self.assertTrue(_architecture_isolates_from_position_ids(_M("qwen3")))
+        self.assertFalse(_architecture_isolates_from_position_ids(_M("qwen3_next")))
+        self.assertFalse(_architecture_isolates_from_position_ids(_M("gpt2")))
+
     def test_fa2_config_without_a_gpu_is_still_not_active(self):
         """FA2 in config is necessary but not sufficient — the hardware must be there."""
         from src.model.varlen_attention import (
