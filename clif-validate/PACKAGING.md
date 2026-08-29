@@ -53,8 +53,16 @@ uv pip download -r wheelhouse/requirements.txt \
 python -m venv /opt/clif-validate-venv
 /opt/clif-validate-venv/bin/pip install --no-index --find-links wheelhouse clif-validate
 
-# Smoke: the CLI resolves and refuses an unverified bundle.
-/opt/clif-validate-venv/bin/clif-validate --help
+# Smoke: prove the install actually loads a bundle AND fails closed. --help alone would
+# pass even if fail-closed bundle loading were broken, so point it at an UNSIGNED bundle
+# with no trust root and assert it refuses (exercises bundle load + signature gate).
+CLIF_OUT=$(/opt/clif-validate-venv/bin/clif-validate \
+    --checkpoint <unsigned_bundle_dir> --data <clif_tables> \
+    --episode-artifact <episodes.parquet> --site-id SMOKE \
+    --release-id smoke --rollback-state /tmp/smoke_rollback.json 2>&1 || true)
+echo "$CLIF_OUT" | grep -qiE 'unsigned|signature|trust' \
+    || { echo "FAIL: unsigned bundle was not refused"; exit 1; }
+echo "OK: install loads a bundle and fails closed on an unsigned one"
 
 # Governed run against a signed bundle + the site's out-of-band trust root.
 # A release must be signature-verified, content-hash-bound, and rollback-protected:
