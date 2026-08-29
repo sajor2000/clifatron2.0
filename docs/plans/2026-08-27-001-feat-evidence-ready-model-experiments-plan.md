@@ -1010,8 +1010,7 @@ read from the actual modules, not assumed.
 - RNG round-trip: `torch.get_rng_state()` after resume matches the straight-through run at the same step, so stochastic ops (dropout, sampling) continue identically.
 - Corrupt/absent checkpoint: `load_checkpoint` on a missing or truncated file fails closed with an actionable error, never a silent fresh start.
 - DDP sample coverage: two gloo ranks over N samples see a partition of [0, N) with no overlap and full coverage in one epoch; `set_epoch(e)` changes the shuffle deterministically between epochs.
-- DDP effective-batch semantics: the two-rank run's per-update sample count matches the declared effective batch (world_size x microbatch x grad_accum).
-- Edge: a dataset size not divisible by world size is handled per the sampler's documented padding/drop behaviour without double-counting a sample as a real update.
+- Edge: a dataset size not divisible by world size is handled per the sampler's documented padding behaviour — `DistributedSampler(drop_last=False)` pads to an even length, so one sample is duplicated across ranks; the coverage test asserts this reality (full coverage, exactly one duplicate) rather than assuming a clean partition. **Deferred to the L40 qualification (needs a real 2-rank training run, not just the sampler):** verifying the two-rank per-update sample count equals the declared effective batch (world_size x microbatch x grad_accum) and that padded indices are not counted as real updates — this unit tests sample-coverage/partitioning only.
 
 **Verification:**
 - `uv run --with pytest pytest tests/test_checkpoint.py tests/test_train_engine.py tests/test_ddp_coverage.py -q` passes; the resume-equivalence and DDP-coverage tests are green on CPU with no GPU and no real data.

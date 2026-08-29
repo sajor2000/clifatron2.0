@@ -406,15 +406,40 @@ class _DropoutModel(torch.nn.Module):
 
 
 class _FixedDS(torch.utils.data.Dataset):
-    """Deterministic data — no RNG in __getitem__ — so the only training-time RNG
-    consumer is dropout, isolating the resume RNG round-trip."""
+    """Deterministic but EPOCH-DEPENDENT data — no RNG in __getitem__ (so dropout is the
+    only training-time RNG consumer, isolating the resume RNG round-trip), but the token
+    content shifts with the epoch. `train()` calls `set_epoch(epoch)`, so restoring the
+    WRONG epoch on resume produces different batches and a divergent result — that is
+    what makes epoch restoration observable in the resume-equivalence tests (CodeRabbit).
+    """
+
+    def __init__(self):
+        self._epoch = 0
+
+    def set_epoch(self, epoch):
+        self._epoch = int(epoch)
 
     def __len__(self):
         return 6
 
     def __getitem__(self, i):
-        return {"input_ids": torch.arange(i, i + 8) % 100,
+        return {"input_ids": torch.arange(i + self._epoch, i + self._epoch + 8) % 100,
                 "attention_mask": torch.ones(8)}
+
+
+def _state_dicts_equal(a: dict, b: dict) -> bool:
+    """Tensor-aware deep equality for optimizer / scheduler state dicts."""
+    if type(a) is not type(b):
+        return False
+    if isinstance(a, dict):
+        if a.keys() != b.keys():
+            return False
+        return all(_state_dicts_equal(a[k], b[k]) for k in a)
+    if isinstance(a, (list, tuple)):
+        return len(a) == len(b) and all(_state_dicts_equal(x, y) for x, y in zip(a, b))
+    if torch.is_tensor(a):
+        return torch.is_tensor(b) and torch.equal(a, b)
+    return a == b
 
 
 class ResumeEquivalenceTest(unittest.TestCase):
@@ -451,6 +476,7 @@ class ResumeEquivalenceTest(unittest.TestCase):
             cfg = self._cfg(td)
             dl = torch.utils.data.DataLoader(_FixedDS(), batch_size=2, shuffle=False)
             for ep in range(total_epochs):
+                dl.dataset.set_epoch(ep)  # epoch-dependent data (mirrors train())
                 _train_one_epoch(model_s, dl, opt_s, sched_s, ep, cfg, dev, rank=0)
             straight = self._params(model_s)
 
@@ -462,6 +488,7 @@ class ResumeEquivalenceTest(unittest.TestCase):
             cfg = self._cfg(td)
             dl = torch.utils.data.DataLoader(_FixedDS(), batch_size=2, shuffle=False)
             for ep in range(split):
+                dl.dataset.set_epoch(ep)
                 _train_one_epoch(model_a, dl, opt_a, sched_a, ep, cfg, dev, rank=0)
             ckpt = Path(td) / "boundary.pt"
             save_checkpoint(ckpt, model=model_a, optimizer=opt_a, scheduler=sched_a,
@@ -480,12 +507,19 @@ class ResumeEquivalenceTest(unittest.TestCase):
             sched_b.load_state_dict(loaded["scheduler"])
             _restore_rng_states(loaded["rng_states"])
             for ep in range(split, total_epochs):
+                dl.dataset.set_epoch(ep)
                 _train_one_epoch(model_b, dl, opt_b, sched_b, ep, cfg, dev, rank=0)
             resumed = self._params(model_b)
+            resumed_opt, resumed_sched = opt_b.state_dict(), sched_b.state_dict()
+        straight_opt, straight_sched = opt_s.state_dict(), sched_s.state_dict()
 
         for a, b in zip(straight, resumed):
             self.assertTrue(torch.equal(a, b),
                             f"resume diverged from straight-through: max|d|={ (a-b).abs().max() }")
+        self.assertTrue(_state_dicts_equal(straight_opt, resumed_opt),
+                        "optimizer state diverged after resume")
+        self.assertTrue(_state_dicts_equal(straight_sched, resumed_sched),
+                        "scheduler state diverged after resume")
 
     def test_production_train_resume_matches_straight_through(self):
         """Drive the real `train(..., resume_ckpt=)` path, not a hand-rolled loop, so a
@@ -522,6 +556,7 @@ class ResumeEquivalenceTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             train(m_s, loader(), None, o_s, s_s, cfg(td, 6, 999), dev, seed=7)
             straight = [p.detach().clone() for p in m_s.parameters()]
+            straight_opt, straight_sched = o_s.state_dict(), s_s.state_dict()
 
         torch.manual_seed(7)
         m_a, o_a, s_a = build()
@@ -536,10 +571,15 @@ class ResumeEquivalenceTest(unittest.TestCase):
             train(m_b, loader(), None, o_b, s_b, cfg(td, 6, 999), dev,
                   resume_ckpt=ckpt, seed=7)
             resumed = [p.detach().clone() for p in m_b.parameters()]
+            resumed_opt, resumed_sched = o_b.state_dict(), s_b.state_dict()
 
         for a, b in zip(straight, resumed):
             self.assertTrue(torch.equal(a, b),
                             f"train() resume diverged: max|d|={ (a-b).abs().max() }")
+        self.assertTrue(_state_dicts_equal(straight_opt, resumed_opt),
+                        "optimizer state diverged after train() resume")
+        self.assertTrue(_state_dicts_equal(straight_sched, resumed_sched),
+                        "scheduler state diverged after train() resume")
 
 
 if __name__ == "__main__":
