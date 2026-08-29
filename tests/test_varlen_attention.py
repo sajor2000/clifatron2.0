@@ -188,6 +188,29 @@ class TrainingIsolationGateTest(unittest.TestCase):
         backbone = _tiny_backbone()  # GPT2, eager attention, no FA2
         self.assertFalse(training_isolation_active(backbone))
 
+    def test_a_config_flipped_to_fa2_over_eager_layers_is_not_trusted(self):
+        """The config string can lie: eager layers under a flipped config must fail closed."""
+        from src.model.varlen_attention import _uses_flash_attention_2
+
+        class _Cfg:
+            _attn_implementation = "flash_attention_2"
+
+        class _Layer(torch.nn.Module):
+            def __init__(self, impl):
+                super().__init__()
+                self._attn_implementation = impl
+
+        class _Model(torch.nn.Module):
+            def __init__(self, layer_impl):
+                super().__init__()
+                self.config = _Cfg()
+                self.attn = _Layer(layer_impl)
+
+        # Config says fa2 but the actual layer is eager -> not trusted.
+        self.assertFalse(_uses_flash_attention_2(_Model("eager")))
+        # Config and the layer agree on fa2 -> trusted.
+        self.assertTrue(_uses_flash_attention_2(_Model("flash_attention_2")))
+
     def test_an_unsupported_architecture_never_takes_the_position_id_path(self):
         """Qwen3-Next reports flash_attention_2 but needs explicit boundary args."""
         from src.model.varlen_attention import (

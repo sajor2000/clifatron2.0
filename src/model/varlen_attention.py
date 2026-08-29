@@ -54,8 +54,28 @@ _POSITION_ID_VARLEN_ARCHITECTURES = frozenset({"qwen2", "qwen3"})
 
 
 def _uses_flash_attention_2(backbone) -> bool:
+    """Whether the backbone is ACTUALLY running FlashAttention-2, not just configured for it.
+
+    `config._attn_implementation` is a mutable string, and on some transformers versions
+    the attention class is chosen at CONSTRUCTION — a model built eager whose config is
+    flipped to "flash_attention_2" afterward keeps eager layers, so the string lies and
+    the position-ids-only path would leak (CodeRabbit). Cross-check every submodule that
+    records its own `_attn_implementation`: if any real attention layer disagrees with
+    the top-level config, fail closed. This is a necessary-not-sufficient signal — the
+    definitive proof that FA2 isolates is U8's runtime GPU qualification, not this
+    predicate; being conservative here costs nothing, since no caller wires the FA2
+    training path yet.
+    """
     impl = getattr(getattr(backbone, "config", None), "_attn_implementation", None)
-    return impl == "flash_attention_2"
+    if impl != "flash_attention_2":
+        return False
+    modules = getattr(backbone, "modules", None)
+    if callable(modules):
+        for module in modules():
+            sub_impl = getattr(module, "_attn_implementation", None)
+            if sub_impl is not None and sub_impl != "flash_attention_2":
+                return False
+    return True
 
 
 def _model_on_cuda(model) -> bool:
