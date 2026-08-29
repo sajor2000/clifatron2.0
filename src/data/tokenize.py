@@ -354,6 +354,11 @@ def tokenize_site(cfg: dict, site: str, base: Path, out: Path,
             {"vocab": vocab, "edges": edges, "manifest": vocab_manifest}, cfg, policy
         )
     con = duckdb.connect()
+    # DuckDB renders TIMESTAMPTZ columns in the SESSION timezone, so on a non-UTC
+    # host every tz-aware parquet came back as e.g. America/Chicago and
+    # restrict_to_observation_window refused it (fail closed, but host-dependent).
+    # Pin the session so tokenization is byte-identical wherever it runs (U9).
+    con.execute("SET TimeZone = 'UTC'")
     keep_ids = None
     if limit_stays is not None:
         hosp_spec = cfg["tables"].get("adt") or next(iter(cfg["tables"].values()))
@@ -519,6 +524,7 @@ def main():
 
     if args.dry_run:
         con = duckdb.connect()
+        con.execute("SET TimeZone = 'UTC'")  # same session-tz pin as tokenize_site
         for name, spec in cfg["tables"].items():
             df = _read_table(con, Path(args.indir), spec)
             print(f"{name}: {len(df):,} events, concepts={df['concept'].n_unique() if len(df) else 0}")

@@ -166,26 +166,32 @@ def zero_shot_predictions(model, batches, target_indices, tau_bins,
     n_stays = len(batches)
     probs = np.zeros((n_stays, n_outcomes))
 
-    for start in range(0, n_stays, batch_size):
-        end = min(start + batch_size, n_stays)
-        batch_ids = [b["input_ids"] for b in batches[start:end]]
-        batch_masks = [b["attention_mask"] for b in batches[start:end]]
+    # inference_mode, not just eval(): the HEAD parameters still require grad (only
+    # the backbone is frozen), so without it the first real call built an autograd
+    # graph across every site batch and `.numpy()` refused the resulting tensor.
+    # U9's synthetic bundle is the first caller to actually execute this path — the
+    # D1 seam kept it uncalled until now.
+    with torch.inference_mode():
+        for start in range(0, n_stays, batch_size):
+            end = min(start + batch_size, n_stays)
+            batch_ids = [b["input_ids"] for b in batches[start:end]]
+            batch_masks = [b["attention_mask"] for b in batches[start:end]]
 
-        max_len = max(len(ids) for ids in batch_ids)
-        ids = torch.zeros((len(batch_ids), max_len), dtype=torch.long, device=device)
-        masks = torch.zeros((len(batch_ids), max_len), dtype=torch.long, device=device)
-        for i, (id_seq, mask_seq) in enumerate(zip(batch_ids, batch_masks)):
-            ids[i, :len(id_seq)] = torch.tensor(id_seq)
-            masks[i, :len(mask_seq)] = torch.tensor(mask_seq)
+            max_len = max(len(ids) for ids in batch_ids)
+            ids = torch.zeros((len(batch_ids), max_len), dtype=torch.long, device=device)
+            masks = torch.zeros((len(batch_ids), max_len), dtype=torch.long, device=device)
+            for i, (id_seq, mask_seq) in enumerate(zip(batch_ids, batch_masks)):
+                ids[i, :len(id_seq)] = torch.tensor(id_seq)
+                masks[i, :len(mask_seq)] = torch.tensor(mask_seq)
 
-        for k in range(n_outcomes):
-            f = model.threshold_prob(
-                ids, masks,
-                torch.tensor([target_indices[k]] * len(batch_ids), device=device),
-                torch.tensor([tau_bins[k]] * len(batch_ids), device=device),
-                torch.tensor([directions[k]] * len(batch_ids), device=device),
-            )
-            probs[start:end, k] = f[:, -1].cpu().numpy()
+            for k in range(n_outcomes):
+                f = model.threshold_prob(
+                    ids, masks,
+                    torch.tensor([target_indices[k]] * len(batch_ids), device=device),
+                    torch.tensor([tau_bins[k]] * len(batch_ids), device=device),
+                    torch.tensor([directions[k]] * len(batch_ids), device=device),
+                )
+                probs[start:end, k] = f[:, -1].cpu().numpy()
 
     return probs
 
@@ -249,7 +255,7 @@ def _binary_labels(labels_df, name: str):
 
 def evaluate_site(checkpoint_path: str, data_path: str, episode_artifact: str,
                   outcome_cfgs: list[dict], *, spec_version: str = "1.0.0",
-                  predict_fn=None) -> dict:
+                  predict_fn=None, cohort_config=None, data_config=None) -> dict:
     """Run full evaluation at one site. Returns a schema-valid, aggregate-only artifact.
 
     **No prediction path in this function can produce a random number (U5 D1).** Two
@@ -265,9 +271,14 @@ def evaluate_site(checkpoint_path: str, data_path: str, episode_artifact: str,
     inference. No test exercised this path, so the suite never caught it.
 
     `predict_fn` is the seam for real inference: a callable taking the labeled frame and
-    returning `(n_stays, n_outcomes)` probabilities. Production wires
-    `tokenize_site -> ModelDataset -> zero_shot_predictions` through it; tests pass a
-    deterministic stub. It has no default, so there is nothing to fall back to.
+    returning `(n_stays, n_outcomes)` probabilities. Production wires it via
+    `src.eval.bundle_inference.bundle_predict_fn` (tokenize_site ->
+    zero_shot_predictions); tests pass a deterministic stub. It has no default, so
+    there is nothing to fall back to.
+
+    `cohort_config` / `data_config` override `auto_label`'s repo-relative defaults.
+    Inside a wheel those defaults dangle (there is no `configs/` checkout), so a
+    bundle-driven caller passes the bundle's own copies (U9).
     """
     from src.eval.clif_auto_labeler import auto_label
 
@@ -279,7 +290,12 @@ def evaluate_site(checkpoint_path: str, data_path: str, episode_artifact: str,
         )
 
     outcome_names = [o["name"] for o in outcome_cfgs]
-    labels_df = auto_label(data_path, episode_artifact, outcome_names)
+    label_kwargs = {}
+    if cohort_config is not None:
+        label_kwargs["cohort_config"] = cohort_config
+    if data_config is not None:
+        label_kwargs["data_config"] = data_config
+    labels_df = auto_label(data_path, episode_artifact, outcome_names, **label_kwargs)
     _log.info("labeled %d stays across %d outcomes", len(labels_df), len(outcome_names))
 
     probs = np.asarray(predict_fn(labels_df), dtype=float)
@@ -514,6 +530,9 @@ def main():
     ap.add_argument("--release-id", required=True,
                     help="unique identifier for THIS release. Replaying one is rejected, "
                          "so a duplicated report cannot be counted as another site.")
+    ap.add_argument("--shard-dir", default="output/intermediate_phi/token_shards",
+                    help="policy-checked directory for the intermediate token shard "
+                         "(patient_level_phi class; never leaves the node).")
     ap.add_argument("--access-log-key-file", default=None,
                     help="file holding this site's access-log chain secret. Required: "
                          "the log's tamper-evidence is an HMAC chain, and an unkeyed "
@@ -540,57 +559,35 @@ def main():
     logging.basicConfig(level=logging.INFO, format="%(message)s")
     _schema.install_log_sanitizer(logging.getLogger())
 
-    outcome_cfgs = [
-        {"name": "in_hospital_mortality", "direction": "above"},
-        {"name": "new_imv_24h", "direction": "above"},
-        {"name": "new_vasopressor_24h", "direction": "above"},
-        {"name": "aki_kdigo_48h", "direction": "above"},
-        {"name": "resp_failure_48h", "direction": "above"},
-    ]
-
     # Preflight the audit trail BEFORE any work (greploop review 5). Publishing first and
     # recording afterward meant a missing key produced a RELEASED artifact with no access
     # record -- the command failed, but only after the report was already visible. An
     # export that cannot be logged must not happen at all.
     _attest.preflight_access_log(args.access_log)
 
-    provenance = verify_bundle_compatibility(args.checkpoint)
+    # U9 closed the D1 inference seam. The bundle carries everything the raising
+    # placeholder used to name as missing: the resolved data config, the pinned
+    # vocabulary and numeric edges, the artifact policy (pinned process-wide by
+    # load_bundle), and the per-outcome zero-shot query parameters. The outcomes
+    # evaluated are exactly those the bundle declares queries for -- sorted, so the
+    # exported payload is byte-stable for identical inputs.
+    from src.eval.bundle import load_bundle
+    from src.eval.bundle_inference import bundle_predict_fn
+
+    bundle = load_bundle(args.checkpoint)
+    provenance = bundle.provenance
     model = load_checkpoint(args.checkpoint)
 
-    def predict_fn(labels_df):
-        """Real inference seam.
-
-        DELIBERATELY UNIMPLEMENTED, and failing closed rather than approximating.
-
-        The pieces exist -- `src/data/tokenize.py::tokenize_site` produces the event
-        shards, `src/data/dataset.py::ModelDataset` / `make_dataloader` batch them, and
-        `zero_shot_predictions` above consumes those batches -- but wiring them needs
-        four things this CLI does not yet receive: the resolved data config, the
-        bundle-pinned vocabulary and numeric edges, a policy-checked output directory
-        for the intermediate shards, and the episode frame rather than its path
-        (`tokenize_site(cfg, site, base, out, vocab, edges, ..., episodes=...)`).
-
-        Raising here is the point. The whole of D1 was a placeholder that produced
-        something plausible instead of stopping, and an approximate call against a
-        signature this module cannot satisfy would be the same defect wearing different
-        clothes -- it would fail at a site, at runtime, with a confusing error, after
-        the operator had already been told the run was under way.
-
-        U5 is data-free by contract: the seam, the fail-closed behaviour, and the export
-        path are in scope and tested; running real inference on governed site data is
-        not. Supply `predict_fn` from a caller that has the bundle artifacts, or wire
-        this once the bundle-manifest vocabulary lands with U9.
-        """
-        raise ArtifactMismatch(
-            "real inference is not wired into this CLI yet: it needs the resolved data "
-            "config, the bundle-pinned vocabulary and numeric edges, and a "
-            "policy-checked shard directory. Pass an explicit predict_fn from a caller "
-            "that holds the bundle artifacts. Refusing rather than approximating -- an "
-            "approximate prediction path is the defect this unit exists to remove."
-        )
+    outcome_cfgs = [{"name": name} for name in sorted(bundle.outcome_queries)]
+    predict_fn = bundle_predict_fn(
+        bundle, model, data_path=args.data, episode_artifact=args.episode_artifact,
+        outcome_cfgs=outcome_cfgs, shard_dir=args.shard_dir, site_id=args.site_id,
+    )
 
     result = evaluate_site(args.checkpoint, args.data, args.episode_artifact,
-                           outcome_cfgs, predict_fn=predict_fn)
+                           outcome_cfgs, predict_fn=predict_fn,
+                           cohort_config=bundle.cohort_path,
+                           data_config=bundle.data_cfg_path)
 
     # The draft/approve split, made real (whole-file review). As previously wired, main()
     # built a DRAFT payload and handed it straight to write_export, which refuses drafts

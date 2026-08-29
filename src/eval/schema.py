@@ -86,14 +86,34 @@ DISCLOSURE_STATUSES = RELEASABLE_DISCLOSURE_STATUSES | {DRAFT_DISCLOSURE_STATUS}
 
 
 # ---------------------------------------------------------------- policy constants
-def load_min_cell_size(policy_path: str | Path = DEFAULT_ARTIFACT_POLICY) -> int:
+# A deployed validator pins its policy from the BUNDLE, not the package: the default
+# path above is repo-relative and dangles inside a wheel, and deep callers reach the
+# policy through the cached `min_cell_size()` accessor with no parameter. This env var
+# is the seam bundle loading uses; setting it must be followed by
+# `min_cell_size.cache_clear()` so the pinned policy actually takes effect.
+POLICY_OVERRIDE_ENV = "CLIF_ARTIFACT_POLICY_FILE"
+
+
+def _resolved_policy_path() -> Path:
+    import os
+    override = os.environ.get(POLICY_OVERRIDE_ENV)
+    return Path(override) if override else DEFAULT_ARTIFACT_POLICY
+
+
+def load_min_cell_size(policy_path: str | Path | None = None) -> int:
     """Read the suppression threshold from the landed artifact policy.
+
+    `policy_path=None` resolves the CLIF_ARTIFACT_POLICY_FILE override first, then the
+    repo default. An override naming a missing file fails closed rather than silently
+    falling back — a bundle that pinned a policy must never be served the package's.
 
     Single source of truth. `configs/artifact_policy.yaml` set `minimum_cell_size: 10`
     in U1 and `tests/test_artifact_policy.py` asserts it; re-deciding the number here is
     how a codebase ends up with two thresholds and a suppression rule that silently stops
     applying (which is exactly what `subgroup_panel`'s hard-coded 30 was).
     """
+    if policy_path is None:
+        policy_path = _resolved_policy_path()
     policy = yaml.safe_load(Path(policy_path).read_text())
     try:
         value = policy["classes"]["aggregate_no_phi"]["minimum_cell_size"]
