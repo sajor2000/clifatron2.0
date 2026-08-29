@@ -34,6 +34,25 @@ class DistributedSamplerPartitionTest(unittest.TestCase):
         self.assertEqual(set(r0) & set(r1), set(), "the two ranks share a sample")
         self.assertEqual(set(r0) | set(r1), set(range(N)), "coverage is not the full set")
 
+    def test_non_divisible_length_pads_and_duplicates_one_sample(self):
+        """The 'no overlap' guarantee holds only for a divisible length (or drop_last).
+
+        `src/train/pretrain.py` uses DistributedSampler with the default
+        drop_last=False, so for an ODD dataset length over two ranks the sampler PADS
+        the index list to make it even — meaning one sample is seen twice across ranks.
+        This documents that reality so the divisible-N tests above are not mistaken for
+        a universal guarantee (CodeRabbit).
+        """
+        odd = 7
+        data = list(range(odd))
+        r0 = list(DistributedSampler(data, num_replicas=2, rank=0, shuffle=False))
+        r1 = list(DistributedSampler(data, num_replicas=2, rank=1, shuffle=False))
+        self.assertEqual(set(r0) | set(r1), set(range(odd)), "coverage is still complete")
+        # 7 -> ceil(7/2)*2 = 8 index slots, so exactly one sample is duplicated.
+        self.assertEqual(len(r0) + len(r1), odd + 1)
+        self.assertEqual(len(set(r0) & set(r1)), 1,
+                         "padding should duplicate exactly one sample across ranks")
+
     def test_set_epoch_reshuffles_deterministically(self):
         data = list(range(N))
         s = DistributedSampler(data, num_replicas=2, rank=0, shuffle=True, seed=0)

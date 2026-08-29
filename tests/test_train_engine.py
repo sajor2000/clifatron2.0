@@ -487,6 +487,60 @@ class ResumeEquivalenceTest(unittest.TestCase):
             self.assertTrue(torch.equal(a, b),
                             f"resume diverged from straight-through: max|d|={ (a-b).abs().max() }")
 
+    def test_production_train_resume_matches_straight_through(self):
+        """Drive the real `train(..., resume_ckpt=)` path, not a hand-rolled loop, so a
+        regression that stops restoring RNG or mishandles epoch/step is caught. The
+        checkpoint must land on an EPOCH BOUNDARY (3 batches/epoch here) — resume
+        re-iterates the epoch, so a mid-epoch checkpoint would change the data order and
+        is not claimed equivalent."""
+        from src.train.engine import train
+
+        dev = torch.device("cpu")
+
+        def cfg(td, total_steps, ckpt_every):
+            return TrainConfig({}, {
+                "batch": {"per_gpu": 2, "grad_accum": 1},
+                "runtime": {"ckpt_dir": td, "ckpt_every": ckpt_every},
+                "schedule": {"warmup_steps": 2, "total_steps": total_steps},
+                "eval_schedule": {"val_every": 10_000},
+                "optimizer": {"grad_clip": 1.0},
+            }, {"compile": False}, total_steps=total_steps)
+
+        def build():
+            torch.manual_seed(20260829)
+            m = _DropoutModel()
+            o = torch.optim.SGD(m.parameters(), lr=0.1, momentum=0.9)
+            s = torch.optim.lr_scheduler.StepLR(o, step_size=2, gamma=0.9)
+            return m, o, s
+
+        # 6 samples, batch 2 -> 3 updates/epoch; boundaries at steps 3, 6.
+        def loader():
+            return torch.utils.data.DataLoader(_FixedDS(), batch_size=2, shuffle=False)
+
+        torch.manual_seed(7)
+        m_s, o_s, s_s = build()
+        with tempfile.TemporaryDirectory() as td:
+            train(m_s, loader(), None, o_s, s_s, cfg(td, 6, 999), dev, seed=7)
+            straight = [p.detach().clone() for p in m_s.parameters()]
+
+        torch.manual_seed(7)
+        m_a, o_a, s_a = build()
+        with tempfile.TemporaryDirectory() as td:
+            train(m_a, loader(), None, o_a, s_a, cfg(td, 3, 3), dev, seed=7)  # 1 epoch, saves at step 3
+            ckpts = list(Path(td).glob("ckpt_*.pt"))
+            self.assertTrue(ckpts, "train() did not write an epoch-boundary checkpoint")
+            ckpt = ckpts[0]
+
+            torch.manual_seed(999_999)  # perturb: a missing RNG restore would diverge
+            m_b, o_b, s_b = build()
+            train(m_b, loader(), None, o_b, s_b, cfg(td, 6, 999), dev,
+                  resume_ckpt=ckpt, seed=7)
+            resumed = [p.detach().clone() for p in m_b.parameters()]
+
+        for a, b in zip(straight, resumed):
+            self.assertTrue(torch.equal(a, b),
+                            f"train() resume diverged: max|d|={ (a-b).abs().max() }")
+
 
 if __name__ == "__main__":
     unittest.main()
