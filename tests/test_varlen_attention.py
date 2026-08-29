@@ -189,11 +189,12 @@ class TrainingIsolationGateTest(unittest.TestCase):
         self.assertFalse(training_isolation_active(backbone))
 
     def test_a_config_flipped_to_fa2_over_eager_layers_is_not_trusted(self):
-        """The config string can lie: eager layers under a flipped config must fail closed."""
+        """Model the real regression: build eager, THEN flip the config to fa2."""
         from src.model.varlen_attention import _uses_flash_attention_2
 
         class _Cfg:
-            _attn_implementation = "flash_attention_2"
+            def __init__(self, impl):
+                self._attn_implementation = impl
 
         class _Layer(torch.nn.Module):
             def __init__(self, impl):
@@ -201,15 +202,27 @@ class TrainingIsolationGateTest(unittest.TestCase):
                 self._attn_implementation = impl
 
         class _Model(torch.nn.Module):
-            def __init__(self, layer_impl):
+            def __init__(self, impl):
                 super().__init__()
-                self.config = _Cfg()
-                self.attn = _Layer(layer_impl)
+                self.config = _Cfg(impl)
+                self.attn = _Layer(impl)  # layers built with the SAME impl as config
 
-        # Config says fa2 but the actual layer is eager -> not trusted.
-        self.assertFalse(_uses_flash_attention_2(_Model("eager")))
-        # Config and the layer agree on fa2 -> trusted.
+        # Construct eager, then flip ONLY the top-level config to fa2 (the exact
+        # post-construction mutation): the eager layer still contradicts -> not trusted.
+        m = _Model("eager")
+        m.config._attn_implementation = "flash_attention_2"
+        self.assertFalse(_uses_flash_attention_2(m))
+
+        # Genuinely constructed fa2 (config AND layers agree) -> trusted.
         self.assertTrue(_uses_flash_attention_2(_Model("flash_attention_2")))
+
+        # Config says fa2 but NO layer positively confirms -> fail closed.
+        class _NoLayerInfo(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.config = _Cfg("flash_attention_2")
+
+        self.assertFalse(_uses_flash_attention_2(_NoLayerInfo()))
 
     def test_an_unsupported_architecture_never_takes_the_position_id_path(self):
         """Qwen3-Next reports flash_attention_2 but needs explicit boundary args."""

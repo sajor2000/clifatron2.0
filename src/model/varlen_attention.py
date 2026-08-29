@@ -69,13 +69,25 @@ def _uses_flash_attention_2(backbone) -> bool:
     impl = getattr(getattr(backbone, "config", None), "_attn_implementation", None)
     if impl != "flash_attention_2":
         return False
+    # POSITIVE confirmation required — the config string alone is not proof. Walk the
+    # module tree: any attention layer that contradicts (reports a non-FA2 impl) fails
+    # closed, AND at least one layer must POSITIVELY report flash_attention_2. A backbone
+    # whose layers expose nothing, or whose tree is not inspectable, is NOT trusted
+    # (returns False), so a config flipped over eager/unknown layers never routes into
+    # the position-ids-only path. The definitive proof stays U8's runtime GPU
+    # qualification; this predicate errs toward the CPU fallback until then.
     modules = getattr(backbone, "modules", None)
-    if callable(modules):
-        for module in modules():
-            sub_impl = getattr(module, "_attn_implementation", None)
-            if sub_impl is not None and sub_impl != "flash_attention_2":
-                return False
-    return True
+    if not callable(modules):
+        return False
+    saw_positive = False
+    for module in modules():
+        sub_impl = getattr(module, "_attn_implementation", None)
+        if sub_impl is None:
+            continue
+        if sub_impl != "flash_attention_2":
+            return False
+        saw_positive = True
+    return saw_positive
 
 
 def _model_on_cuda(model) -> bool:
