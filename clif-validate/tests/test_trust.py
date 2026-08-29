@@ -126,6 +126,19 @@ class LoadBundleTrustTest(unittest.TestCase):
         with self.assertRaisesRegex(ArtifactMismatch, "revoked"):
             v_bundle.load_bundle(self.bundle_dir, trust_roles_path=root)
 
+    def test_rewriting_signed_by_to_an_unknown_key_is_refused(self):
+        """signed_by is not in the signed subset, so an attacker can rewrite it — but the
+        rewritten id must resolve in the trust root, and a bogus/alias id fails closed
+        (U11 review; belt-and-suspenders with the trust root's duplicate-key refusal)."""
+        import json
+        tampered = self._copy("swapped_signer")
+        mpath = tampered / v_bundle.BUNDLE_MANIFEST
+        m = json.loads(mpath.read_text())
+        m["signed_by"] = "some-unknown-releaser"
+        mpath.write_text(json.dumps(m))
+        with self.assertRaisesRegex(ArtifactMismatch, "not in the trust root"):
+            v_bundle.load_bundle(tampered, trust_roles_path=self.trust_roles)
+
     def test_a_tampered_signed_field_is_refused(self):
         """Mutating a signed manifest field breaks the signature (not just a file hash)."""
         import json

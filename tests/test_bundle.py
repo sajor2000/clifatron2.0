@@ -432,6 +432,7 @@ class RepoCliEndToEndTest(_BundleFixtureCase):
             "--signing-key-file", str(signing_key),
             "--access-log-key-file", str(access_key),
             "--trust-roles", str(self.trust_roles),
+            "--rollback-state", "output/intermediate_phi/repo_cli_rollback.json",
             *extra,
         ]
 
@@ -477,8 +478,8 @@ class RepoCliEndToEndTest(_BundleFixtureCase):
                 main()
         self.assertFalse(Path("output/final_no_phi/repo_cli.json").exists())
 
-    def test_approved_without_hash_or_waiver_fails_closed(self):
-        """--approved must bind to reviewed content or explicitly waive it."""
+    def test_approved_without_a_content_hash_fails_closed(self):
+        """--approved must bind to reviewed content — there is no waiver (U11 review)."""
         from unittest import mock
 
         from src.eval.clif_validate import main
@@ -487,6 +488,34 @@ class RepoCliEndToEndTest(_BundleFixtureCase):
             with self.assertRaises(SystemExit):
                 main()
         self.assertFalse(Path("output/final_no_phi/repo_cli.json").exists())
+
+    def test_approved_without_a_rollback_state_fails_closed(self):
+        """A governed release must enforce anti-rollback; omitting the state path is refused."""
+        from unittest import mock
+
+        from src.eval.clif_validate import main
+
+        argv = [a for a in self._cli_argv("--approved", "--approved-hash", "0" * 64)
+                if a != "output/intermediate_phi/repo_cli_rollback.json"]
+        argv = [a for a in argv if a != "--rollback-state"]
+        with mock.patch("sys.argv", argv):
+            with self.assertRaises(SystemExit):
+                main()
+        self.assertFalse(Path("output/final_no_phi/repo_cli.json").exists())
+
+    def test_allow_unsigned_cannot_produce_an_approved_release(self):
+        """The load-bearing bypass (U11 review): --allow-unsigned + --approved is refused,
+        so a not-for-release (unverified) bundle can never be published as reviewed_approved."""
+        from unittest import mock
+
+        from src.eval.clif_validate import main
+
+        argv = self._cli_argv("--approved", "--approved-hash", "0" * 64, "--allow-unsigned")
+        with mock.patch("sys.argv", argv):
+            with self.assertRaises(SystemExit):
+                main()
+        self.assertFalse(Path("output/final_no_phi/repo_cli.json").exists())
+        self.assertFalse(Path("output/intermediate_phi/repo_cli_ledger.jsonl").exists())
 
     def test_a_governed_load_without_a_trust_root_fails_closed(self):
         """Omitting --trust-roles (and --allow-unsigned) refuses to load — no anchor."""

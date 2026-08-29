@@ -111,12 +111,33 @@ def load_trust_roots(path: str | Path) -> dict:
             "a bundle against an undefined trust root"
         )
     keys: dict[str, bytes] = {}
+    seen_pubkeys: dict[bytes, str] = {}
     for entry in block.get("trusted_keys") or []:
         key_id = entry.get("key_id")
         hex_pub = entry.get("public_key_hex")
         if not key_id or not isinstance(hex_pub, str) or len(hex_pub) != 64:
             raise TrustError(f"trusted key entry is malformed: {entry!r}")
-        keys[key_id] = bytes.fromhex(hex_pub)
+        try:
+            pub = bytes.fromhex(hex_pub)
+        except ValueError as exc:
+            # A 64-char but non-hex value passes the length guard; keep the failure inside
+            # the TrustError/ArtifactMismatch contract the load boundary catches, rather
+            # than letting a bare ValueError escape every `except ArtifactMismatch`.
+            raise TrustError(
+                f"trusted key {key_id!r} has a non-hex public_key_hex; refusing the trust root"
+            ) from exc
+        # Reject the same public key under two key ids. Revocation is keyed by key_id
+        # against the manifest's (unsigned) signed_by, so an alias for a revoked key would
+        # let a bundle dodge revocation while its signature still verifies. Forbidding
+        # duplicate public keys removes that precondition at the trust-root boundary.
+        prior = seen_pubkeys.get(pub)
+        if prior is not None:
+            raise TrustError(
+                f"trust root maps one public key to both {prior!r} and {key_id!r}; a "
+                "duplicate key would let a revoked id be bypassed via its alias"
+            )
+        seen_pubkeys[pub] = key_id
+        keys[key_id] = pub
     if not keys:
         raise TrustError(f"trust roles at {path} declare no trusted signing keys")
     return {
@@ -146,11 +167,33 @@ def verify_against_trust_root(manifest: dict, signature_hex: str, key_id: str,
 
 # ---------------------------------------------------------------- anti-rollback
 def _version_tuple(version: str) -> tuple:
-    """Parse a dotted version into an int tuple for ordering; non-numeric parts sort low."""
+    """Parse a dotted version into an int tuple for ordering; non-numeric parts sort low.
+
+    NOTE: this is a deliberately small parser, not full semver. A non-numeric segment
+    maps to a single sentinel (-1), so two distinct build tags on the same base
+    (`1.0-alpha` vs `1.0-beta`) compare EQUAL. Anti-rollback still fails closed (an equal
+    compare never advances or refuses wrongly in the unsafe direction), but releases
+    should use plain numeric versions; `model_version` is inside the signed subset, so an
+    attacker cannot choose a tag to game this without a trusted key.
+    """
     parts = []
     for chunk in str(version).split("."):
         parts.append(int(chunk) if chunk.isdigit() else -1)
     return tuple(parts)
+
+
+def _version_lt(a: str, b: str) -> bool:
+    """True iff version `a` is strictly older than `b`.
+
+    Zero-pads to equal length before comparing so `1.2` and `1.2.0` are EQUAL, not
+    `1.2 < 1.2.0` — the raw tuple compare `(1,2) < (1,2,0)` would otherwise refuse a
+    semantically-equal 2-segment version as a rollback.
+    """
+    ta, tb = _version_tuple(a), _version_tuple(b)
+    width = max(len(ta), len(tb))
+    ta = ta + (0,) * (width - len(ta))
+    tb = tb + (0,) * (width - len(tb))
+    return ta < tb
 
 
 def read_rollback_floor(state_path: str | Path) -> str | None:
@@ -158,6 +201,15 @@ def read_rollback_floor(state_path: str | Path) -> str | None:
 
     A malformed/corrupt state file FAILS CLOSED (raises) rather than being treated as
     "no floor" — a downgrade attack could otherwise just corrupt the file to reset it.
+
+    RESIDUAL (by design, not a code gap): an ABSENT file returns None (no floor) — it must,
+    since the very first governed load has no prior floor. So an attacker with WRITE access
+    to this site-local state path can delete the file (or write a lower well-formed floor)
+    to reset downgrade protection. That is out of the bundle-trust threat model: it requires
+    local write to the site's own state directory, where an attacker could tamper with far
+    more. The file's integrity is a site-custody concern (see configs/trust_roles.yaml,
+    execution_host.rollback_state_location); only corruption of an existing file is caught
+    here. Anti-rollback defends against a malicious BUNDLE, not a compromised site host.
     """
     path = Path(state_path)
     if not path.exists():
@@ -178,7 +230,7 @@ def read_rollback_floor(state_path: str | Path) -> str | None:
 def enforce_anti_rollback(model_version: str, state_path: str | Path) -> None:
     """Fail closed if `model_version` is older than the persisted floor."""
     floor = read_rollback_floor(state_path)
-    if floor is not None and _version_tuple(model_version) < _version_tuple(floor):
+    if floor is not None and _version_lt(model_version, floor):
         raise TrustError(
             f"bundle version {model_version!r} is older than the highest accepted "
             f"version {floor!r}; refusing a rollback to a superseded bundle"
@@ -189,7 +241,7 @@ def advance_rollback_floor(model_version: str, state_path: str | Path) -> None:
     """Record `model_version` as the new floor if it is newer (call AFTER acceptance)."""
     path = Path(state_path)
     floor = read_rollback_floor(path)
-    if floor is None or _version_tuple(model_version) > _version_tuple(floor):
+    if floor is None or _version_lt(floor, model_version):
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps({"highest_trusted_version": str(model_version)}))
 

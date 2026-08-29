@@ -16,6 +16,8 @@
 # a governed bundle. There is deliberately no default-trusted key: a key committed to
 # this repo would be a shared secret, which cannot model a trust root.
 
+# Governance metadata only — NOT read by trust.py (load_trust_roots reads just the
+# release_signing block below). Versions this document, not an enforced control.
 policy_version: "1.0.0"
 
 # ---------------------------------------------------------------- machine-read trust root

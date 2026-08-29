@@ -125,6 +125,32 @@ class TrustRootTest(unittest.TestCase):
             with self.assertRaises(trust.TrustError):
                 trust.load_trust_roots(path)
 
+    def test_a_64_char_non_hex_public_key_fails_as_TrustError(self):
+        """The malformed-key guard checks length; a 64-char non-hex value must still land
+        as TrustError (an ArtifactMismatch), not a bare ValueError that escapes the load
+        boundary's `except ArtifactMismatch` (U11 review)."""
+        with tempfile.TemporaryDirectory() as td:
+            import yaml
+            path = Path(td) / "nonhex.yaml"
+            path.write_text(yaml.safe_dump({"release_signing": {
+                "trusted_keys": [{"key_id": "k", "public_key_hex": "z" * 64}]}}))
+            with self.assertRaises(trust.TrustError):
+                trust.load_trust_roots(path)
+
+    def test_a_duplicate_public_key_under_two_key_ids_is_refused(self):
+        """Same public key under two ids would let a revoked id be dodged via its alias;
+        the trust root refuses it at load (U11 review)."""
+        _, pub_hex = _keypair()
+        with tempfile.TemporaryDirectory() as td:
+            import yaml
+            path = Path(td) / "dup.yaml"
+            path.write_text(yaml.safe_dump({"release_signing": {"trusted_keys": [
+                {"key_id": "primary", "public_key_hex": pub_hex},
+                {"key_id": "alias", "public_key_hex": pub_hex},
+            ]}}))
+            with self.assertRaisesRegex(trust.TrustError, "duplicate|both"):
+                trust.load_trust_roots(path)
+
 
 class AntiRollbackTest(unittest.TestCase):
     def test_newer_advances_and_older_is_refused(self):
@@ -152,6 +178,40 @@ class AntiRollbackTest(unittest.TestCase):
                 trust.read_rollback_floor(state)
             with self.assertRaises(trust.TrustError):
                 trust.enforce_anti_rollback("9.9.9", state)
+
+    def test_equal_versions_of_differing_segment_counts_are_not_a_rollback(self):
+        """'1.2' and '1.2.0' are the same version; the raw tuple compare (1,2)<(1,2,0)
+        would wrongly refuse '1.2' as a rollback. Padding fixes it (U11 review)."""
+        with tempfile.TemporaryDirectory() as td:
+            state = Path(td) / "rollback.json"
+            trust.advance_rollback_floor("1.2.0", state)
+            trust.enforce_anti_rollback("1.2", state)      # equal: must NOT raise
+            trust.advance_rollback_floor("1.2", state)     # equal: no lowering
+            self.assertEqual(trust.read_rollback_floor(state), "1.2.0")
+            # A genuinely older 2-segment version is still refused.
+            with self.assertRaisesRegex(trust.TrustError, "rollback"):
+                trust.enforce_anti_rollback("1.1", state)
+
+    def test_deleting_the_state_file_resets_the_floor_accepted_residual(self):
+        """DOCUMENTED RESIDUAL (U11 review): an ABSENT state file is 'no floor', so deleting
+        it re-opens downgrades. This is out of the bundle-trust threat model (it needs local
+        write to the site's own state dir). Corruption still fails closed; deletion does not.
+        This test pins the accepted behavior so a future change is a conscious decision."""
+        with tempfile.TemporaryDirectory() as td:
+            state = Path(td) / "rollback.json"
+            trust.advance_rollback_floor("2.0.0", state)
+            state.unlink()                                  # attacker/ops deletes it
+            self.assertIsNone(trust.read_rollback_floor(state))
+            trust.enforce_anti_rollback("1.0.0", state)     # no floor => does NOT raise
+
+
+class SignatureFilenameContractTest(unittest.TestCase):
+    def test_bundle_and_trust_agree_on_the_signature_filename(self):
+        """bundle.py keeps a local _SIGNATURE_FILENAME to avoid importing trust at module
+        load; assert it equals the authoritative trust.SIGNATURE_FILENAME so drift fails
+        loudly instead of the writer and reader disagreeing on the file name (U11 review)."""
+        from src.eval import bundle
+        self.assertEqual(bundle._SIGNATURE_FILENAME, trust.SIGNATURE_FILENAME)
 
 
 if __name__ == "__main__":
