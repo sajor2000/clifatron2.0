@@ -69,11 +69,13 @@ class WheelRepoEquivalenceTest(unittest.TestCase):
     def _reset_pins():
         os.environ.pop(v_schema.POLICY_OVERRIDE_ENV, None)
         v_schema.min_cell_size.cache_clear()
+        v_schema.max_dropped_fraction.cache_clear()
         try:
             from src.eval import schema as r_schema
         except ImportError:
             return
         r_schema.min_cell_size.cache_clear()
+        r_schema.max_dropped_fraction.cache_clear()
 
     def tearDown(self):
         self._reset_pins()

@@ -66,10 +66,17 @@ INSUFFICIENT_PARTITIONS = "insufficient_partitions"
 SMALL_CELL_SUPPRESSED = "small_cell_suppressed"
 ARTIFACT_MISMATCH = "artifact_mismatch"
 RUNTIME_FAILURE = "runtime_failure"
+# The model could not score enough of the ascertained cohort for the metric to mean
+# anything — the frozen vocabulary did not transfer to this site (the PORTER failure
+# mode). Distinct from INSUFFICIENT_N: a small site and a site where 99% of stays
+# failed to tokenize must not report the same status, or a coverage failure hides as
+# "too few patients" while the dropped majority vanishes from the artifact entirely.
+COVERAGE_INSUFFICIENT = "coverage_insufficient"
 
 OUTCOME_STATUSES = frozenset({
     EVALUABLE, UNSUPPORTED_AT_SITE, SINGLE_CLASS, INSUFFICIENT_N,
     INSUFFICIENT_PARTITIONS, SMALL_CELL_SUPPRESSED, ARTIFACT_MISMATCH, RUNTIME_FAILURE,
+    COVERAGE_INSUFFICIENT,
 })
 
 NON_EVALUABLE_STATUSES = OUTCOME_STATUSES - {EVALUABLE}
@@ -137,6 +144,56 @@ def min_cell_size() -> int:
     inconsistent with every other config load in this repo.
     """
     return load_min_cell_size()
+
+
+def load_max_dropped_fraction(policy_path: str | Path | None = None) -> float:
+    """Read the coverage gate from the landed artifact policy (fail-closed).
+
+    The maximum fraction of an outcome's ascertained cohort that may be dropped as
+    untokenizable before the outcome is reported COVERAGE_INSUFFICIENT rather than
+    scored on the surviving sliver. Like `minimum_cell_size`, it is a declared
+    disclosure/validity decision, not a default this module may guess: a policy that
+    does not declare it fails closed, so a governed bundle cannot silently ship without
+    a coverage threshold. Resolves the CLIF_ARTIFACT_POLICY_FILE override first.
+    """
+    if policy_path is None:
+        policy_path = _resolved_policy_path()
+    policy = yaml.safe_load(Path(policy_path).read_text())
+    try:
+        value = policy["classes"]["aggregate_no_phi"]["max_dropped_fraction"]
+    except (KeyError, TypeError) as exc:
+        raise DisclosureError(
+            f"artifact policy at {policy_path} does not declare "
+            "classes.aggregate_no_phi.max_dropped_fraction; refusing to guess a "
+            "coverage threshold. A validation run that cannot say how much of the "
+            "cohort it dropped is not evaluable."
+        ) from exc
+    if not isinstance(value, (int, float)) or isinstance(value, bool) or not 0 < value <= 1:
+        raise DisclosureError(
+            f"max_dropped_fraction must be a number in (0, 1], got {value!r}"
+        )
+    return float(value)
+
+
+@functools.lru_cache(maxsize=1)
+def max_dropped_fraction() -> float:
+    """Cached accessor for the coverage gate; cleared by the same bundle policy pin."""
+    return load_max_dropped_fraction()
+
+
+def band_dropped_count(n_dropped: int) -> int | str:
+    """A dropped-stay count is releasable exactly only when it hides no small cell.
+
+    0 (nobody dropped) and counts at or above the floor are safe to state precisely.
+    A count in (0, floor) is an exact small-subgroup size — the stays whose data
+    produced no token sequence, plausibly correlated with care setting or data pathway
+    — and releasing it beside the released metrics is the same numerator disclosure
+    `suppress_cell` refuses. Band it to `<floor`, matching `banded_status_counts`.
+    """
+    floor = min_cell_size()
+    if n_dropped == 0 or n_dropped >= floor:
+        return n_dropped
+    return f"<{floor}"
 
 
 def curve_release_min() -> int:

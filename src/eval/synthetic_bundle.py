@@ -78,6 +78,7 @@ FIXTURE_POLICY = {
             "export_allowed": True,
             "disclosure_review_required": True,
             "minimum_cell_size": 10,
+            "max_dropped_fraction": 0.2,
         },
         "operational_logs": {
             "directory": "output/intermediate_phi",

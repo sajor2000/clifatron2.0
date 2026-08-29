@@ -39,6 +39,7 @@ from src.eval.synthetic_bundle import (
 def _reset_policy_pin():
     os.environ.pop(S.POLICY_OVERRIDE_ENV, None)
     S.min_cell_size.cache_clear()
+    S.max_dropped_fraction.cache_clear()
 
 
 class _BundleFixtureCase(unittest.TestCase):
@@ -344,6 +345,56 @@ class BundleInferenceTest(_BundleFixtureCase):
         self.assertEqual(probs.shape, (2, 1))
         self.assertTrue(np.isfinite(probs[0, 0]))
         self.assertTrue(np.isnan(probs[1, 0]))
+
+    def _dropping_predict_fn(self, cfgs, n_pos_drop, n_neg_drop, shard):
+        """Wrap real inference, then NaN out a controlled count from each class.
+
+        Class-balanced drops keep the survivors evaluable so the test isolates the
+        coverage gate / banding, not a suppression side effect.
+        """
+        base = self._predict_fn(cfgs, shard=shard)
+        name = cfgs[0]["name"]
+
+        def pf(labels_df):
+            probs = base(labels_df)
+            status = labels_df[f"{name}_status"].to_list()
+            pos = [i for i, s in enumerate(status) if s == "positive"]
+            neg = [i for i, s in enumerate(status) if s == "negative"]
+            for i in pos[:n_pos_drop] + neg[:n_neg_drop]:
+                probs[i, 0] = np.nan
+            return probs
+
+        return pf
+
+    def _evaluate(self, cfgs, predict_fn):
+        from src.eval.clif_validate import evaluate_site
+
+        return evaluate_site(
+            str(self.bundle_dir), str(self.site), str(self.episodes), cfgs,
+            predict_fn=predict_fn, cohort_config=self.bundle.cohort_path,
+            data_config=self.bundle.data_cfg_path,
+        )["outcomes"][cfgs[0]["name"]]
+
+    def test_a_sub_floor_dropped_count_is_banded_not_released_exactly(self):
+        """An exact small count of untokenizable stays is a numerator disclosure."""
+        cfgs = [{"name": SYNTHETIC_OUTCOME}]
+        # 24 stays (12/12). Drop 2 per class: fraction 4/24=0.167 <= 0.2 (evaluable),
+        # survivors 10/10 clear the floor, dropped count 4 is in (0, 10) -> banded.
+        cell = self._evaluate(cfgs, self._dropping_predict_fn(cfgs, 2, 2, "shards_band"))
+        self.assertEqual(cell["status"], S.EVALUABLE)
+        self.assertEqual(cell["metrics"]["n_dropped_nan"], f"<{S.min_cell_size()}")
+        self.assertNotIn("4", json.dumps(cell["metrics"]["n_dropped_nan"]))
+
+    def test_near_total_tokenization_failure_is_coverage_insufficient(self):
+        """A biased sliver must not release as a score; the PORTER vocab-drop scenario."""
+        cfgs = [{"name": SYNTHETIC_OUTCOME}]
+        # Drop 6/24 = 0.25 > 0.2: the coverage gate fires before suppression, so the
+        # outcome is coverage_insufficient rather than a metric on the survivors.
+        cell = self._evaluate(cfgs, self._dropping_predict_fn(cfgs, 3, 3, "shards_cov"))
+        self.assertEqual(cell["status"], S.COVERAGE_INSUFFICIENT)
+        self.assertNotIn("metrics", cell)  # non-evaluable carries no numbers
+        # And the reason must not leak an exact sub-floor count either.
+        self.assertNotIn("6", cell["reason"])
 
 
 class RepoCliEndToEndTest(_BundleFixtureCase):

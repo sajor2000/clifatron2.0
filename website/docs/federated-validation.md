@@ -138,7 +138,12 @@ flowchart LR
 Fairness is reported aggregate (ICareFM precedent). Small-cell suppression is **implemented and
 enforced** (U5): denominator suppression, numerator suppression, and curve-resolution bounding are
 three separate controls in `src/eval/schema.py`, checked by the export validator at the writer and
-again at the aggregator.
+again at the aggregator. Two further disclosure/validity controls landed with U9: a **coverage gate**
+(`max_dropped_fraction` in the artifact policy) reports an outcome `coverage_insufficient` — a
+distinct status, not a score — when the frozen vocabulary fails to transfer and most stays cannot be
+tokenized (the PORTER failure mode), rather than releasing a biased sliver; and the count of
+untokenizable stays is **banded** when it falls below the cell floor, since an exact small count is
+the same numerator disclosure suppression exists to prevent.
 
 ---
 

@@ -226,11 +226,13 @@ def pin_bundle_policy(policy_path: str | Path) -> None:
 
     `schema.min_cell_size()` is lru_cached and called with no arguments throughout
     the export path, so pinning is two steps: point the override env var at the
-    bundled policy AND drop the cache so a value resolved earlier (possibly from a
-    repo checkout that only exists on the releaser's machine) cannot linger.
+    bundled policy AND drop EVERY policy-derived cache so a value resolved earlier
+    (possibly from a repo checkout that only exists on the releaser's machine) cannot
+    linger. Any new lru_cached policy accessor must be cleared here too.
     """
     os.environ[_schema.POLICY_OVERRIDE_ENV] = str(Path(policy_path).resolve())
     _schema.min_cell_size.cache_clear()
+    _schema.max_dropped_fraction.cache_clear()
 
 
 @dataclass(frozen=True)

@@ -45,12 +45,14 @@ class CeremonyParityTest(unittest.TestCase):
         os.environ.pop(schema.POLICY_OVERRIDE_ENV, None)
         os.environ.pop("CLIF_ACCESS_LOG_KEY_FILE", None)
         schema.min_cell_size.cache_clear()
+        schema.max_dropped_fraction.cache_clear()
         cls._tmp.cleanup()
 
     def tearDown(self):
         os.environ.pop(schema.POLICY_OVERRIDE_ENV, None)
         os.environ.pop("CLIF_ACCESS_LOG_KEY_FILE", None)
         schema.min_cell_size.cache_clear()
+        schema.max_dropped_fraction.cache_clear()
 
     def _argv(self, tag: str, *extra: str) -> list[str]:
         return [

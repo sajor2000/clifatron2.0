@@ -328,9 +328,27 @@ def evaluate_site(checkpoint_path: str, data_path: str, episode_artifact: str,
         # scalar metrics on the post-drop rows, and the DCA curve on the raw arrays --
         # where NaN comparisons silently read as negative decisions. Saturated +/-inf is
         # kept: it is a legitimate confident prediction, not an undefined one.
+        n_ascertained = int(mask.sum())
         defined = ~np.isnan(p)
         n_dropped = int((~defined).sum())
         p, y = p[defined], y[defined]
+
+        # Coverage gate, BEFORE suppression (review finding). When the frozen
+        # vocabulary does not transfer, most stays produce no token sequence and score
+        # NaN; scoring the metric on the surviving sliver is a biased 0.3%-of-cohort
+        # estimate dressed as a site result (the PORTER scenario). If the dropped
+        # fraction exceeds the policy's declared ceiling, the outcome is
+        # coverage-insufficient — a distinct status — rather than a score, and rather
+        # than an INSUFFICIENT_N that would let the dropped majority vanish silently.
+        dropped_fraction = n_dropped / n_ascertained if n_ascertained else 1.0
+        if dropped_fraction > _schema.max_dropped_fraction():
+            outcomes[name] = _schema.non_evaluable(
+                _schema.COVERAGE_INSUFFICIENT,
+                f"{_schema.n_band(n_dropped)} of {_schema.n_band(n_ascertained)} "
+                "ascertained stays could not be tokenized; the frozen vocabulary did "
+                "not transfer to this site",
+                validity)
+            continue
 
         status, reason = _schema.suppress_cell(int(len(y)), int(y.sum()))
         if status != _schema.EVALUABLE:
@@ -348,7 +366,10 @@ def evaluate_site(checkpoint_path: str, data_path: str, episode_artifact: str,
                 "calib_slope": panel.get("calib_slope"),
                 "calib_intercept": panel.get("calib_intercept"),
                 "ici": panel.get("ici"), "temperature": panel.get("temperature"),
-                "n_dropped_nan": n_dropped,
+                # Banded when in (0, floor): an exact sub-floor count of untokenizable
+                # stays is a small-subgroup size, the same numerator disclosure
+                # suppress_cell refuses (review finding).
+                "n_dropped_nan": _schema.band_dropped_count(n_dropped),
             },
         }
         block["metrics"] = {k2: v for k2, v in block["metrics"].items() if v is not None}
