@@ -144,6 +144,18 @@ class CeremonyParityTest(unittest.TestCase):
         self.assertFalse(Path("output/final_no_phi/nosign.json").exists())
         self.assertFalse(Path("output/intermediate_phi/nosign_ledger.jsonl").exists())
 
+    def test_approved_with_an_empty_signing_key_is_refused(self):
+        empty = self.work / "empty.key"
+        empty.write_text("   \n")
+        argv = self._argv("emptysign", "--approved")
+        idx = argv.index("--signing-key-file")
+        argv[idx + 1] = str(empty)
+        with mock.patch("sys.argv", argv):
+            with self.assertRaises(SystemExit):
+                main()
+        self.assertFalse(Path("output/final_no_phi/emptysign.json").exists())
+        self.assertFalse(Path("output/intermediate_phi/emptysign_ledger.jsonl").exists())
+
     def test_a_shard_dir_outside_the_policy_class_is_refused(self):
         with mock.patch("sys.argv",
                         self._argv("badshard", "--approved", "--shard-dir",

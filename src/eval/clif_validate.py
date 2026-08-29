@@ -651,6 +651,14 @@ def main():
             "Refusing to release rather than emit an unsigned reviewed_approved report."
         )
     signing_key = bytes.fromhex(Path(args.signing_key_file).read_text().strip())
+    # An empty or whitespace-only key file parses to b"", which build_export treats as
+    # "no key" (`if signing_key:` is falsy) and silently skips signing — the same
+    # unsigned-release hole as omitting the flag (CodeRabbit). Reject it here.
+    if not signing_key:
+        raise SystemExit(
+            f"--signing-key-file {args.signing_key_file} is empty: a release must be "
+            "signed. Refusing rather than publishing an unsigned reviewed_approved report."
+        )
     payload = build_export(result["outcomes"], provenance, site_id=args.site_id,
                            site_role=args.site_role, partition_role=args.partition_role,
                            release_id=args.release_id,

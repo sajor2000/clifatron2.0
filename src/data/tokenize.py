@@ -116,14 +116,20 @@ def _read_table(con, base: Path, spec: dict,
     id_filter = ""
     params: list = []
     if keep_ids is not None:
-        # Parameterize the id list rather than inlining quoted literals: a
-        # hospitalization_id containing an apostrophe would otherwise terminate the
-        # literal and corrupt the query (CodeRabbit). Column/table identifiers cannot
-        # be bound as parameters, so those stay interpolated — the bundle path
-        # validates them as identifiers before they reach here.
-        placeholders = ", ".join("?" for _ in keep_ids)
-        id_filter = f"AND CAST(hospitalization_id AS VARCHAR) IN ({placeholders})"
-        params = [str(i) for i in keep_ids]
+        # An empty keep_ids would generate `IN ()`, which DuckDB rejects as a syntax
+        # error (CodeRabbit). An empty allow-list means "keep nothing", so match no
+        # rows explicitly rather than emitting invalid SQL.
+        if not keep_ids:
+            id_filter = "AND 1 = 0"
+        else:
+            # Parameterize the id list rather than inlining quoted literals: a
+            # hospitalization_id containing an apostrophe would otherwise terminate the
+            # literal and corrupt the query (CodeRabbit). Column/table identifiers
+            # cannot be bound as parameters, so those stay interpolated — the bundle
+            # path validates them as identifiers before they reach here.
+            placeholders = ", ".join("?" for _ in keep_ids)
+            id_filter = f"AND CAST(hospitalization_id AS VARCHAR) IN ({placeholders})"
+            params = [str(i) for i in keep_ids]
     q = f"""
         SELECT hospitalization_id       AS hosp_id,
                {time_col}                AS dttm,
@@ -368,6 +374,10 @@ def tokenize_site(cfg: dict, site: str, base: Path, out: Path,
     con.execute("SET TimeZone = 'UTC'")
     keep_ids = None
     if limit_stays is not None:
+        # A zero or negative sample size is a usage error, not "tokenize nothing":
+        # fail fast rather than silently producing an empty shard (CodeRabbit).
+        if limit_stays < 1:
+            raise ValueError(f"limit_stays must be a positive integer, got {limit_stays}")
         hosp_spec = cfg["tables"].get("adt") or next(iter(cfg["tables"].values()))
         hosp_fp = base / f"{hosp_spec['file']}.parquet"
         keep_ids = [

@@ -82,5 +82,31 @@ class TokenizeAlignmentTest(unittest.TestCase):
             self.assertTrue(saw_skip, "the nulled-measurement stay was not tokenized")
 
 
+class ReadTableEdgeCaseTest(unittest.TestCase):
+    def test_empty_keep_ids_matches_nothing_instead_of_invalid_sql(self):
+        """keep_ids=[] must not emit `IN ()` (a DuckDB syntax error)."""
+        import duckdb
+        import polars as pl
+
+        from src.data.tokenize import _read_table
+
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            pl.DataFrame({
+                "hospitalization_id": ["a", "b"],
+                "recorded_dttm": ["2026-01-01T00:00:00", "2026-01-01T01:00:00"],
+                "vital_category": ["map", "map"],
+                "vital_value": [70.0, 80.0],
+                "vital_unit": ["mmHg", "mmHg"],
+            }).write_parquet(base / "clif_vitals.parquet")
+            spec = {"file": "clif_vitals", "availability_col": "recorded_dttm",
+                    "concept_col": "vital_category", "value_col": "vital_value",
+                    "unit_col": "vital_unit"}
+            con = duckdb.connect()
+            con.execute("SET TimeZone = 'UTC'")
+            out = _read_table(con, base, spec, keep_ids=[])
+            self.assertEqual(len(out), 0)  # empty allow-list keeps nothing, no error
+
+
 if __name__ == "__main__":
     unittest.main()
