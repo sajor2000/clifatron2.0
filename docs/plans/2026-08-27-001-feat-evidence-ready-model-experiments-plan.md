@@ -36,7 +36,7 @@ sequencing (U12 gates U6/U7). Ask before U9 completes, not after.
 | **U13. Varlen/document-isolated attention** (was "U2 follow-up") | **Implemented — CPU-qualified; GPU/U8 pending; blocks U8** | Model-consumption path, per-document CPU fallback, anchor gather, and tests landed (PR #6). CPU isolation + equivalence proven data-free. The FA2 GPU path is architecture-gated (Qwen2/Qwen3) and stays unqualified until U8's L40 run; the multi-doc training reject is intentionally NOT lifted (see approach). |
 | U5. Evaluation, calibration, validation gate | Landed | PR #4 / `53e3c2c`; suite 266 passed, 3 skipped. Grew well beyond plan: `src/eval/schema.py`, `attestation.py`, `log_sanitizer.py` |
 | U9. Validator core | **Next** | `clif-validate/` does not exist; deepened 2026-08-29 with U5's execution-taught packaging facts |
-| U11. Release-trust machinery | Blocked on U9 | Split out of the original U9 on 2026-08-28 |
+| U11. Release-trust machinery | **Next — unblocked by U9's merge** | Deepened 2026-08-29 with the Ed25519 KTD. Closes U9's deferred security gaps: bundle trust anchor (signature), approval-by-content-hash, chain-key custody. Data-free-implementable; operational key custody/distribution stay pending exit criteria. |
 | U12. v0 real-site federation proof | Blocked on U9, U11 | Added 2026-08-28; also blocked on external-site onboarding |
 | U6, U7, U8 | Blocked on U9, U12 | See per-unit entry gates; U7 additionally conditional on U12's coverage findings |
 | U10. Release milestone | Gated milestone | Moved out of Implementation Units 2026-08-28; re-planned after selection |
@@ -957,21 +957,33 @@ read from the actual modules, not assumed.
 
 **Requirements:** R5, R14, R15, R16
 
-**Dependencies:** U9
+**Dependencies:** U9 (landed — PR #5).
+
+**Status:** Next. Deepened 2026-08-29 against the landed U9 code. U11's entry gate is now satisfied (U9 validator core qualified on a synthetic bundle). This unit closes three security gaps U9's own review explicitly DEFERRED to U11: the bundle has no cryptographic trust anchor (a re-hashed replacement bundle passes `load_bundle` today — the manifest is self-hashed only); approval-by-content-hash (the `--approved` rerun recomputes the report and could release a payload different from the reviewed draft); and access-log chain-key / report-signing-secret custody.
 
 **Entry gate — do not start until all hold:**
-- U9 validator core qualified on a synthetic bundle.
-- Workflow approval obtained before distributing even a synthetic bundle.
+- U9 validator core qualified on a synthetic bundle. **(Met — PR #5 merged.)**
+- Workflow approval obtained before distributing even a synthetic bundle. **(Governance, pending — not a code gate for the data-free implementation below; required before any real distribution.)**
 - No real-training preconditions apply; U11 packages no trained weights.
 
+**Key technical decision — asymmetric (Ed25519) bundle signing against an out-of-band trust root.** U5/U9 sign *reports* and the *access-log chain* with HMAC-SHA256 (symmetric shared secret) — correct for the site→aggregator direction and unchanged here. But the releaser→site direction needs a true trust ROOT: the releaser signs the bundle manifest with a PRIVATE key; every site verifies with the releaser's PUBLIC key distributed out of band. A symmetric HMAC does not model this (both sides would hold the secret, so any site could forge a bundle). Decision: add `cryptography` (Ed25519) as a `clif-validate` dependency — well-audited, ships manylinux x86_64 wheels matching U11's Linux-x86_64/py3.11 target; tests run it via `uv run --with cryptography`. The detached signature covers the manifest's identity fields + `files` map + `outcome_queries` (canonical JSON), binding everything `load_bundle` already trusts. **Alternative considered and rejected:** a detached HMAC with a site-held verification key — weaker (no true trust root; a compromised site key forges bundles), so rejected.
+
 **Files:**
-- Create: `clif-validate/src/clif_validate/trust.py` (signature verification, trust root, revocation, anti-rollback state)
+- Create: `clif-validate/src/clif_validate/trust.py` (Ed25519 detached-signature sign/verify over the manifest; trust-root loading from `configs/trust_roles.yaml`; revocation-list check; anti-rollback state read/write). Vendored into the wheel via `scripts/sync_vendor.py` only if it must run inside `_vendor` — otherwise it lives at the package top level like `bundle.py`'s shim, since it depends on `cryptography`, not on repo `src/`.
+- Modify: `src/eval/bundle.py` — `load_bundle(..., verify_signature=...)`: a signature-verification step that fails closed on absent/invalid/revoked/rolled-back signature. Default: required; a synthetic fixture may opt out explicitly (`verify_signature=False`) with a loud unsuitable-for-release marker. `write_bundle_manifest` gains an optional signing key so a sealed manifest can be signed.
+- Modify: `src/eval/clif_validate.py` — approval-by-content-hash in `main()`: `--approved <draft-hash>` recomputes the payload, canonicalizes, and verifies the hash matches the reviewed draft before stamping `reviewed_approved`; else fail closed.
+- Create: `src/eval/synthetic_bundle.py` signing helper (or a sibling) — produce a SIGNED synthetic bundle + a throwaway Ed25519 keypair for tests.
+- Create: `configs/trust_roles.yaml`
+- Create: `clif-validate/tests/test_trust.py` (signature/revocation/anti-rollback fail-closed cases)
+- Modify: `tests/test_bundle.py`, `tests/test_eval_schema.py`, `clif-validate/tests/test_ceremony_parity.py` — signed-bundle load + approval-by-content-hash coverage
 - Create: `clif-validate/tests/test_clean_install.py`
 - Create: `clif-validate/uv.lock`
 - Create: `clif-validate/SBOM.json`
-- Create: `configs/trust_roles.yaml`
+- Modify: `clif-validate/pyproject.toml` (add `cryptography`)
 - Modify: `website/docs/federated-validation.md`
 - Modify: `README.md`
+
+**Execution note:** Test-first on every fail-closed gate — write the red case (absent signature, invalid signature, revoked key, rolled-back version, approval-hash mismatch) and watch it fail against the ungated behavior BEFORE wiring the check, matching U5/U9's discipline. `trust.py` and the two source integrations come first (they close the U9 security deferrals and are the most testable); trust_roles.yaml alongside; packaging (lockfile/wheelhouse/SBOM/clean-install) last.
 
 **Approach:**
 - Produce a validator wheel, pinned CPU dependency lock, supported-platform wheelhouse, SBOM, and signed release manifest for offline, no-telemetry execution. Verify signatures against an out-of-band trust root and define revocation/anti-rollback behavior.
@@ -981,14 +993,28 @@ read from the actual modules, not assumed.
 - **Approval-by-content-hash (inherited from U5, recorded in its `--approved` help text).** The draft/release two-step currently assumes a deterministic pipeline between review and release; U11 closes that honestly: approval names the hash of the reviewed draft, and release verifies the recomputed payload against it before stamping `reviewed_approved`.
 - **Access-log chain-key custody (inherited from U5).** `CLIF_ACCESS_LOG_KEY_FILE` fails closed with no fallback — U5 enforced presence; U11 owns provisioning: where each site's chain key and report-signing secret live, who may read them, rotation cadence, and compromise handling, alongside the release trust root in `configs/trust_roles.yaml`.
 
+- **Signature-in-load_bundle contract (the trust anchor, closing U9's re-hashed-replacement finding).** `trust.py` produces a detached Ed25519 signature over the canonical-JSON of the manifest's identity fields + `files` map + `outcome_queries`, stored beside the bundle (e.g. `bundle_manifest.sig` + a `key_id`). `load_bundle` verifies it against the trust root BEFORE trusting the self-hash: a bundle whose files are internally consistent but signed by no trusted key (a re-hashed replacement) now fails closed. Verification is REQUIRED by default; `verify_signature=False` is the explicit, loudly-marked synthetic-only escape (the fixture is stamped not-for-release), never a silent bypass.
+
+- **Revocation + anti-rollback state model.** The trust root carries (or points to) a SIGNED revocation list — revoked releaser `key_id`s and/or revoked `model_bundle_id`s — checked during verification; a revoked signer/bundle fails closed. Anti-rollback: the site persists the highest trusted release version it has accepted (a small local state file, itself integrity-checked); loading a validly-signed but OLDER bundle than the persisted floor fails closed, so a downgrade to a superseded (possibly weakened) bundle cannot be forced. Both the revocation list and the minimum-version metadata travel the same controlled offline channel and are signed by the trust root — never fetched over the network.
+
+- **Honest code-vs-governance split.** IMPLEMENTABLE and data-free here: the sign/verify/revoke/anti-rollback logic, `load_bundle` integration, approval-by-content-hash, `configs/trust_roles.yaml` as a declared schema, and the packaging (lockfile/wheelhouse/SBOM/offline clean-install). NOT code — record as U11 EXIT CRITERIA, pending, do not pretend to implement: the actual private-signing-key custody (where real keys live — HSM/sealed store), the out-of-band trust-root distribution to sites, and the workflow approval to distribute even a synthetic bundle (this unit's entry gate names it). These are governance/ops, like the derived-model transfer approval — surfaced, not dropped.
+
 **Test scenarios:**
+- Happy path: a signed synthetic bundle (signed by a trusted test key) loads and validates; the approved release run matches the reviewed draft hash and stamps `reviewed_approved`.
+- Error path (red-first): a bundle with NO signature fails closed when verification is required.
+- Error path: a bundle whose files are internally consistent but signed by an UNTRUSTED key (the re-hashed-replacement attack) fails closed.
+- Error path: a tampered manifest (identity/files/outcome_queries changed after signing) fails signature verification.
+- Error path: a bundle signed by a REVOKED `key_id`, or carrying a revoked `model_bundle_id`, fails closed.
+- Error path: a validly-signed but ROLLED-BACK bundle (version below the persisted anti-rollback floor) fails closed; a corrupted anti-rollback state file fails closed rather than resetting the floor.
+- Error path: `--approved` with a draft hash that does NOT match the recomputed payload fails closed (closing U9's "approved rerun releases an unreviewed payload").
+- Edge: `verify_signature=False` is accepted only for a fixture and the resulting artifact is marked not-for-release; it can never be reached on the governed path.
+- Error path: any network or telemetry attempt during validation fails closed (offline-only).
 - Happy path: a clean CPU-only environment installs the package offline from the wheelhouse and validates a signed synthetic bundle.
-- Error path: invalid signature, revoked or rolled-back version, or an untrusted release root fails closed.
-- Error path: any network or telemetry attempt during validation fails closed.
 
 **Verification:**
-- Governance reviewers can audit a complete artifact lifecycle and bundle manifest before site distribution.
-- Release-signing key custody, rotation, and revocation are documented and testable.
+- Governance reviewers can audit a complete artifact lifecycle — signed manifest, revocation state, anti-rollback floor, approval hash — before site distribution.
+- Every fail-closed gate above has a red-first test that fails against the ungated behavior; the full data-free suite (repo + clif-validate) stays green with no GPU and no real data; `cryptography` is the only new runtime dependency.
+- Release-signing key custody, rotation, and revocation are documented in `configs/trust_roles.yaml`; the operational custody/distribution/approval steps are recorded as pending exit criteria, not silently closed.
 
 ### U12. Run the v0 real-site federation proof
 
@@ -1269,4 +1295,5 @@ Every unit carries the same exit criteria, applied before it is considered done:
 - PyTorch DistributedDataParallel: https://docs.pytorch.org/docs/stable/generated/torch.nn.parallel.DistributedDataParallel.html
 - PyTorch AMP examples: https://docs.pytorch.org/docs/stable/notes/amp_examples.html
 - Hugging Face Transformers — "Improving Hugging Face Training Efficiency Through Packing with Flash Attention" (packing-with-FA2), https://huggingface.co/blog/packing-with-FA2. Grounds U13: packing under Flash Attention 2 without cross-document contamination is "limited to providing the `position_ids`" (per-document reset); Qwen2 is on the supported-models list. Retrieved 2026-08-29 via Context7.
+- `cryptography` (pyca) Ed25519 — https://cryptography.io/en/latest/hazmat/primitives/asymmetric/ed25519/. Grounds U11's release-signing KTD: detached Ed25519 signatures over the bundle manifest, verified against an out-of-band public-key trust root; ships manylinux x86_64 wheels for the Linux/py3.11 target.
 - PyTorch reproducibility: https://docs.pytorch.org/docs/stable/notes/randomness.html
