@@ -139,17 +139,23 @@ class FederationE2ETest(unittest.TestCase):
         self.assertEqual(set(panel["site_ids"]), {"SITE-A", "SITE-B"})
         # The cumulative ledger recorded both releases as confirmed.
         self.assertEqual(attest.confirmed_releases(cum), {"rel-a", "rel-b"})
-        # No patient-level fields leaked into the aggregate: the panel is metrics/among
-        # allow-listed keys only, never raw counts below the floor or local paths.
+        # No patient-level fields leaked into the aggregate: no local path anywhere, and the
+        # per-metric blocks carry only summary statistics — never a raw patient count `n`.
         blob = json.dumps(panel)
         self.assertNotIn(str(self.site), blob)      # no site data path
         self.assertNotIn("/Users", blob)            # no absolute local path of any kind
+        allowed = {"values", "mean", "std", "min", "max", "n_sites"}
+        for row in panel["table"]:  # list of per-outcome rows
+            for metric in ("auroc", "auprc", "ece"):
+                stats = row[metric]
+                self.assertTrue(set(stats).issubset(allowed),
+                                f"panel stats leaked a non-allow-listed key: {set(stats)}")
+                self.assertNotIn("n", stats)        # summary carries n_sites, never patient n
 
     # ----------------------------------------------------------------- fail closed
     def test_a_tampered_report_is_refused(self):
         payload = json.loads(self.report_a.read_text())
-        payload["outcomes"] = dict(payload["outcomes"])  # shallow copy, then tamper a value
-        # Flip one signed byte without re-signing: the HMAC must no longer verify.
+        # Change a signed field without re-signing: the HMAC must no longer verify.
         payload["model_version"] = str(payload["model_version"]) + "-forged"
         tampered = self.work / "tampered.json"
         tampered.write_text(json.dumps(payload))
@@ -160,22 +166,67 @@ class FederationE2ETest(unittest.TestCase):
         self.assertEqual(attest.read_ledger(cum), [])  # nothing entered the ledger
 
     def test_an_unregistered_site_is_refused(self):
-        payload = json.loads(self.report_a.read_text())
-        payload = self._resign({**payload, "site_id": "SITE-UNKNOWN"}, "SITE-A")
+        payload = self._resign({**json.loads(self.report_a.read_text()),
+                                "site_id": "SITE-UNKNOWN"}, "SITE-A")
         # Signed with A's key but claims an unregistered site: no key to attribute it.
         rp = self.work / "unregistered.json"
         rp.write_text(json.dumps(payload))
+        cum = "output/intermediate_phi/unreg_ledger.jsonl"
         with self.assertRaises(attest.AuthenticationError):
-            agg.ingest_report(str(rp), signing_keys=self.site_keys,
-                              cumulative_ledger_path="output/intermediate_phi/unreg_ledger.jsonl")
+            agg.ingest_report(str(rp), signing_keys=self.site_keys, cumulative_ledger_path=cum)
+        self.assertEqual(attest.read_ledger(cum), [])  # attribution precedes any ledger write
+
+    def test_a_report_relabeled_to_a_different_registered_site_is_refused(self):
+        """A's real content relabeled SITE-B but still signed with A's key: verifying against
+        B's registered key fails, so a cross-key confusion cannot enter the aggregate."""
+        payload = {**json.loads(self.report_a.read_text()), "site_id": "SITE-B"}
+        payload = self._resign(payload, "SITE-A")  # signed with A's key, claims B
+        rp = self.work / "relabeled.json"
+        rp.write_text(json.dumps(payload))
+        cum = "output/intermediate_phi/relabel_ledger.jsonl"
+        with self.assertRaises(attest.AuthenticationError):
+            agg.ingest_report(str(rp), signing_keys=self.site_keys, cumulative_ledger_path=cum)
+        self.assertEqual(attest.read_ledger(cum), [])
+
+    def test_a_non_releasable_status_report_is_refused(self):
+        """The independent approval gate: a validly-signed pending_review (draft) report is
+        refused by the aggregator, which does not trust the site to have run its own gate."""
+        payload = {k: v for k, v in json.loads(self.report_a.read_text()).items()
+                   if k != "signature"}
+        payload["disclosure_status"] = S.DRAFT_DISCLOSURE_STATUS
+        payload = attest.sign_report(payload, self.site_keys["SITE-A"])  # a genuinely signed draft
+        rp = self.work / "draft.json"
+        rp.write_text(json.dumps(payload))
+        cum = "output/intermediate_phi/draft_ledger.jsonl"
+        with self.assertRaises(S.DisclosureError):
+            agg.ingest_report(str(rp), signing_keys=self.site_keys, cumulative_ledger_path=cum)
+        self.assertEqual(attest.read_ledger(cum), [])
+
+    def test_a_schema_violating_report_is_refused(self):
+        """Gate 2: a validly-signed report smuggling a stray top-level key fails the schema
+        allow-list before any ledger write."""
+        payload = {k: v for k, v in json.loads(self.report_a.read_text()).items()
+                   if k != "signature"}
+        payload["smuggled_field"] = "not in the export allow-list"
+        payload = attest.sign_report(payload, self.site_keys["SITE-A"])
+        rp = self.work / "smuggled.json"
+        rp.write_text(json.dumps(payload))
+        cum = "output/intermediate_phi/smuggle_ledger.jsonl"
+        with self.assertRaises(S.DisclosureError):
+            agg.ingest_report(str(rp), signing_keys=self.site_keys, cumulative_ledger_path=cum)
+        self.assertEqual(attest.read_ledger(cum), [])
 
     def test_a_replayed_release_is_refused(self):
         cum = "output/intermediate_phi/replay_ledger.jsonl"
         agg.ingest_report(str(self.report_a), signing_keys=self.site_keys,
                           cumulative_ledger_path=cum)  # first ingest ok
+        before = attest.read_ledger(cum)
         with self.assertRaises(S.DisclosureError):
             agg.ingest_report(str(self.report_a), signing_keys=self.site_keys,
                               cumulative_ledger_path=cum)  # same release id again
+        # The refused replay recorded nothing new; only the first release is confirmed.
+        self.assertEqual(attest.confirmed_releases(cum), {"rel-a"})
+        self.assertEqual(attest.read_ledger(cum), before)
 
     def test_the_aggregator_blocks_cross_release_differencing(self):
         """The load-bearing scenario (KTD-U15d): a site suppresses a cell in release 1 then
@@ -183,6 +234,9 @@ class FederationE2ETest(unittest.TestCase):
         cumulative ledger catches the differencing leak and refuses the second report."""
         base = json.loads(self.report_a.read_text())
         outcome = next(iter(base["outcomes"]))
+        # Precondition (asserted, not assumed): the base cell is EVALUABLE, so release 2's cell
+        # trips the sticky-suppression branch against release 1's suppressed cell.
+        self.assertEqual(base["outcomes"][outcome]["status"], S.EVALUABLE)
         # Reuse the real cell's label_validity so the suppressed block is schema-valid; a
         # suppressed cell just carries status + reason + label_validity (no metrics).
         label_validity = base["outcomes"][outcome]["label_validity"]
