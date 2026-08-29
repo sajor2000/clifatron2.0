@@ -137,6 +137,39 @@ class TrustRootTest(unittest.TestCase):
             with self.assertRaises(trust.TrustError):
                 trust.load_trust_roots(path)
 
+    def test_a_missing_trust_root_file_fails_as_TrustError(self):
+        """An absent --trust-roles path must land as TrustError, not a bare
+        FileNotFoundError that escapes the load boundary's except (CodeRabbit)."""
+        with tempfile.TemporaryDirectory() as td:
+            with self.assertRaises(trust.TrustError):
+                trust.load_trust_roots(Path(td) / "does_not_exist.yaml")
+
+    def test_a_scalar_revocation_list_fails_closed_not_open(self):
+        """`revoked_key_ids: releaser-2026` (a scalar) would become set('releaser-2026') —
+        single chars that never match a full key_id, silently failing revocation OPEN. It
+        must be refused (CodeRabbit)."""
+        _, pub_hex = _keypair()
+        with tempfile.TemporaryDirectory() as td:
+            import yaml
+            path = Path(td) / "scalar.yaml"
+            path.write_text(yaml.safe_dump({"release_signing": {
+                "trusted_keys": [{"key_id": "releaser-2026", "public_key_hex": pub_hex}],
+                "revoked_key_ids": "releaser-2026",  # scalar, not a list
+            }}))
+            with self.assertRaisesRegex(trust.TrustError, "list of strings"):
+                trust.load_trust_roots(path)
+
+    def test_a_non_mapping_trusted_key_entry_fails_as_TrustError(self):
+        """A bare string in trusted_keys would raise AttributeError on .get (outside the
+        TrustError contract); it must be refused as a malformed root (CodeRabbit)."""
+        with tempfile.TemporaryDirectory() as td:
+            import yaml
+            path = Path(td) / "badentry.yaml"
+            path.write_text(yaml.safe_dump({"release_signing": {
+                "trusted_keys": ["not-a-mapping"]}}))
+            with self.assertRaises(trust.TrustError):
+                trust.load_trust_roots(path)
+
     def test_a_duplicate_public_key_under_two_key_ids_is_refused(self):
         """Same public key under two ids would let a revoked id be dodged via its alias;
         the trust root refuses it at load (U11 review)."""

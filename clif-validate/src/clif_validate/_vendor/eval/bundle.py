@@ -369,18 +369,20 @@ def load_bundle(path: str | Path, *, pin_policy: bool = True,
         _verify_bundle_signature(root, manifest, provenance,
                                  trust_roles_path, rollback_state_path)
 
-    # Every check has passed; nothing below can raise. NOW pin the policy — see the
-    # ordering rationale in the docstring. validate_vocabulary_artifact above took the
-    # policy as an explicit dict, so nothing so far depended on the env pin.
-    if pin_policy:
-        pin_bundle_policy(policy_path)
-
-    # Anti-rollback floor advances only after FULL acceptance, so a bundle rejected
-    # after its signature verified never raises the floor.
+    # Anti-rollback floor advances only after FULL acceptance, so a bundle rejected after
+    # its signature verified never raises the floor. This does mkdir + write_text, which
+    # CAN fail (read-only mount, full disk); do it BEFORE pinning the policy so a failed
+    # floor write never leaves the bundled policy pinned process-wide (CodeRabbit).
     if verify_signature and rollback_state_path is not None:
         from clif_validate._vendor.eval import trust as _trust
 
         _trust.advance_rollback_floor(provenance["model_version"], rollback_state_path)
+
+    # Every check has passed and the floor is recorded; nothing below can raise. NOW pin
+    # the policy — see the ordering rationale in the docstring. validate_vocabulary_artifact
+    # above took the policy as an explicit dict, so nothing so far depended on the env pin.
+    if pin_policy:
+        pin_bundle_policy(policy_path)
 
     return Bundle(
         path=root,
@@ -433,6 +435,14 @@ def write_bundle_manifest(bundle_dir: str | Path, *, model_bundle_id: str,
         manifest["signed_by"] = key_id  # metadata, deliberately NOT part of the signed subset
         signature = sign_manifest(manifest, signing_key)
         (root / SIGNATURE_FILENAME).write_text(signature)
+    else:
+        # An unsigned re-seal must not leave a stale signature behind: it would match no
+        # manifest (which now has no signed_by), stay invisible to hash_bundle_files (which
+        # excludes the .sig), and only surface as a confusing "declares no signed_by" at a
+        # governed load. Remove it so the on-disk state is honest (CodeRabbit).
+        from clif_validate._vendor.eval.trust import SIGNATURE_FILENAME
+
+        (root / SIGNATURE_FILENAME).unlink(missing_ok=True)
     out = root / BUNDLE_MANIFEST
     out.write_text(json.dumps(manifest, indent=2, sort_keys=True))
     return out

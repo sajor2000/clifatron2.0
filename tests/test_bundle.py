@@ -202,6 +202,18 @@ class BundleContractTest(_BundleFixtureCase):
             clif_version=m["clif_version"], outcome_queries=m["outcome_queries"],
         )
 
+    def test_an_unsigned_reseal_removes_a_stale_signature(self):
+        """A re-seal without a signing key must delete any prior .sig, so the bundle never
+        carries a signature that matches no manifest (CodeRabbit)."""
+        from src.eval.trust import SIGNATURE_FILENAME
+        d = self._mutable_copy("bundle_reseal_sig")
+        self.assertTrue((d / SIGNATURE_FILENAME).exists())  # fixture ships signed
+        self._reseal(d)
+        self.assertFalse((d / SIGNATURE_FILENAME).exists())
+        # And a governed load now fails as unsigned, not with a confusing signed_by error.
+        with self.assertRaisesRegex(ArtifactMismatch, "unsigned"):
+            load_bundle(d, trust_roles_path=self.trust_roles)
+
     def test_a_nested_manifest_named_file_does_not_escape_the_envelope(self):
         """An unlisted `sub/bundle_manifest.json` must be caught, not skipped by name."""
         broken = self._mutable_copy("bundle_nested_manifest")

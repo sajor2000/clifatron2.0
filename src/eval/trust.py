@@ -103,7 +103,15 @@ def load_trust_roots(path: str | Path) -> dict:
           revoked_key_ids: [<key_id>, ...]
           revoked_bundle_ids: [<model_bundle_id>, ...]
     """
-    doc = yaml.safe_load(Path(path).read_text())
+    root_path = Path(path)
+    if not root_path.exists():
+        # A missing trust root must land as TrustError (an ArtifactMismatch), not a bare
+        # FileNotFoundError that escapes the load boundary's `except ArtifactMismatch`.
+        raise TrustError(
+            f"trust roles at {path} do not exist; refusing to verify against an absent "
+            "trust root"
+        )
+    doc = yaml.safe_load(root_path.read_text())
     block = (doc or {}).get("release_signing")
     if not isinstance(block, dict):
         raise TrustError(
@@ -113,6 +121,10 @@ def load_trust_roots(path: str | Path) -> dict:
     keys: dict[str, bytes] = {}
     seen_pubkeys: dict[bytes, str] = {}
     for entry in block.get("trusted_keys") or []:
+        # A non-mapping entry (e.g. a bare string in the list) would raise AttributeError
+        # on .get — outside the TrustError contract. Reject it as a malformed trust root.
+        if not isinstance(entry, dict):
+            raise TrustError(f"trusted key entry is not a mapping: {entry!r}")
         key_id = entry.get("key_id")
         hex_pub = entry.get("public_key_hex")
         if not key_id or not isinstance(hex_pub, str) or len(hex_pub) != 64:
@@ -142,9 +154,27 @@ def load_trust_roots(path: str | Path) -> dict:
         raise TrustError(f"trust roles at {path} declare no trusted signing keys")
     return {
         "keys": keys,
-        "revoked_key_ids": set(block.get("revoked_key_ids") or []),
-        "revoked_bundle_ids": set(block.get("revoked_bundle_ids") or []),
+        "revoked_key_ids": _revocation_set(block.get("revoked_key_ids"), "revoked_key_ids",
+                                           path),
+        "revoked_bundle_ids": _revocation_set(block.get("revoked_bundle_ids"),
+                                              "revoked_bundle_ids", path),
     }
+
+
+def _revocation_set(value, field: str, path) -> set:
+    """A revocation list must be a list of strings. A SCALAR (e.g. `revoked_key_ids:
+    releaser-2026`) would become a set of single characters via `set("releaser-2026")`, so
+    `verify_against_trust_root` never matches the full id and revocation fails OPEN. Reject
+    anything that is not a list of strings so a mis-typed revocation entry fails closed.
+    """
+    if value is None:
+        return set()
+    if not isinstance(value, list) or not all(isinstance(v, str) for v in value):
+        raise TrustError(
+            f"{field} in trust roles at {path} must be a list of strings, not {value!r}; "
+            "a scalar would silently fail revocation open"
+        )
+    return set(value)
 
 
 def verify_against_trust_root(manifest: dict, signature_hex: str, key_id: str,
