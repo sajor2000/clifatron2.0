@@ -243,39 +243,45 @@ class TrainingIsolationGateTest(unittest.TestCase):
         self.assertFalse(_architecture_isolates_from_position_ids(_M("qwen3_next")))
         self.assertFalse(_architecture_isolates_from_position_ids(_M("gpt2")))
 
-    def test_fa2_config_without_a_gpu_is_still_not_active(self):
-        """FA2 in config is necessary but not sufficient — the hardware must be there."""
-        from src.model.varlen_attention import (
-            flash_attention_available,
-            training_isolation_active,
-        )
+    def test_a_gpt2_backbone_never_becomes_isolation_active(self):
+        """GPT-2 is not a supported position-ids isolation architecture, and flipping its
+        config to FA2 gives no positive per-layer confirmation — so the gate stays closed
+        UNCONDITIONALLY, independent of hardware. (A CUDA FA2 host must not flip this to
+        True, which is why the assertion is not `== flash_attention_available()`.)"""
+        from src.model.varlen_attention import training_isolation_active
 
         backbone = _tiny_backbone()
         backbone.config._attn_implementation = "flash_attention_2"
-        # On a CPU CI box flash_attention_available() is False, so the gate stays closed.
-        self.assertEqual(training_isolation_active(backbone),
-                         flash_attention_available())
+        self.assertFalse(training_isolation_active(backbone))
 
 
 @unittest.skipUnless(
     torch.cuda.is_available(), "FlashAttention-2 path requires a CUDA device")
 class VarlenFlashAttentionTest(unittest.TestCase):
-    def test_fa2_and_fallback_agree_on_anchors_when_available(self):
+    def test_gpt2_stays_on_the_fallback_even_on_a_gpu(self):
+        """GPT-2 is not FA2-position-ids-supported, so even on CUDA with flash-attn the
+        isolation gate stays closed and document_hidden_states routes to the fallback —
+        a real Qwen2/Qwen3 GPU qualification of the FA2 path is U8's job, not a GPT-2
+        double's. This guards against a regression that would let GPT-2 take the
+        unqualified FA2 path."""
         from src.model.varlen_attention import (
             document_hidden_states,
             flash_attention_available,
+            training_isolation_active,
         )
 
         if not flash_attention_available():
             self.skipTest("flash-attn not installed")
         backbone = _tiny_backbone().cuda()
+        backbone.config._attn_implementation = "flash_attention_2"
+        self.assertFalse(training_isolation_active(backbone),
+                         "GPT-2 must never be trusted for FA2 document isolation")
         ids = torch.tensor([3, 4, 5, 6, 7, 8, 9])
         cu = torch.tensor([0, 4, 7], dtype=torch.int32)
-        fallback = document_hidden_states(backbone, ids, cu, force_fallback=True)
-        # Reload with FA2 to exercise the GPU path.
-        backbone.config._attn_implementation = "flash_attention_2"
-        fa2 = document_hidden_states(backbone, ids, cu)
-        self.assertTrue(torch.allclose(fallback, fa2.cpu(), atol=1e-2))
+        # Both routes are the fallback for GPT-2; they must agree exactly.
+        forced = document_hidden_states(backbone, ids, cu, force_fallback=True)
+        auto = document_hidden_states(backbone, ids, cu)
+        self.assertTrue(torch.equal(forced, auto))
 
 
 if __name__ == "__main__":
