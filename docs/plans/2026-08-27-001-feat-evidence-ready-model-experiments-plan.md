@@ -3,8 +3,8 @@ title: "feat: Establish evidence-ready CLIFATRON model experiments"
 type: feat
 status: active
 date: 2026-08-27
-deepened: 2026-08-28
-landed: U1, U2, U3, U4, value-stats follow-up
+deepened: 2026-08-29
+landed: U1, U2, U3, U4, value-stats follow-up, U5
 ---
 
 # feat: Establish evidence-ready CLIFATRON model experiments
@@ -17,9 +17,13 @@ Establish a leakage-safe, resumable training and evaluation baseline, then use o
 
 ## Execution Status
 
-Updated 2026-08-28 against `main` at `0d3eae0`. Working tree clean. The plan holds U1-U10; U1-U4
-and the value-statistics follow-up have landed via PR #2 and PR #3. Progress is derived from git,
-not stored here — this section is orientation, not state.
+Updated 2026-08-29 against `main` at `53e3c2c` (merge of PR #4). Working tree clean. U1-U5 and
+the value-statistics follow-up have landed. Progress is derived from git, not stored here — this
+section is orientation, not state.
+
+**Standing non-code action, still the longest lead item:** the governance question gating U12 —
+*may a pre-selection v0 bundle run at an external site?* — remains unasked. A "no" reshapes the
+sequencing (U12 gates U6/U7). Ask before U9 completes, not after.
 
 | Unit | Status | Evidence |
 |---|---|---|
@@ -30,15 +34,15 @@ not stored here — this section is orientation, not state.
 | Value-statistics follow-up | Landed | `src/data/value_stats.py`, `tests/test_value_stats.py` |
 | **U4 follow-up: hardware + resume verification** | **Unowned — blocks U6** | Owns `tests/test_checkpoint.py` (absent), a resume-*equivalence* test, and a two-process DDP smoke test. Completion artifact for P5-P7. |
 | **U2 follow-up: block-diagonal/varlen attention** | **Unowned — blocks U8** | Qwen2/Qwen3 varlen path. U8's entry gate qualifies packed attention that nothing builds. |
-| U5. Evaluation, calibration, validation gate | **Next** | Targets confirmed absent; nine defects catalogued in U5 below |
-| U9. Validator core | Blocked on U5 | `clif-validate/` does not exist |
+| U5. Evaluation, calibration, validation gate | Landed | PR #4 / `53e3c2c`; suite 266 passed, 3 skipped. Grew well beyond plan: `src/eval/schema.py`, `attestation.py`, `log_sanitizer.py` |
+| U9. Validator core | **Next** | `clif-validate/` does not exist; deepened 2026-08-29 with U5's execution-taught packaging facts |
 | U11. Release-trust machinery | Blocked on U9 | Split out of the original U9 on 2026-08-28 |
 | U12. v0 real-site federation proof | Blocked on U9, U11 | Added 2026-08-28; also blocked on external-site onboarding |
-| U6, U7, U8 | Blocked on U5, U9, U12 | See per-unit entry gates; U7 additionally conditional on U12's coverage findings |
+| U6, U7, U8 | Blocked on U9, U12 | See per-unit entry gates; U7 additionally conditional on U12's coverage findings |
 | U10. Release milestone | Gated milestone | Moved out of Implementation Units 2026-08-28; re-planned after selection |
 
-Verification at handoff: `uv run --with pytest pytest tests/ -q` passed with `108 passed, 3 skipped`
-on the U1-U4 feature branch, and value-stats focused tests passed on the follow-up branch.
+Verification at U5 merge: `uv run --with pytest pytest tests/ -q` passes with `266 passed,
+3 skipped` on `main` at `53e3c2c` (122 at the branch point).
 
 Two caveats carried forward from the handoff, both still open:
 
@@ -53,6 +57,25 @@ Two caveats carried forward from the handoff, both still open:
   rather than equivalence to an uninterrupted run. Those obligations reappear below as blocking
   preconditions P5-P7 with no unit chartered to satisfy them, which is why the follow-up rows above
   are called out as unowned.
+
+What U5's execution taught, absorbed into U9/U11 below (full history: git `d9d2d92..4a57a59`,
+eight external review rounds — Greptile PR, greploop CLI, CodeRabbit — plus a whole-file
+coherence pass):
+
+- Three principles now govern `src/eval/attestation.py` and are stated at its top: **write-ahead
+  everything; confirmation follows visibility; verification precedes extension.** U9 packages
+  these behaviors; it does not reinvent them.
+- Deliberate limitations recorded in code, each assigned an owner: real inference is unwired
+  (`predict_fn` raises; the bundle-pinned vocabulary is **U9's**); approval-by-content-hash of a
+  reviewed draft is **U11's**; access-log chain-key custody/rotation is **U11's**; advisory
+  `flock` does not cover cross-host ledgers on network filesystems (recorded limitation); sticky
+  suppression deliberately over-blocks never-published suppressed intents (escape = the
+  disclosure-review exception, not a code path).
+- New operational surface every downstream doc and the U9 wheel CLI must mirror: `--release-id`
+  (required, replay-rejected), `--signing-key-file`, `--access-log-key-file`
+  (`CLIF_ACCESS_LOG_KEY_FILE`, fail-closed, no fallback), the `--approved` draft/release
+  two-step, `published_release_ids` crash reconciliation, and policy-aligned default paths
+  under `output/final_no_phi` and `output/intermediate_phi`.
 
 ---
 ## Problem Frame
@@ -518,7 +541,13 @@ flowchart TB
 
 **Dependencies:** U1, U2, U3, U4 — all landed. U5 is the immediate next coding target; do not begin U6-U10 until U5 passes review.
 
-**Status:** Not started. Confirmed absent on `main` at `0d3eae0` (2026-08-28): `src/eval/schema.py`, `tests/test_eval_splits.py`, `tests/test_eval_metrics.py`.
+**Status:** Landed via PR #4 as of `main` @ `53e3c2c` (2026-08-29). The defect table and file
+list below record work done, not work to do — and the unit grew well beyond them: review rounds
+added `src/eval/attestation.py` (report signing, write-ahead disclosure ledger with two-phase
+intent→publish→confirm, HMAC access chain with a durable head anchor, `flock`-serialized writes),
+`src/eval/log_sanitizer.py` (fail-closed record and traceback redaction), and the draft/`--approved`
+release workflow in `clif_validate.py`. See Execution Status for the learned constraints U9/U11
+absorb.
 
 #### Confirmed defects
 
@@ -803,11 +832,13 @@ Verified by reading `main` at `0d3eae0` on 2026-08-28. These are the concrete ta
 
 **Requirements:** R5, R11, R12, R14, R16
 
-**Dependencies:** U5
+**Dependencies:** U5 (landed, `53e3c2c`)
+
+**Status:** Next. Deepened 2026-08-29 against the landed U5 code — the packaging facts below are
+read from the actual modules, not assumed.
 
 **Entry gate — do not start until all hold:**
-- U5 merged with no residual P0/P1 findings. U9 consumes U5's allow-listed result schema; building
-  it first would fork the schema into two implementations.
+- U5 merged with no residual P0/P1 findings — **satisfied** (PR #4, 266 tests).
 - No real-training preconditions apply — U9 is synthetic-bundle-only and packages no trained weights.
 
 > **Split from the original U9 (decided 2026-08-28).** Release-trust machinery — wheelhouse, SBOM,
@@ -816,19 +847,27 @@ Verified by reading `main` at `0d3eae0` on 2026-08-28. These are the concrete ta
 > distribution package no longer stalls the experimental program.
 
 **Files:**
-- Create: `clif-validate/pyproject.toml`
+- Create: `clif-validate/pyproject.toml` (deps mirror the vendored set's real needs — see torch note)
 - Create: `clif-validate/src/clif_validate/__init__.py`
-- Create: `clif-validate/src/clif_validate/bundle.py` (manifest parse, compatibility hashes)
-- Create: `clif-validate/src/clif_validate/inference.py` (offline CPU scoring)
-- Create: `clif-validate/src/clif_validate/report.py` (allow-listed schema emission)
-- Create: `clif-validate/src/clif_validate/cli.py`
-- Create: `clif-validate/tests/test_bundle_compatibility.py`
+- Create: `clif-validate/src/clif_validate/_vendor/` (synced copies of `src/eval/{schema,metrics,attestation,log_sanitizer}.py`)
+- Create: `clif-validate/scripts/sync_vendor.py` (the checked-in sync step: copy + import rewrite + manifest of source hashes)
+- Create: `clif-validate/src/clif_validate/bundle.py` (manifest parse, compatibility hashes, bundle-carried policy/vocab/edges loading)
+- Create: `clif-validate/src/clif_validate/inference.py` (offline CPU scoring; wires the `predict_fn` seam)
+- Create: `clif-validate/src/clif_validate/report.py` (allow-listed schema emission via vendored `schema.validate_export`)
+- Create: `clif-validate/src/clif_validate/cli.py` (mirrors the U5 operational surface — see Approach)
+- Create: `clif-validate/tests/test_bundle_compatibility.py` (includes the vendor-hash assertion)
 - Create: `clif-validate/tests/test_disclosure.py`
+- Create: `clif-validate/tests/test_ceremony_parity.py` (release-id replay, draft/approved, key fail-closed, reconciliation)
+- Create: `clif-validate/tests/fixtures/` (synthetic bundle: manifest, vocab, edges, policy, episode artifact, tiny checkpoint)
 - Modify: `website/docs/federated-validation.md`
 
 **Approach:**
 - Assemble a synthetic versioned bundle with checkpoint-pinned representation artifacts, outcome specification, target map, and compatibility hashes.
-- **State the sharing mechanism, or the fork happens anyway.** U9's entry gate exists to stop the result schema being implemented twice, and its integration test demands the standalone package and the in-repo evaluator produce equivalent aggregate results — but a wheel installed in a clean offline environment cannot `import src.eval`. `src/eval/metrics.py` and `src/eval/schema.py` are the single implementation, vendored into the wheel by a checked-in sync step whose hash is asserted by `clif-validate/tests/test_bundle_compatibility.py`, so the equivalence test compares one implementation running in two environments rather than two implementations agreeing by luck. (`src/eval/matrix.py` already asserts this intent in its docstring with no code path that makes it true.)
+- **State the sharing mechanism, or the fork happens anyway.** The vendored set is now FOUR modules — `src/eval/{schema,metrics,attestation,log_sanitizer}.py` — because U5's execution moved the ledger, signing, and redaction contracts into the last two, and a validator that reimplements any of them forks the very behavior the entry gate exists to protect. `scripts/sync_vendor.py` copies them into `clif_validate/_vendor/`, rewrites the `from src.eval ...` absolute imports (read from the code: `metrics`→`schema`, `attestation`→`schema`, `schema`→`log_sanitizer` — the rewrite is mechanical because the graph is small and acyclic), and records source hashes that `test_bundle_compatibility.py` asserts against the repo — so drift fails a test on either side rather than shipping.
+- **The artifact policy travels in the BUNDLE, not the package.** `schema.DEFAULT_ARTIFACT_POLICY` is a repo-relative path (`parents[2]/configs/artifact_policy.yaml`) that dangles inside a wheel, and `min_cell_size()` caches its read. The wheel never uses the default: `bundle.py` loads the policy from the bundle and threads it through `load_min_cell_size(policy_path=...)` explicitly. This is also the disclosure-correct choice — the suppression threshold is pinned per release, hash-covered by the bundle manifest, not whatever the package happened to ship.
+- **Specify the bundle format U5's code already demands.** `verify_bundle_compatibility` requires `bundle_manifest.json` (model_bundle_id, model_version, vocab_hash, outcome_spec_hash, clif_version) plus `head_weights.pt`; wiring `predict_fn` (the seam `clif_validate.main` deliberately leaves raising) additionally needs the bundle-pinned vocabulary and numeric edges, the resolved data config, and the artifact policy — exactly the four things its docstring names. U9's bundle format enumerates all of these with per-file hashes in the manifest, and `inference.py` assembles `tokenize_site -> ModelDataset -> zero_shot_predictions` from them. The synthetic fixture bundle exercises this end to end with a tiny checkpoint.
+- **CPU torch ships in the wheel — decided, not discovered later.** Inference needs `torch` and `transformers` (backbone forward pass), calibration's LBFGS needs torch, and the metric panel needs numpy/scikit-learn. The earlier deferred question ("does the wheelhouse need CPU torch?") is answered yes by the code as it exists; U11 owns pinning the CPU wheelhouse, U9's `pyproject.toml` owns declaring the floor versions (match the repo pins: `torch>=2.4`, `scikit-learn>=1.5`). `attestation.py` imports `fcntl`, so the core is POSIX-only — consistent with the Linux x86_64 / py3.11 first-platform decision already recorded.
+- **The wheel CLI mirrors the U5 ceremony, not just its metrics.** `cli.py` carries the full operational surface U5 landed: `--release-id` (required, replay-rejected), `--signing-key-file`, `--access-log-key-file` (fail-closed, no fallback), the `--approved` draft/release two-step, and `published_release_ids` reconciliation after a crash. The three attestation principles (write-ahead; confirm-after-visibility; verify-before-extend) arrive via the vendored module — the wheel adds no new ledger or log semantics of its own.
 - **Open release is a deliverable, not a side effect (decided 2026-08-28).** The package, its source, and its bundle-compatibility contract are published publicly with **no DUA and no per-site approval required to obtain them**. Trained-weight bundles remain governed and signed (U11/U10). This is the split that makes the differentiator against DUA-gated ICareFM real: anyone can inspect and run the validation tooling, which is a claim the project can actually keep. Reconcile U11's trust-root and revocation design against public availability of the package itself.
 - Classify raw inputs, episode artifacts, labels, predictions, caches, logs, checkpoints, weights, and aggregate outputs by storage, access, retention, exportability, and deletion requirements.
 - **Define and obtain the derived-model transfer approval** for reusable development-site transport evaluation. This is a **U9 exit criterion**, not an Approach aspiration — U6 and U7 gate on it. If it is absent, U6/U7 run as same-site studies and transport performance cannot enter the selection rule.
@@ -839,15 +878,20 @@ Verified by reading `main` at `0d3eae0` on 2026-08-28. These are the concrete ta
 - Fail-closed artifact verification in `src/data/value_stats.py`.
 
 **Test scenarios:**
-- Happy path: a clean CPU-only environment installs the package and emits an aggregate report from synthetic CLIF fixtures.
-- Edge case: an unsupported outcome or small subgroup is represented by a non-evaluable/suppressed status without complementary disclosure.
-- Error path: missing weights, incompatible artifact family, hash mismatch, prohibited network access, or unexpected output field fails closed.
-- Integration: the external package and in-repo evaluator produce equivalent aggregate results for the same synthetic fixture and frozen bundle.
+- Happy path: a clean CPU-only environment installs the package and, from the synthetic fixture bundle, completes the full ceremony — draft, `--approved` release, signed report, ledger intent/confirm, access record — and emits a schema-valid aggregate report.
+- Happy path: `sync_vendor.py` is idempotent, and `test_bundle_compatibility.py` fails RED when any vendored source hash drifts from `src/eval/` (prove the guard guards: mutate a byte, watch it fail).
+- Edge case: an unsupported outcome or small subgroup is represented by a non-evaluable/suppressed status without complementary disclosure — through the VENDORED schema, proving the wheel enforces suppression at its own boundary.
+- Error path: missing `head_weights.pt`, absent/null manifest hashes, vocab or policy hash mismatch, prohibited network access, or an unexpected output field fails closed (mirror `tests/test_clif_validate.py`'s fail-closed suite against the vendored modules).
+- Error path (ceremony parity): a replayed `--release-id` is rejected; a run without `--access-log-key-file`/env fails closed before publishing anything; a draft cannot be released; unclassified crash residue blocks until `published_release_ids` classifies it.
+- Integration: the external package and in-repo evaluator produce byte-equivalent aggregate payloads (pre-signature) for the same synthetic fixture and frozen bundle — one implementation, two environments.
+- Integration: `inference.py` produces a deterministic prediction matrix from the fixture bundle's tiny checkpoint, and `evaluate_site` consumes it through the same `predict_fn` seam the repo CLI exposes.
 
 **Verification:**
 - A clean-machine run requires no development-site assets, network access, training dependencies, or patient-level export.
+- `python -m src.eval.clif_validate` with the fixture bundle's artifacts completes end to end via the now-wired `predict_fn` — the deliberate D1 seam closes here, with the bundle-pinned vocabulary the docstring promised.
 - The derived-model transfer approval is obtained and recorded, or its absence is recorded and U6/U7's same-site branch is the one that runs.
 - The package and bundle contract are publicly obtainable.
+- Plus the shared per-unit review gates.
 
 ### U11. Qualify the release-trust and distribution machinery
 
@@ -876,6 +920,8 @@ Verified by reading `main` at `0d3eae0` on 2026-08-28. These are the concrete ta
 - **Own the releaser-to-site direction of the trust model (decided 2026-08-28).** Releaser, transfer-channel, and execution-host roles; release signing key custody, rotation, and revocation; unsealing authorization; separation of duties; compromise handling. The site-to-aggregator direction — report authentication and the tamper-evident access log — stays in U5, which builds the aggregate writer. Splitting by direction is what closes the gap where site reports were unauthenticated until U10.
 - Target Linux x86_64 with Python 3.11 as the initial offline platform. Carry signed minimum-version and revocation metadata through the same controlled offline channel and persist the trusted release state locally; other platforms require separate qualification.
 - Reconcile the signed, revocable distribution channel with U9's public package release: the *package* is open, the *bundles* are signed and governed.
+- **Approval-by-content-hash (inherited from U5, recorded in its `--approved` help text).** The draft/release two-step currently assumes a deterministic pipeline between review and release; U11 closes that honestly: approval names the hash of the reviewed draft, and release verifies the recomputed payload against it before stamping `reviewed_approved`.
+- **Access-log chain-key custody (inherited from U5).** `CLIF_ACCESS_LOG_KEY_FILE` fails closed with no fallback — U5 enforced presence; U11 owns provisioning: where each site's chain key and report-signing secret live, who may read them, rotation cadence, and compromise handling, alongside the release trust root in `configs/trust_roles.yaml`.
 
 **Test scenarios:**
 - Happy path: a clean CPU-only environment installs the package offline from the wheelhouse and validates a signed synthetic bundle.

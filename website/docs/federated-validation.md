@@ -135,8 +135,15 @@ flowchart LR
     class AGG,SUB out;
 ```
 
-Fairness is reported aggregate (ICareFM precedent). Small-cell suppression for subgroup metrics
-is an open item to specify before shipping.
+Fairness is reported aggregate (ICareFM precedent). Small-cell suppression is **implemented and
+enforced** (U5): denominator suppression, numerator suppression, and curve-resolution bounding are
+three separate controls in `src/eval/schema.py`, checked by the export validator at the writer and
+again at the aggregator. Two further disclosure/validity controls landed with U9: a **coverage gate**
+(`max_dropped_fraction` in the artifact policy) reports an outcome `coverage_insufficient` — a
+distinct status, not a score — when the frozen vocabulary fails to transfer and most stays cannot be
+tokenized (the PORTER failure mode), rather than releasing a biased sliver; and the count of
+untokenizable stays is **banded** when it falls below the cell floor, since an exact small count is
+the same numerator disclosure suppression exists to prevent.
 
 ---
 
@@ -157,17 +164,70 @@ flowchart LR
 Run:
 
 ```bash
-# at each external site (returns aggregate metrics only)
-python -m src.eval.clif_validate \
-      --checkpoint <ckpt> \
+# Step 1 — at each external site: the DRAFT run (no --approved). Writes a local,
+# unsigned, unledgered draft (<out>.draft) for the site's disclosure review. Nothing
+# is released.
+clif-validate \
+      --checkpoint /path/to/bundle \
       --data /path/to/clif_parquet \
       --episode-artifact /path/to/episodes.parquet \
       --site-id SITE-07 \
-      --release-id 2026-08-28-site07-v0 \
-      --signing-key-file /secure/site07.key
+      --release-id 2026-08-29-site07-v0 \
+      --signing-key-file /secure/site07.key \
+      --access-log-key-file /secure/site07-accesslog.key
+
+# Step 2 — after disclosure review approves the draft: the RELEASE run. Add --approved
+# to stamp reviewed_approved, sign, record access, and ledger the release. (--approved
+# without --signing-key-file is refused, so a release is never published unsigned.)
+clif-validate \
+      --checkpoint /path/to/bundle \
+      --data /path/to/clif_parquet \
+      --episode-artifact /path/to/episodes.parquet \
+      --site-id SITE-07 \
+      --release-id 2026-08-29-site07-v0 \
+      --signing-key-file /secure/site07.key \
+      --access-log-key-file /secure/site07-accesslog.key \
+      --approved
+
 # at the hub (metrics JSONs only)
 python -m src.eval.clif_forest_plot --results results/SiteA.json results/SiteB.json
 ```
+
+`python -m src.eval.clif_validate` in-repo and the `clif-validate` console script from the wheel
+are the same code — see the packaging section below.
+
+---
+
+## The `clif-validate` package and the bundle contract (U9)
+
+What a site actually receives is two things, both verifiable:
+
+1. **The `clif-validate` wheel** (`clif-validate/` in this repo; MIT). Its
+   `clif_validate/_vendor/` tree is a byte-identical, import-rewritten copy of this
+   repository's `src/` evaluation stack, produced by `clif-validate/scripts/sync_vendor.py`
+   and guarded by `vendor_manifest.json` — a test fails on either side if they drift, and a
+   byte-equivalence test asserts the wheel and the repo produce identical pre-signature
+   payloads for the same bundle. One implementation, two environments.
+2. **A frozen model bundle** — a directory sealed by `bundle_manifest.json`: identity hashes
+   (vocabulary, outcome spec, CLIF version), a per-file SHA-256 map covering **every** file in
+   the bundle (an unlisted extra file is a hard failure — that's a tamper channel, not a
+   passenger), per-outcome zero-shot query parameters, the backbone + trained heads, the pinned
+   vocabulary and numeric edges, the resolved data config, the frozen outcome contract, and the
+   **artifact policy the run enforces**. No repo-relative path survives into the wheel: the
+   bundle carries its own configs and `load_bundle` pins them process-wide.
+
+The full ceremony ships with the wheel: `--release-id` (replays rejected via the write-ahead
+disclosure ledger), `--signing-key-file` (HMAC report signature), `--access-log-key-file`
+(tamper-evident access chain; recording **fails closed** without it, before anything publishes),
+and the draft/`--approved` two-step. A vendored synthetic fixture
+(`clif_validate._vendor.eval.synthetic_bundle`) lets any site run the entire pipeline —
+tokenize → zero-shot inference → suppression → signing → ledger — on generated data as a
+self-test before touching governed tables.
+
+**Openness boundary:** package, source, and bundle *contract* are public (MIT). Trained
+weights are governed artifacts under separate agreements; shipping a real bundle to an external
+site additionally requires the derived-model transfer approval (pending — a governance action,
+not a code change). Publication mechanics (PyPI, wheelhouse, SBOM, chain-key custody) are U11.
 
 :::info Open design question — vocabulary transfer
 The federation assumes the frozen mCIDE vocab covers each site's concepts. PORTER (arXiv:2606.24102)

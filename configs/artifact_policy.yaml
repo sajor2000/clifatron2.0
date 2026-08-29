@@ -34,6 +34,11 @@ classes:
     export_allowed: true
     disclosure_review_required: true
     minimum_cell_size: 10
+    # Coverage gate (U9): the largest share of an outcome's ascertained cohort that may
+    # be dropped as untokenizable before the outcome is reported coverage_insufficient
+    # instead of scored on the survivors. Guards against a frozen vocabulary that did
+    # not transfer (PORTER) turning into a biased sliver that reads like a site result.
+    max_dropped_fraction: 0.2
     includes: [cohort_reports, metrics, figures, provenance]
     backup: approved_project_storage
     retention: approved_project_lifecycle

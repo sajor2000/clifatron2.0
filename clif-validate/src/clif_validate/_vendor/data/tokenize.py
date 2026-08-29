@@ -29,12 +29,12 @@ import numpy as np
 import polars as pl
 import yaml
 
-from src.data.cohort import (
+from clif_validate._vendor.data.cohort import (
     QualificationError,
     validate_artifact_destination,
     validate_episode_artifact,
 )
-from src.data.splits import fit_partition
+from clif_validate._vendor.data.splits import fit_partition
 
 SPECIAL = {"<pad>": 0, "<bos>": 1, "<eos>": 2}
 ROOT = Path(__file__).parents[2]

@@ -705,7 +705,7 @@ def banded_status_counts(counts: dict[str, int]) -> dict[str, object]:
 
 
 # Backwards-compatible re-exports: log sanitization moved to its own module (finding #34).
-from src.eval.log_sanitizer import (  # noqa: E402,F401
+from clif_validate._vendor.eval.log_sanitizer import (  # noqa: E402,F401
     SanitizingFilter,
     install_log_sanitizer,
     redact,

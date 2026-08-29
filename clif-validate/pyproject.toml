@@ -1,0 +1,33 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "clif-validate"
+version = "0.1.0"
+description = "Turnkey federated validation for CLIF sites: run a frozen CLIFATRON bundle on local CLIF 2.1 tables and export only disclosure-controlled aggregate metrics."
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.11"
+# First supported platform is Linux x86_64 / CPython 3.11; the attestation layer
+# uses fcntl advisory locks, so Windows is unsupported (POSIX-only, accepted in
+# the U9 plan). Torch is the CPU wheel by default; sites needing CUDA install
+# their own torch first.
+dependencies = [
+  "torch>=2.4",
+  "transformers>=4.44",
+  "scikit-learn>=1.5",
+  "numpy>=1.26",
+  "pyyaml>=6.0",
+  "polars>=1.6",
+  "duckdb>=1.0",
+]
+
+[project.scripts]
+clif-validate = "clif_validate.cli:main"
+
+[project.urls]
+Repository = "https://github.com/sajor2000/clifatron2.0"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/clif_validate"]

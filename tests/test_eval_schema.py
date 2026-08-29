@@ -296,3 +296,63 @@ class CurveResolutionTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class PolicyOverrideTest(unittest.TestCase):
+    """The bundle, not the package, owns the policy in a deployed validator.
+
+    `DEFAULT_ARTIFACT_POLICY` is a repo-relative path that dangles inside a wheel, and
+    deep callers (`suppress_cell` via `min_cell_size()`) reach it through a cached
+    accessor with no parameter. `CLIF_ARTIFACT_POLICY_FILE` is the seam that lets a
+    bundle pin the policy process-wide -- and the cache must honor the switch.
+    """
+
+    def tearDown(self):
+        import os
+        os.environ.pop("CLIF_ARTIFACT_POLICY_FILE", None)
+        S.min_cell_size.cache_clear()
+        S.max_dropped_fraction.cache_clear()
+
+    def test_coverage_gate_reads_the_pinned_policy_and_fails_closed_when_absent(self):
+        import os
+        import tempfile
+        from pathlib import Path
+        with tempfile.TemporaryDirectory() as td:
+            # A policy that declares the cell floor but NOT the coverage gate must fail
+            # closed, not default: a coverage threshold is a disclosure decision.
+            no_cov = Path(td) / "no_cov.yaml"
+            no_cov.write_text(
+                "classes:\n  aggregate_no_phi:\n    minimum_cell_size: 10\n")
+            os.environ["CLIF_ARTIFACT_POLICY_FILE"] = str(no_cov)
+            S.max_dropped_fraction.cache_clear()
+            with self.assertRaises(S.DisclosureError):
+                S.max_dropped_fraction()
+            # A policy that declares it is honored through the cached accessor.
+            with_cov = Path(td) / "with_cov.yaml"
+            with_cov.write_text(
+                "classes:\n  aggregate_no_phi:\n    minimum_cell_size: 10\n"
+                "    max_dropped_fraction: 0.15\n")
+            os.environ["CLIF_ARTIFACT_POLICY_FILE"] = str(with_cov)
+            S.max_dropped_fraction.cache_clear()
+            self.assertEqual(S.max_dropped_fraction(), 0.15)
+
+    def test_env_override_wins_and_cache_follows(self):
+        import os
+        import tempfile
+        from pathlib import Path
+        with tempfile.TemporaryDirectory() as td:
+            alt = Path(td) / "policy.yaml"
+            alt.write_text(
+                "classes:\n  aggregate_no_phi:\n    minimum_cell_size: 25\n")
+            os.environ["CLIF_ARTIFACT_POLICY_FILE"] = str(alt)
+            S.min_cell_size.cache_clear()
+            self.assertEqual(S.min_cell_size(), 25)
+            # And suppression follows the pinned policy, not the repo default.
+            self.assertEqual(S.suppress_cell(n=20, n_positive=10)[0], S.INSUFFICIENT_N)
+
+    def test_missing_override_file_fails_closed(self):
+        import os
+        os.environ["CLIF_ARTIFACT_POLICY_FILE"] = "/nonexistent/policy.yaml"
+        S.min_cell_size.cache_clear()
+        with self.assertRaises((S.DisclosureError, FileNotFoundError)):
+            S.min_cell_size()

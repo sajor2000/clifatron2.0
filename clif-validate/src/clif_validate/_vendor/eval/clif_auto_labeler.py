@@ -9,7 +9,7 @@ from typing import Any
 import polars as pl
 import yaml
 
-from src.data.cohort import (
+from clif_validate._vendor.data.cohort import (
     QualificationError,
     derive_outcome_states,
     validate_artifact_destination,

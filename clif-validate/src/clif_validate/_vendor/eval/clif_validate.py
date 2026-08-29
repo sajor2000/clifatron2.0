@@ -34,9 +34,9 @@ from pathlib import Path
 
 import numpy as np
 
-from src.eval import attestation as _attest
-from src.eval import metrics as M
-from src.eval import schema as _schema
+from clif_validate._vendor.eval import attestation as _attest
+from clif_validate._vendor.eval import metrics as M
+from clif_validate._vendor.eval import schema as _schema
 
 # Site-side logging is sanitized at the source. Stripping the path from the exported
 # JSON is not enough on its own: this module used to print the data path and per-outcome
@@ -76,7 +76,7 @@ def load_checkpoint(path: str):
     reads as a considered safety valve while behaving as an open door.
     """
     import torch
-    from src.model.head_adapter import CLIFATRONHeads, load_backbone
+    from clif_validate._vendor.model.head_adapter import CLIFATRONHeads, load_backbone
 
     ckpt = Path(path)
     head_path = ckpt / "head_weights.pt"
@@ -293,7 +293,7 @@ def evaluate_site(checkpoint_path: str, data_path: str, episode_artifact: str,
     Inside a wheel those defaults dangle (there is no `configs/` checkout), so a
     bundle-driven caller passes the bundle's own copies (U9).
     """
-    from src.eval.clif_auto_labeler import auto_label
+    from clif_validate._vendor.eval.clif_auto_labeler import auto_label
 
     if predict_fn is None:
         raise ArtifactMismatch(
@@ -605,8 +605,8 @@ def main():
     # load_bundle), and the per-outcome zero-shot query parameters. The outcomes
     # evaluated are exactly those the bundle declares queries for -- sorted, so the
     # exported payload is byte-stable for identical inputs.
-    from src.eval.bundle import load_bundle
-    from src.eval.bundle_inference import bundle_predict_fn
+    from clif_validate._vendor.eval.bundle import load_bundle
+    from clif_validate._vendor.eval.bundle_inference import bundle_predict_fn
 
     bundle = load_bundle(args.checkpoint)
     provenance = bundle.provenance

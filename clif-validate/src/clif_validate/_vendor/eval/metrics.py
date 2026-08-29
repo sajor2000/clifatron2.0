@@ -18,7 +18,7 @@ import numpy as np
 from sklearn.isotonic import IsotonicRegression
 from sklearn.metrics import average_precision_score, brier_score_loss, roc_auc_score
 
-from src.eval import schema as _schema
+from clif_validate._vendor.eval import schema as _schema
 
 _EPS = 1e-7
 
