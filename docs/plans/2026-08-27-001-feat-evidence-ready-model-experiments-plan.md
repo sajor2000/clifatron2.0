@@ -17,8 +17,8 @@ Establish a leakage-safe, resumable training and evaluation baseline, then use o
 
 ## Execution Status
 
-Updated 2026-08-29 against `main` at `53e3c2c` (merge of PR #4). Working tree clean. U1-U5 and
-the value-statistics follow-up have landed. Progress is derived from git, not stored here — this
+Updated 2026-08-29 against `main` at `282cafa` (merge of PR #9). Working tree clean. U1-U5, the
+value-statistics follow-up, U13, U14, U9, and U11 have all landed. Progress is derived from git, not stored here — this
 section is orientation, not state.
 
 **Standing non-code action, still the longest lead item:** the governance question gating U12 —
@@ -35,9 +35,9 @@ sequencing (U12 gates U6/U7). Ask before U9 completes, not after.
 | **U14. Resume-equivalence + DDP coverage** (was "U4 follow-up") | **Implemented — CPU-qualified; blocks U6** | PR #7: `tests/test_checkpoint.py`, the resume-*equivalence* tests (including the production `train(..., resume_ckpt=)` path), and the two-process gloo DDP sample-coverage test all landed and green data-free — the software half of P5-P7. The 2xL40 hardware report stays a pending real-hardware run. |
 | **U13. Varlen/document-isolated attention** (was "U2 follow-up") | **Implemented — CPU-qualified; GPU/U8 pending; blocks U8** | Model-consumption path, per-document CPU fallback, anchor gather, and tests landed (PR #6). CPU isolation + equivalence proven data-free. The FA2 GPU path is architecture-gated (Qwen2/Qwen3) and stays unqualified until U8's L40 run; the multi-doc training reject is intentionally NOT lifted (see approach). |
 | U5. Evaluation, calibration, validation gate | Landed | PR #4 / `53e3c2c`; suite 266 passed, 3 skipped. Grew well beyond plan: `src/eval/schema.py`, `attestation.py`, `log_sanitizer.py` |
-| U9. Validator core | **Next** | `clif-validate/` does not exist; deepened 2026-08-29 with U5's execution-taught packaging facts |
-| U11. Release-trust machinery | **Next — unblocked by U9's merge** | Deepened 2026-08-29 with the Ed25519 KTD. Closes U9's deferred security gaps: bundle trust anchor (signature), approval-by-content-hash, chain-key custody. Data-free-implementable; operational key custody/distribution stay pending exit criteria. |
-| U12. v0 real-site federation proof | Blocked on U9, U11 | Added 2026-08-28; also blocked on external-site onboarding |
+| U9. Validator core | **Landed** | PR #5. `clif-validate/` package: vendored eval closure, synthetic bundle + fixtures, wired inference path, ceremony-parity + disclosure tests |
+| U11. Release-trust machinery | **Landed** | PR #8 (+ packaging PR #9). Ed25519 releaser->site signature verified in `load_bundle`, signed revocation + anti-rollback (atomic fcntl floor), approval-by-content-hash CLI, `configs/trust_roles.yaml`, `src/eval/trust.py`; packaging = `clif-validate/uv.lock` + `SBOM.json` + `PACKAGING.md`. Operational key custody/distribution stay pending exit criteria (see `trust_roles.yaml` `pending_governance`). |
+| U12. v0 real-site federation proof | Blocked on external onboarding + governance | U9, U11 done. Still blocked on external-site onboarding AND the standing governance question ("may a pre-selection v0 bundle run at an external site?"). A data-free synthetic federation harness (releaser->site->aggregator + cumulative ledger differencing) is the buildable software slice. |
 | U6, U7, U8 | Blocked on U9, U12 | See per-unit entry gates; U7 additionally conditional on U12's coverage findings |
 | U10. Release milestone | Gated milestone | Moved out of Implementation Units 2026-08-28; re-planned after selection |
 
@@ -892,7 +892,7 @@ Verified by reading `main` at `0d3eae0` on 2026-08-28. These are the concrete ta
 
 **Dependencies:** U5 (landed, `53e3c2c`)
 
-**Status:** Next. Deepened 2026-08-29 against the landed U5 code — the packaging facts below are
+**Status:** Landed (PR #5). Deepened 2026-08-29 against the landed U5 code — the packaging facts below are
 read from the actual modules, not assumed.
 
 **Entry gate — do not start until all hold:**
@@ -959,7 +959,7 @@ read from the actual modules, not assumed.
 
 **Dependencies:** U9 (landed — PR #5).
 
-**Status:** Next. Deepened 2026-08-29 against the landed U9 code. U11's entry gate is now satisfied (U9 validator core qualified on a synthetic bundle). This unit closes three security gaps U9's own review explicitly DEFERRED to U11: the bundle has no cryptographic trust anchor (a re-hashed replacement bundle passes `load_bundle` today — the manifest is self-hashed only); approval-by-content-hash (the `--approved` rerun recomputes the report and could release a payload different from the reviewed draft); and access-log chain-key / report-signing-secret custody.
+**Status:** Landed (PR #8; packaging PR #9). Delivered against the landed U9 code. Closed the three security gaps U9's own review explicitly DEFERRED to U11: the bundle trust anchor (Ed25519 releaser->site signature verified LAST in `load_bundle`, with signed revocation + atomic anti-rollback); approval-by-content-hash (`--approved` requires `--approved-hash` binding the release to the reviewed draft — no waiver); and chain-key / report-signing-secret custody (recorded in `configs/trust_roles.yaml`). Reviewed by a multi-agent + Codex cross-model pass and multiple CodeRabbit rounds. Operational key custody / out-of-band trust-root distribution / synthetic-bundle distribution approval stay pending exit criteria (`trust_roles.yaml` `pending_governance`). Original deepening rationale (still accurate) below.
 
 **Entry gate — do not start until all hold:**
 - U9 validator core qualified on a synthetic bundle. **(Met — PR #5 merged.)**
