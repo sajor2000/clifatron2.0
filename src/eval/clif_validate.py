@@ -415,7 +415,13 @@ def write_export(payload: dict, out_path: str | Path, ledger_path: str | Path,
     # record is unconfirmed. Saying in a docstring that an operator "should" reconcile
     # before the next export is not a control: nothing stopped the next export from
     # running against an incomplete history. This gate does.
-    residue = _attest.unconfirmed_releases(ledger_path) - {payload.get("release_id")}
+    # The current release id is NOT exempt (Greptile review 6). Excluding it was meant to
+    # keep a crashed attempt retryable, but it skipped the one check that catches the
+    # dangerous case: if THIS id published and then crashed before confirming, retrying it
+    # with different content confirms an identity that a different visible artifact
+    # already carries. The id is classified like any other residue -- it may proceed only
+    # when the inventory shows it never became visible.
+    residue = _attest.unconfirmed_releases(ledger_path)
     if residue:
         if published_release_ids is None:
             raise _schema.DisclosureError(
@@ -423,7 +429,10 @@ def write_export(payload: dict, out_path: str | Path, ledger_path: str | Path,
                 "attempt. Each either published and needs confirming, or never published "
                 "and is inert -- and this process cannot tell which. Pass "
                 "published_release_ids={...} listing what is actually visible on the "
-                "export volume so the residue can be classified."
+                "export volume so the residue can be classified. This includes "
+                f"{payload.get('release_id')!r} itself: retrying an id that already "
+                "published under different content would confirm an identity two "
+                "artifacts share."
             )
         unresolved = _attest.reconcile_ledger(ledger_path, published_release_ids)
         if unresolved:

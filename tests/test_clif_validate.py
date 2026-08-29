@@ -593,9 +593,40 @@ class ReleaseBoundaryTest(unittest.TestCase):
         self.assertFalse(out.exists())
         self.assertFalse(list(self.out.glob("*.partial")), "temp file must be cleaned up")
 
-        # The same release id retries cleanly -- the earlier entry is unconfirmed.
-        written = write_export(self._payload(release="rel-1"), out, ledger)
+        # The retry must now state what it knows: the rename failed, so rel-1 never
+        # became visible. That assertion is the thing that makes the retry safe.
+        written = write_export(self._payload(release="rel-1"), out, ledger,
+                               published_release_ids=set())
         self.assertTrue(written.exists())
+
+    def test_retrying_an_id_that_already_published_is_refused(self):
+        """Greptile review 6. Exempting the current release id from residue skipped the
+        one check that catches a retry over an artifact that is already visible under
+        that same id -- confirming an identity two artifacts would then share."""
+        from src.eval.attestation import append_to_ledger
+        from src.eval.clif_validate import write_export
+        from src.eval.schema import DisclosureError
+        ledger = self.out / "ledger.jsonl"
+
+        # rel-1 published, then crashed before confirmation.
+        append_to_ledger(self._payload(release="rel-1"), ledger)
+
+        with self.assertRaises(DisclosureError) as ctx:
+            write_export(self._payload(release="rel-1"), self.out / "again.json", ledger,
+                         published_release_ids={"rel-1"})
+        self.assertIn("published but unconfirmed", str(ctx.exception))
+        self.assertFalse((self.out / "again.json").exists())
+
+    def test_unclassified_residue_names_the_current_id_too(self):
+        from src.eval.attestation import append_to_ledger
+        from src.eval.clif_validate import write_export
+        from src.eval.schema import DisclosureError
+        ledger = self.out / "ledger.jsonl"
+        append_to_ledger(self._payload(release="rel-1"), ledger)
+
+        with self.assertRaises(DisclosureError) as ctx:
+            write_export(self._payload(release="rel-1"), self.out / "x.json", ledger)
+        self.assertIn("rel-1", str(ctx.exception))
 
     def test_ledger_entry_is_durable_before_publication(self):
         """Greptile PR #4, round 2: a buffered write is not a record. A crash between the
