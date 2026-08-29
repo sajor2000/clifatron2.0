@@ -87,6 +87,26 @@ def _durably_append(path: Path, line: str) -> None:
             os.close(dir_fd)
 
 
+def _durably_write(path: Path, text: str) -> None:
+    """Replace a file's contents and return only once they are on stable storage.
+
+    Temp file, fsync, atomic rename, then fsync the directory so the rename itself is
+    durable. A plain `write_text` leaves the bytes in the page cache, which is not good
+    enough for a file whose whole job is to survive the crash it is meant to detect.
+    """
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    with tmp.open("w") as fh:
+        fh.write(text)
+        fh.flush()
+        os.fsync(fh.fileno())
+    tmp.replace(path)
+    dir_fd = os.open(str(path.parent), os.O_RDONLY)
+    try:
+        os.fsync(dir_fd)
+    finally:
+        os.close(dir_fd)
+
+
 def _head_path(log_path: Path) -> Path:
     """Sidecar anchor naming the chain's expected terminal record."""
     return log_path.with_suffix(log_path.suffix + ".head")
@@ -197,13 +217,20 @@ def record_access(log_path: str | Path, *, model_version: str, actor_role: str,
         (prev + json.dumps(entry, sort_keys=True, separators=(",", ":"))).encode("utf-8"),
         hashlib.sha256,
     ).hexdigest()
-    _durably_append(path, json.dumps(entry, sort_keys=True, separators=(",", ":")) + "\n")
-    # Head anchor, written outside the log. Truncating or deleting the log no longer
-    # produces a self-consistent shorter chain, because the head still names the record
-    # count and terminal hash it must end at (U5 review #10).
+    # ORDER MATTERS, and it is the anchor that goes first (greploop review 3).
+    #
+    # The anchor is what makes truncation detectable, so it must never be able to lag the
+    # log. Appending first and anchoring second leaves a window where a power loss keeps
+    # the fsynced record but loses the buffered head -- and a stale head authenticates a
+    # deliberate truncation back to it, which is exactly the attack the anchor exists to
+    # stop. Anchoring first inverts that: a crash in the window leaves the head one record
+    # AHEAD, verification sees the mismatch and returns False, and the failure is a false
+    # alarm rather than a concealed deletion. Head-behind is exploitable; head-ahead fails
+    # closed. Both writes are durable, so the window is only the gap between two fsyncs.
     head = _head_path(path)
-    head.write_text(json.dumps({"seq": seq, "chain": entry["chain"]},
-                               sort_keys=True, separators=(",", ":")))
+    _durably_write(head, json.dumps({"seq": seq, "chain": entry["chain"]},
+                                    sort_keys=True, separators=(",", ":")))
+    _durably_append(path, json.dumps(entry, sort_keys=True, separators=(",", ":")) + "\n")
 
 
 def verify_access_log(log_path: str | Path) -> bool:

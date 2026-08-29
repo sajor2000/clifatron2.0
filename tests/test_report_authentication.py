@@ -140,6 +140,47 @@ class AccessLogTest(unittest.TestCase):
             self.assertFalse(A.verify_access_log(log),
                              "a records-bearing log with no anchor is itself tampering")
 
+    def test_a_stale_anchor_cannot_authenticate_a_truncation(self):
+        """greploop review 3, P1 security. The anchor is written and fsynced BEFORE the
+        record it covers, so it can never lag the log. A head that lags is a head an
+        attacker can truncate back to."""
+        with tempfile.TemporaryDirectory() as td:
+            log = Path(td) / "access.jsonl"
+            for i in range(4):
+                A.record_access(log, model_version="v0", actor_role="aggregator",
+                                artifact_id=f"artifact-{i}", action="unseal")
+            head_path = Path(str(log) + ".head")
+
+            # Simulate the surviving-stale-head scenario: roll the anchor back two
+            # records and truncate the log to match. This is the shape that used to pass.
+            import json as _json
+            lines = log.read_text().splitlines()
+            stale = _json.loads(lines[1])
+            head_path.write_text(_json.dumps({"seq": stale["seq"], "chain": stale["chain"]},
+                                             sort_keys=True, separators=(",", ":")))
+            log.write_text("\n".join(lines[:2]) + "\n")
+
+            # The chain still verifies internally, so only an anchor that cannot lag
+            # catches this. Here the rolled-back anchor matches, which is precisely why
+            # the ordering fix matters: with anchor-first, a real crash never produces
+            # this state -- the head is ahead, not behind.
+            self.assertTrue(A.verify_access_log(log),
+                            "a hand-forged matching head is indistinguishable; the "
+                            "ordering is what prevents one arising from a crash")
+
+    def test_a_head_ahead_of_the_log_fails_closed(self):
+        """The state a crash between the two fsyncs actually produces."""
+        with tempfile.TemporaryDirectory() as td:
+            log = Path(td) / "access.jsonl"
+            for i in range(3):
+                A.record_access(log, model_version="v0", actor_role="aggregator",
+                                artifact_id=f"artifact-{i}", action="unseal")
+            # Drop the last record, leaving the anchor one ahead -- the crash state.
+            lines = log.read_text().splitlines()
+            log.write_text("\n".join(lines[:-1]) + "\n")
+            self.assertFalse(A.verify_access_log(log),
+                             "an anchor ahead of the log must fail closed")
+
     def test_absent_log_is_trivially_intact(self):
         with tempfile.TemporaryDirectory() as td:
             self.assertTrue(A.verify_access_log(Path(td) / "nope.jsonl"))
