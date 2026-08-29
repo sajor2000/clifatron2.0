@@ -27,6 +27,7 @@ module never requires it — only signing or verifying does.
 
 from __future__ import annotations
 
+import fcntl
 import json
 from pathlib import Path
 
@@ -112,6 +113,10 @@ def load_trust_roots(path: str | Path) -> dict:
             "trust root"
         )
     doc = yaml.safe_load(root_path.read_text())
+    # A truthy non-mapping document (a bare scalar or sequence) has no .get; guard it so it
+    # fails as TrustError rather than a bare AttributeError escaping the load boundary.
+    if doc is not None and not isinstance(doc, dict):
+        raise TrustError(f"trust roles at {path} are not a mapping document")
     block = (doc or {}).get("release_signing")
     if not isinstance(block, dict):
         raise TrustError(
@@ -127,7 +132,11 @@ def load_trust_roots(path: str | Path) -> dict:
             raise TrustError(f"trusted key entry is not a mapping: {entry!r}")
         key_id = entry.get("key_id")
         hex_pub = entry.get("public_key_hex")
-        if not key_id or not isinstance(hex_pub, str) or len(hex_pub) != 64:
+        # key_id must be a non-empty STRING: a YAML `key_id: 2026` parses to int 2026, which
+        # would be stored as an int key and never match the manifest's string signed_by (nor
+        # a revocation entry) — silently un-revocable. Reject non-string ids.
+        if (not isinstance(key_id, str) or not key_id
+                or not isinstance(hex_pub, str) or len(hex_pub) != 64):
             raise TrustError(f"trusted key entry is malformed: {entry!r}")
         try:
             pub = bytes.fromhex(hex_pub)
@@ -268,12 +277,32 @@ def enforce_anti_rollback(model_version: str, state_path: str | Path) -> None:
 
 
 def advance_rollback_floor(model_version: str, state_path: str | Path) -> None:
-    """Record `model_version` as the new floor if it is newer (call AFTER acceptance)."""
+    """Record `model_version` as the new floor if it is newer (call AFTER acceptance).
+
+    ATOMIC + MONOTONIC (CodeRabbit): the read-compare-write is done under an exclusive
+    advisory `flock` on a sidecar, and the floor is re-read INSIDE the lock. Without this,
+    two concurrent loads of versions 2.0 and 1.0 can both pass `enforce_anti_rollback`
+    against the same old floor, and whichever advance writes last wins — the 1.0 writer
+    would LOWER the persisted floor and re-open a rollback. Serializing the write and
+    re-reading under the lock makes the floor strictly monotonic regardless of interleaving,
+    so it can only ever rise to the max accepted version. `enforce_anti_rollback` remains a
+    fail-fast pre-check; this is the operation that actually guards the persisted state.
+
+    Advisory locking suffices because every writer goes through this module (same rationale
+    as attestation's ledger lock); a cross-host state file on a network FS would need a real
+    coordinator, recorded as a limitation rather than papered over.
+    """
     path = Path(state_path)
-    floor = read_rollback_floor(path)
-    if floor is None or _version_lt(floor, model_version):
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps({"highest_trusted_version": str(model_version)}))
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = path.with_suffix(path.suffix + ".lock")
+    with lock_path.open("w") as fh:
+        fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+        try:
+            floor = read_rollback_floor(path)  # re-read UNDER the lock
+            if floor is None or _version_lt(floor, model_version):
+                path.write_text(json.dumps({"highest_trusted_version": str(model_version)}))
+        finally:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
 
 
 __all__ = [

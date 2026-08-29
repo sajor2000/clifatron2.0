@@ -159,6 +159,27 @@ class TrustRootTest(unittest.TestCase):
             with self.assertRaisesRegex(trust.TrustError, "list of strings"):
                 trust.load_trust_roots(path)
 
+    def test_a_non_mapping_top_level_document_fails_as_TrustError(self):
+        """A truthy scalar/sequence YAML doc has no .get; it must raise TrustError, not a
+        bare AttributeError that escapes the load boundary (CodeRabbit)."""
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "scalardoc.yaml"
+            path.write_text("just a string\n")
+            with self.assertRaises(trust.TrustError):
+                trust.load_trust_roots(path)
+
+    def test_a_numeric_key_id_is_refused(self):
+        """`key_id: 2026` parses to int 2026, which would never match the manifest's string
+        signed_by (silently un-revocable); require a non-empty string (CodeRabbit)."""
+        _, pub_hex = _keypair()
+        with tempfile.TemporaryDirectory() as td:
+            import yaml
+            path = Path(td) / "numid.yaml"
+            path.write_text(yaml.safe_dump({"release_signing": {
+                "trusted_keys": [{"key_id": 2026, "public_key_hex": pub_hex}]}}))
+            with self.assertRaises(trust.TrustError):
+                trust.load_trust_roots(path)
+
     def test_a_non_mapping_trusted_key_entry_fails_as_TrustError(self):
         """A bare string in trusted_keys would raise AttributeError on .get (outside the
         TrustError contract); it must be refused as a malformed root (CodeRabbit)."""
