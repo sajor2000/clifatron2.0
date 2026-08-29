@@ -54,10 +54,18 @@ class WheelRepoEquivalenceTest(unittest.TestCase):
         cls.work = Path(cls._tmp.name)
         cls._old_cwd = os.getcwd()
         os.chdir(cls.work)
-        cls.site = cls.work / "site"
-        cls.episodes = build_synthetic_site(cls.site)
-        cls.bundle_dir = build_synthetic_bundle(cls.work / "bundle", cls.site,
-                                                cls.episodes)
+        # Restore CWD if the fallible fixture build raises (CodeRabbit): otherwise
+        # tearDownClass never runs and TemporaryDirectory deletes the directory the
+        # process is still sitting in.
+        try:
+            cls.site = cls.work / "site"
+            cls.episodes = build_synthetic_site(cls.site)
+            cls.bundle_dir = build_synthetic_bundle(cls.work / "bundle", cls.site,
+                                                    cls.episodes)
+        except BaseException:
+            os.chdir(cls._old_cwd)
+            cls._tmp.cleanup()
+            raise
 
     @classmethod
     def tearDownClass(cls):

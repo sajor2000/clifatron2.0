@@ -123,6 +123,9 @@ def main() -> None:
     parser.add_argument("--outcomes", nargs="*", help="subset from configs/cohort.yaml")
     parser.add_argument("--episodes", required=True, help="canonical episode/split artifact")
     parser.add_argument("--cohort-config", default=str(DEFAULT_COHORT_CONFIG))
+    parser.add_argument("--data-config", default=str(DEFAULT_DATA_CONFIG),
+                        help="resolved data config; pass the bundle's copy at a wheel "
+                             "install where the repo configs/ directory is absent")
     parser.add_argument("--artifact-policy", default=str(ROOT / "configs/artifact_policy.yaml"))
     args = parser.parse_args()
 
@@ -130,7 +133,8 @@ def main() -> None:
     policy = _load_yaml(args.artifact_policy)
     validate_artifact_destination(output, "patient_level_phi", policy)
     labels = auto_label(
-        args.data, args.episodes, args.outcomes or None, cohort_config=args.cohort_config
+        args.data, args.episodes, args.outcomes or None,
+        cohort_config=args.cohort_config, data_config=args.data_config,
     )
     output.parent.mkdir(parents=True, exist_ok=True)
     labels.write_parquet(output)

@@ -485,19 +485,30 @@ def cr_d_calibration(cif: np.ndarray, events: np.ndarray,
 
 def aj_k_calibration(cif: np.ndarray, events: np.ndarray,
                      event_times: np.ndarray, time_horizon: int) -> dict:
-    """Aalen-Johansen K-calibration: for each cause k, group predicted CIF into
-    deciles and compare mean predicted vs observed. Returns per-cause slope."""
+    """Aalen-Johansen K-calibration: for each cause k, group the predicted CIF at the
+    horizon into deciles and compare mean predicted vs observed cause-k incidence.
+
+    The predicted CIF_k(time_horizon) is evaluated over the WHOLE at-risk population,
+    and the observed outcome is 1 iff the subject actually experienced cause k by the
+    horizon. Restricting to `events == k` and setting the outcome to all-ones (the
+    previous implementation) made every bucket's observed rate identically 1.0, so the
+    slope carried no calibration information and was ~0 regardless of fit (CodeRabbit).
+
+    Caveat: this decile calibration does not reweight for right-censoring before the
+    horizon; it is the same simplification `cr_d_calibration` makes and is adequate for
+    the site-level sanity check, not a censoring-corrected Aalen-Johansen estimator.
+    """
     K = cif.shape[1]
+    horizon = int(np.clip(time_horizon, 0, cif.shape[2] - 1))
     results = {}
     for k in range(K):
-        mask = events == k
-        if mask.sum() < 20:
-            continue
-        p = cif[mask, k, event_times[mask]]
-        y = np.ones_like(p)
+        # Predicted cumulative incidence of cause k by the horizon, for everyone at
+        # risk — not only those who ended up experiencing cause k.
+        p = cif[:, k, horizon]
+        y = ((events == k) & (event_times <= horizon)).astype(float)
         finite = np.isfinite(p)
         p, y = p[finite], y[finite]
-        if len(np.unique(p)) < 3:
+        if len(p) < 20 or int(y.sum()) < 1 or len(np.unique(p)) < 3:
             continue
         dec = np.percentile(p, np.linspace(10, 100, 10))
         preds, obss = [], []
@@ -510,10 +521,10 @@ def aj_k_calibration(cif: np.ndarray, events: np.ndarray,
                 obss.append(y[in_bucket].mean())
         if len(preds) < 3:
             continue
-        slope, _ = np.polyfit(preds, obss, 1) if len(preds) >= 2 else (float("nan"), float("nan"))
+        slope, _ = np.polyfit(preds, obss, 1)
         results[k] = {
             "aj_k_slope": float(slope),
             "n_deciles": len(preds),
-            "n": int(mask.sum()),
+            "n": int(finite.sum()),
         }
     return results

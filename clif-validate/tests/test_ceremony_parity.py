@@ -31,13 +31,22 @@ class CeremonyParityTest(unittest.TestCase):
         cls.work = Path(cls._tmp.name)
         cls._old_cwd = os.getcwd()
         os.chdir(cls.work)
-        cls.site = cls.work / "site"
-        cls.episodes = build_synthetic_site(cls.site)
-        cls.bundle = build_synthetic_bundle(cls.work / "bundle", cls.site, cls.episodes)
-        cls.signing_key = cls.work / "signing.key"
-        cls.signing_key.write_text("ab" * 32)
-        cls.access_key = cls.work / "access.key"
-        cls.access_key.write_bytes(b"synthetic-chain-key-for-tests")
+        # Restore CWD if the fallible fixture build raises: otherwise tearDownClass
+        # never runs, the process stays inside cls.work, and TemporaryDirectory then
+        # deletes the directory out from under the rest of the session (CodeRabbit).
+        try:
+            cls.site = cls.work / "site"
+            cls.episodes = build_synthetic_site(cls.site)
+            cls.bundle = build_synthetic_bundle(cls.work / "bundle", cls.site,
+                                                cls.episodes)
+            cls.signing_key = cls.work / "signing.key"
+            cls.signing_key.write_text("ab" * 32)
+            cls.access_key = cls.work / "access.key"
+            cls.access_key.write_bytes(b"synthetic-chain-key-for-tests")
+        except BaseException:
+            os.chdir(cls._old_cwd)
+            cls._tmp.cleanup()
+            raise
 
     @classmethod
     def tearDownClass(cls):
@@ -123,6 +132,17 @@ class CeremonyParityTest(unittest.TestCase):
         self.assertFalse(Path("output/final_no_phi/nokey.json").exists())
         self.assertFalse(Path("output/final_no_phi/nokey.json.draft").exists())
         self.assertFalse(Path("output/intermediate_phi/nokey_ledger.jsonl").exists())
+
+    def test_approved_without_a_signing_key_is_refused_before_publishing(self):
+        argv = self._argv("nosign", "--approved")
+        idx = argv.index("--signing-key-file")
+        del argv[idx:idx + 2]
+        with mock.patch("sys.argv", argv):
+            with self.assertRaises(SystemExit):
+                main()
+        # Nothing published, ledgered, or drafted — the refusal precedes the write.
+        self.assertFalse(Path("output/final_no_phi/nosign.json").exists())
+        self.assertFalse(Path("output/intermediate_phi/nosign_ledger.jsonl").exists())
 
     def test_a_shard_dir_outside_the_policy_class_is_refused(self):
         with mock.patch("sys.argv",

@@ -164,9 +164,21 @@ flowchart LR
 Run:
 
 ```bash
-# at each external site (returns aggregate metrics only).
-# First run writes a LOCAL DRAFT for the site's disclosure review;
-# re-run with --approved to stamp, sign, and release.
+# Step 1 — at each external site: the DRAFT run (no --approved). Writes a local,
+# unsigned, unledgered draft (<out>.draft) for the site's disclosure review. Nothing
+# is released.
+clif-validate \
+      --checkpoint /path/to/bundle \
+      --data /path/to/clif_parquet \
+      --episode-artifact /path/to/episodes.parquet \
+      --site-id SITE-07 \
+      --release-id 2026-08-29-site07-v0 \
+      --signing-key-file /secure/site07.key \
+      --access-log-key-file /secure/site07-accesslog.key
+
+# Step 2 — after disclosure review approves the draft: the RELEASE run. Add --approved
+# to stamp reviewed_approved, sign, record access, and ledger the release. (--approved
+# without --signing-key-file is refused, so a release is never published unsigned.)
 clif-validate \
       --checkpoint /path/to/bundle \
       --data /path/to/clif_parquet \
@@ -176,6 +188,7 @@ clif-validate \
       --signing-key-file /secure/site07.key \
       --access-log-key-file /secure/site07-accesslog.key \
       --approved
+
 # at the hub (metrics JSONs only)
 python -m src.eval.clif_forest_plot --results results/SiteA.json results/SiteB.json
 ```

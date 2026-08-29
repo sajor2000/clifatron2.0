@@ -166,6 +166,16 @@ def zero_shot_predictions(model, batches, target_indices, tau_bins,
     n_stays = len(batches)
     probs = np.zeros((n_stays, n_outcomes))
 
+    # Cap each sequence to the backbone's context length BEFORE it is embedded. A long
+    # ICU stay can exceed the checkpoint's positional range (GPT-2 `n_positions`), and
+    # an over-length sequence indexes the position embedding out of range and crashes
+    # mid-inference (CodeRabbit). Keep the MOST RECENT tokens: the threshold head
+    # anchors on the last real token, so tail truncation preserves the anchor while
+    # dropping the oldest context. tokenize_site's observation window bounds most
+    # stays already; this is the hard backstop.
+    cfg = getattr(model.backbone, "config", None)
+    ctx = getattr(cfg, "n_positions", None) or getattr(cfg, "max_position_embeddings", None)
+
     # inference_mode, not just eval(): the HEAD parameters still require grad (only
     # the backbone is frozen), so without it the first real call built an autograd
     # graph across every site batch and `.numpy()` refused the resulting tensor.
@@ -176,6 +186,9 @@ def zero_shot_predictions(model, batches, target_indices, tau_bins,
             end = min(start + batch_size, n_stays)
             batch_ids = [b["input_ids"] for b in batches[start:end]]
             batch_masks = [b["attention_mask"] for b in batches[start:end]]
+            if ctx:
+                batch_ids = [ids[-ctx:] for ids in batch_ids]
+                batch_masks = [m[-ctx:] for m in batch_masks]
 
             max_len = max(len(ids) for ids in batch_ids)
             ids = torch.zeros((len(batch_ids), max_len), dtype=torch.long, device=device)
@@ -627,8 +640,17 @@ def main():
                   "re-run with --approved to stamp, sign, and release.")
         return
 
-    signing_key = (bytes.fromhex(Path(args.signing_key_file).read_text().strip())
-                   if args.signing_key_file else None)
+    # Fail closed at the CLI: --approved without a signing key would build, publish,
+    # AND ledger a `reviewed_approved` artifact with no signature — the aggregator
+    # refuses it, but only after it is already on disk and recorded (CodeRabbit). An
+    # unsignable release must not happen at all, mirroring the access-log preflight.
+    if not args.signing_key_file:
+        raise SystemExit(
+            "--approved requires --signing-key-file: without it the artifact is "
+            "published and ledgered unsigned, then rejected by the aggregator. "
+            "Refusing to release rather than emit an unsigned reviewed_approved report."
+        )
+    signing_key = bytes.fromhex(Path(args.signing_key_file).read_text().strip())
     payload = build_export(result["outcomes"], provenance, site_id=args.site_id,
                            site_role=args.site_role, partition_role=args.partition_role,
                            release_id=args.release_id,

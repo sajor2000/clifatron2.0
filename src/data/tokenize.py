@@ -114,9 +114,16 @@ def _read_table(con, base: Path, spec: dict,
     unit_sql = f"CAST({unit} AS VARCHAR)" if unit else "CAST('' AS VARCHAR)"
     time_col = spec["availability_col"]
     id_filter = ""
+    params: list = []
     if keep_ids is not None:
-        id_list = ", ".join(f"'{i}'" for i in keep_ids)
-        id_filter = f"AND CAST(hospitalization_id AS VARCHAR) IN ({id_list})"
+        # Parameterize the id list rather than inlining quoted literals: a
+        # hospitalization_id containing an apostrophe would otherwise terminate the
+        # literal and corrupt the query (CodeRabbit). Column/table identifiers cannot
+        # be bound as parameters, so those stay interpolated — the bundle path
+        # validates them as identifiers before they reach here.
+        placeholders = ", ".join("?" for _ in keep_ids)
+        id_filter = f"AND CAST(hospitalization_id AS VARCHAR) IN ({placeholders})"
+        params = [str(i) for i in keep_ids]
     q = f"""
         SELECT hospitalization_id       AS hosp_id,
                {time_col}                AS dttm,
@@ -128,7 +135,7 @@ def _read_table(con, base: Path, spec: dict,
           AND {time_col} IS NOT NULL
           {id_filter}
     """
-    return con.execute(q).pl()
+    return con.execute(q, params).pl()
 
 
 def validate_units(events: pl.DataFrame, cfg: dict) -> None:
@@ -438,8 +445,17 @@ def tokenize_site(cfg: dict, site: str, base: Path, out: Path,
     # Map each event using positions derived from canonical ICU admission.
     def encode(group: pl.DataFrame) -> pl.DataFrame:
         token, soft_token, soft_weight, valnum = [], [], [], []
+        # Positions and eligibility flags are collected INSIDE the loop, aligned with
+        # `token`. A skipped event (missing numeric) drops its token, so emitting the
+        # full `group["pos_min"]` / `group["target_eligible"]` instead would shift every
+        # position and eligibility flag after the first skip and make n_events disagree
+        # with the sequence length (CodeRabbit: critical desync).
+        pos_min, target_eligible = [], []
         bin_cfg = cfg["value_binning"]
-        for c, v in zip(group["concept"], group["value"]):
+        for c, v, pos, eligible in zip(
+            group["concept"], group["value"],
+            group["pos_min"], group["target_eligible"],
+        ):
             v_for_bin = float(v) if v is not None and np.isfinite(v) else None
             if v_for_bin is None and c in edges:
                 # Missing numeric measurements are not physiologic low-bin events.
@@ -473,15 +489,17 @@ def tokenize_site(cfg: dict, site: str, base: Path, out: Path,
                 weights.append(weight)
             soft_token.append(soft_tokens)
             soft_weight.append(weights)
+            pos_min.append(pos)
+            target_eligible.append(eligible)
             valnum.append(float(v) if v is not None else float("nan"))  # ORA value-regression target
         return pl.DataFrame({
             "hosp_id": group["hosp_id"][0],
             "token": [token],
             "soft_token": [soft_token],
             "soft_weight": [soft_weight],
-            "pos_min": [group["pos_min"].to_list()],
+            "pos_min": [pos_min],
             "value": [valnum],
-            "target_eligible": [group["target_eligible"].to_list()],
+            "target_eligible": [target_eligible],
             "partition": group["partition"][0],
             "n_events": len(token),
         })

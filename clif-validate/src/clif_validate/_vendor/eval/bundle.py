@@ -77,23 +77,24 @@ def hash_bundle_files(bundle_dir: str | Path) -> dict[str, str]:
     root = Path(bundle_dir)
     out: dict[str, str] = {}
     for p in sorted(root.rglob("*")):
-        if not p.is_file():
-            continue
         rel = p.relative_to(root).as_posix()
-        # Exclude only the TOP-LEVEL manifest — a name match at any depth
-        # (`subdir/bundle_manifest.json`) would let a nested file escape both
-        # this map and the unlisted-file check, defeating rule 1 (review finding).
-        if rel == BUNDLE_MANIFEST:
-            continue
-        # A symlink is not a bundle file: rglob does not descend a symlinked
-        # directory (so files under it would be unhashed AND unlisted), and a
-        # symlinked regular file could point outside the bundle. Refuse rather
-        # than hash through the link.
+        # Check is_symlink FIRST — before is_file, which FOLLOWS the link and returns
+        # False for a symlink to a directory or a dangling one, so both would slip past
+        # a later symlink check (CodeRabbit). rglob also does not descend a symlinked
+        # directory, so files beneath it would be neither hashed nor flagged as
+        # unlisted. Refuse any symlink outright: a bundle is plain files.
         if p.is_symlink():
             raise ArtifactMismatch(
                 f"bundle contains a symlink ({rel}); bundles must be plain files "
                 "so nothing escapes the integrity envelope through a link"
             )
+        if not p.is_file():
+            continue
+        # Exclude only the TOP-LEVEL manifest — a name match at any depth
+        # (`subdir/bundle_manifest.json`) would let a nested file escape both
+        # this map and the unlisted-file check, defeating rule 1 (review finding).
+        if rel == BUNDLE_MANIFEST:
+            continue
         out[rel] = _sha256_file(p)
     return out
 
