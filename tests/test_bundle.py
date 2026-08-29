@@ -218,3 +218,52 @@ class BundleInferenceTest(_BundleFixtureCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class RepoCliEndToEndTest(_BundleFixtureCase):
+    """The repo CLI itself, driven end to end against the fixture bundle.
+
+    This is the plan's U9 Verification item verbatim: main()'s predict_fn — the
+    seam that used to raise by design — now runs real zero-shot inference from
+    the bundle and completes the approved release ceremony.
+    """
+
+    def test_main_runs_the_wired_inference_path_and_releases(self):
+        from unittest import mock
+
+        from src.eval import attestation as attest
+        from src.eval.clif_validate import main
+
+        signing_key = self.work / "cli_signing.key"
+        signing_key.write_text("cd" * 32)
+        access_key = self.work / "cli_access.key"
+        access_key.write_bytes(b"repo-cli-chain-key")
+        argv = [
+            "clif_validate",
+            "--checkpoint", str(self.bundle_dir),
+            "--data", str(self.site),
+            "--episode-artifact", str(self.episodes),
+            "--site-id", "SYNTH-A",
+            "--release-id", "rel-repo-cli",
+            "--out", "output/final_no_phi/repo_cli.json",
+            "--ledger", "output/intermediate_phi/repo_cli_ledger.jsonl",
+            "--access-log", "output/intermediate_phi/repo_cli_access.jsonl",
+            "--shard-dir", "output/intermediate_phi/repo_cli_shards",
+            "--signing-key-file", str(signing_key),
+            "--access-log-key-file", str(access_key),
+            "--approved",
+        ]
+        with mock.patch("sys.argv", argv):
+            main()
+        out = Path("output/final_no_phi/repo_cli.json")
+        payload = json.loads(out.read_text())
+        self.assertEqual(payload["disclosure_status"], "reviewed_approved")
+        self.assertEqual(payload["release_id"], "rel-repo-cli")
+        self.assertIn(SYNTHETIC_OUTCOME, payload["outcomes"])
+        self.assertTrue(
+            attest.verify_report(payload, bytes.fromhex(signing_key.read_text()))
+        )
+        self.assertEqual(
+            attest.confirmed_releases(Path("output/intermediate_phi/repo_cli_ledger.jsonl")),
+            {"rel-repo-cli"},
+        )
