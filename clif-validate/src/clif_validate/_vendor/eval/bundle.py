@@ -47,6 +47,9 @@ from clif_validate._vendor.eval import schema as _schema
 from clif_validate._vendor.eval.clif_validate import ArtifactMismatch, verify_bundle_compatibility
 
 BUNDLE_MANIFEST = "bundle_manifest.json"
+# The detached Ed25519 signature over the manifest (U11). Kept in sync with
+# trust.SIGNATURE_FILENAME; defined here to avoid importing trust at module load.
+_SIGNATURE_FILENAME = "bundle_manifest.sig"
 
 # Roles the manifest must cover by exact name. The backbone checkpoint files
 # (config.json + weights) vary by format, so they are covered by the walk in
@@ -90,10 +93,12 @@ def hash_bundle_files(bundle_dir: str | Path) -> dict[str, str]:
             )
         if not p.is_file():
             continue
-        # Exclude only the TOP-LEVEL manifest — a name match at any depth
-        # (`subdir/bundle_manifest.json`) would let a nested file escape both
-        # this map and the unlisted-file check, defeating rule 1 (review finding).
-        if rel == BUNDLE_MANIFEST:
+        # Exclude only the TOP-LEVEL manifest and its detached signature — a name match
+        # at any depth (`subdir/bundle_manifest.json`) would let a nested file escape
+        # both this map and the unlisted-file check, defeating rule 1 (review finding).
+        # The signature (U11) covers the manifest, which covers this map, so it cannot
+        # itself be in the map it signs.
+        if rel in (BUNDLE_MANIFEST, _SIGNATURE_FILENAME):
             continue
         out[rel] = _sha256_file(p)
     return out
@@ -249,20 +254,57 @@ class Bundle:
     policy_path: Path
     cohort_path: Path
     data_cfg_path: Path
+    for_release: bool = True    # False when loaded with verify_signature=False (fixture)
 
 
-def load_bundle(path: str | Path, *, pin_policy: bool = True) -> Bundle:
+def _verify_bundle_signature(root: Path, manifest: dict, provenance: dict,
+                             trust_roles_path, rollback_state_path) -> None:
+    """Releaser-to-site trust: signature by a trusted, non-revoked key, not a rollback."""
+    from clif_validate._vendor.eval import trust as _trust
+
+    if trust_roles_path is None:
+        raise ArtifactMismatch(
+            "signature verification is required but no trust_roles_path was given; "
+            "refusing to accept a bundle with no trust root to verify against"
+        )
+    sig_path = root / _SIGNATURE_FILENAME
+    if not sig_path.exists():
+        raise ArtifactMismatch(
+            f"bundle is unsigned ({_SIGNATURE_FILENAME} absent); a governed bundle must "
+            "carry a releaser signature. A self-consistent but unsigned bundle is exactly "
+            "the re-hashed-replacement case this check exists to refuse."
+        )
+    key_id = manifest.get("signed_by")
+    if not key_id:
+        raise ArtifactMismatch("bundle manifest declares no signed_by key id")
+    trust_root = _trust.load_trust_roots(trust_roles_path)
+    _trust.verify_against_trust_root(manifest, sig_path.read_text().strip(), key_id,
+                                     trust_root)
+    if rollback_state_path is not None:
+        _trust.enforce_anti_rollback(provenance["model_version"], rollback_state_path)
+
+
+def load_bundle(path: str | Path, *, pin_policy: bool = True,
+                verify_signature: bool = True, trust_roles_path: str | Path | None = None,
+                rollback_state_path: str | Path | None = None) -> Bundle:
     """Verify and load a bundle, fail-closed at every step.
 
     Order matters, and every mutation of process state waits until AFTER the bundle
     has fully proven out: file hashes are verified before any bundled file is parsed,
     the data config's SQL-bound identifiers are validated before they can reach a
     query, the manifest's identity is cross-checked against the vocabulary's own
-    manifest, and only then — with nothing left that can raise — is the policy pinned
-    process-wide. A bundle refused at any check must not leave its disclosure policy
-    governing the rest of the process (review finding: pin ran before the identity
-    cross-checks, so a rejected bundle carrying `minimum_cell_size: 1` still lowered
-    the floor for every later `min_cell_size()` call).
+    manifest, the releaser signature is verified against the trust root, and only then
+    — with nothing left that can raise — is the policy pinned process-wide. A bundle
+    refused at any check must not leave its disclosure policy governing the rest of the
+    process (review finding: pin ran before the identity cross-checks).
+
+    Signature (U11): `verify_signature=True` (the default, the governed path) requires a
+    detached Ed25519 signature over the manifest, signed by a key in
+    `trust_roles_path`, not revoked, and not a rollback below the persisted floor —
+    closing the re-hashed-replacement finding, since a self-consistent bundle signed by
+    no trusted key is refused. `verify_signature=False` is the EXPLICIT, loudly-recorded
+    synthetic-fixture escape (`Bundle.for_release` is False); it can never be the
+    governed default. `trust_roles_path` is required when verifying.
     """
     root = Path(path)
     manifest_path = root / BUNDLE_MANIFEST
@@ -318,9 +360,27 @@ def load_bundle(path: str | Path, *, pin_policy: bool = True) -> Bundle:
             f"{data_cfg['schema_version']!r}"
         )
 
-    # Every check has passed; nothing below can raise. NOW pin the policy — see the
-    # ordering rationale in the docstring. validate_vocabulary_artifact above took the
-    # policy as an explicit dict, so nothing so far depended on the env pin.
+    # Releaser signature LAST (U11), after every self-consistency and identity check: a
+    # bundle that fails an internal check fails THERE (its specific error), and only a
+    # fully self-consistent bundle reaches the signature — which is exactly the
+    # re-hashed-replacement case (internally perfect, signed by no trusted key) that the
+    # signature exists to refuse. Verified before any process state is pinned.
+    if verify_signature:
+        _verify_bundle_signature(root, manifest, provenance,
+                                 trust_roles_path, rollback_state_path)
+
+    # Anti-rollback floor advances only after FULL acceptance, so a bundle rejected after
+    # its signature verified never raises the floor. This does mkdir + write_text, which
+    # CAN fail (read-only mount, full disk); do it BEFORE pinning the policy so a failed
+    # floor write never leaves the bundled policy pinned process-wide (CodeRabbit).
+    if verify_signature and rollback_state_path is not None:
+        from clif_validate._vendor.eval import trust as _trust
+
+        _trust.advance_rollback_floor(provenance["model_version"], rollback_state_path)
+
+    # Every check has passed and the floor is recorded; nothing below can raise. NOW pin
+    # the policy — see the ordering rationale in the docstring. validate_vocabulary_artifact
+    # above took the policy as an explicit dict, so nothing so far depended on the env pin.
     if pin_policy:
         pin_bundle_policy(policy_path)
 
@@ -336,18 +396,26 @@ def load_bundle(path: str | Path, *, pin_policy: bool = True) -> Bundle:
         policy_path=policy_path,
         cohort_path=cohort_path,
         data_cfg_path=data_cfg_path,
+        for_release=verify_signature,
     )
 
 
 def write_bundle_manifest(bundle_dir: str | Path, *, model_bundle_id: str,
                           model_version: str, vocab_hash: str,
                           outcome_spec_hash: str, clif_version: str,
-                          outcome_queries: dict[str, dict]) -> Path:
+                          outcome_queries: dict[str, dict],
+                          signing_key: bytes | None = None,
+                          key_id: str | None = None) -> Path:
     """Releaser-side: hash the bundle's files and seal the manifest over them.
 
     Shared by the synthetic fixture and any real release path so there is exactly one
     implementation of "what a manifest contains". Must be called LAST, after every
     other file is in place — the file map covers whatever is present at call time.
+
+    When `signing_key` (raw Ed25519 private key) and `key_id` are given (U11), the
+    manifest records `signed_by: key_id` and a detached signature over its signed subset
+    is written to `bundle_manifest.sig`. `load_bundle(..., verify_signature=True)` then
+    anchors trust in that signature rather than the self-hash alone.
     """
     root = Path(bundle_dir)
     manifest = {
@@ -359,6 +427,22 @@ def write_bundle_manifest(bundle_dir: str | Path, *, model_bundle_id: str,
         "outcome_queries": outcome_queries,
         "files": hash_bundle_files(root),
     }
+    if (signing_key is None) != (key_id is None):
+        raise ValueError("signing_key and key_id must be provided together")
+    if signing_key is not None:
+        from clif_validate._vendor.eval.trust import SIGNATURE_FILENAME, sign_manifest
+
+        manifest["signed_by"] = key_id  # metadata, deliberately NOT part of the signed subset
+        signature = sign_manifest(manifest, signing_key)
+        (root / SIGNATURE_FILENAME).write_text(signature)
+    else:
+        # An unsigned re-seal must not leave a stale signature behind: it would match no
+        # manifest (which now has no signed_by), stay invisible to hash_bundle_files (which
+        # excludes the .sig), and only surface as a confusing "declares no signed_by" at a
+        # governed load. Remove it so the on-disk state is honest (CodeRabbit).
+        from clif_validate._vendor.eval.trust import SIGNATURE_FILENAME
+
+        (root / SIGNATURE_FILENAME).unlink(missing_ok=True)
     out = root / BUNDLE_MANIFEST
     out.write_text(json.dumps(manifest, indent=2, sort_keys=True))
     return out

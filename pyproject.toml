@@ -16,6 +16,7 @@ dependencies = [
     "transformers>=4.44",    # load CLIFATRON GPT2/Qwen2 checkpoints (head_adapter)
     "sentence-transformers>=3.0",  # leakage-safe note embeddings (small clinical model)
     "tqdm>=4.66",
+    "cryptography>=44.0.1",    # U11 Ed25519 releaser->site bundle signing (trust.py)
 ]
 
 [tool.uv]

@@ -27,9 +27,9 @@ from clif_validate._vendor.eval.synthetic_bundle import (
 
 
 def _run_pipeline(modules: dict, bundle_dir: Path, site: Path, episodes: Path,
-                  shard_tag: str) -> dict:
+                  shard_tag: str, trust_roles: Path) -> dict:
     """Run bundle → inference → evaluate → build_export with either module set."""
-    bundle = modules["bundle"].load_bundle(bundle_dir)
+    bundle = modules["bundle"].load_bundle(bundle_dir, trust_roles_path=trust_roles)
     model = modules["clif_validate"].load_checkpoint(str(bundle_dir))
     cfgs = [{"name": SYNTHETIC_OUTCOME}]
     predict_fn = modules["bundle_inference"].bundle_predict_fn(
@@ -62,6 +62,8 @@ class WheelRepoEquivalenceTest(unittest.TestCase):
             cls.episodes = build_synthetic_site(cls.site)
             cls.bundle_dir = build_synthetic_bundle(cls.work / "bundle", cls.site,
                                                     cls.episodes)
+            # build_synthetic_bundle writes the synthetic trust root beside the bundle.
+            cls.trust_roles = cls.work / "trust_roles.yaml"
         except BaseException:
             os.chdir(cls._old_cwd)
             cls._tmp.cleanup()
@@ -101,11 +103,11 @@ class WheelRepoEquivalenceTest(unittest.TestCase):
 
         vendored = _run_pipeline(
             {"bundle": v_bundle, "bundle_inference": v_inference, "clif_validate": v_cv},
-            self.bundle_dir, self.site, self.episodes, "shards_wheel",
+            self.bundle_dir, self.site, self.episodes, "shards_wheel", self.trust_roles,
         )
         in_repo = _run_pipeline(
             {"bundle": r_bundle, "bundle_inference": r_inference, "clif_validate": r_cv},
-            self.bundle_dir, self.site, self.episodes, "shards_repo",
+            self.bundle_dir, self.site, self.episodes, "shards_repo", self.trust_roles,
         )
         self.assertEqual(v_attest.canonical_bytes(vendored),
                          r_attest.canonical_bytes(in_repo))
@@ -116,7 +118,7 @@ class WheelRepoEquivalenceTest(unittest.TestCase):
     def test_loading_a_bundle_pins_its_policy_for_the_whole_process(self):
         from clif_validate._vendor.eval import bundle as v_bundle
 
-        v_bundle.load_bundle(self.bundle_dir)
+        v_bundle.load_bundle(self.bundle_dir, trust_roles_path=self.trust_roles)
         pinned = os.environ.get(v_schema.POLICY_OVERRIDE_ENV)
         self.assertEqual(Path(pinned), (self.bundle_dir / "artifact_policy.yaml").resolve())
         self.assertEqual(v_schema.min_cell_size(), 10)

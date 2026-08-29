@@ -39,6 +39,8 @@ class CeremonyParityTest(unittest.TestCase):
             cls.episodes = build_synthetic_site(cls.site)
             cls.bundle = build_synthetic_bundle(cls.work / "bundle", cls.site,
                                                 cls.episodes)
+            # build_synthetic_bundle writes the synthetic trust root beside the bundle.
+            cls.trust_roles = cls.work / "trust_roles.yaml"
             cls.signing_key = cls.work / "signing.key"
             cls.signing_key.write_text("ab" * 32)
             cls.access_key = cls.work / "access.key"
@@ -77,8 +79,16 @@ class CeremonyParityTest(unittest.TestCase):
             "--shard-dir", f"output/intermediate_phi/{tag}_shards",
             "--signing-key-file", str(self.signing_key),
             "--access-log-key-file", str(self.access_key),
+            "--trust-roles", str(self.trust_roles),
+            "--rollback-state", f"output/intermediate_phi/{tag}_rollback.json",
             *extra,
         ]
+
+    def _draft_hash(self, tag: str) -> str:
+        """Run the draft (unapproved) leg and return the reviewer's content hash."""
+        with mock.patch("sys.argv", self._argv(tag)):
+            main()
+        return Path(f"output/final_no_phi/{tag}.json.draft.sha256").read_text().strip()
 
     def test_draft_then_approved_two_step(self):
         """Unapproved run: a local draft, nothing released, nothing ledgered."""
@@ -92,9 +102,14 @@ class CeremonyParityTest(unittest.TestCase):
         draft = json.loads(draft_path.read_text())
         self.assertEqual(draft["disclosure_status"], schema.DRAFT_DISCLOSURE_STATUS)
         self.assertNotIn("signature", draft)
+        # The draft run emits the content hash a reviewer approves against.
+        draft_hash = Path(str(out) + ".draft.sha256").read_text().strip()
+        self.assertEqual(len(draft_hash), 64)
 
-        # Approved run: released, signed over the FINAL status, ledger confirmed.
-        with mock.patch("sys.argv", self._argv("twostep", "--approved")):
+        # Approved run: bound to the reviewed draft by hash, released, signed over the
+        # FINAL status, ledger confirmed.
+        with mock.patch("sys.argv",
+                        self._argv("twostep", "--approved", "--approved-hash", draft_hash)):
             main()
         self.assertTrue(out.exists())
         payload = json.loads(out.read_text())
@@ -111,17 +126,18 @@ class CeremonyParityTest(unittest.TestCase):
         self.assertTrue(attest.verify_access_log(access))
 
     def test_a_replayed_release_id_is_rejected(self):
-        with mock.patch("sys.argv", self._argv("replay", "--approved")):
+        h = self._draft_hash("replay")
+        with mock.patch("sys.argv", self._argv("replay", "--approved", "--approved-hash", h)):
             main()
         out = Path("output/final_no_phi/replay.json")
         first = out.read_bytes()
-        with mock.patch("sys.argv", self._argv("replay", "--approved")):
+        with mock.patch("sys.argv", self._argv("replay", "--approved", "--approved-hash", h)):
             with self.assertRaises(schema.DisclosureError):
                 main()
         self.assertEqual(out.read_bytes(), first)  # nothing overwrote the release
 
     def test_a_missing_access_log_key_fails_before_anything_publishes(self):
-        argv = self._argv("nokey", "--approved")
+        argv = self._argv("nokey", "--approved", "--approved-hash", "0" * 64)
         # Strip the key flag and make sure no ambient variable leaks in.
         idx = argv.index("--access-log-key-file")
         del argv[idx:idx + 2]
@@ -134,7 +150,7 @@ class CeremonyParityTest(unittest.TestCase):
         self.assertFalse(Path("output/intermediate_phi/nokey_ledger.jsonl").exists())
 
     def test_approved_without_a_signing_key_is_refused_before_publishing(self):
-        argv = self._argv("nosign", "--approved")
+        argv = self._argv("nosign", "--approved", "--approved-hash", "0" * 64)
         idx = argv.index("--signing-key-file")
         del argv[idx:idx + 2]
         with mock.patch("sys.argv", argv):
@@ -147,7 +163,7 @@ class CeremonyParityTest(unittest.TestCase):
     def test_approved_with_an_empty_signing_key_is_refused(self):
         empty = self.work / "empty.key"
         empty.write_text("   \n")
-        argv = self._argv("emptysign", "--approved")
+        argv = self._argv("emptysign", "--approved", "--approved-hash", "0" * 64)
         idx = argv.index("--signing-key-file")
         argv[idx + 1] = str(empty)
         with mock.patch("sys.argv", argv):
@@ -158,8 +174,8 @@ class CeremonyParityTest(unittest.TestCase):
 
     def test_a_shard_dir_outside_the_policy_class_is_refused(self):
         with mock.patch("sys.argv",
-                        self._argv("badshard", "--approved", "--shard-dir",
-                                   "somewhere_unclassified/shards")):
+                        self._argv("badshard", "--approved", "--approved-hash", "0" * 64,
+                                   "--shard-dir", "somewhere_unclassified/shards")):
             with self.assertRaisesRegex(ValueError, "must be stored under"):
                 main()
         self.assertFalse(Path("output/final_no_phi/badshard.json").exists())

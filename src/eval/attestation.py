@@ -632,10 +632,20 @@ def append_to_ledger(payload: dict, ledger_path: str | Path) -> None:
 
 
 __all__ = [
-    "AuthenticationError", "confirm_publication", "confirmed_releases", "reconcile_ledger",
-    "preflight_access_log", "ledger_lock",
+    "AuthenticationError",
+    "append_to_ledger",
+    "canonical_bytes",
+    "check_cross_release_differencing",
+    "confirm_publication",
+    "confirmed_releases",
+    "ledger_entries",
+    "ledger_lock",
+    "preflight_access_log",
+    "read_ledger",
+    "reconcile_ledger",
+    "record_access",
+    "sign_report",
     "unconfirmed_releases",
-    "canonical_bytes", "sign_report", "verify_report",
-    "record_access", "verify_access_log",
-    "ledger_entries", "read_ledger", "check_cross_release_differencing", "append_to_ledger",
+    "verify_access_log",
+    "verify_report",
 ]

@@ -28,6 +28,8 @@ identifies the institution's filesystem or, by itself, the institution.
 from __future__ import annotations
 
 import argparse
+import hashlib
+import hmac
 import json
 import logging
 from pathlib import Path
@@ -544,6 +546,18 @@ def _write_export_locked(payload: dict, out_path: str | Path, ledger_path: str |
     return out
 
 
+def _draft_content_hash(draft: dict) -> str:
+    """SHA-256 over the canonical bytes of a DRAFT payload — the reviewer's anchor.
+
+    Hashes exactly the bytes the draft file is written with, so the hash a reviewer
+    records off the on-disk draft equals the hash the approved run recomputes from the
+    freshly-built draft. `build_export` is deterministic for identical inputs, so a
+    matching hash proves the release carries the reviewed content and nothing else.
+    """
+    canonical = json.dumps(draft, indent=2, sort_keys=True, allow_nan=False)
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--checkpoint", required=True)
@@ -577,12 +591,79 @@ def main():
     ap.add_argument("--approved", action="store_true",
                     help="attest that the site's disclosure review approved this "
                          "release. Without it the run writes a LOCAL DRAFT (unsigned, "
-                         "unledgered, not a release) and stops. With it the artifact is "
-                         "stamped reviewed_approved, signed, and released. NOTE: the "
-                         "approved run recomputes the report; approval-by-content-hash "
-                         "of a specific draft is U11's, so this flag assumes the "
-                         "pipeline is deterministic between review and release.")
+                         "unledgered, not a release) plus a .draft.sha256 of its content, "
+                         "and stops. With it the artifact is stamped reviewed_approved, "
+                         "signed, and released — but a governed release requires ALL of "
+                         "--approved-hash (bind to the reviewed draft), --rollback-state "
+                         "(anti-rollback), and a verified signature (i.e. NOT "
+                         "--allow-unsigned). Each is fail-closed; there is no waiver.")
+    ap.add_argument("--approved-hash", default=None,
+                    help="hex SHA-256 of the reviewed draft (printed by the draft run as "
+                         "<out>.draft.sha256). REQUIRED with --approved: the run recomputes "
+                         "the payload's content hash and refuses to release unless it equals "
+                         "this value — so a release can never carry a payload other than the "
+                         "one reviewed (closes U9's 'approved rerun releases an unreviewed "
+                         "payload'). There is deliberately no waiver: bind to the draft, or "
+                         "do not release.")
+    ap.add_argument("--trust-roles", default=None,
+                    help="path to the out-of-band trust root (configs/trust_roles.yaml) "
+                         "holding releaser public keys and the revocation list. Required "
+                         "to load a governed bundle: load_bundle verifies the bundle's "
+                         "Ed25519 releaser signature against it and fails closed on an "
+                         "absent/invalid/revoked signature.")
+    ap.add_argument("--allow-unsigned", action="store_true",
+                    help="explicit escape for SYNTHETIC/dev bundles only: load without "
+                         "verifying a releaser signature (also disables revocation and "
+                         "anti-rollback, which run only under signature verification). The "
+                         "bundle is marked not-for-release and CANNOT be combined with "
+                         "--approved — a governed release is refused for an unverified "
+                         "bundle. Use only for a local draft/inspection run.")
+    ap.add_argument("--rollback-state", default=None,
+                    help="path persisting the highest release version this site has "
+                         "accepted. REQUIRED with --approved so a release enforces "
+                         "anti-rollback: load_bundle refuses a validly-signed but OLDER "
+                         "bundle (a forced downgrade) and advances the floor on acceptance. "
+                         "A corrupt state file fails closed. Has no effect under "
+                         "--allow-unsigned (no signature => no rollback check).")
     args = ap.parse_args()
+
+    # Governed-release preconditions, checked UP FRONT (before any inference or I/O) so an
+    # ill-formed release invocation fails fast and loud. A release must be signed, bound to
+    # the reviewed draft, and rollback-protected — each fail-closed, no waiver (U11 review).
+    if args.approved:
+        if args.allow_unsigned:
+            raise SystemExit(
+                "--allow-unsigned cannot be combined with --approved: an unverified "
+                "(not-for-release) bundle must never produce a governed reviewed_approved "
+                "release. Drop --allow-unsigned and supply --trust-roles, or omit "
+                "--approved to write a local draft."
+            )
+        if not args.approved_hash:
+            raise SystemExit(
+                "--approved requires --approved-hash <hex of the reviewed draft>: a "
+                "release must be bound to the reviewed content. Run without --approved "
+                "first to write the draft and its .draft.sha256, then approve that hash."
+            )
+        if args.rollback_state is None:
+            raise SystemExit(
+                "--approved requires --rollback-state <path>: a governed release must "
+                "enforce anti-rollback (downgrade protection), not silently skip it."
+            )
+        # Signing key checked up front too (before any inference): an unsignable release
+        # must not run at all. build_export treats an empty key as "no key" and would
+        # silently skip signing, so reject the empty/whitespace file here as well.
+        if not args.signing_key_file:
+            raise SystemExit(
+                "--approved requires --signing-key-file: without it the artifact is "
+                "published and ledgered unsigned, then rejected by the aggregator. "
+                "Refusing to release rather than emit an unsigned reviewed_approved report."
+            )
+        _signing_key = bytes.fromhex(Path(args.signing_key_file).read_text().strip())
+        if not _signing_key:
+            raise SystemExit(
+                f"--signing-key-file {args.signing_key_file} is empty: a release must be "
+                "signed. Refusing rather than publishing an unsigned reviewed_approved report."
+            )
 
     # Provision the access-log chain key before anything records into it. Passing the
     # flag sets the variable attestation reads; without either, recording fails closed.
@@ -608,7 +689,10 @@ def main():
     from clif_validate._vendor.eval.bundle import load_bundle
     from clif_validate._vendor.eval.bundle_inference import bundle_predict_fn
 
-    bundle = load_bundle(args.checkpoint)
+    bundle = load_bundle(args.checkpoint,
+                         verify_signature=not args.allow_unsigned,
+                         trust_roles_path=args.trust_roles,
+                         rollback_state_path=args.rollback_state)
     provenance = bundle.provenance
     model = load_checkpoint(args.checkpoint)
 
@@ -636,34 +720,46 @@ def main():
         draft_path = Path(str(args.out) + ".draft")
         draft_path.parent.mkdir(parents=True, exist_ok=True)
         draft_path.write_text(json.dumps(draft, indent=2, sort_keys=True, allow_nan=False))
-        _log.info("DRAFT written (not a release: unsigned, unledgered). Review it, then "
-                  "re-run with --approved to stamp, sign, and release.")
+        draft_hash = _draft_content_hash(draft)
+        Path(str(args.out) + ".draft.sha256").write_text(draft_hash + "\n")
+        _log.info("DRAFT written (not a release: unsigned, unledgered). Content hash "
+                  "%s. Review it, then re-run with --approved --approved-hash %s to bind "
+                  "the release to exactly this content, stamp, sign, and release.",
+                  draft_hash, draft_hash)
         return
 
-    # Fail closed at the CLI: --approved without a signing key would build, publish,
-    # AND ledger a `reviewed_approved` artifact with no signature — the aggregator
-    # refuses it, but only after it is already on disk and recorded (CodeRabbit). An
-    # unsignable release must not happen at all, mirroring the access-log preflight.
-    if not args.signing_key_file:
+    # Defense in depth (U11 review): even though --allow-unsigned + --approved is refused
+    # up front, never let a not-for-release bundle reach a governed release by any path.
+    # `for_release` is False whenever the releaser signature was not verified.
+    if not bundle.for_release:
         raise SystemExit(
-            "--approved requires --signing-key-file: without it the artifact is "
-            "published and ledgered unsigned, then rejected by the aggregator. "
-            "Refusing to release rather than emit an unsigned reviewed_approved report."
+            "refusing to release a not-for-release bundle: its releaser signature was not "
+            "verified (loaded with --allow-unsigned / verify_signature=False). A governed "
+            "reviewed_approved release requires a verified bundle."
         )
-    signing_key = bytes.fromhex(Path(args.signing_key_file).read_text().strip())
-    # An empty or whitespace-only key file parses to b"", which build_export treats as
-    # "no key" (`if signing_key:` is falsy) and silently skips signing — the same
-    # unsigned-release hole as omitting the flag (CodeRabbit). Reject it here.
-    if not signing_key:
+
+    # Approval-by-content-hash (U11), BEFORE any signing or publication. The up-front gate
+    # already guaranteed --approved-hash is present; recompute the draft the reviewer saw
+    # and refuse unless its hash matches. There is no waiver — bind to the draft or do not
+    # release (closes U9's 'approved rerun releases an unreviewed payload' for good).
+    draft = build_export(result["outcomes"], provenance, site_id=args.site_id,
+                         site_role=args.site_role, partition_role=args.partition_role,
+                         release_id=args.release_id)
+    recomputed = _draft_content_hash(draft)
+    approved = args.approved_hash.strip().lower()
+    if not hmac.compare_digest(recomputed, approved):
         raise SystemExit(
-            f"--signing-key-file {args.signing_key_file} is empty: a release must be "
-            "signed. Refusing rather than publishing an unsigned reviewed_approved report."
+            f"approval-by-content-hash MISMATCH: the reviewed draft was approved as "
+            f"{approved}, but this run's payload hashes to {recomputed}. The release "
+            "differs from what was reviewed; refusing to stamp reviewed_approved."
         )
+
+    # Signing key was validated and read up front (see the --approved precondition block).
     payload = build_export(result["outcomes"], provenance, site_id=args.site_id,
                            site_role=args.site_role, partition_role=args.partition_role,
                            release_id=args.release_id,
                            disclosure_status="reviewed_approved",
-                           signing_key=signing_key)
+                           signing_key=_signing_key)
 
     # WRITE-AHEAD (whole-file review, closing greploop review 5 for good): the access
     # record precedes publication, like the ledger intent precedes it. Recording after

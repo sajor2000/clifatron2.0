@@ -47,6 +47,7 @@ VENDOR_FILES = (
     "src/eval/attestation.py",
     "src/eval/clif_auto_labeler.py",
     "src/eval/clif_validate.py",
+    "src/eval/trust.py",
     "src/eval/bundle.py",
     "src/eval/bundle_inference.py",
     "src/eval/synthetic_bundle.py",
@@ -54,6 +55,7 @@ VENDOR_FILES = (
     "src/data/cohort.py",
     "src/data/tokenize.py",
     "src/model/heads.py",
+    "src/model/varlen_attention.py",
     "src/model/head_adapter.py",
 )
 

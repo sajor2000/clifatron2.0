@@ -1,0 +1,117 @@
+# Releaser-to-site trust root and custody governance (U11).
+#
+# TWO THINGS LIVE HERE:
+#   1. `release_signing` — the MACHINE-READ trust root that src/eval/trust.py loads:
+#      the releaser public keys a site will accept a bundle signature from, plus the
+#      revocation lists. This is the anchor that makes a re-hashed replacement bundle
+#      detectable (a self-hashed manifest proves consistency, not provenance).
+#   2. Everything else — the CUSTODY GOVERNANCE (roles, rotation, separation of duties,
+#      where the real private keys and shared secrets live). This is prose the code does
+#      NOT enforce; it is the operational contract a deployment must satisfy. It is
+#      recorded here honestly as governance, not pretended to be a control.
+#
+# FAIL-CLOSED DEFAULT: `trusted_keys` ships EMPTY. src/eval/trust.py::load_trust_roots
+# raises on an empty key set, so this file as shipped verifies nothing — a site MUST
+# provision its own trust root out of band (see `distribution` below) before it can load
+# a governed bundle. There is deliberately no default-trusted key: a key committed to
+# this repo would be a shared secret, which cannot model a trust root.
+
+# Governance metadata only — NOT read by trust.py (load_trust_roots reads just the
+# release_signing block below). Versions this document, not an enforced control.
+policy_version: "1.0.0"
+
+# ---------------------------------------------------------------- machine-read trust root
+release_signing:
+  algorithm: ed25519            # asymmetric: releaser signs with a private key; every
+                                # site verifies with the public key below. Symmetric HMAC
+                                # (used for the site->aggregator report + access-log chain)
+                                # cannot model a trust root — both sides would hold it.
+
+  # Fill this in OUT OF BAND with the releaser's real public key(s). Shape:
+  #   - key_id: releaser-2026-q3         # stable id; the manifest's `signed_by`
+  #     public_key_hex: <64 hex chars>   # 32-byte Ed25519 public key
+  #     valid_from: "2026-07-01"         # governance metadata (not enforced by code)
+  #     custodian: release-engineering
+  trusted_keys: []
+
+  # Signed revocation lists. A revoked signer or bundle fails closed even with an
+  # otherwise-valid signature. Populate as compromises/withdrawals occur.
+  revoked_key_ids: []
+  revoked_bundle_ids: []
+
+# ---------------------------------------------------------------- custody governance (prose)
+# The code does NOT enforce anything below. It is the operational contract for whoever
+# operates the releaser and each site. Recorded so it is owned, not assumed.
+
+roles:
+  releaser:
+    description: >-
+      Holds the release-signing PRIVATE key and signs bundle manifests. Exactly one
+      role may sign; sites accept only key_ids listed in release_signing.trusted_keys.
+    private_key_custody: hardware_security_module     # real private key never on disk
+    separation_of_duties: >-
+      The releaser cannot also approve the disclosure review at a site, and cannot hold
+      any site's report-signing secret or access-log chain key.
+  transfer_channel:
+    description: >-
+      Moves the signed bundle and (separately) the trust root to sites. The bundle may
+      travel over an untrusted channel — its signature is verified on arrival. The trust
+      root must travel over an INDEPENDENT, authenticated out-of-band channel.
+    integrity: signature_on_bundle + out_of_band_trust_root
+  execution_host:
+    description: >-
+      The site node that runs clif-validate. Verifies the bundle signature against its
+      provisioned trust root, enforces anti-rollback, and never exports raw data.
+    trust_root_location: site_provisioned_read_only
+    rollback_state_location: site_local_append_only   # --rollback-state; corrupt => fail closed
+
+key_lifecycle:
+  rotation:
+    release_signing_key: rotate_at_least_annually_or_on_suspicion
+    procedure: >-
+      Generate the new keypair in the HSM, add the new key_id to every site's trust root
+      out of band, sign new bundles with the new key, then revoke the old key_id once no
+      supported bundle depends on it.
+  revocation:
+    trigger: [private_key_compromise, custodian_departure, bundle_withdrawal]
+    mechanism: >-
+      Add the key_id to revoked_key_ids (or the bundle to revoked_bundle_ids) and
+      redistribute the trust root out of band. Sites fail closed on the next load.
+  unsealing_authorization: >-
+    Using the release-signing private key requires two-person authorization at the HSM;
+    no single custodian can sign a bundle alone.
+
+distribution:
+  trust_root:
+    channel: out_of_band_authenticated      # NOT the same channel as the bundle
+    verification: fingerprint_confirmed_with_releaser
+    note: >-
+      A site that cannot independently authenticate the trust root must not load a
+      governed bundle. The shipped empty trusted_keys enforces this by failing closed.
+
+# ---------------------------------------------------------------- inherited U5 secrets (prose)
+# These are SYMMETRIC secrets for the site->aggregator direction; they are NOT part of the
+# release trust root above. Recorded here so their custody is not lost. They are provisioned
+# to the CLI by file path (never committed), and an unkeyed chain/report fails closed.
+site_secrets:
+  access_log_chain_key:
+    purpose: HMAC chain that makes the access log tamper-evident
+    provisioning: CLIF_ACCESS_LOG_KEY_FILE / --access-log-key-file (path to a keyfile)
+    custody: site_local_secret_manager
+    rotation: per_project_window
+    compromise: rotate + re-seal the chain from a fresh genesis; the old log stays sealed
+  report_signing_secret:
+    purpose: HMAC over the exported report the aggregator verifies (site authenticity)
+    provisioning: --signing-key-file (path to a hex keyfile)
+    custody: site_local_secret_manager
+    rotation: per_project_window
+    compromise: rotate + notify the aggregator to distrust the old secret
+
+# ---------------------------------------------------------------- pending governance (not code)
+# Honest exit criteria that are operational, not implementable here (like the derived-model
+# transfer approval). Tracked as pending so they are surfaced, not dropped.
+pending_governance:
+  - real_private_key_custody: where production release-signing keys physically live (HSM)
+  - out_of_band_trust_root_distribution: the concrete channel each site uses
+  - synthetic_bundle_distribution_approval: workflow sign-off to distribute even a
+      synthetic bundle (U11's entry gate names this)

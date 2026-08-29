@@ -42,6 +42,9 @@ SYNTHETIC_OUTCOME_QUERIES = {
     SYNTHETIC_OUTCOME: {"target_index": 0, "tau_bin": 1, "direction": 0},
 }
 SYNTHETIC_SITE = "SYNTH-A"
+SYNTHETIC_KEY_ID = "synthetic-releaser"
+TRUST_ROLES_FILENAME = "trust_roles.yaml"      # written beside the bundle (out of band)
+RELEASER_KEY_FILENAME = "releaser.key"         # the throwaway private key, for re-signing
 
 FIXTURE_COHORT = {
     "contract_version": "1.0.0",
@@ -283,6 +286,16 @@ def build_synthetic_bundle(bundle_dir: str | Path, site_dir: str | Path,
     model = CLIFATRONHeads(load_backbone(str(root)), 10, freeze_backbone=True)
     torch.save(model.state_dict(), root / "head_weights.pt")
 
+    # Sign the fixture like a real release (U11): generate a throwaway Ed25519 keypair,
+    # sign the manifest, and write the trust root + private key BESIDE the bundle (out of
+    # band, as a real trust root is). Tests load with trust_roles_path pointing at it;
+    # reseal helpers re-sign with the same private key.
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+
+    priv = Ed25519PrivateKey.generate()
+    priv_bytes = priv.private_bytes_raw()
+    pub_hex = priv.public_key().public_bytes_raw().hex()
+
     hashes = blob["manifest"]["hashes"]
     write_bundle_manifest(
         root,
@@ -292,17 +305,40 @@ def build_synthetic_bundle(bundle_dir: str | Path, site_dir: str | Path,
         outcome_spec_hash=hashes["outcome_spec"],
         clif_version="2.1",
         outcome_queries=SYNTHETIC_OUTCOME_QUERIES,
+        signing_key=priv_bytes,
+        key_id=SYNTHETIC_KEY_ID,
     )
+    write_synthetic_trust_root(root.parent / TRUST_ROLES_FILENAME, pub_hex)
+    (root.parent / RELEASER_KEY_FILENAME).write_text(priv_bytes.hex())
     return root
+
+
+def write_synthetic_trust_root(path: str | Path, public_key_hex: str) -> Path:
+    """Write a trust_roles.yaml naming the synthetic releaser's public key."""
+    import yaml
+
+    path = Path(path)
+    path.write_text(yaml.safe_dump({
+        "release_signing": {
+            "trusted_keys": [{"key_id": SYNTHETIC_KEY_ID, "public_key_hex": public_key_hex}],
+            "revoked_key_ids": [],
+            "revoked_bundle_ids": [],
+        }
+    }))
+    return path
 
 
 __all__ = [
     "FIXTURE_COHORT",
     "FIXTURE_DATA_CONFIG",
     "FIXTURE_POLICY",
+    "RELEASER_KEY_FILENAME",
+    "SYNTHETIC_KEY_ID",
     "SYNTHETIC_OUTCOME",
     "SYNTHETIC_OUTCOME_QUERIES",
     "SYNTHETIC_SITE",
+    "TRUST_ROLES_FILENAME",
     "build_synthetic_bundle",
     "build_synthetic_site",
+    "write_synthetic_trust_root",
 ]

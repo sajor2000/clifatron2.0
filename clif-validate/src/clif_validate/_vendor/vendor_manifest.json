@@ -2,15 +2,17 @@
   "src/data/cohort.py": "8d8ada65a66f40b94dedc98d8268f77844ba317e7c97bb6b2762150388883a2e",
   "src/data/splits.py": "275ce8bff7bc89a3e6cc00d7431dcb6c8ebbdd3c9ee4817f5702540c7316b105",
   "src/data/tokenize.py": "cdf2c2f8713cc18e68612c7fdb57f36cb36595dbbf8fbc4261d266413efc3e9e",
-  "src/eval/attestation.py": "c915b1fc7891e2f39b55f9190b6a67cdfe11261aa8e6b587fa4c77ad2ff5f30a",
-  "src/eval/bundle.py": "60e2d48b0459d9996ecd04589db21e1c463c36a8e90a4dec49f33671138c174b",
+  "src/eval/attestation.py": "8e95d971b5c6e1fbf4cdaaf8f397ff567c817ce3b671d9ffe98dfea9b5af76d4",
+  "src/eval/bundle.py": "b900e0fef518b8c5ab6fafac7b65c2b5b690b8d72d6e87a27ff18c0bd054a808",
   "src/eval/bundle_inference.py": "661a29dc937924e6c790ab0fee0465cf2475d775e4603374fb86346352d1b6e0",
   "src/eval/clif_auto_labeler.py": "9a4d96356c0373b1162fe542aaa77984646b266b9f8744be0818b52c90347e45",
-  "src/eval/clif_validate.py": "a1967534acc33c10232cde7029f88bf75d0fab2ec80a506368b3df82ae2b72f9",
+  "src/eval/clif_validate.py": "1d1dbd3849f6b76973de12ce743d5bd43c8e2963c3d1438289625b2ddd43781b",
   "src/eval/log_sanitizer.py": "2343b209833702cad94b951b50c0688dfd92a2b02cff2d6079e0fd75dbcbfc8a",
   "src/eval/metrics.py": "90f6284cacc40038f5bf794a99bc70e8f5936e52e1f0955f3ddd10b3b842d1e1",
   "src/eval/schema.py": "eae7b314f9ae3898314eb737f28062aa9eed8c86e3127f98c95a2a9f4b9bc133",
-  "src/eval/synthetic_bundle.py": "85e02ac19c302efb000e7e7a031d9493d6106e6dc5cf68c99b9735d83ebb5e32",
-  "src/model/head_adapter.py": "a0d0bcb1707e62859077b4e945eab5c0bc1ab41887a32ec058994b0666952c2b",
-  "src/model/heads.py": "c8959dd1d772c614b8e1c5571a9c27247307ac34eefd4d742eb4fb282232b965"
+  "src/eval/synthetic_bundle.py": "a804a308875b44907c149702c2012c6ad24cb40008ffd93f1f21cb9f7743b946",
+  "src/eval/trust.py": "ca206619aa6e019f90e957e99b265f984aa3a1a585f0a8ac8d760d9ce9807325",
+  "src/model/head_adapter.py": "502b7d162f11e0aac806d530634670c91b93a0d524c9056e3fb330d827b25a48",
+  "src/model/heads.py": "c8959dd1d772c614b8e1c5571a9c27247307ac34eefd4d742eb4fb282232b965",
+  "src/model/varlen_attention.py": "60cf5cf782f6500472c51644f9132b2f97a2754f51b1795cc4cce3e7d5a086d6"
 }
