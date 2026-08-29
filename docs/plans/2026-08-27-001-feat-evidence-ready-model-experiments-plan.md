@@ -38,6 +38,7 @@ sequencing (U12 gates U6/U7). Ask before U9 completes, not after.
 | U9. Validator core | **Landed** | PR #5. `clif-validate/` package: vendored eval closure, synthetic bundle + fixtures, wired inference path, ceremony-parity + disclosure tests |
 | U11. Release-trust machinery | **Landed** | PR #8 (+ packaging PR #9). Ed25519 releaser->site signature verified in `load_bundle`, signed revocation + anti-rollback (atomic fcntl floor), approval-by-content-hash CLI, `configs/trust_roles.yaml`, `src/eval/trust.py`; packaging = `clif-validate/uv.lock` + `SBOM.json` + `PACKAGING.md`. Operational key custody/distribution stay pending exit criteria (see `trust_roles.yaml` `pending_governance`). |
 | U12. v0 real-site federation proof | Blocked on external onboarding + governance | U9, U11 done. Still blocked on external-site onboarding AND the standing governance question ("may a pre-selection v0 bundle run at an external site?"). A data-free synthetic federation harness (releaser->site->aggregator + cumulative ledger differencing) is the buildable software slice. |
+| **U15. Synthetic federation harness** | **Next — unblocked (U9+U11 landed)** | Chartered + planned 2026-08-29. The data-free software precursor to U12: end-to-end releaser->site->aggregator loop + a new `src/eval/aggregator.py` with a cumulative cross-release differencing ledger, proven to fail closed on synthetic fixtures. Independent of onboarding/governance/GPU. |
 | U6, U7, U8 | Blocked on U9, U12 | See per-unit entry gates; U7 additionally conditional on U12's coverage findings |
 | U10. Release milestone | Gated milestone | Moved out of Implementation Units 2026-08-28; re-planned after selection |
 
@@ -1054,6 +1055,126 @@ read from the actual modules, not assumed.
 - A site operator who is not a project member completes the run from published documentation alone.
 - The returned artifact passes the same disclosure tests as the synthetic case.
 - v0 results are recorded as workflow evidence and are excluded from every selection rule.
+
+---
+
+### U15. Synthetic federation harness — releaser -> site -> aggregator, end to end
+
+**Status:** Chartered + planned 2026-08-29. The **data-free software precursor to U12**: it proves
+the full federation loop composes and fails closed on synthetic fixtures, independent of external-site
+onboarding, the pre-selection governance answer, and GPU. Unblocked now (U9 + U11 landed).
+
+**Goal:** One end-to-end path exercised on synthetic data — a **releaser** signs a bundle (U11
+Ed25519), one or more **sites** validate it and emit signed, disclosure-controlled reports (the
+`clif-validate` CLI), and an **aggregator** verifies every report, maintains a *cumulative*
+append-only disclosure ledger, and blocks a cross-release differencing leak — so U12's real-site run
+is a rehearsed repeat and U10's aggregate milestone has its software half already proven.
+
+**Requirements:** R11, R12, R14, R15 (software-provable slice); de-risks U10, U12.
+
+**Dependencies:** U9 (validator core + synthetic fixtures), U11 (release trust). Both landed.
+
+**Grounding (researched 2026-08-29).**
+- *Federated model-to-data is the established pattern.* Multi-hospital privacy-preserving evaluation
+  where the model travels and only aggregates return is well-precedented (e.g. D-CLEF across five
+  California hospitals, PMC11799213; multi-site federated EHR mortality models, PMC7430624 /
+  PMC12643281). The harness models exactly this shape on synthetic sites.
+- *Cross-release differencing is a real disclosure-control risk*, not a theoretical one — statistical
+  disclosure control treats a cell recoverable by differencing successive releases as a genuine leak
+  (SDC in public-health research, PMC6888099; disclosure-risk assessment, PMC10945743). The
+  aggregator's cumulative ledger + differencing check (`attestation.check_cross_release_differencing`)
+  is the correct defense; the harness must exercise it.
+- *Ed25519 usage is canonical* (pyca/cryptography docs via Context7): raw-bytes sign/verify with
+  `InvalidSignature` handling — exactly what `src/eval/trust.py` already does. No change needed.
+
+**What already exists (build on it, do not reinvent):**
+- Releaser: `src/eval/synthetic_bundle.py` signs a synthetic bundle; `src/eval/trust.py` verifies.
+- Site: `src/eval/clif_validate.py` `main()` runs the full ceremony and already calls
+  `check_cross_release_differencing` (line ~515) against its *own* ledger before export, signs the
+  report (HMAC), and confirms the release.
+- Aggregator-side primitives in `src/eval/attestation.py`: `verify_report`, `ledger_entries`,
+  `read_ledger`, `check_cross_release_differencing`, `confirmed_releases`, `ledger_lock`,
+  `_durably_append`. `src/eval/clif_forest_plot.py::load_site_results` already verifies multi-site
+  signed reports with per-site keys, validates via the schema allow-list, and rejects replayed
+  `release_id`s — the aggregator's *ingestion* half.
+
+**What is new:** there is **no standalone aggregator** that ingests N sites' signed reports and
+maintains a **cumulative cross-release ledger of its own** (the site keeps only its local ledger; an
+aggregator that re-derives ledger entries from each signed report and runs differencing against its
+*own* cumulative record is the independent second line of defense U10 names — it does not trust that a
+site kept its local ledger honestly). And the full releaser->site->aggregator loop is not exercised
+as one integration test.
+
+**Key technical decisions.**
+- **KTD-U15a — a new `src/eval/aggregator.py`, NOT an extension of `clif_forest_plot.py`.** The forest
+  plot is a presentation tool; folding trust + cumulative-ledger logic into it muddies responsibility.
+  The aggregator imports `load_site_results` for ingestion/verification and owns the cumulative
+  ledger + differencing. *Rejected:* growing `clif_forest_plot` (conflates aggregation trust with
+  plotting) and putting the aggregator in `clif-validate/` (the site package — the aggregator runs at
+  the coordinating center, never at a site, so it must NOT be vendored into the site wheel).
+- **KTD-U15b — the deliverable is a data-free integration TEST plus the aggregator module, not a new
+  production CLI.** U12's real-site run is the production path; U15's job is to prove the software
+  composes and fails closed. The harness drives the *real* `clif_validate.main()` and the *real*
+  synthetic releaser — no mocks of the trust boundary.
+- **KTD-U15c — both asymmetric and symmetric trust boundaries are exercised as distinct gates.**
+  Releaser->site is Ed25519 (`trust.py`); site->aggregator is per-site HMAC (`attestation`). The
+  harness holds both and proves each refuses independently, so a pass on one can never substitute for
+  the other.
+- **KTD-U15d — the aggregator's cumulative differencing is its own ledger, re-derived from signed
+  reports.** On each ingest the aggregator recomputes `ledger_entries(payload)` and runs
+  `check_cross_release_differencing` against the aggregator-held ledger before appending — catching a
+  site whose local ledger was reset or absent. Deliberately independent of the site-local check.
+
+**Files.**
+- Create `src/eval/aggregator.py`: `ingest_report(report_path_or_payload, *, signing_keys,
+  cumulative_ledger_path)` -> verify (via `load_site_results` for one report) + aggregator-side
+  `check_cross_release_differencing` against the cumulative ledger + append `ledger_entries` under
+  `ledger_lock`; `aggregate_site_reports(paths, *, signing_keys, cumulative_ledger_path)` -> ingest
+  each then return the schema-validated multi-site panel (reuse `build_forest_table` /
+  `summary_statistics`). Fails closed on tamper / unregistered site / replay / differencing.
+- Create `tests/test_federation_e2e.py`: the end-to-end harness (see Test scenarios). Reuses
+  `build_synthetic_site` / `build_synthetic_bundle` and drives `clif_validate.main()`.
+- Modify (only if needed) `src/eval/clif_forest_plot.py`: expose a single-report verify helper if
+  `load_site_results` cannot be reused cleanly for one report; prefer reuse over new code.
+- No `clif-validate` vendoring change — the aggregator is coordinating-center code, not site code.
+
+**Approach — integration-first (see Execution note).** Write the happy-path end-to-end test first: it
+drives the real releaser + real CLI + the not-yet-existing aggregator and fails at the import. Then
+build `aggregator.py` to make it pass. Then add each fail-closed composition as a red-first test.
+
+**Test scenarios** (all data-free, CPU, synthetic):
+- **Happy path, full loop.** Releaser signs a synthetic bundle; two synthetic sites each run
+  `clif_validate.main()` (draft -> approve with `--approved-hash`, `--rollback-state`, `--trust-roles`)
+  producing signed reports; the aggregator verifies both, appends to the cumulative ledger, and
+  returns a schema-valid multi-site panel. Assert no patient-level fields, no local paths, and one
+  cumulative-ledger entry per released cell.
+- **Tampered report rejected.** Flip a byte in a site's signed report -> aggregator `verify_report`
+  fails closed; nothing enters the panel or the cumulative ledger.
+- **Unattributed site rejected.** A report whose `site_id` has no registered signing key is refused.
+- **Replayed release rejected.** The same signed report ingested twice is refused (would double-count
+  a site).
+- **Aggregator cross-release differencing.** A site emits release 1 that suppresses a cell, then
+  release 2 that would expose it; with the site-local ledger absent/reset, the aggregator's cumulative
+  differencing still blocks the second ingest. This is the load-bearing scenario.
+- **Composition of the two trust gates.** An unsigned/untrusted bundle never yields an approvable
+  report (U11's `--allow-unsigned` cannot reach `--approved`), so it can never enter the aggregate —
+  assert the composition end to end rather than re-testing the gate in isolation.
+
+**Verification / Definition of Done.**
+- The end-to-end happy-path harness passes on synthetic fixtures, data-free, CPU.
+- Every fail-closed path above has a red-first test and refuses.
+- No patient-level field, metric value, or local path appears in any aggregated artifact or the
+  cumulative ledger (same disclosure assertions as the synthetic U9 case).
+- Full data-free suite green; `git diff --check` clean; no real-data output written.
+- Then run `ce-code-review` on the branch (the loop's third phase) and report.
+
+**Execution note:** integration-first. Prove the whole loop end to end before hardening the parts;
+write the happy-path harness as the first failing test, then build the aggregator to green it, then add
+the fail-closed compositions. Every fail-closed gate gets a red-first test. The aggregator's cumulative
+differencing (KTD-U15d) is the highest-value, most-testable piece — do it first after the happy path.
+
+**Not in scope (honest boundary):** real-site onboarding, the pre-selection governance answer, and any
+non-synthetic bundle — those are U12. GPU qualification is U8. U15 is the synthetic software proof only.
 
 ---
 
