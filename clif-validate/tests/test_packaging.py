@@ -10,6 +10,7 @@ so a dependency bump that forgets to re-lock / re-SBOM fails HERE, not at a site
 """
 
 import json
+import os
 import tomllib
 import unittest
 from pathlib import Path
@@ -26,10 +27,23 @@ class PackagingArtifactsTest(unittest.TestCase):
         self.pyproject = PKG_ROOT / "pyproject.toml"
         self.lock = PKG_ROOT / "uv.lock"
         self.sbom = PKG_ROOT / "SBOM.json"
-        for p in (self.pyproject, self.lock, self.sbom):
-            if not p.exists():
-                self.skipTest(f"{p.name} not present (packaging artifacts not built here)")
+        # A missing committed artifact is a FAILURE, not a skip: a packaging change that
+        # deletes uv.lock / SBOM.json must not report green (CodeRabbit). Skipping is
+        # allowed ONLY through an explicit non-packaging opt-out, so a repo checkout that
+        # forgot to regenerate an artifact fails loudly here.
+        if os.environ.get("CLIF_VALIDATE_SKIP_PACKAGING"):
+            self.skipTest("CLIF_VALIDATE_SKIP_PACKAGING set (explicit non-packaging mode)")
+        missing = [p.name for p in (self.pyproject, self.lock, self.sbom) if not p.exists()]
+        self.assertEqual(missing, [], f"committed packaging artifact(s) missing: {missing} "
+                                      "(regenerate per PACKAGING.md)")
         self.declared = tomllib.loads(self.pyproject.read_text())["project"]["dependencies"]
+
+    def _lock_versions(self) -> dict:
+        """name -> version for every locked package EXCEPT the project itself."""
+        lock = tomllib.loads(self.lock.read_text())
+        root = tomllib.loads(self.pyproject.read_text())["project"]["name"]
+        return {_norm(p["name"]): p["version"] for p in lock.get("package", [])
+                if _norm(p["name"]) != _norm(root)}
 
     def _dep_names(self):
         # "torch>=2.4" -> "torch"; strip version/extras/markers.
@@ -59,13 +73,22 @@ class PackagingArtifactsTest(unittest.TestCase):
                                 f"locked cryptography {pkgs['cryptography']} is below the "
                                 "44.0.1 advisory floor set in review")
 
-    def test_sbom_is_valid_cyclonedx_and_lists_cryptography(self):
+    def test_sbom_matches_the_lock_name_and_version(self):
+        """The SBOM must mirror the lock EXACTLY — every locked dependency present with the
+        SAME version — so a dependency update that forgets to regenerate SBOM.json fails
+        here rather than shipping a stale bill of materials (CodeRabbit)."""
         doc = json.loads(self.sbom.read_text())
         self.assertEqual(doc.get("bomFormat"), "CycloneDX")
         self.assertTrue(str(doc.get("specVersion", "")).startswith("1."))
-        names = {_norm(c.get("name", "")) for c in doc.get("components", [])}
-        self.assertIn("cryptography", names,
-                      "SBOM.json is stale — re-generate it from uv.lock (see PACKAGING.md)")
+        sbom = {_norm(c.get("name", "")): c.get("version") for c in doc.get("components", [])}
+        lock = self._lock_versions()
+        missing = sorted(n for n in lock if n not in sbom)
+        mismatched = sorted(f"{n}: lock {lock[n]} != sbom {sbom[n]}"
+                            for n in lock if n in sbom and lock[n] != sbom[n])
+        self.assertEqual(missing, [], f"locked deps absent from SBOM.json: {missing} "
+                                      "(regenerate SBOM.json from uv.lock — see PACKAGING.md)")
+        self.assertEqual(mismatched, [], f"SBOM/lock version drift: {mismatched}")
+        self.assertIn("cryptography", sbom)
 
 
 if __name__ == "__main__":
