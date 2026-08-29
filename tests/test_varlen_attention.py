@@ -109,6 +109,50 @@ class VarlenIsolationTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             gather_anchor_states(flat, torch.tensor([3, 7]))  # 7 == total, out of range
 
+    def test_an_anchor_in_the_wrong_document_fails_closed(self):
+        """In-global-range but wrong-document anchor must not gather a neighbour's row."""
+        from src.model.varlen_attention import gather_anchor_states
+
+        flat = torch.arange(21, dtype=torch.float32).reshape(7, 3)
+        boundaries = [0, 4, 7]  # doc A = [0,4), doc B = [4,7)
+        # Two anchors both inside doc A (indices 1 and 3) — not strictly increasing docs.
+        with self.assertRaisesRegex(ValueError, "document"):
+            gather_anchor_states(flat, torch.tensor([1, 3]), boundaries)
+        # Backwards: anchor in doc B then doc A.
+        with self.assertRaisesRegex(ValueError, "document"):
+            gather_anchor_states(flat, torch.tensor([5, 1]), boundaries)
+        # In-order, one per document: accepted.
+        ok = gather_anchor_states(flat, torch.tensor([3, 5]), boundaries)
+        self.assertEqual(tuple(ok.shape), (2, 3))
+
+    def test_zero_anchors_returns_an_empty_gather(self):
+        from src.model.varlen_attention import gather_anchor_states
+
+        flat = torch.zeros((5, 3))
+        out = gather_anchor_states(flat, torch.tensor([], dtype=torch.long))
+        self.assertEqual(tuple(out.shape), (0, 3))
+
+    def test_a_three_document_pack_isolates_and_gathers_all_three(self):
+        from src.model.varlen_attention import (
+            document_hidden_states,
+            gather_anchor_states,
+        )
+
+        backbone = _tiny_backbone()
+        cu = torch.tensor([0, 3, 5, 9], dtype=torch.int32)  # docs of len 3, 2, 4
+        ids = torch.tensor([3, 4, 5, 6, 7, 8, 9, 10, 11])
+        flat = document_hidden_states(backbone, ids, cu, force_fallback=True)
+        self.assertEqual(flat.size(0), 9)
+        # Mutating the MIDDLE document leaves both neighbours bit-identical.
+        ids2 = torch.tensor([3, 4, 5, 20, 21, 8, 9, 10, 11])
+        flat2 = document_hidden_states(backbone, ids2, cu, force_fallback=True)
+        self.assertTrue(torch.equal(flat[0:3], flat2[0:3]), "doc 0 leaked")
+        self.assertTrue(torch.equal(flat[5:9], flat2[5:9]), "doc 2 leaked")
+        self.assertFalse(torch.allclose(flat[3:5], flat2[3:5]))
+        anchors = gather_anchor_states(flat, torch.tensor([2, 4, 8]),
+                                       [0, 3, 5, 9])
+        self.assertEqual(tuple(anchors.shape), (3, 16))
+
     def test_a_malformed_pack_fails_closed_before_the_model_runs(self):
         from src.model.varlen_attention import validate_pack
 

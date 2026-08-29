@@ -24,6 +24,11 @@ from src.model.heads import (
     ValueRegressionHead,
     next_event_loss,
 )
+from src.model.varlen_attention import (
+    document_hidden_states,
+    gather_anchor_states,
+    validate_pack,
+)
 
 
 def load_backbone(checkpoint: str):
@@ -91,15 +96,11 @@ class CLIFATRONHeads(nn.Module):
         episode-documents can share a packed row without attending across boundaries.
         One anchor row per anchored document — the shape the CR/threshold heads expect.
         """
-        from src.model.varlen_attention import (
-            document_hidden_states,
-            gather_anchor_states,
-        )
-
         flat = document_hidden_states(
             self.backbone, batch["flash_input_ids"], batch["cu_seqlens"],
             frozen=self.frozen, force_fallback=force_fallback)
-        return gather_anchor_states(flat, batch["flash_anchor_idx"])
+        boundaries = validate_pack(batch["cu_seqlens"], flat.size(0))
+        return gather_anchor_states(flat, batch["flash_anchor_idx"], boundaries)
 
     # ---- zero-shot inference (no trained head needed for threshold queries) ----
     def threshold_prob(self, input_ids, attention_mask, target_idx, tau_bin, direction,

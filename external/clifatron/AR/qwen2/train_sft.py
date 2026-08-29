@@ -505,7 +505,14 @@ Examples:
             "attention_mask": torch.tensor([f["attention_mask"] for f in features], dtype=torch.long),
             "labels": torch.tensor([f["labels"] for f in features], dtype=torch.long),
         }
-        if all("segments" in f for f in features):
+        if any("segments" in f for f in features):
+            # `any`, not `all` (review: P1): a MIXED batch — some v2 rows carrying
+            # `segments`, some v1 rows without — must also be rejected. With `all`, a
+            # single v1 row in the batch flipped the condition to False, the segment
+            # metadata was dropped, and the multi-document rows trained with full
+            # cross-document attention: a silent leak that no test covered. The sibling
+            # collator (src/data/collate.py) already fails closed on mixed schemas; this
+            # guard now matches.
             # Document-isolated attention now EXISTS (U13, src/model/varlen_attention.py):
             # the CPU fallback isolates by running one forward per document, and the GPU
             # path lets FlashAttention-2 isolate from per-document position ids. But this

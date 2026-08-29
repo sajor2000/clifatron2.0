@@ -55,9 +55,13 @@ def training_isolation_active(model) -> bool:
     boundaries from per-document position ids) AND a CUDA device + `flash-attn` are
     present. Eager/SDPA Qwen2 SFT has no document-isolation path that avoids a dense
     `[batch, heads, len, len]` mask (prohibited), so a multi-document pack there WOULD
-    leak across documents and must stay rejected. A training entry point that accepts
-    multi-document packs must gate on this — it is the enforced condition behind the
-    fail-closed guard, not a comment beside it.
+    leak across documents and must stay rejected.
+
+    This is the condition a training entry point MUST gate on before it accepts a
+    multi-document pack. No caller wires it into training yet (train_sft.py still
+    rejects multi-doc packs outright); that wiring — and the GPU qualification that
+    proves the FA2 path actually isolates — is U8's L40 packed-attention step. Until
+    then this is a tested predicate ready for that caller, not an active gate.
     """
     return _uses_flash_attention_2(model) and flash_attention_available()
 
@@ -90,6 +94,13 @@ def document_hidden_states(backbone, flash_input_ids, cu_seqlens, *,
 
     `force_fallback=True` pins the per-document CPU path regardless of hardware — the
     test suite uses it so the isolation contract is exercised without a GPU.
+
+    Position convention: this consumes only `flash_input_ids` and `cu_seqlens`. The FA2
+    path builds 0-based per-document position ids (0,1,…,0,1,…) from `cu_seqlens` — do
+    NOT pass the collator's `flash_position_ids` (admission-minute `pos_min`) here: FA2
+    reads position ids to find document boundaries, and minute-valued positions would
+    both mis-signal boundaries and overrun a learned position table. Whoever wires the
+    U8 FA2 training path must respect this.
     """
     total = int(flash_input_ids.shape[0])
     boundaries = validate_pack(cu_seqlens, total)
@@ -97,8 +108,9 @@ def document_hidden_states(backbone, flash_input_ids, cu_seqlens, *,
     ctx = torch.no_grad() if frozen else torch.enable_grad()
     spans = list(zip(boundaries[:-1], boundaries[1:]))
 
-    use_fa2 = (not force_fallback and _uses_flash_attention_2(backbone)
-               and flash_attention_available())
+    # Same gate the training entry point uses — kept in one place (training_isolation_active)
+    # so the two never drift.
+    use_fa2 = not force_fallback and training_isolation_active(backbone)
     if use_fa2:
         # Per-document 0-based position ids (0,1,…,0,1,…) are what FA2 reads to find
         # document boundaries; do not reuse admission-minute `pos_min` here.
@@ -134,12 +146,19 @@ def document_hidden_states(backbone, flash_input_ids, cu_seqlens, *,
     return hidden
 
 
-def gather_anchor_states(flat_hidden, flash_anchor_idx):
+def gather_anchor_states(flat_hidden, flash_anchor_idx, boundaries=None):
     """`[n_anchors, hidden]` — each anchored document's anchor hidden state.
 
     `flash_anchor_idx` indexes the flattened stream (the collator computes it as the
     document's start offset plus its local anchor). An index outside `[0, total)` is a
     corrupted pack and fails closed rather than gathering a neighbouring document's row.
+
+    When `boundaries` (from `validate_pack`) is supplied, the check is stronger: the
+    collator emits at most one anchor per document, in document order, so the anchors'
+    documents must be STRICTLY INCREASING. A global-range-valid anchor that lands in the
+    wrong document (a collator offset bug) would otherwise silently gather another
+    patient's anchor state — the per-document membership check turns that into a hard
+    failure (review: adversarial + cross-model).
     """
     total = flat_hidden.size(0)
     if flash_anchor_idx.numel() == 0:
@@ -151,6 +170,20 @@ def gather_anchor_states(flat_hidden, flash_anchor_idx):
             f"flash_anchor_idx spans [{lo}, {hi}] outside the flattened stream "
             f"[0, {total}); the pack is malformed"
         )
+    if boundaries is not None:
+        import bisect
+
+        prev_doc = -1
+        for idx in (int(x) for x in flash_anchor_idx.tolist()):
+            # The document whose [start, end) contains idx.
+            doc = bisect.bisect_right(boundaries, idx) - 1
+            if doc <= prev_doc:
+                raise ValueError(
+                    f"anchor at flat index {idx} lands in document {doc}, not strictly "
+                    f"after the previous anchor's document {prev_doc}; the pack's "
+                    "anchor offsets disagree with its document boundaries"
+                )
+            prev_doc = doc
     return flat_hidden[flash_anchor_idx.to(flat_hidden.device)]
 
 
