@@ -505,17 +505,32 @@ Examples:
             "attention_mask": torch.tensor([f["attention_mask"] for f in features], dtype=torch.long),
             "labels": torch.tensor([f["labels"] for f in features], dtype=torch.long),
         }
-        if all("segments" in f for f in features):
+        if any("segments" in f for f in features):
+            # `any`, not `all` (review: P1): a MIXED batch — some v2 rows carrying
+            # `segments`, some v1 rows without — must also be rejected. With `all`, a
+            # single v1 row in the batch flipped the condition to False, the segment
+            # metadata was dropped, and the multi-document rows trained with full
+            # cross-document attention: a silent leak that no test covered. The sibling
+            # collator (src/data/collate.py) already fails closed on mixed schemas; this
+            # guard now matches.
+            # Document-isolated attention now EXISTS (U13, src/model/varlen_attention.py):
+            # the CPU fallback isolates by running one forward per document, and the GPU
+            # path lets FlashAttention-2 isolate from per-document position ids. But this
+            # HF Trainer SFT forward is the standard Qwen2 forward — it is NOT yet wired to
+            # feed the flattened + position-id form FA2 needs, and eager/SDPA Qwen2 has no
+            # isolation path that avoids a dense [batch, heads, len, len] mask. So a
+            # multi-document pack HERE would still leak across documents. Keep it fail-
+            # closed until the SFT forward is wired to the isolation core and qualified on
+            # GPU (U8's L40 packed-attention entry gate). The dead pass-through code that
+            # used to sit below this raise was removed — unreachable "handling" beside a
+            # blanket reject is the prose-beside-no-control anti-pattern this repo tracks.
             raise ValueError(
-                "v2 packed records contain multiple document segments; Qwen2 SFT does not yet "
-                "apply block-diagonal attention from document_ids, so training would leak across documents"
+                "v2 packed records contain multiple document segments; this Qwen2 SFT "
+                "forward is not yet wired to the U13 document-isolation path "
+                "(src/model/varlen_attention.py), so training would leak across "
+                "documents. Pack one document per row until the FA2 training path is "
+                "qualified (U8 L40 gate)."
             )
-            batch["segments"] = [f["segments"] for f in features]
-            batch["document_ids"] = torch.tensor(
-                [f["document_ids"] for f in features], dtype=torch.long
-            )
-            if all("packed_schema_version" in f for f in features):
-                batch["packed_schema_version"] = features[0]["packed_schema_version"]
         return batch
 
     # Initialize Trainer with packing support

@@ -33,7 +33,7 @@ sequencing (U12 gates U6/U7). Ask before U9 completes, not after.
 | U4. Training engine, checkpoints, manifest | Landed | `src/train/engine.py`, `src/train/checkpoint.py`, `src/train/manifest.py`, `src/train/pretrain.py` |
 | Value-statistics follow-up | Landed | `src/data/value_stats.py`, `tests/test_value_stats.py` |
 | **U4 follow-up: hardware + resume verification** | **Unowned — blocks U6** | Owns `tests/test_checkpoint.py` (absent), a resume-*equivalence* test, and a two-process DDP smoke test. Completion artifact for P5-P7. |
-| **U2 follow-up: block-diagonal/varlen attention** | **Unowned — blocks U8** | Qwen2/Qwen3 varlen path. U8's entry gate qualifies packed attention that nothing builds. |
+| **U13. Varlen/document-isolated attention** (was "U2 follow-up") | **Implemented — CPU-qualified; GPU/U8 pending; blocks U8** | Model-consumption path, per-document CPU fallback, anchor gather, and tests landed (PR #6). CPU isolation + equivalence proven data-free. The FA2 GPU path is architecture-gated (Qwen2/Qwen3) and stays unqualified until U8's L40 run; the multi-doc training reject is intentionally NOT lifted (see approach). |
 | U5. Evaluation, calibration, validation gate | Landed | PR #4 / `53e3c2c`; suite 266 passed, 3 skipped. Grew well beyond plan: `src/eval/schema.py`, `attestation.py`, `log_sanitizer.py` |
 | U9. Validator core | **Next** | `clif-validate/` does not exist; deepened 2026-08-29 with U5's execution-taught packaging facts |
 | U11. Release-trust machinery | Blocked on U9 | Split out of the original U9 on 2026-08-28 |
@@ -49,7 +49,8 @@ Two caveats carried forward from the handoff, both still open:
 - Real site data still needs `ce-data-qa` before any outcome prevalence, unit mapping, storetime
   field, or follow-up assumption can be relied on.
 - Block-diagonal/varlen attention for Qwen2/Qwen3 training is not implemented. Multi-document
-  packed rows are deliberately rejected in dense training paths until it is.
+  packed rows are deliberately rejected in dense training paths until it is. **Chartered as U13**
+  (deepened 2026-08-29); the data side already emits the varlen view, so U13 is the model path.
 - **"Landed" means code merged, not verification complete.** U4 is the case that separates them:
   its own Verification calls for a 2 x L40 qualification report, one-batch overfit, resume
   equivalence, and DDP coverage, and none of those have run. `tests/test_checkpoint.py` does not
@@ -416,7 +417,7 @@ flowchart TB
 - Emit threshold at-risk and censor-time fields that distinguish observed non-crossing through horizon, right censoring before horizon, not ascertainable, unsupported target, and prevalence at the anchor.
 - Pad sequences and soft assignments, emit explicit attention/target masks and anchor indices, and seed threshold sampling from sample ID, epoch, and run seed.
 - Keep workers CPU-only and make the collator top-level/picklable; device transfer remains the trainer's responsibility.
-- Use a variable-length FlashAttention-compatible causal path driven by cumulative document lengths for Qwen2/GPT2 adapters; prohibit dense `[batch, heads, length, length]` isolation masks and require a tested fallback that preserves isolation for data-free CPU checks. **Deferred out of U2's landed scope — see the U4/U2 follow-up row in Execution Status.** U2 shipped the fail-closed rejection of multi-document packed rows instead; the varlen path itself is unbuilt and U8's entry gate depends on qualifying it.
+- Use a variable-length FlashAttention-compatible causal path driven by cumulative document lengths for Qwen2/GPT2 adapters; prohibit dense `[batch, heads, length, length]` isolation masks and require a tested fallback that preserves isolation for data-free CPU checks. **Deferred out of U2's landed scope — chartered as U13 (deepened 2026-08-29).** U2 shipped the fail-closed rejection of multi-document packed rows and the collator's varlen view; U13 builds the model-consumption path and lifts the rejection. U8's entry gate depends on qualifying it.
 
 **Patterns to follow:**
 - Packed dataset and sequence assembly in `external/clifatron/AR/qwen2/data/packed_dataset.py` and `external/clifatron/AR/qwen2/scripts/pack_sequences.py`.
@@ -764,18 +765,75 @@ Verified by reading `main` at `0d3eae0` on 2026-08-28. These are the concrete ta
 - The TextCode arm contains no synthetic fallback descriptions in evidence-producing runs.
 - Portability reports distinguish event coverage, input transfer, and finite output-vocabulary limitations.
 
+### U13. Build and qualify the variable-length, document-isolated attention path
+
+**Goal:** Let multiple episode-documents share one packed row without attending across document boundaries, then lift the fail-closed multi-document rejection — so packed training/inference stops wasting a row per document and U8's packed-attention entry gate is satisfied.
+
+**Requirements:** R6 (leakage-safe: no cross-document attention), R9, R16; completes U2's deferred varlen bullet and U4/R17's "packed attention" L40 qualification line.
+
+**Dependencies:** U2 (the data side is already built — see below). Unblocks U8.
+
+**Status:** Chartered and deepened 2026-08-29 (was the "U2 follow-up: block-diagonal/varlen attention" row). This is the highest-value unblocked unit; independent of the U9/U11/U12 validator/governance chain, so it proceeds off `main` in parallel.
+
+**Verified current state (re-verify cheaply at execution):**
+- **Data side is DONE.** `src/data/collate.py::collate_model_samples` already emits the flattened varlen view: `flash_input_ids`, `flash_position_ids` (per-document position ids that reset to 0 at each document start), `cu_seqlens` (int32 cumulative document lengths), `max_seqlen`, `document_ids` (`-1`-padded per-token doc id), `segment_map` (`[row, start, end]` per document), and `flash_anchor_idx` (each document's anchor offset into the flattened stream). Confirm the shapes before consuming them.
+- **Model side (was NOT built at charter time; now IMPLEMENTED in PR #6).** `src/model/varlen_attention.py` consumes `flash_input_ids` / `cu_seqlens` / `flash_anchor_idx`; `CLIFATRONHeads.anchor_states_from_pack` returns per-document anchors. The row-wise `anchor_state`/`hidden_states` dense path is unchanged for the non-packed case.
+- **Training fails closed on multi-doc rows — kept fail-closed on purpose (implementation status).** `external/clifatron/AR/qwen2/train_sft.py` still rejects multi-document packs; the reject was NOT lifted, because wiring the SFT training forward to the isolation core is GPU work qualified under U8 (removing the guard without it re-introduces the leak). The dead pass-through code below the raise was removed.
+
+**Approach:**
+- **One contract, two execution modes** over the fields `collate.py` already emits. The batch's flattened varlen view is authoritative; both modes must produce the same document-isolated hidden states and the same per-document anchor gather.
+  - **(a) GPU FlashAttention-2 path (Qwen2/Qwen3 ONLY).** Per Hugging Face's packing-with-FA2 guidance (see Sources), isolating packed documents under FA2 is "limited to providing the `position_ids`" — FA2 reads per-document-resetting position ids to derive boundaries internally, no dense mask. **Architecture-gated (as implemented):** only backbones that isolate from position ids alone (`config.model_type` in {`qwen2`, `qwen3`}) may take this path. Architectures needing explicit boundary arguments — notably **Qwen3-Next** (`cu_seq_lens_q` / `seq_idx`) — are excluded and fall back, or the position-ids-only path would leak across documents for them. The path also requires the model's parameters actually on CUDA and `flash-attn` importable, and derives 0-based per-document position ids from `cu_seqlens` (NOT the collator's admission-minute `flash_position_ids`).
+  - **(b) CPU fallback (the real path for GPT2, the test backbone) — structural per-document forwards.** As implemented, isolation is realized by running **one backbone forward per non-empty `cu_seqlens[start:end]` span**, concatenating the outputs at their flattened offsets. This is isolated by construction — cross-document attention is impossible — and no dense `[batch, heads, length, length]` mask is ever materialized (a single eager/SDPA call over the concatenated stream would require one, which is prohibited).
+- **Per-document anchor gather.** Select each document's anchor hidden state via `flash_anchor_idx` into the flattened stream, returning `[documents, hidden]`. **Cardinality contract:** the collator emits exactly one non-sentinel anchor per *eligible* document (a segment with `anchor_offset`), in the same order as `document_labels`; the gather asserts the anchors' documents are strictly increasing, and a caller holding `document_labels` must require equal lengths before gathering so an anchor/label misalignment fails closed rather than scoring the wrong document. Both modes return identical anchors for the same input.
+- **Sequence, isolation last.** Lift `train_sft.py`'s multi-document rejection and relax `dataset.py`'s single-document enforcement **only after** the isolation test passes on real multi-document packs. Until then the stopgap stays fail-closed.
+- **Data-free by default.** Tests use a tiny GPT2 backbone, synthetic packed rows, CPU. The FA2/GPU path is exercised behind a `torch.cuda.is_available()` + `flash-attn`-importable guard and is never required for the suite to pass; when the guard is unmet, that path's test skips (not passes silently).
+
+**Patterns to follow:**
+- Field names and shapes emitted by `src/data/collate.py::collate_model_samples` (the varlen view) and consumed by `src/model/head_adapter.py` / `src/train/run_arm.py`.
+- The fail-closed-then-lift discipline U9 used for its deferred seams: keep the guard until the qualifying test is green, then remove it in the same change that adds the test.
+
+**Files:**
+- Modify: `src/model/head_adapter.py` (varlen-aware `hidden_states` dispatch + per-document anchor gather)
+- Create: `src/model/varlen_attention.py` (block-diagonal bias builder from `cu_seqlens`/`document_ids`; mode dispatch)
+- Modify: `src/data/collate.py` (only if a shape/contract gap surfaces; the fields already exist)
+- Modify: `external/clifatron/AR/qwen2/train_sft.py` (wire the FA2 path; lift the multi-doc rejection last)
+- Modify: `src/data/dataset.py` (relax single-document enforcement once qualified)
+- Create: `tests/test_varlen_attention.py`
+- Modify: `tests/test_collate.py` (assert the varlen fields the model consumes)
+
+**Execution note:** Test-first on the isolation invariant — write the failing "changing document A's tokens must not move document B's hidden states/anchor" test against the block-diagonal fallback before wiring the model path, and keep the multi-doc rejection fail-closed until it is green.
+
+**Test scenarios:**
+- Happy path: a packed row of two synthetic documents produces `[documents, hidden]` anchors via `flash_anchor_idx`, each anchor equal to that document's last-real-token hidden state.
+- Isolation (load-bearing): mutating the tokens of document A leaves document B's hidden states, anchor state, and loss bit-identical under the block-diagonal fallback. `Covers` the U2 test scenario "changing tokens in one packed document cannot change another document's hidden states or losses".
+- Equivalence: for a single-document packed row, the varlen path and the existing dense `attention_mask` path produce numerically equivalent hidden states and anchor state (proving the new path is a faithful generalization, not a behavior change).
+- Edge case: a document of length 1 and a document spanning the full row both gather the correct anchor; `cu_seqlens` boundaries are respected with no off-by-one at document starts.
+- Edge case: causality holds within a document — a token cannot attend to later tokens in its own document (the block is causal, not full).
+- Error path: a `flash_anchor_idx` outside its document's `[cu_seqlens[i], cu_seqlens[i+1])` range, or a `document_ids` / `cu_seqlens` disagreement, fails closed before model execution.
+- Guarded integration: when CUDA + `flash-attn` are present, the FA2 path and the CPU fallback agree on per-document anchors for the same pack (skipped otherwise, never passed silently).
+- Sequencing: with the multi-doc rejection still in place, a multi-document pack is refused; after U13 lands, the same pack is accepted and isolated.
+
+**Verification:**
+- The isolation and equivalence tests pass on CPU with a tiny GPT2 and synthetic packs; the suite stays data-free and green without a GPU.
+- The multi-document rejection in `train_sft.py` is lifted only in the change that also adds the passing isolation test; no dense `[batch, heads, length, length]` production mask is introduced.
+- U8's entry-gate "packed attention" line (R17) can now be qualified on real hardware.
+
+---
+
 ### U8. Run scaling, label-efficiency, and multi-horizon studies
 
 **Goal:** Quantify where capacity, local data volume, labeled sample size, and forecast distance help or fail under the qualified baseline.
 
 **Requirements:** R9, R10, R12, R13, R14, R15, R17
 
-**Dependencies:** U5, U6, U9; U7 for inclusion of the PORTER arm.
+**Dependencies:** U5, U6, U9, U13 (packed attention); U7 for inclusion of the PORTER arm.
 
 **Entry gate — do not start until all hold:**
 - U5 and U6 complete; U7 complete only if the PORTER arm is being included.
+- U13 complete: the varlen/document-isolated attention path is built and its isolation test is
+  green, so "packed attention" is a real capability rather than a rejected one.
 - Real-training preconditions below satisfied, plus U4's L40 qualification (R17): data loading,
-  packed attention, memory, throughput, checkpoint overhead, and DDP efficiency measured on
+  packed attention (U13), memory, throughput, checkpoint overhead, and DDP efficiency measured on
   2 x L40 before the matrix launches.
 
 > **Gated content.** The three substudies (capacity/data scaling, label efficiency, multi-horizon)
@@ -1165,4 +1223,5 @@ Every unit carries the same exit criteria, applied before it is considered done:
 - PyTorch data loading: https://docs.pytorch.org/docs/stable/data.html
 - PyTorch DistributedDataParallel: https://docs.pytorch.org/docs/stable/generated/torch.nn.parallel.DistributedDataParallel.html
 - PyTorch AMP examples: https://docs.pytorch.org/docs/stable/notes/amp_examples.html
+- Hugging Face Transformers — "Improving Hugging Face Training Efficiency Through Packing with Flash Attention" (packing-with-FA2), https://huggingface.co/blog/packing-with-FA2. Grounds U13: packing under Flash Attention 2 without cross-document contamination is "limited to providing the `position_ids`" (per-document reset); Qwen2 is on the supported-models list. Retrieved 2026-08-29 via Context7.
 - PyTorch reproducibility: https://docs.pytorch.org/docs/stable/notes/randomness.html
