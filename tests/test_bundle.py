@@ -30,6 +30,7 @@ from src.eval.bundle import (
 )
 from src.eval.clif_validate import ArtifactMismatch
 from src.eval.synthetic_bundle import (
+    SYNTHETIC_KEY_ID,
     SYNTHETIC_OUTCOME,
     build_synthetic_bundle,
     build_synthetic_site,
@@ -68,6 +69,9 @@ class _BundleFixtureCase(unittest.TestCase):
             cls.episodes = build_synthetic_site(cls.site)
             cls.bundle_dir = build_synthetic_bundle(cls.work / "bundle", cls.site,
                                                     cls.episodes)
+            # The signed fixture writes its trust root + releaser key beside the bundle.
+            cls.trust_roles = cls.work / "trust_roles.yaml"
+            cls.releaser_key = bytes.fromhex((cls.work / "releaser.key").read_text())
         except BaseException:
             os.chdir(cls._old_cwd)
             if cls._old_tz is None:
@@ -106,7 +110,7 @@ class _BundleFixtureCase(unittest.TestCase):
 
 class BundleContractTest(_BundleFixtureCase):
     def test_load_bundle_happy_path(self):
-        b = load_bundle(self.bundle_dir)
+        b = load_bundle(self.bundle_dir, trust_roles_path=self.trust_roles)
         self.assertEqual(b.provenance["model_bundle_id"], "synthetic-fixture")
         self.assertEqual(b.provenance["clif_version"], "2.1")
         self.assertIn(SYNTHETIC_OUTCOME, b.outcome_queries)
@@ -175,7 +179,7 @@ class BundleContractTest(_BundleFixtureCase):
                                             "minimum_cell_size: 17")
         )
         manifest = json.loads((pinned / BUNDLE_MANIFEST).read_text())
-        write_bundle_manifest(  # re-seal over the edited policy
+        write_bundle_manifest(  # re-seal (and re-sign) over the edited policy
             pinned,
             model_bundle_id=manifest["model_bundle_id"],
             model_version=manifest["model_version"],
@@ -183,8 +187,10 @@ class BundleContractTest(_BundleFixtureCase):
             outcome_spec_hash=manifest["outcome_spec_hash"],
             clif_version=manifest["clif_version"],
             outcome_queries=manifest["outcome_queries"],
+            signing_key=self.releaser_key,
+            key_id=SYNTHETIC_KEY_ID,
         )
-        load_bundle(pinned)
+        load_bundle(pinned, trust_roles_path=self.trust_roles)
         self.assertEqual(S.min_cell_size(), 17)
         self.assertEqual(S.curve_release_min(), 85)
 
@@ -284,7 +290,8 @@ class BundleContractTest(_BundleFixtureCase):
     def test_pin_policy_false_leaves_process_state_untouched(self):
         """The opt-out branch a comparison/introspection caller uses."""
         before = os.environ.get(S.POLICY_OVERRIDE_ENV)
-        load_bundle(self.bundle_dir, pin_policy=False)
+        load_bundle(self.bundle_dir, pin_policy=False,
+                    trust_roles_path=self.trust_roles)
         self.assertEqual(os.environ.get(S.POLICY_OVERRIDE_ENV), before)
 
 
@@ -296,7 +303,7 @@ class BundleInferenceTest(_BundleFixtureCase):
         super().setUpClass()
         from src.eval.clif_validate import load_checkpoint
 
-        cls.bundle = load_bundle(cls.bundle_dir)
+        cls.bundle = load_bundle(cls.bundle_dir, trust_roles_path=cls.trust_roles)
         cls.model = load_checkpoint(str(cls.bundle_dir))
 
     def _predict_fn(self, outcome_cfgs, shard="shards_default"):
@@ -405,17 +412,13 @@ class RepoCliEndToEndTest(_BundleFixtureCase):
     the bundle and completes the approved release ceremony.
     """
 
-    def test_main_runs_the_wired_inference_path_and_releases(self):
-        from unittest import mock
-
-        from src.eval import attestation as attest
-        from src.eval.clif_validate import main
-
+    def _cli_argv(self, *extra):
         signing_key = self.work / "cli_signing.key"
         signing_key.write_text("cd" * 32)
         access_key = self.work / "cli_access.key"
         access_key.write_bytes(b"repo-cli-chain-key")
-        argv = [
+        self._cli_signing_key = signing_key
+        return [
             "clif_validate",
             "--checkpoint", str(self.bundle_dir),
             "--data", str(self.site),
@@ -428,9 +431,26 @@ class RepoCliEndToEndTest(_BundleFixtureCase):
             "--shard-dir", "output/intermediate_phi/repo_cli_shards",
             "--signing-key-file", str(signing_key),
             "--access-log-key-file", str(access_key),
-            "--approved",
+            "--trust-roles", str(self.trust_roles),
+            *extra,
         ]
-        with mock.patch("sys.argv", argv):
+
+    def test_main_runs_the_wired_inference_path_and_releases(self):
+        """The full U9 ceremony under U11's trust + content-hash gates: verify the
+        releaser signature, write a draft, then release exactly the reviewed draft."""
+        from unittest import mock
+
+        from src.eval import attestation as attest
+        from src.eval.clif_validate import main
+
+        # Step 1: the draft run (no --approved) writes the draft + its content hash.
+        with mock.patch("sys.argv", self._cli_argv()):
+            main()
+        draft_hash = Path("output/final_no_phi/repo_cli.json.draft.sha256").read_text().strip()
+        self.assertEqual(len(draft_hash), 64)
+
+        # Step 2: approve THAT draft by its hash — the release is bound to reviewed content.
+        with mock.patch("sys.argv", self._cli_argv("--approved", "--approved-hash", draft_hash)):
             main()
         out = Path("output/final_no_phi/repo_cli.json")
         payload = json.loads(out.read_text())
@@ -438,12 +458,47 @@ class RepoCliEndToEndTest(_BundleFixtureCase):
         self.assertEqual(payload["release_id"], "rel-repo-cli")
         self.assertIn(SYNTHETIC_OUTCOME, payload["outcomes"])
         self.assertTrue(
-            attest.verify_report(payload, bytes.fromhex(signing_key.read_text()))
+            attest.verify_report(payload, bytes.fromhex(self._cli_signing_key.read_text()))
         )
         self.assertEqual(
             attest.confirmed_releases(Path("output/intermediate_phi/repo_cli_ledger.jsonl")),
             {"rel-repo-cli"},
         )
+
+    def test_approved_with_a_wrong_content_hash_fails_closed(self):
+        """A release whose payload does not match the approved draft hash is refused."""
+        from unittest import mock
+
+        from src.eval.clif_validate import main
+
+        argv = self._cli_argv("--approved", "--approved-hash", "0" * 64)
+        with mock.patch("sys.argv", argv):
+            with self.assertRaises(SystemExit):
+                main()
+        self.assertFalse(Path("output/final_no_phi/repo_cli.json").exists())
+
+    def test_approved_without_hash_or_waiver_fails_closed(self):
+        """--approved must bind to reviewed content or explicitly waive it."""
+        from unittest import mock
+
+        from src.eval.clif_validate import main
+
+        with mock.patch("sys.argv", self._cli_argv("--approved")):
+            with self.assertRaises(SystemExit):
+                main()
+        self.assertFalse(Path("output/final_no_phi/repo_cli.json").exists())
+
+    def test_a_governed_load_without_a_trust_root_fails_closed(self):
+        """Omitting --trust-roles (and --allow-unsigned) refuses to load — no anchor."""
+        from unittest import mock
+
+        from src.eval.clif_validate import main
+
+        argv = [a for a in self._cli_argv() if a not in ("--trust-roles",)]
+        argv = [a for a in argv if a != str(self.trust_roles)]
+        with mock.patch("sys.argv", argv):
+            with self.assertRaises(ArtifactMismatch):
+                main()
 
 
 if __name__ == "__main__":

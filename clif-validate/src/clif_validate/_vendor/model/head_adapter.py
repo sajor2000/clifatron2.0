@@ -24,6 +24,11 @@ from clif_validate._vendor.model.heads import (
     ValueRegressionHead,
     next_event_loss,
 )
+from clif_validate._vendor.model.varlen_attention import (
+    document_hidden_states,
+    gather_anchor_states,
+    validate_pack,
+)
 
 
 def load_backbone(checkpoint: str):
@@ -82,6 +87,20 @@ class CLIFATRONHeads(nn.Module):
             anchor_idx = attention_mask.long().sum(1) - 1   # last real token
         idx = torch.arange(H.size(0), device=H.device)
         return H[idx, anchor_idx]                          # [B, d]
+
+    def anchor_states_from_pack(self, batch, *, force_fallback: bool = False):
+        """Per-document anchor states `[documents, d]` from a packed varlen batch (U13).
+
+        Consumes the collator's flattened view (`flash_input_ids`, `cu_seqlens`,
+        `flash_anchor_idx`) and runs the document-isolated attention path, so multiple
+        episode-documents can share a packed row without attending across boundaries.
+        One anchor row per anchored document — the shape the CR/threshold heads expect.
+        """
+        flat = document_hidden_states(
+            self.backbone, batch["flash_input_ids"], batch["cu_seqlens"],
+            frozen=self.frozen, force_fallback=force_fallback)
+        boundaries = validate_pack(batch["cu_seqlens"], flat.size(0))
+        return gather_anchor_states(flat, batch["flash_anchor_idx"], boundaries)
 
     # ---- zero-shot inference (no trained head needed for threshold queries) ----
     def threshold_prob(self, input_ids, attention_mask, target_idx, tau_bin, direction,
