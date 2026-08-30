@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 import sys
 import tempfile
 from pathlib import Path
@@ -31,21 +32,23 @@ _SITE_KEYS = {"SITE-A": b"synthetic-site-a-report-secret",
 _ACCESS_KEY = b"synthetic-access-chain-key"
 
 
-def _reset_policy_pin() -> None:
-    os.environ.pop(_schema.POLICY_OVERRIDE_ENV, None)
-    _schema.min_cell_size.cache_clear()
-    _schema.max_dropped_fraction.cache_clear()
+# The directory that contains the `src` package, so a child process can `-m src.eval...`
+# regardless of its working directory.
+_REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
-def _run_site(bundle_dir: Path, site: Path, episodes: Path, trust_roles: Path,
+def _run_site(root: Path, bundle_dir: Path, site: Path, episodes: Path, trust_roles: Path,
               access_key: Path, keyfiles: dict, site_id: str, release_id: str,
               tag: str) -> Path:
-    """Drive the real site CLI through the governed draft -> approve ceremony."""
-    from src.eval.clif_validate import main
+    """Drive the real site CLI as a CHILD PROCESS through the governed draft -> approve ceremony.
 
+    Running the CLI out-of-process is both faithful (a real site IS a separate process) and the
+    clean isolation boundary: the CLI's `sys.argv` and the environment variables it sets (e.g.
+    CLIF_ACCESS_LOG_KEY_FILE) live and die in the child, never touching this process.
+    """
     out = f"output/final_no_phi/{tag}.json"
     base = [
-        "clif_validate",
+        sys.executable, "-m", "src.eval.clif_validate",
         "--checkpoint", str(bundle_dir),
         "--data", str(site),
         "--episode-artifact", str(episodes),
@@ -60,41 +63,39 @@ def _run_site(bundle_dir: Path, site: Path, episodes: Path, trust_roles: Path,
         "--trust-roles", str(trust_roles),
         "--rollback-state", f"output/intermediate_phi/{tag}_rollback.json",
     ]
-    saved = sys.argv
-    try:
-        sys.argv = base  # draft: writes <out>.draft + <out>.draft.sha256
-        main()
-        draft_hash = Path(out + ".draft.sha256").read_text().strip()
-        # approve: bound to the reviewed draft hash — the GOVERNED path, never the unsigned escape hatch.
-        sys.argv = base + ["--approved", "--approved-hash", draft_hash]
-        main()
-    finally:
-        sys.argv = saved
-        _reset_policy_pin()
-    return Path(out)
-
-
-# The site CLI mutates these process-global env vars; snapshot and restore them so importing
-# and calling this function never contaminates the caller's process.
-_TOUCHED_ENV = (_schema.POLICY_OVERRIDE_ENV, "CLIF_ACCESS_LOG_KEY_FILE")
+    # cwd=root so the CLI's relative output paths land under the throwaway dir; PYTHONPATH so
+    # `-m src.eval.clif_validate` resolves against the repo whatever the cwd is.
+    env = {**os.environ,
+           "PYTHONPATH": (str(_REPO_ROOT) + os.pathsep
+                          + os.environ.get("PYTHONPATH", "")).rstrip(os.pathsep)}
+    subprocess.run(base, check=True, cwd=root, env=env,  # draft
+                   capture_output=True, text=True)
+    draft_hash = (root / (out + ".draft.sha256")).read_text().strip()
+    # approve: bound to the reviewed draft hash — the GOVERNED path, never the unsigned escape hatch.
+    subprocess.run(base + ["--approved", "--approved-hash", draft_hash],
+                   check=True, cwd=root, env=env, capture_output=True, text=True)
+    return root / out
 
 
 def run_synthetic_federation() -> dict:
     """Run the full synthetic loop and return the aggregate panel. Data-free, CPU.
 
     Builds synthetic fixtures + a signed bundle, runs two synthetic sites through the real
-    governed site CLI, and aggregates their signed reports. Returns the aggregator's panel.
+    governed site CLI (each as a child process), and aggregates their signed reports.
 
-    Always runs inside a throwaway `TemporaryDirectory` — never a caller-supplied path, so it
-    cannot overwrite real files — and restores the process CWD and the environment variables
-    the site CLI touches on every exit path, so it leaves the caller's process unchanged.
+    Everything runs inside a throwaway `TemporaryDirectory` — never a caller-supplied path, so it
+    cannot overwrite real files. The two site CLIs run out-of-process, so their `sys.argv` and env
+    mutations never reach this process. The in-process fixture builders write intermediate
+    artifacts under `output/` relative to the cwd, so this briefly changes the process cwd and the
+    `POLICY_OVERRIDE_ENV` pin and restores both on every exit path. It is a single-shot
+    reproduction entrypoint, not intended for concurrent in-process use.
     """
-    saved_env = {k: os.environ.get(k) for k in _TOUCHED_ENV}
-    old_cwd = os.getcwd()
+    saved_cwd = os.getcwd()
+    saved_policy = os.environ.get(_schema.POLICY_OVERRIDE_ENV)
     with tempfile.TemporaryDirectory() as name:
         root = Path(name)
         try:
-            os.chdir(root)  # the artifact policy classifies shards relative to CWD
+            os.chdir(root)  # the fixture builders write output/ relative to cwd
             site = root / "site"
             episodes = build_synthetic_site(site)
             bundle_dir = build_synthetic_bundle(root / "bundle", site, episodes)
@@ -107,21 +108,28 @@ def run_synthetic_federation() -> dict:
                 kf.write_text(secret.hex())
                 keyfiles[sid] = kf
 
-            reports = []
-            for sid, rel, tag in (("SITE-A", "rel-a", "site_a"), ("SITE-B", "rel-b", "site_b")):
-                reports.append(_run_site(bundle_dir, site, episodes, trust_roles, access_key,
-                                         keyfiles, sid, rel, tag))
+            reports = [_run_site(root, bundle_dir, site, episodes, trust_roles, access_key,
+                                 keyfiles, sid, rel, tag)
+                       for sid, rel, tag in (("SITE-A", "rel-a", "site_a"),
+                                             ("SITE-B", "rel-b", "site_b"))]
+
+            # The aggregator reads the disclosure floor (min_cell_size) from the pinned policy.
+            # The site CLIs pinned it in their own processes; pin the same bundle policy here so
+            # the aggregate uses the bundle's floor, not whatever POLICY_OVERRIDE_ENV the caller
+            # happened to have. Restored in the finally below.
+            os.environ[_schema.POLICY_OVERRIDE_ENV] = str(bundle_dir / "artifact_policy.yaml")
+            _schema.min_cell_size.cache_clear()
+            _schema.max_dropped_fraction.cache_clear()
 
             return _agg.aggregate_site_reports(
                 [str(p) for p in reports], signing_keys=_SITE_KEYS,
-                cumulative_ledger_path="output/intermediate_phi/aggregate_ledger.jsonl")
+                cumulative_ledger_path=str(root / "output/intermediate_phi/aggregate_ledger.jsonl"))
         finally:
-            os.chdir(old_cwd)
-            for key, prior in saved_env.items():
-                if prior is None:
-                    os.environ.pop(key, None)
-                else:
-                    os.environ[key] = prior
+            os.chdir(saved_cwd)
+            if saved_policy is None:
+                os.environ.pop(_schema.POLICY_OVERRIDE_ENV, None)
+            else:
+                os.environ[_schema.POLICY_OVERRIDE_ENV] = saved_policy
             _schema.min_cell_size.cache_clear()
             _schema.max_dropped_fraction.cache_clear()
 

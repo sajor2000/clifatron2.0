@@ -3,20 +3,49 @@
 Smoke-first: the entrypoint's value is that it RUNS the full releaser -> site -> aggregator
 loop on synthetic fixtures and yields a two-site aggregate with no patient-level data. The
 deep fail-closed coverage lives in tests/test_federation_e2e.py (the gates this composes);
-this test only proves the reproduction wires them and stays governed + data-free.
+this test only proves the reproduction wires them, stays governed + data-free, and leaves the
+caller's process untouched.
 """
 
 import json
+import os
+import sys
 import unittest
 from pathlib import Path
 
 from src.eval import reproduce_synthetic as repro
+from src.eval import schema as S
+
+_SENTINEL_POLICY = "/sentinel/policy.yaml"
+_SENTINEL_ACCESS = "/sentinel/access.key"
 
 
 class ReproduceSyntheticTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
+        # Snapshot process state and plant sentinels so we can prove the run leaves the caller
+        # pristine — restoring any prior values afterward (save/restore, never blind delete).
+        cls._argv_before = list(sys.argv)
+        cls._cwd_before = os.getcwd()
+        cls._prior_env = {k: os.environ.get(k)
+                          for k in (S.POLICY_OVERRIDE_ENV, "CLIF_ACCESS_LOG_KEY_FILE")}
+        os.environ[S.POLICY_OVERRIDE_ENV] = _SENTINEL_POLICY
+        os.environ["CLIF_ACCESS_LOG_KEY_FILE"] = _SENTINEL_ACCESS
         cls.panel = repro.run_synthetic_federation()  # builds fixtures under its own temp dir
+        cls._argv_after = list(sys.argv)
+        cls._cwd_after = os.getcwd()
+        cls._policy_after = os.environ.get(S.POLICY_OVERRIDE_ENV)
+        cls._access_after = os.environ.get("CLIF_ACCESS_LOG_KEY_FILE")
+
+    @classmethod
+    def tearDownClass(cls):
+        for key, prior in cls._prior_env.items():
+            if prior is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = prior
+        S.min_cell_size.cache_clear()
+        S.max_dropped_fraction.cache_clear()
 
     def test_produces_a_two_site_aggregate(self):
         self.assertEqual(self.panel["n_sites"], 2)
@@ -41,33 +70,13 @@ class ReproduceSyntheticTest(unittest.TestCase):
         source = Path(repro.__file__).read_text()
         self.assertNotIn("--allow-unsigned", source)
 
-    def test_a_site_cli_failure_restores_cwd_argv_and_env(self):
-        """The runner must leave the caller's process untouched even when the site CLI raises:
-        CWD, sys.argv, and the env vars the CLI mutates are restored on the failure path
-        (CodeRabbit/Codex review)."""
-        import os
-        import sys
-        from unittest import mock
-
-        from src.eval import schema as S
-
-        before_cwd, before_argv = os.getcwd(), list(sys.argv)
-        os.environ[S.POLICY_OVERRIDE_ENV] = "/sentinel/policy.yaml"
-        os.environ["CLIF_ACCESS_LOG_KEY_FILE"] = "/sentinel/access.key"
-        try:
-            with mock.patch("src.eval.clif_validate.main",
-                            side_effect=RuntimeError("boom")):
-                with self.assertRaises(RuntimeError):
-                    repro.run_synthetic_federation()
-            self.assertEqual(os.getcwd(), before_cwd)
-            self.assertEqual(sys.argv, before_argv)
-            self.assertEqual(os.environ.get(S.POLICY_OVERRIDE_ENV), "/sentinel/policy.yaml")
-            self.assertEqual(os.environ.get("CLIF_ACCESS_LOG_KEY_FILE"), "/sentinel/access.key")
-        finally:
-            os.environ.pop(S.POLICY_OVERRIDE_ENV, None)
-            os.environ.pop("CLIF_ACCESS_LOG_KEY_FILE", None)
-            S.min_cell_size.cache_clear()
-            S.max_dropped_fraction.cache_clear()
+    def test_the_run_leaves_the_caller_process_pristine(self):
+        """The site CLIs run out-of-process, so their sys.argv/env mutations never reach here;
+        the in-process fixture build changes cwd + the policy pin but restores both."""
+        self.assertEqual(self._cwd_after, self._cwd_before)
+        self.assertEqual(self._argv_after, self._argv_before)
+        self.assertEqual(self._policy_after, _SENTINEL_POLICY)   # restored by the runner
+        self.assertEqual(self._access_after, _SENTINEL_ACCESS)   # never touched (child-only)
 
 
 if __name__ == "__main__":

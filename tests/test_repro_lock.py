@@ -65,6 +65,21 @@ class RootLockConsistencyTest(unittest.TestCase):
                       "pytest is not in uv.lock — add it to the [dependency-groups] dev group "
                       "and re-run `uv lock`")
 
+    def test_uv_lock_check_confirms_the_lock_is_current(self):
+        """Authoritative drift detection: `uv lock --check` fails if the lock is stale relative
+        to pyproject — including a version bump the name-only checks above would miss. Skips
+        only when uv is not installed (the parse-based checks still run)."""
+        import shutil
+        import subprocess
+        uv = shutil.which("uv")
+        if uv is None:
+            self.skipTest("uv not on PATH")
+        result = subprocess.run([uv, "lock", "--check"], cwd=REPO_ROOT,
+                                capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0,
+                         "`uv lock --check` reports the root lock is out of date with "
+                         f"pyproject.toml — run `uv lock`:\n{result.stderr}")
+
 
 if __name__ == "__main__":
     unittest.main()

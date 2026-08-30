@@ -17,8 +17,9 @@ __pycache__/
 .venv/
 uv.lock
 # Commit the root lock for reproducible CI + a recreatable research environment (U16), and
-# clif-validate's for reproducible offline site installs (U11).
-!uv.lock
+# clif-validate's for reproducible offline site installs (U11). Anchor the root exception to
+# the repo root (!/uv.lock) so it does not accidentally un-ignore nested/generated lockfiles.
+!/uv.lock
 !clif-validate/uv.lock
 .ipynb_checkpoints/
 
