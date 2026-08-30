@@ -74,43 +74,56 @@ def _run_site(bundle_dir: Path, site: Path, episodes: Path, trust_roles: Path,
     return Path(out)
 
 
-def run_synthetic_federation(work_dir: str | Path | None = None) -> dict:
+# The site CLI mutates these process-global env vars; snapshot and restore them so importing
+# and calling this function never contaminates the caller's process.
+_TOUCHED_ENV = (_schema.POLICY_OVERRIDE_ENV, "CLIF_ACCESS_LOG_KEY_FILE")
+
+
+def run_synthetic_federation() -> dict:
     """Run the full synthetic loop and return the aggregate panel. Data-free, CPU.
 
     Builds synthetic fixtures + a signed bundle, runs two synthetic sites through the real
     governed site CLI, and aggregates their signed reports. Returns the aggregator's panel.
+
+    Always runs inside a throwaway `TemporaryDirectory` — never a caller-supplied path, so it
+    cannot overwrite real files — and restores the process CWD and the environment variables
+    the site CLI touches on every exit path, so it leaves the caller's process unchanged.
     """
-    tmp = tempfile.TemporaryDirectory() if work_dir is None else None
-    root = Path(work_dir) if work_dir is not None else Path(tmp.name)
+    saved_env = {k: os.environ.get(k) for k in _TOUCHED_ENV}
     old_cwd = os.getcwd()
-    try:
-        os.chdir(root)  # the artifact policy classifies shards relative to CWD
-        site = root / "site"
-        episodes = build_synthetic_site(site)
-        bundle_dir = build_synthetic_bundle(root / "bundle", site, episodes)
-        trust_roles = root / "trust_roles.yaml"  # written beside the bundle by the releaser
-        access_key = root / "access.key"
-        access_key.write_bytes(_ACCESS_KEY)
-        keyfiles = {}
-        for sid, secret in _SITE_KEYS.items():
-            kf = root / f"{sid}.key"
-            kf.write_text(secret.hex())
-            keyfiles[sid] = kf
+    with tempfile.TemporaryDirectory() as name:
+        root = Path(name)
+        try:
+            os.chdir(root)  # the artifact policy classifies shards relative to CWD
+            site = root / "site"
+            episodes = build_synthetic_site(site)
+            bundle_dir = build_synthetic_bundle(root / "bundle", site, episodes)
+            trust_roles = root / "trust_roles.yaml"  # written beside the bundle by the releaser
+            access_key = root / "access.key"
+            access_key.write_bytes(_ACCESS_KEY)
+            keyfiles = {}
+            for sid, secret in _SITE_KEYS.items():
+                kf = root / f"{sid}.key"
+                kf.write_text(secret.hex())
+                keyfiles[sid] = kf
 
-        reports = []
-        for sid, rel, tag in (("SITE-A", "rel-a", "site_a"), ("SITE-B", "rel-b", "site_b")):
-            reports.append(_run_site(bundle_dir, site, episodes, trust_roles, access_key,
-                                     keyfiles, sid, rel, tag))
+            reports = []
+            for sid, rel, tag in (("SITE-A", "rel-a", "site_a"), ("SITE-B", "rel-b", "site_b")):
+                reports.append(_run_site(bundle_dir, site, episodes, trust_roles, access_key,
+                                         keyfiles, sid, rel, tag))
 
-        panel = _agg.aggregate_site_reports(
-            [str(p) for p in reports], signing_keys=_SITE_KEYS,
-            cumulative_ledger_path="output/intermediate_phi/aggregate_ledger.jsonl")
-        return panel
-    finally:
-        os.chdir(old_cwd)
-        _reset_policy_pin()
-        if tmp is not None:
-            tmp.cleanup()
+            return _agg.aggregate_site_reports(
+                [str(p) for p in reports], signing_keys=_SITE_KEYS,
+                cumulative_ledger_path="output/intermediate_phi/aggregate_ledger.jsonl")
+        finally:
+            os.chdir(old_cwd)
+            for key, prior in saved_env.items():
+                if prior is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = prior
+            _schema.min_cell_size.cache_clear()
+            _schema.max_dropped_fraction.cache_clear()
 
 
 def main() -> None:

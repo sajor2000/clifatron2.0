@@ -17,7 +17,8 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
 def _norm(name: str) -> str:
-    return name.lower().replace("_", "-")
+    # PEP 503 name normalization: collapse runs of -_. to a single - and lowercase.
+    return re.sub(r"[-_.]+", "-", name).lower()
 
 
 class RootLockConsistencyTest(unittest.TestCase):

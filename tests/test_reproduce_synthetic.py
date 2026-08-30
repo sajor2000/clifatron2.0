@@ -41,6 +41,34 @@ class ReproduceSyntheticTest(unittest.TestCase):
         source = Path(repro.__file__).read_text()
         self.assertNotIn("--allow-unsigned", source)
 
+    def test_a_site_cli_failure_restores_cwd_argv_and_env(self):
+        """The runner must leave the caller's process untouched even when the site CLI raises:
+        CWD, sys.argv, and the env vars the CLI mutates are restored on the failure path
+        (CodeRabbit/Codex review)."""
+        import os
+        import sys
+        from unittest import mock
+
+        from src.eval import schema as S
+
+        before_cwd, before_argv = os.getcwd(), list(sys.argv)
+        os.environ[S.POLICY_OVERRIDE_ENV] = "/sentinel/policy.yaml"
+        os.environ["CLIF_ACCESS_LOG_KEY_FILE"] = "/sentinel/access.key"
+        try:
+            with mock.patch("src.eval.clif_validate.main",
+                            side_effect=RuntimeError("boom")):
+                with self.assertRaises(RuntimeError):
+                    repro.run_synthetic_federation()
+            self.assertEqual(os.getcwd(), before_cwd)
+            self.assertEqual(sys.argv, before_argv)
+            self.assertEqual(os.environ.get(S.POLICY_OVERRIDE_ENV), "/sentinel/policy.yaml")
+            self.assertEqual(os.environ.get("CLIF_ACCESS_LOG_KEY_FILE"), "/sentinel/access.key")
+        finally:
+            os.environ.pop(S.POLICY_OVERRIDE_ENV, None)
+            os.environ.pop("CLIF_ACCESS_LOG_KEY_FILE", None)
+            S.min_cell_size.cache_clear()
+            S.max_dropped_fraction.cache_clear()
+
 
 if __name__ == "__main__":
     unittest.main()
