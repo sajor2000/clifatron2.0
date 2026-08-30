@@ -17,9 +17,12 @@ Establish a leakage-safe, resumable training and evaluation baseline, then use o
 
 ## Execution Status
 
-Updated 2026-08-29 against `main` at `282cafa` (merge of PR #9). Working tree clean. U1-U5, the
-value-statistics follow-up, U13, U14, U9, and U11 have all landed. Progress is derived from git, not stored here — this
-section is orientation, not state.
+Updated 2026-08-29 against `main` at `ec8a7d5` (merge of PR #11). Working tree clean; both data-free
+suites green (repo 366 passed / 4 skipped, clif-validate 32) with CI now enforcing them on every PR.
+U1-U5, the value-statistics follow-up, U13, U14, U9, U11, U15, and the U16-U19 Nature-paper
+infrastructure have all landed. **Every data-free, unblocked unit is now complete.** What remains
+(U12, U6-U8, U10) is gated on real data, GPU hardware, or the external-site governance decision — not
+on code. Progress is derived from git, not stored here — this section is orientation, not state.
 
 **Standing non-code action, still the longest lead item:** the governance question gating U12 —
 *may a pre-selection v0 bundle run at an external site?* — remains unasked. A "no" reshapes the
@@ -38,9 +41,10 @@ sequencing (U12 gates U6/U7). Ask before U9 completes, not after.
 | U9. Validator core | **Landed** | PR #5. `clif-validate/` package: vendored eval closure, synthetic bundle + fixtures, wired inference path, ceremony-parity + disclosure tests |
 | U11. Release-trust machinery | **Landed** | PR #8 (+ packaging PR #9). Ed25519 releaser->site signature verified in `load_bundle`, signed revocation + anti-rollback (atomic fcntl floor), approval-by-content-hash CLI, `configs/trust_roles.yaml`, `src/eval/trust.py`; packaging = `clif-validate/uv.lock` + `SBOM.json` + `PACKAGING.md`. Operational key custody/distribution stay pending exit criteria (see `trust_roles.yaml` `pending_governance`). |
 | U12. v0 real-site federation proof | Blocked on external onboarding + governance | U9, U11 done. Still blocked on external-site onboarding AND the standing governance question ("may a pre-selection v0 bundle run at an external site?"). A data-free synthetic federation harness (releaser->site->aggregator + cumulative ledger differencing) is the buildable software slice. |
-| **U15. Synthetic federation harness** | **Next — unblocked (U9+U11 landed)** | Chartered + planned 2026-08-29. The data-free software precursor to U12: end-to-end releaser->site->aggregator loop + a new `src/eval/aggregator.py` with a cumulative cross-release differencing ledger, proven to fail closed on synthetic fixtures. Independent of onboarding/governance/GPU. |
-| U6, U7, U8 | Blocked on U9, U12 | See per-unit entry gates; U7 additionally conditional on U12's coverage findings |
-| U10. Release milestone | Gated milestone | Moved out of Implementation Units 2026-08-28; re-planned after selection |
+| **U15. Synthetic federation harness** | **Landed** | PR #10. Data-free software precursor to U12: end-to-end releaser->site->aggregator loop + `src/eval/aggregator.py` (verify + independent releasable-status gate + cumulative cross-release differencing ledger), proven fail-closed on synthetic fixtures. Reviewed multi-agent + Codex. |
+| **U16-U19. Nature-paper infrastructure** | **Landed** | PR #11 (plan `docs/plans/2026-08-29-001-...`). First test CI (`.github/workflows/ci.yml`, matrix 3.11/3.13, frozen, SHA-pinned) running both data-free suites on every PR; committed root `uv.lock` + drift guards; `MODEL_CARD.md` + `docs/architecture.md`; and `python -m src.eval.reproduce_synthetic` (one-command synthetic reproduction). |
+| U6, U7, U8 | Blocked on U9, U12 (+ GPU for U8) | See per-unit entry gates; U7 additionally conditional on U12's coverage findings. U8 also needs the 2xL40 run (with U13-FA2 + U14 report). |
+| U10. Release milestone | Gated milestone | Moved out of Implementation Units 2026-08-28; re-planned after selection. Software half (cumulative ledger + aggregator) proven by U15. |
 
 Verification at U5 merge: `uv run --with pytest pytest tests/ -q` passes with `266 passed,
 3 skipped` on `main` at `53e3c2c` (122 at the branch point).
