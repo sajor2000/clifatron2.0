@@ -27,8 +27,21 @@ class ReproduceSyntheticTest(unittest.TestCase):
         # pristine — restoring any prior values afterward (save/restore, never blind delete).
         cls._argv_before = list(sys.argv)
         cls._cwd_before = os.getcwd()
-        cls._prior_env = {k: os.environ.get(k)
-                          for k in (S.POLICY_OVERRIDE_ENV, "CLIF_ACCESS_LOG_KEY_FILE")}
+        prior_env = {k: os.environ.get(k)
+                     for k in (S.POLICY_OVERRIDE_ENV, "CLIF_ACCESS_LOG_KEY_FILE")}
+
+        def _restore():
+            for key, prior in prior_env.items():
+                if prior is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = prior
+            S.min_cell_size.cache_clear()
+            S.max_dropped_fraction.cache_clear()
+
+        # Register restoration BEFORE mutating the env, so a failure in the run below still
+        # restores the caller's state (a raise in setUpClass would skip tearDownClass).
+        cls.addClassCleanup(_restore)
         os.environ[S.POLICY_OVERRIDE_ENV] = _SENTINEL_POLICY
         os.environ["CLIF_ACCESS_LOG_KEY_FILE"] = _SENTINEL_ACCESS
         cls.panel = repro.run_synthetic_federation()  # builds fixtures under its own temp dir
@@ -36,16 +49,6 @@ class ReproduceSyntheticTest(unittest.TestCase):
         cls._cwd_after = os.getcwd()
         cls._policy_after = os.environ.get(S.POLICY_OVERRIDE_ENV)
         cls._access_after = os.environ.get("CLIF_ACCESS_LOG_KEY_FILE")
-
-    @classmethod
-    def tearDownClass(cls):
-        for key, prior in cls._prior_env.items():
-            if prior is None:
-                os.environ.pop(key, None)
-            else:
-                os.environ[key] = prior
-        S.min_cell_size.cache_clear()
-        S.max_dropped_fraction.cache_clear()
 
     def test_produces_a_two_site_aggregate(self):
         self.assertEqual(self.panel["n_sites"], 2)
