@@ -19,6 +19,14 @@ dependencies = [
     "cryptography>=44.0.1",    # U11 Ed25519 releaser->site bundle signing (trust.py)
 ]
 
+# Test runner, grouped for reproducible CI installs (`uv run --frozen --group dev pytest`).
+# cryptography is already a runtime dependency above, so the data-free suites need only
+# the test runner added here.
+[dependency-groups]
+dev = [
+  "pytest>=8.0",
+]
+
 [tool.uv]
 # 2x L40 box is Linux/CUDA; pin CUDA wheels there via `uv sync --extra cuda` if needed.
 
