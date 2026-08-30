@@ -1,0 +1,60 @@
+name: CI
+
+# Run the data-free test suites on every push and pull request. Reproducible: installs
+# come from the committed root uv.lock via `uv run --frozen` (see U16).
+on:
+  push:
+    branches: [main]
+  pull_request: {}
+  workflow_dispatch: {}
+
+# Least privilege: CI only reads the repo.
+permissions:
+  contents: read
+
+# One run per ref; cancel superseded runs on the same branch/PR.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: tests (py${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # Bracket the supported range: the declared floor (requires-python >= 3.11)
+        # and the development interpreter (3.13).
+        python-version: ["3.11", "3.13"]
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          # CI never pushes; don't leave the token in the checkout's git config.
+          persist-credentials: false
+
+      - name: Install uv (pinned) with caching
+        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+        with:
+          enable-cache: true
+          # Scope the cache key to the two committed locks. The default `**/uv.lock` /
+          # `**/pyproject.toml` globs recurse into the vendored external/ tree, which
+          # contains a symlink loop (external/clifatron/AR/qwen2/config/*.json) that makes
+          # the glob abort with ELOOP.
+          cache-dependency-glob: |
+            uv.lock
+            clif-validate/uv.lock
+          python-version: ${{ matrix.python-version }}
+
+      - name: Sync the frozen environment (root lock + dev test group)
+        run: uv sync --frozen --group dev
+
+      # Two separate invocations by design: the repo suite and the clif-validate suite each
+      # contain a test_trust.py, so collecting both in one pytest run fails on the duplicate
+      # basename. Both run under this one root environment (torch/cryptography/etc. are root
+      # deps; clif-validate's conftest puts its package and the repo root on sys.path).
+      - name: Repo data-free suite
+        run: uv run --frozen --group dev pytest tests/ -q
+
+      - name: clif-validate suite (vendor-drift guard included)
+        run: uv run --frozen --group dev pytest clif-validate/tests/ -q
