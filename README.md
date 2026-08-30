@@ -1,5 +1,7 @@
 # CLIFATRON 2.0
 
+[![CI](https://github.com/sajor2000/clifatron2.0/actions/workflows/ci.yml/badge.svg)](https://github.com/sajor2000/clifatron2.0/actions/workflows/ci.yml)
+
 A **methods-upgrade layer** on [CLIFATRON](https://github.com/Common-Longitudinal-ICU-data-Format/CLIFATRON),
 the CLIF consortium's compact (~30M-param) CLIF-native ICU foundation model. We keep CLIFATRON's
 tokenizer / sequence-packing / DeepSpeed training / benchmark and add the pieces that make a small
@@ -53,6 +55,44 @@ src/eval/metrics.py      TRIPOD+AI panel: AUROC/AUPRC/ECE/Brier/calib-slope/ICI/
 src/eval/method3.py      the wedge: anchor states → our probe vs XGBoost → 3×3 transport matrix   [KEEPER]
 src/eval/matrix.py       stable re-export surface
 ```
+
+## Validation & release-trust infrastructure (landed, data-free)
+
+The federated model-to-data path is implemented and tested end to end on synthetic fixtures — no
+real data or GPU needed to exercise it:
+
+- **`clif-validate/`** — the turnkey site package a hospital runs on its **local** CLIF 2.1 tables.
+  It loads a frozen, **signed** bundle, runs zero-shot inference, and exports only
+  disclosure-controlled aggregate metrics. Fail-closed and data-free by default.
+- **Release trust** (`src/eval/trust.py`, `configs/trust_roles.yaml`) — an **Ed25519** releaser→site
+  signature verified at load, a signed revocation list, anti-rollback, and **approval-by-content-hash**
+  so a release can only carry the reviewed payload. Report authentication + the cumulative disclosure
+  ledger use HMAC (`src/eval/attestation.py`).
+- **Aggregator** (`src/eval/aggregator.py`) — the coordinating-center reader: it verifies every signed
+  site report, independently re-enforces the releasable-status gate, and blocks a cross-release
+  differencing leak against its own cumulative ledger.
+- **Model card:** [`MODEL_CARD.md`](MODEL_CARD.md) · **Architecture + reproducibility guide:**
+  [`docs/architecture.md`](docs/architecture.md).
+
+### Reproduce the synthetic federated-validation result (one command)
+
+```bash
+uv sync --group dev
+python -m src.eval.reproduce_synthetic
+```
+
+Runs the whole **releaser → site → aggregator** loop on synthetic fixtures (data-free, CPU) and prints
+the disclosure-controlled two-site aggregate. Every trust gate is exercised on the governed path.
+
+### Run the test suites
+
+```bash
+uv run --frozen --group dev pytest tests/ -q                 # the repo's data-free suite
+uv run --frozen --group dev pytest clif-validate/tests/ -q   # the site-package suite (+ vendor-drift guard)
+```
+
+CI (`.github/workflows/ci.yml`) runs both suites on every push and pull request across Python 3.11 and
+3.13, installing from the committed `uv.lock` with `--frozen` for reproducibility.
 
 ## Method 3 — the wedge (smallest publishable unit)
 Attach our calibrated survival/probe heads to a CLIFATRON checkpoint's hour-24 anchor hidden state and
