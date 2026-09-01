@@ -110,6 +110,40 @@ every event (numeric or not) so batching stays dense.
 
 ---
 
+## Value-head normalization — per-token, frozen from a reference site
+
+The ORA value-regression head predicts the continuous *value* of the next event. Raw ICU values span
+~5 orders of magnitude per concept (creatinine ~1, platelets ~2×10⁵), so an un-normalized Gaussian NLL
+is dominated by high-magnitude concepts and never trains (observed `val≈46000` on real MIMIC). The fix:
+standardize each numeric event to ~N(0,1) using per-**token** center/scale frozen from a reference site
+— the same freeze-on-MIMIC pattern as the decile edges.
+
+```mermaid
+flowchart TB
+    REF["reference-site events.parquet<br/>(token, value pairs)"] --> STATS["compute per-token (center, scale)<br/>robust: median · IQR÷1.349"]
+    STATS --> BIND["bind to vocab hash<br/>(reject stale / cross-vocab file)"]
+    BIND --> JSON["value_stats.json<br/>{token_id: [center, scale]}"]
+    JSON --> STD["at training: (value − center) / scale<br/>→ ~N(0,1), well-scaled NLL"]
+
+    classDef ref fill:#e3f2fd,stroke:#1565c0,color:#0d1b2a;
+    classDef out fill:#e8f5e9,stroke:#2e7d32,color:#0d1b2a;
+    class REF,STATS,BIND ref;
+    class JSON,STD out;
+```
+
+- **Robust** center/scale (median, IQR÷1.349, std fallback) so physiologic outliers (severe
+  hyperkalemia, extreme lactate) don't inflate the scale and flatten the dangerous tails.
+- **Coverage contract:** every token carrying a finite value gets stats — a rare numeric token is
+  *widened*, never dropped — because the target builder rejects any numeric target lacking stats.
+- **Vocabulary-bound:** the artifact carries the vocab hash; a stale or cross-vocabulary stats file is
+  rejected at load, not silently applied.
+
+*Verified:* per-token standardization collapses mean raw value² from ~1.4×10¹⁰ to **0.95** (the O(1)
+target). *Code:* `src/data/value_stats.py`; generate with
+`python -m src.data.value_stats --events <ref_events.parquet> --out value_stats.json`.
+
+---
+
 ## Frozen decile edges + forced clinical thresholds
 
 Bin **edges** are frozen from a reference site (`build_from_site: mimic`) and applied

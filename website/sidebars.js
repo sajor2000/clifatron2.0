@@ -12,6 +12,15 @@ const sidebars = {
     'federated-validation',
     'evaluation-panel',
     'ablations',
+    {
+      type: 'category',
+      label: 'Engineering & governance',
+      collapsed: false,
+      items: [
+        'governance-trust',
+        'project-status',
+      ],
+    },
   ],
 };
 

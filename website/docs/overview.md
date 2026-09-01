@@ -24,6 +24,16 @@ and `notes/METHODS.md` carry the evidence base but are marked **pre-pivot** — 
 disagree with `MEMORY.md`, `MEMORY.md` wins. These docs mirror the current (post-pivot) spec.
 :::
 
+:::tip What's new / where things stand
+Every **data-free, unblocked** unit has landed — the codebase is a complete, CI-enforced, reproducible
+methods artifact. New since the first docs: per-token **value-head normalization**, the full
+**governance / trust / disclosure** machinery (Ed25519 release-trust, cumulative disclosure ledger,
+artifact-classification policy), the **synthetic federation harness**, and **CI + one-command
+reproduction**. What remains (real-site federation, method experiments, scaling) is gated on data /
+GPU / governance, not code. See **[Governance, Trust & Reproducibility](./governance-trust.md)** and
+**[Project Status & Roadmap](./project-status.md)**.
+:::
+
 ---
 
 ## The end-to-end pipeline
