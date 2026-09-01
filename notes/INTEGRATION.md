@@ -1,5 +1,13 @@
 # Integration Plan — Build ON CLIFATRON (not parallel to it)
 
+> **⚠️ PARTIALLY SUPERSEDED (see `MEMORY.md`).** Two things here are now out of date:
+> (1) **Backbone** — this doc treats the from-scratch decoder as an ablation arm only; the locked
+> decision (`MEMORY.md` §B) makes the **from-scratch Qwen3-arch decoder the PRIMARY paper**, with the
+> CLIFATRON-Qwen2 attach as the cheap wedge / first rung. (2) **"Immediate next code tasks"** and the
+> "new deliverable" `clif-validate/` are **DONE** — `head_adapter.py`, the metric panel, and the U9
+> validator core have all landed. The build-on-CLIFATRON *integration approach* below is still accurate;
+> only its status framing and backbone hierarchy are stale.
+
 **Decision (2026-08-27):** CLIFATRON (github.com/Common-Longitudinal-ICU-data-Format/CLIFATRON,
 MIT, PyPI `clifatron`) is the consortium's working CLIF-native ICU FM — built by our lab's
 data scientist, and **we control it**. We build our RESEARCH.md methods ON it rather than
@@ -59,7 +67,7 @@ tasks → a clean, CLIF-native tokenization ablation nobody has published.
    to first 24h) — locate it from the `day/hour` markers.
 
 ## Sites & federated design — RESOLVED (2026-08-27): develop on 3, validate on the CLIF federation
-- **Development cohort (data we hold):** MIMIC + Rush + UChicago. Freeze CLIFATRON mCIDE vocab
+- **Development cohort (planned):** MIMIC + Rush + UChicago (only MIMIC staged so far). Freeze CLIFATRON mCIDE vocab
   across all → identical token space everywhere, ensemble-able, turnkey at any CLIF site.
 - **Internal 3×3 transportability matrix**: rows=train site, cols=test site; diagonal=internal,
   off-diagonal=external transport. AUROC/AUPRC + calibration slope per cell. Ensemble column =

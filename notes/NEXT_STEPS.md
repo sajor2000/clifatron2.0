@@ -1,5 +1,14 @@
 # Handoff — CLIFATRON 2.0: research, decisions, and next steps
 
+> **⚠️ STALE ORIENTATION (2026-08-27) — the "current state" and "next steps" here are SUPERSEDED.**
+> This was written before any code ran on real data. Since then almost everything landed: U1–U5,
+> value-stats normalization, U9, U11, U13–U19 are all merged and CI-enforced, and 42+ tests pass on
+> real MIMIC. Its **§3 evidence tables and §2 finalized decisions remain valid**; its **§1 "nothing has
+> been run" and §4 "next steps" (Steps 1–5) are DONE.** For current state + what's left, read
+> `docs/plans/2026-09-01-001-feat-completion-roadmap-plan.md` and `MEMORY.md` (§LOCKED DECISIONS +
+> §Status). Backbone: the primary paper is now the **from-scratch Qwen3** decoder (this file's Qwen2/
+> from-scratch-as-ablation framing predates that lock — `MEMORY.md` §B wins).
+
 **Audience:** the next agent (or engineer) taking this over cold. Read this top-to-bottom before
 touching code. It carries the *why* behind every decision plus the 2026 evidence, so you can
 execute — or overrule with cause — without re-running the research.

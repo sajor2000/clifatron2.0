@@ -6,14 +6,22 @@ sidebar_position: 3
 
 # Model Architecture
 
-The trunk is **CLIFATRON's Qwen2 backbone** (primary path) — a flat causal decoder in the
-Llama/Qwen family (RoPE, SwiGLU, RMSNorm, GQA), ~30M-neighborhood, 8192 context, **untied**
-embeddings. We attach four heads to its per-token hidden states. A from-scratch flat decoder
-(`src/model/encoder.py`) is kept only as an ablation arm.
+The trunk is a flat causal decoder in the Llama/Qwen family (RoPE, SwiGLU, RMSNorm, GQA), 8192
+context, **untied** embeddings. Two backbone paths, run as a ladder:
+
+- **Primary paper — from-scratch Qwen3-arch decoder, ~30M, fully ours** (`src/model/encoder.py`).
+  Qwen3 adds free QK-Norm training stability; no upstream dependency. This is the headline.
+- **Wedge / cheap first result — attach heads to CLIFATRON's released Qwen2 checkpoint** (`head_adapter.py`).
+  CLIFATRON's Qwen2 is **0.5B** — a *larger comparator*, never our ~30M model. This is the fast first
+  rung (Method 3) and half of the finetune-vs-scratch ablation.
+
+We attach the same four heads to either backbone's per-token hidden states. "Qwen2 vs Qwen3" is itself
+a **measured ablation row**, not an assertion.
 
 :::info Objective, not backbone, is the lever
-ORA (arXiv:2602.00541) shows the gains are backbone-agnostic. We attach to CLIFATRON's Qwen2
-rather than rebuild a trunk — that is the "build ON CLIFATRON" pivot (`notes/INTEGRATION.md`).
+ORA (arXiv:2602.00541) shows the gains are backbone-agnostic — so the backbone is a footnote and the
+*objective* is where the novelty lives. The from-scratch Qwen3 model is the primary contribution; the
+CLIFATRON-Qwen2 attach is the cheap wedge that de-risks it first. See `MEMORY.md` §B.
 :::
 
 ---
@@ -24,7 +32,7 @@ rather than rebuild a trunk — that is the "build ON CLIFATRON" pivot (`notes/I
 flowchart TB
     IN["input_ids · attention_mask<br/>(fused CLIF tokens, ≤8192)"] --> BB
 
-    subgraph BB["CLIFATRON Qwen2 backbone (HF causal LM)"]
+    subgraph BB["Backbone (from-scratch Qwen3 ~30M · OR · CLIFATRON Qwen2 0.5B wedge)"]
         direction TB
         EMB["Untied token embeddings"] --> L1["Decoder layers<br/>RoPE · SwiGLU · RMSNorm · GQA"]
         L1 --> HS["Per-token hidden states H<br/>output_hidden_states=True"]

@@ -131,8 +131,11 @@ FSDP is *not* used (only pays off past ~2.3B params and is worse without NVLink)
 `src/train/joint_pretrain.py` drives the joint path; `src/train/run_arm.py` drives the ablation
 arms.
 
-:::warning Known tuning issue
-On real MIMIC the value-regression loss is currently unnormalized and dominates (raw lab
-magnitudes — creatinine, platelet counts in the thousands). Per-concept value scaling is needed
-before Step-3 joint pretraining. See `notes/TAKEOVER_PROMPT.md`.
+:::tip Value-head normalization — resolved
+The value-regression loss was unnormalized on real MIMIC (raw lab magnitudes — creatinine ~1,
+platelet counts ~2×10⁵ — made it dominate, `val≈46000`). **Fixed:** `src/data/value_stats.py`
+freezes per-token robust (median/IQR) value statistics from a reference site, vocab-hash-bound;
+training standardizes `(value − center) / scale` and fails closed on a missing/stale map.
+Standardization collapses mean raw value² from ~1.4×10¹⁰ to ~0.95 (O(1) NLL). See
+**[Data & Tokenization → Value-head normalization](./data-tokenization.md)**.
 :::

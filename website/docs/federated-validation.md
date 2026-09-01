@@ -80,35 +80,45 @@ flowchart LR
 
 ---
 
-## Auto-labeler — outcomes derivable from standard CLIF fields
+## Auto-labeler — incident physiologic threshold-crossings from standard CLIF fields
 
-To need no manual annotation, outcomes are restricted to those computable from standard CLIF
-tables. Implemented in `src/eval/clif_auto_labeler.py`.
+To need no manual annotation, the auto-labeler derives **incident physiologic outcome states** —
+threshold crossings in a specified direction within a horizon — straight from standard CLIF vitals/labs.
+This is deliberate: the outcomes *are* threshold crossings, so they line up exactly with the
+threshold-hazard head's zero-shot query (`concept crosses τ in direction within h`). Implemented in
+`src/eval/clif_auto_labeler.py` → `derive_outcome_states`, driven by `configs/cohort.yaml`.
 
 ```mermaid
 flowchart TB
     subgraph CLIF["Standard CLIF 2.1 fields"]
-        H["clif_hospitalization<br/>discharge_category"]
-        RS["clif_respiratory_support<br/>device_category"]
-        MED["clif_medication_admin_continuous<br/>vasopressors"]
-        ADT["clif_adt / icu_admit"]
+        V["clif_vitals<br/>map · spo2"]
+        L["clif_labs<br/>lactate"]
     end
-    H --> O1["in_hospital_mortality<br/>= discharge == Expired"]
-    RS --> O2["new_imv_24h<br/>= new IMV ≤ 24h of ICU admit"]
-    MED --> O3["new_vasopressor_24h<br/>= new pressor ≤ 24h"]
-    ADT --> O2
-    ADT --> O3
+    V --> O1["map_below_65_48h<br/>MAP crosses &lt;65 mmHg within 48h"]
+    L --> O2["lactate_above_4_48h<br/>lactate crosses &gt;4 mmol/L within 48h"]
+    V --> O3["spo2_below_88_48h<br/>SpO₂ crosses &lt;88% within 48h"]
 
-    O1 & O2 & O3 --> LBL["labels.parquet (local only)"]
+    O1 & O2 & O3 --> LBL["outcome states (local only)<br/>positive · negative · censored · not_ascertainable"]
 
     classDef f fill:#e3f2fd,stroke:#1565c0,color:#0d1b2a;
     classDef o fill:#f3e5f5,stroke:#6a1b9a,color:#0d1b2a;
-    class H,RS,MED,ADT f;
+    class V,L f;
     class O1,O2,O3 o;
 ```
 
-Other CLIF-derivable outcomes on the roadmap: discharge disposition (home/LTACH), IMV on/off,
-hypoxia, organ-failure thresholds.
+Each outcome is a `{concept, direction, threshold, horizon}` crossing with baseline look-back and
+ascertainment windows (see `configs/cohort.yaml → outcomes`). The label states are explicit
+(`positive` / `negative` / `censored` / `not_ascertainable`), not a naive binary — a stay whose value
+was never measured within the ascertainment window is *not* forced to negative.
+
+:::note Treatments are inputs, never targets (Rule 1)
+IMV and vasopressors are deliberately **not** auto-labeled outcomes — they are treatments, so they are
+model *inputs* only. `tests/test_data_config.py` asserts `new_imv_24h` / `new_vasopressor_24h` are not
+tasks. Mortality enters only as the competing-risk death event, not as an auto-labeled binary outcome.
+:::
+
+Other CLIF-derivable threshold outcomes on the roadmap: additional organ-failure cutpoints (creatinine/
+KDIGO, bilirubin, platelets) as coverage allows — all expressible as the same directional crossings.
 
 ---
 

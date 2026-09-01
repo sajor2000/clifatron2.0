@@ -43,7 +43,7 @@ flowchart TB
     subgraph DEV["DEVELOPMENT (data we hold — 3 sites)"]
         direction TB
         A["CLIF 2.1 parquet<br/>MIMIC · Rush · UChicago"] --> B["Tokenization<br/>fused code=bin · deciles<br/>soft discretization · RoPE"]
-        B --> C["CLIFATRON Qwen2 backbone<br/>~30M · 8192 ctx · untied emb"]
+        B --> C["Backbone<br/>from-scratch Qwen3 ~30M (primary)<br/>· CLIFATRON Qwen2 0.5B wedge<br/>8192 ctx · untied emb"]
         C --> D["Our heads<br/>threshold-hazard · competing-risk<br/>value-regression · next-event"]
         D --> E["Joint pretrain<br/>NTP → TTE curriculum<br/>uncertainty + grad-norm balancing"]
     end
@@ -80,13 +80,13 @@ contested; the **conjunction**, executed CLIF-native, is the defensible headline
 mindmap
   root((CLIFATRON 2.0))
     CLIF-native
-      first-mover, fully open
+      open tooling, no DUA
       frozen mCIDE vocab
     Structured + notes ICU
       vitals / labs / meds as events
       pre-anchor notes only
     ~30M efficient
-      saturates near 28M on MIMIC
+      utility saturates ~28M on MIMIC (arXiv:2505.22964)
       one node, 2× L40
     Federated real-data
       model-to-data validation

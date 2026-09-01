@@ -87,7 +87,8 @@ DUA-gated ICareFM — treat it as a deliverable, not plumbing.
 
 ## Known blockers before any real training run
 
-- **Value-head loss is unnormalized** (val≈46000 on real MIMIC) — add per-concept value scaling first.
+- ~~Value-head loss unnormalized~~ **RESOLVED** — `src/data/value_stats.py` freezes per-token robust
+  value stats (vocab-hash-bound); `pretrain.py --value-stats` applies them and fails closed if missing.
 - **No CLIFATRON checkpoint staged** yet (needed for the Method-3 wedge).
 - **Rush + UChicago data not on the L40 box** (only MIMIC: 546,028 stays / ~134M events) — the 3-site
   claim needs them. Override data dir with `CLIF_DATA_DIR`.

@@ -4,7 +4,8 @@ Global memory: ~/.claude/CLAUDE.md (rules) + ~/.claude/memory/memory.md (index).
 
 ## What this is
 Compact (~30M-param) multimodal ICU foundation model on **federated CLIF 2.1**
-(Rush + MIMIC-IV-Ext-CLIF v2.1), pretrained with a **threshold-conditioned
+(dev cohort = MIMIC-IV-Ext-CLIF + Rush + UChicago; **only MIMIC is currently staged on the L40
+box** — see LOCKED DECISIONS G2), pretrained with a **threshold-conditioned
 time-to-event** objective. Thesis: one small model → many outcomes → many
 hospitals → one node (2× L40, no cluster). Nature-Medicine framing: efficiency +
 federated-fairness + CLIF-native + deployable multimodal SLM.
@@ -74,11 +75,15 @@ metrics. No raw data, labels, or gradients ever leave any node. This IS the thes
   labels**, which each site auto-derives from its own CLIF tables (below). So the pipeline is
   *no-local-training + no-manual-annotation*, NOT "no labels at all." The auto-labeler's definitions
   are themselves a validity dependency — audit them per site.
-- **Labels auto-derived locally (for evaluation only):** restrict outcomes to those derivable from
-  standard CLIF fields (mortality, discharge disposition/home/LTACH, IMV on/off, hypoxia,
-  organ-failure thresholds) so each external site auto-labels from its own tables — no manual
-  annotation. These derived labels are noisy phenotypes that vary by site coding; report each
-  outcome's label definition + provenance alongside its metrics.
+- **Labels auto-derived locally (for evaluation only):** the auto-labeler derives **incident physiologic
+  threshold-crossings** from standard CLIF vitals/labs (implemented: `map_below_65_48h`,
+  `lactate_above_4_48h`, `spo2_below_88_48h` — see `configs/cohort.yaml → outcomes`;
+  `src/eval/clif_auto_labeler.py → derive_outcome_states`). Each is a `{concept, direction, threshold,
+  horizon}` crossing, aligning outcomes with the threshold-hazard head's zero-shot query. **Treatments
+  (IMV, vasopressors) are NOT outcomes — inputs only (Rule 1); `tests/test_data_config.py` asserts it.
+  Mortality enters only as the competing-risk death event.** Roadmap: add more organ-failure cutpoints
+  (creatinine/KDIGO, bilirubin, platelets) as coverage allows. These derived labels are noisy phenotypes
+  that vary by site coding; report each outcome's definition + provenance alongside its metrics.
 - **Vocab:** CLIFATRON frozen mCIDE across ALL sites → turnkey everywhere, no refitting.
 - **Governance:** only aggregate + subgroup metrics return; fairness reported aggregate (ICareFM precedent).
 - **Internal eval (3 held sites):** 3×3 train-A/test-B matrix + adaptation ladder
@@ -153,8 +158,11 @@ These resolve every open design question as of this date. Change only with new e
 
 **D. Objective (LOCKED — where the novelty lives)**
 - D1. Loss weights CR 1.0 · threshold 1.0 · value 0.5 · NTP 0.2 (in code). D2. NTP→TTE curriculum
-  (15% warmup / 5% transition). D3. **BLOCKER: value-head loss is unnormalized (val≈46000 on real MIMIC) —
-  MUST add per-concept value scaling before any real pretraining run.**
+  (15% warmup / 5% transition). D3. **RESOLVED (was: value-head loss unnormalized, val≈46000 on real
+  MIMIC).** `src/data/value_stats.py` now freezes per-**token** robust (median/IQR) value stats from a
+  reference site, vocab-hash-bound; `pretrain.py --value-stats` applies `(value−center)/scale` and
+  fails closed on a missing/stale map. Verified: standardization collapses mean raw value² from ~1.4e10
+  to ~0.95 (O(1) NLL). Landed via PR #3.
 
 **E. Tokenization (LOCKED)**
 - E1. Fused `code=bin`, frozen population deciles, soft discretization, forced clinical-threshold edges,

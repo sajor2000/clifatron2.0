@@ -29,7 +29,8 @@ outcomes are states doctors *act on* (never treatments — those are inputs only
 (does acting on the model help the patient), not AUROC alone.
 
 ## Sites — develop on 3, validate on the whole CLIF federation
-- **Development cohort (data we hold):** MIMIC-IV-Ext-CLIF v2.1 · Rush · UChicago (CLIF origin site).
+- **Development cohort:** MIMIC-IV-Ext-CLIF v2.1 · Rush · UChicago (CLIF origin site). *Currently
+  only MIMIC is staged on the training box; Rush + UChicago are planned dev sites, not yet staged.*
 - **External validation:** *all other CLIF consortium sites* via model-to-data — each runs a turnkey
   `clifpy`/tokenETL eval script on its **local** CLIF tables and returns only aggregate + subgroup metrics.
 - Vocab = a **frozen** CLIF-native mCIDE, applied identically everywhere; **raw data is never pooled.**
