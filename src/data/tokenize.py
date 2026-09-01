@@ -36,7 +36,7 @@ from src.data.cohort import (
 )
 from src.data.splits import fit_partition
 
-SPECIAL = {"<pad>": 0, "<bos>": 1, "<eos>": 2}
+SPECIAL = {"<pad>": 0, "<bos>": 1, "<eos>": 2, "<unk>": 3}
 ROOT = Path(__file__).parents[2]
 
 
@@ -478,14 +478,12 @@ def tokenize_site(cfg: dict, site: str, base: Path, out: Path,
                 if hard_token is None and c in edges:
                     b = 0
                     key = fused_token(c, b)
-                    hard_token = vocab.get(key, SPECIAL["<pad>"])
+                    hard_token = vocab.get(key, SPECIAL["<unk>"])
             else:
                 key = fused_token(c, b)
-                hard_token = vocab.get(key, SPECIAL["<pad>"])
+                hard_token = vocab.get(key, SPECIAL["<unk>"])
             if hard_token is None:
-                raise KeyError(
-                    f"unknown token {key!r} — frozen vocab does not cover this concept+bin"
-                )
+                hard_token = SPECIAL["<unk>"]
             token.append(hard_token)
             assignments = (
                 _soft_bins(v_for_bin, c, edges, bin_cfg["soft_kernel_bins"])
@@ -495,7 +493,7 @@ def tokenize_site(cfg: dict, site: str, base: Path, out: Path,
             soft_tokens, weights = [], []
             for soft_bin, weight in assignments:
                 st_key = fused_token(c, soft_bin) if soft_bin is not None else fused_token(c, None)
-                soft_tokens.append(vocab.get(st_key, SPECIAL["<pad>"]))
+                soft_tokens.append(vocab.get(st_key, SPECIAL["<unk>"]))
                 weights.append(weight)
             soft_token.append(soft_tokens)
             soft_weight.append(weights)
