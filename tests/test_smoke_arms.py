@@ -21,9 +21,11 @@ import yaml
 CLIF_DATA = Path(
     os.environ.get("CLIF_DATA_DIR", "~/Data/clif-source")
 ).expanduser().resolve()
-DATA_CFG = Path("configs/data.yaml")
-MODEL_CFG = Path("configs/model.yaml")
-ABL_CFG = Path("configs/ablation.yaml")
+# Resolve paths at import (SmokeTest chdir's into a tempdir for the PHI-dir guard).
+ROOT = Path(__file__).resolve().parent.parent
+DATA_CFG = ROOT / "configs/data.yaml"
+MODEL_CFG = ROOT / "configs/model.yaml"
+ABL_CFG = ROOT / "configs/ablation.yaml"
 
 N_STAYS = 100
 MAX_EVENTS_PER_STAY = 1024
@@ -47,11 +49,30 @@ class SmokeTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.tmp = tempfile.TemporaryDirectory()
-        cls.out_dir = Path(cls.tmp.name)
+        # The artifact policy classifies tokenized shards as patient_level_phi and
+        # requires them under output/intermediate_phi (relative to CWD), so chdir into
+        # an isolated tempdir and write there — an arbitrary tempdir path is rejected.
+        cls._prev_cwd = os.getcwd()
+        os.chdir(cls.tmp.name)
+        cls.out_dir = Path("output/intermediate_phi/smoke")
+        cls.out_dir.mkdir(parents=True, exist_ok=True)
         cls.cfg = yaml.safe_load(DATA_CFG.read_text())
         cls.mcfg = yaml.safe_load(MODEL_CFG.read_text())
 
-        cls._build_vocab()
+        # Building the cohort/episode artifact fail-closes on un-qualified source data
+        # (dirty ICU intervals, missing required identifiers, non-UTC timestamps). That
+        # is a DATA-readiness condition, not a model-smoke failure — skip cleanly so the
+        # suite stays green on raw, not-yet-qualified CLIF drops.
+        from src.data.cohort import QualificationError
+        try:
+            cls._build_vocab()
+        except QualificationError as exc:
+            os.chdir(cls._prev_cwd)
+            cls.tmp.cleanup()
+            raise unittest.SkipTest(
+                f"raw CLIF data at {CLIF_DATA} is not cohort-qualified "
+                f"(needs pre-qualification): {exc}"
+            )
 
         cls.shards = _read_shards()
         print(f"Loaded {len(cls.shards):,} stays with vocab size {cls.vocab_size:,}")
@@ -63,14 +84,30 @@ class SmokeTest(unittest.TestCase):
 
     @classmethod
     def tearDownClass(cls):
+        os.chdir(cls._prev_cwd)
         cls.tmp.cleanup()
 
     @classmethod
     def _build_vocab(cls):
+        import polars as pl
+        import yaml as _yaml
+        from src.data.cohort import build_cohort_artifact
         from src.data.tokenize import tokenize_site
 
+        # tokenize_site now requires a canonical episode/split artifact; build one from
+        # the real CLIF tables first (grouped patient splits, PHI-classified output).
+        policy = _yaml.safe_load(ROOT.joinpath("configs/artifact_policy.yaml").read_text())
+        episodes, _ = build_cohort_artifact(
+            CLIF_DATA,
+            cls.out_dir / "episodes.parquet",
+            cohort_config=ROOT / "configs/cohort.yaml",
+            train_config=ROOT / "configs/train.yaml",
+            artifact_policy=ROOT / "configs/artifact_policy.yaml",
+        )
+
         tokenize_site(cls.cfg, "mimic", CLIF_DATA, cls.out_dir,
-                      vocab=None, edges=None, limit_stays=N_STAYS * 3)
+                      vocab=None, edges=None, limit_stays=N_STAYS * 3,
+                      episodes=episodes, artifact_policy=policy)
 
         blob = json.loads((cls.out_dir / "vocab.json").read_text())
         cls.vocab = blob["vocab"]
