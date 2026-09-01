@@ -176,12 +176,22 @@ class CohortContractTest(unittest.TestCase):
         with self.assertRaisesRegex(QualificationError, "one hospital"):
             build_cohort(multiple, self.adt, self.config)
 
-    def test_rejects_null_linkage_identifier_before_join(self):
+    def test_allows_null_optional_linkage_identifier(self):
+        """hospitalization_joined_id is an OPTIONAL CLIF field (all-null in MIMIC);
+        nulls there must NOT block qualification — only true primary IDs must be non-null."""
+        joined_nulled = self.hospitalization.with_columns(
+            pl.lit(None, dtype=pl.String).alias("hospitalization_joined_id")
+        )
+        # Must not raise (previously rejected; corrected per CLIF 2.1 optionality).
+        build_cohort(joined_nulled, self.adt, self.config)
+
+    def test_rejects_null_required_identifier_before_join(self):
+        """A null in a TRULY required identifier (patient_id) is still rejected."""
         invalid = self.hospitalization.with_columns(
             pl.when(pl.col("hospitalization_id") == "stay-a")
             .then(None)
-            .otherwise(pl.col("hospitalization_joined_id"))
-            .alias("hospitalization_joined_id")
+            .otherwise(pl.col("patient_id"))
+            .alias("patient_id")
         )
         with self.assertRaisesRegex(QualificationError, "null identifiers"):
             build_cohort(invalid, self.adt, self.config)

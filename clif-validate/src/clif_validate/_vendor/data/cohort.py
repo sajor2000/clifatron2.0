@@ -54,7 +54,14 @@ def _require_columns(frame: pl.DataFrame, name: str, columns: set[str]) -> None:
 
 def _require_string(frame: pl.DataFrame, name: str, columns: list[str]) -> None:
     for column in columns:
-        if column in frame.columns and frame.schema[column] != pl.String:
+        if column not in frame.columns:
+            continue
+        dtype = frame.schema[column]
+        # An all-null optional column is typed Null by polars, not String — accept it
+        # (nullability is enforced separately for the truly required identifiers).
+        if dtype == pl.Null and frame[column].null_count() == frame.height:
+            continue
+        if dtype != pl.String:
             raise QualificationError(f"{name}.{column} must be a string identifier")
 
 
@@ -108,10 +115,14 @@ def build_cohort(
     _require_string(adt, "adt", ["hospitalization_id"])
     _require_string(hospitalization, "hospitalization", ["hospital_id"])
     _require_string(adt, "adt", ["hospital_id"])
+    # hospitalization_joined_id (CLIF `linked_encounter_identifier`) is OPTIONAL: it links
+    # hospitalizations across transfers and is legitimately all-null in sources without
+    # inter-hospital linkage (e.g. MIMIC-IV-Ext-CLIF). Require its *type* when present,
+    # but do NOT reject nulls — only the true primary identifiers must be non-null.
     _reject_null_identifiers(
         hospitalization,
         "hospitalization",
-        ["hospitalization_id", "patient_id", "hospitalization_joined_id"],
+        ["hospitalization_id", "patient_id"],
     )
     _reject_null_identifiers(adt, "adt", ["hospitalization_id"])
     _reject_null_identifiers(hospitalization, "hospitalization", ["hospital_id"])
