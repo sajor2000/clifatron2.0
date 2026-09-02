@@ -61,7 +61,8 @@ DUA-gated ICareFM — treat it as a deliverable, not plumbing.
   "Qwen2 vs Qwen3" is a *measured* ablation row, not an assertion.
 - **Size:** our own model targets **~30M** (d512×8L×8H). CLIFATRON's Qwen2 checkpoint we attach to is
   **0.5B** — always state it as a *larger comparator*, never as our compact model.
-- **Tokenizer:** fused `code=bin`, frozen population deciles, soft discretization, forced clinical-threshold
+- **Tokenizer:** fused `code=bin`, **physician-designed clinical-segment bins** (primary, revised 2026-09-02;
+  population deciles = `decile_ablation` arm), soft discretization, forced clinical-threshold
   edges, storetime ordering, **untied embeddings**, **8192** context.
 - **TextCode / language-grounded arm is elevated to a real transfer-robustness arm** (PORTER 2026:
   frozen-vocab drops ~69% of events on cross-site transfer). Frozen mCIDE stays primary; TextCode is

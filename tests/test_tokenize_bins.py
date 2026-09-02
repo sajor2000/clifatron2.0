@@ -3,8 +3,80 @@ import unittest
 import polars as pl
 import torch
 
-from src.data.tokenize import _soft_bins, build_value_bins
+from src.data.tokenize import (
+    ROOT,
+    _bin_of,
+    _soft_bins,
+    build_clinical_segment_bins,
+    build_edges,
+    build_value_bins,
+)
 from src.model.encoder import CLIFEncoder
+
+_SEGMENT_CSV = (
+    "external/clifatron/tokenETL/config/"
+    "critical_illness_tokenization_final_with_intervals.csv"
+)
+
+
+class ClinicalSegmentBinsTest(unittest.TestCase):
+    """The primary v2 scheme: physician-designed clinical-segment bins from the CSV."""
+
+    def test_reads_physician_segments_for_target_concepts(self):
+        edges = build_clinical_segment_bins(
+            ROOT / _SEGMENT_CSV, ["lactate", "map", "creatinine"]
+        )
+        self.assertEqual(set(edges), {"lactate", "map", "creatinine"})
+        # lactate has the clinician-designed granularity (many bins, sepsis-zone edges)
+        self.assertGreater(len(edges["lactate"]), 10)
+        self.assertTrue(all(edges["lactate"][i] < edges["lactate"][i + 1]
+                            for i in range(len(edges["lactate"]) - 1)))  # strictly sorted
+
+    def test_forced_edges_pinned_onto_segment_grid(self):
+        edges = build_clinical_segment_bins(
+            ROOT / _SEGMENT_CSV, ["lactate"], forced_edges={"lactate": [2.0, 4.0]}
+        )["lactate"]
+        self.assertTrue(any(abs(e - 2.0) < 1e-9 for e in edges))
+        self.assertTrue(any(abs(e - 4.0) < 1e-9 for e in edges))
+
+    def test_map_65_decision_threshold_is_a_bin_edge(self):
+        edges = build_clinical_segment_bins(
+            ROOT / _SEGMENT_CSV, ["map"], forced_edges={"map": [65.0]}
+        )["map"]
+        self.assertTrue(any(abs(e - 65.0) < 1e-9 for e in edges))
+        # a MAP of 64 and 66 fall on opposite sides of the 65 edge
+        self.assertNotEqual(_bin_of(64.0, "map", {"map": edges}),
+                            _bin_of(66.0, "map", {"map": edges}))
+
+    def test_build_edges_dispatches_on_scheme(self):
+        events = pl.DataFrame({"concept": ["lactate"] * 40,
+                               "value": [float(v) / 8 for v in range(40)]})
+        clinical = build_edges(
+            {"scheme": "clinical_segment", "segment_source": _SEGMENT_CSV},
+            events, ["lactate"],
+        )
+        decile = build_edges(
+            {"scheme": "decile", "n_bins": 4}, events, ["lactate"],
+        )
+        self.assertIn("lactate", clinical)
+        self.assertIn("lactate", decile)
+        self.assertNotEqual(clinical["lactate"], decile["lactate"])  # different schemes
+
+    def test_unknown_scheme_and_missing_params_fail_closed(self):
+        events = pl.DataFrame({"concept": ["lactate"], "value": [1.0]})
+        with self.assertRaises(ValueError):
+            build_edges({"scheme": "nonsense"}, events, ["lactate"])
+        with self.assertRaises(ValueError):
+            build_edges({"scheme": "clinical_segment"}, events, ["lactate"])  # no source
+        with self.assertRaises(ValueError):
+            build_edges({"scheme": "decile"}, events, ["lactate"])  # no n_bins
+
+    def test_decile_ablation_scheme_uses_n_bins(self):
+        events = pl.DataFrame({"concept": ["lactate"] * 40,
+                               "value": [float(v) / 8 for v in range(40)]})
+        edges = build_edges({"scheme": "decile_ablation", "n_bins": 10}, events, ["lactate"])
+        self.assertIn("lactate", edges)
+        self.assertEqual(len(edges["lactate"]), 9)  # 10 bins -> 9 interior edges
 
 
 class TokenizeBinsTest(unittest.TestCase):

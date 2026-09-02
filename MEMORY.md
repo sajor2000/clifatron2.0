@@ -92,6 +92,12 @@ metrics. No raw data, labels, or gradients ever leave any node. This IS the thes
   outcome — the "does it travel" result. UChicago = CLIF origin site (Bhavani).
 
 ## STEERING PRINCIPLE (2026-08-27) — clinically derived: encode "good vs bad for doctors"
+> **⚠️ BINNING DECISION BELOW REVERSED 2026-09-02 — see LOCKED DECISIONS §E1a.** This section argued
+> for population deciles as the base scheme (Lee 2026: deciles ≈ ref-range). We have since made
+> **physician-designed clinical segments the PRIMARY scheme** on clinical-relevance grounds, with
+> deciles as the `decile_ablation` arm that measures the two head-to-head. The GOAL (sensitive where
+> danger is, legible to a doctor) is unchanged; only the mechanism was reversed. §E1a is authoritative.
+
 GOAL (unchanged, correct): the model must be most sensitive where clinical DANGER is, and be legible
 to a doctor. But the MECHANISM matters — the 2026 evidence (both research threads landed) says hard
 clinical bins are NOT how you achieve it. CORRECTED tokenization decision:
@@ -164,9 +170,22 @@ These resolve every open design question as of this date. Change only with new e
   fails closed on a missing/stale map. Verified: standardization collapses mean raw value² from ~1.4e10
   to ~0.95 (O(1) NLL). Landed via PR #3.
 
-**E. Tokenization (LOCKED)**
-- E1. Fused `code=bin`, frozen population deciles, soft discretization, forced clinical-threshold edges,
-  storetime ordering, untied embeddings, 8192 context (settled; see reconciled RESEARCH.md/NEXT_STEPS.md §2).
+**E. Tokenization (LOCKED — binning scheme REVISED 2026-09-02)**
+- E1. Fused `code=bin`, soft discretization, forced clinical-threshold edges, storetime ordering,
+  untied embeddings, 8192 context.
+- **E1a. PRIMARY binning = physician-designed CLINICAL SEGMENTS (revised 2026-09-02).** The CLIF
+  consortium's `critical_illness_tokenization_final_with_intervals.csv` (1268 clinician-designed
+  segments across labs/vitals) is the default (`configs/data.yaml → value_binning.scheme:
+  clinical_segment`; `src/data/build_clinical_segment_bins`). These encode measurement-density
+  granularity — tighter intervals in decision zones, extreme-value quintiles at the tails — that
+  the team judges **more clinically relevant** than data-driven deciles, and it is what differentiates
+  this model from a plain AR token predictor. **Population deciles are demoted to the `decile_ablation`
+  arm** (Lee 2026 found deciles ≈ ref-range at matched granularity — so we MEASURE the two head-to-head
+  in the tokenization ablation rather than assert either; whichever wins under the frozen protocol
+  stays the default). *This supersedes the earlier "frozen deciles PRIMARY, clinical bins = ablation"
+  decision (2026-08-27) — reversed on clinical-relevance grounds; the ablation keeps it honest.*
+  Clinical decision thresholds (lactate 2/4, MAP 65, SpO₂ 88/90, KDIGO, P/F Berlin) are guaranteed
+  bin edges under either scheme.
 - E2. **TextCode / language-grounded arm ELEVATED from future-work to a real transfer-robustness arm.**
   PORTER (arXiv:2606.24102, 2026): frozen-vocab models drop ~69% of events on cross-site transfer;
   language-grounded recovers 97.1% AUROC without vocab mapping. Frozen mCIDE stays PRIMARY (turnkey, matches

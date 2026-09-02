@@ -7,7 +7,7 @@ sidebar_position: 2
 # Data & Tokenization
 
 Turning raw CLIF 2.1 parquet into the fused event-token stream the backbone consumes.
-Implemented in `src/data/tokenize.py` (decile arm), `src/data/tokenize_continuous.py`
+Implemented in `src/data/tokenize.py` (clinical-segment + decile arms), `src/data/tokenize_continuous.py`
 (McCann ablation), and `src/data/tokenize_textcode.py` (language-grounded ablation);
 configured by `configs/data.yaml`.
 
@@ -31,7 +31,7 @@ flowchart TB
     V & L & M & RS & ADT --> MELT["Melt to long events<br/>(hosp_id, dttm, concept, value, unit)"]
     MELT --> UNIT["Unit normalization<br/>(error on non-canonical CLIF units)"]
     UNIT --> ORDER["Order by storetime / availability<br/>per hospitalization"]
-    ORDER --> BIN["Value binning<br/>per-concept deciles"]
+    ORDER --> BIN["Value binning<br/>physician clinical segments (primary)"]
     BIN --> FUSE["Fuse: concept=bin → single token"]
     FUSE --> SOFT["Soft discretization<br/>(spread mass to ± neighbor bins)"]
     SOFT --> ROPE["Admission-relative-minute position<br/>(time-aware RoPE)"]
@@ -144,26 +144,33 @@ target). *Code:* `src/data/value_stats.py`; generate with
 
 ---
 
-## Frozen decile edges + forced clinical thresholds
+## Binning: physician-designed clinical segments (primary) + forced thresholds
 
-Bin **edges** are frozen from a reference site (`build_from_site: mimic`) and applied
-identically everywhere, so the token space transports across hospitals (Federated GEMs: only
-0.025 AUROC cross-site penalty). ICU decision cutpoints are then **forced to be guaranteed bin
-edges** so tokens align with the threshold-hazard head's queries.
+The **primary** binning scheme is the CLIF consortium's **physician-designed clinical segments** —
+1268 clinician-defined bins across labs/vitals
+(`critical_illness_tokenization_final_with_intervals.csv`), with measurement-density granularity:
+tighter intervals in decision zones, wider above/below ranges, extreme-value quintiles at the tails.
+This encodes clinical domain expertise that data-driven binning can't recover, and it's what
+differentiates the model from a plain autoregressive token predictor. Bin **edges** are frozen from a
+reference site and applied identically everywhere so the token space transports across hospitals; ICU
+decision cutpoints are **forced to be guaranteed bin edges** so tokens align with the threshold-hazard
+head's queries. *Population deciles are kept as the `decile_ablation` arm — the scheme is measured
+head-to-head, not asserted (Lee 2026 found deciles ≈ ref-range at matched granularity).*
 
 ```mermaid
 flowchart LR
-    REF["Reference site (MIMIC)<br/>per-concept value distribution"] --> DEC["Compute deciles<br/>(10 bins / concept)"]
-    DEC --> FORCE["Force clinical edges onto grid:<br/>lactate 2/4 · MAP 65 · SpO₂ 88/90<br/>KDIGO · P/F Berlin"]
+    CSV["Physician-designed segments<br/>(1268 clinical bins, CLIF consortium CSV)"] --> EDGES["Per-concept interior edges<br/>build_clinical_segment_bins()"]
+    EDGES --> FORCE["Force clinical edges onto grid:<br/>lactate 2/4 · MAP 65 · SpO₂ 88/90<br/>KDIGO · P/F Berlin"]
     FORCE --> FROZEN["Frozen edges (vocab.json)"]
     FROZEN -->|"applied identically, no refit"| MIMIC["MIMIC tokens"]
     FROZEN -->|"applied identically, no refit"| RUSH["Rush tokens"]
     FROZEN -->|"applied identically, no refit"| UC["UChicago tokens"]
+    CSV -. "decile_ablation arm" .-> DEC["Population deciles<br/>(the measured comparison)"]
 
     classDef ref fill:#e3f2fd,stroke:#1565c0,color:#0d1b2a;
-    classDef site fill:#e8f5e9,stroke:#2e7d32,color:#0d1b2a;
-    class REF,DEC,FORCE,FROZEN ref;
-    class MIMIC,RUSH,UC site;
+    classDef abl fill:#fff8e1,stroke:#f9a825,color:#0d1b2a;
+    class CSV,EDGES,FORCE,FROZEN ref;
+    class DEC abl;
 ```
 
 ---
@@ -205,29 +212,27 @@ flowchart TB
     DATA --> A4
     DATA --> A5
 
-    A1["1 · Clinical bins<br/>(CLIFATRON baseline)"]
-    A2["2 · Global deciles"]
-    A3["3 · Deciles + soft<br/>(predicted winner)"]
+    A1["1 · Clinical segments + soft<br/>(PRIMARY — physician-designed)"]
+    A2["2 · Population deciles<br/>(decile_ablation)"]
+    A3["3 · Deciles + soft"]
     A4["4 · Continuous-fused<br/>(McCann)"]
     A5["5 · TextCode<br/>(frozen BERT descriptions)"]
 
     A1 & A2 & A3 & A4 & A5 --> CMP["Compare AUPRC + calibration,<br/>esp. tail/threshold outcomes"]
 
-    classDef base fill:#eceff1,stroke:#546e7a,color:#0d1b2a;
     classDef win fill:#e8f5e9,stroke:#2e7d32,color:#0d1b2a;
     classDef abl fill:#fff8e1,stroke:#f9a825,color:#0d1b2a;
-    class A1 base;
-    class A3 win;
-    class A2,A4,A5 abl;
+    class A1 win;
+    class A2,A3,A4,A5 abl;
 ```
 
-| Arm | Representation | Evidence anchor |
-|-----|----------------|-----------------|
-| Clinical bins | CLIFATRON reference-range quantiles | baseline |
-| Global deciles | population deciles, frozen | Lee 2026 |
-| **Deciles + soft** | deciles + Gaussian adjacent-bin mass | Lee 2026 (wins tails) |
-| Continuous-fused | fused numeric channel + MC | McCann 2026 |
-| TextCode | frozen BioClinical-ModernBERT code descriptions | Al Attrach 2025 / PORTER 2026 |
+| Arm | Representation | Role |
+|-----|----------------|------|
+| **Clinical segments + soft** | physician-designed CLIF segment CSV (1268 bins) + adjacent-bin mass | **primary** — clinical-relevance default |
+| Population deciles | data-driven quantile edges, frozen | `decile_ablation` (Lee 2026 comparison) |
+| Deciles + soft | deciles + Gaussian adjacent-bin mass | ablation |
+| Continuous-fused | fused numeric channel + MC | McCann 2026 ablation |
+| TextCode | frozen BioClinical-ModernBERT code descriptions | Al Attrach 2025 / PORTER 2026 ablation |
 
 :::tip Target concepts (K hazard heads)
 The threshold-hazard head is trained over `configs/data.yaml → target_concepts`: MAP, lactate,
