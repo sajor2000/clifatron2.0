@@ -17,6 +17,7 @@ dependencies = [
     "sentence-transformers>=3.0",  # leakage-safe note embeddings (small clinical model)
     "tqdm>=4.66",
     "cryptography>=44.0.1",    # U11 Ed25519 releaser->site bundle signing (trust.py)
+    "xformers>=0.0.32",          # memory-efficient attention (flash-attn fallback; flash-attn lacks cu13+cp313 wheel)
 ]
 
 # Test runner, grouped for reproducible CI installs (`uv run --frozen --group dev pytest`).
@@ -29,6 +30,7 @@ dev = [
 
 [tool.uv]
 # 2x L40 box is Linux/CUDA; pin CUDA wheels there via `uv sync --extra cuda` if needed.
+# flash-attn lacks cu13+cp313 prebuilt wheel; source build ~36h. Use xformers + torch SDPA instead.
 
 [build-system]
 requires = ["hatchling"]

@@ -5,6 +5,7 @@
 const sidebars = {
   workflowSidebar: [
     'overview',
+    'v1-vs-v2',
     'data-tokenization',
     'architecture',
     'objectives-training',

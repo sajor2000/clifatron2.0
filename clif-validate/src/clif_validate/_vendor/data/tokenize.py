@@ -36,7 +36,7 @@ from clif_validate._vendor.data.cohort import (
 )
 from clif_validate._vendor.data.splits import fit_partition
 
-SPECIAL = {"<pad>": 0, "<bos>": 1, "<eos>": 2}
+SPECIAL = {"<pad>": 0, "<bos>": 1, "<eos>": 2, "<unk>": 3}
 ROOT = Path(__file__).parents[2]
 
 
@@ -452,6 +452,18 @@ def tokenize_site(cfg: dict, site: str, base: Path, out: Path,
     elif vocab_manifest is None:
         raise QualificationError("an imported vocabulary requires a validated manifest")
 
+    # The unknown-concept fallback below emits SPECIAL["<unk>"] for a concept+bin the
+    # frozen vocab does not cover (cross-site coverage). That is only safe if the vocab
+    # actually reserves that id for <unk>. A freshly built vocab always does (build_vocab
+    # starts from dict(SPECIAL)); a legacy IMPORTED vocab predating the <unk> token would
+    # map id 3 to a real token, so an unknown concept would silently become a valid token.
+    # Fail closed rather than emit an incorrect or out-of-range id.
+    if vocab.get("<unk>") != SPECIAL["<unk>"]:
+        raise QualificationError(
+            f"vocabulary must reserve id {SPECIAL['<unk>']} for '<unk>' "
+            f"(found {vocab.get('<unk>')!r}); the unknown-concept fallback is unsafe otherwise"
+        )
+
     # Map each event using positions derived from canonical ICU admission.
     def encode(group: pl.DataFrame) -> pl.DataFrame:
         token, soft_token, soft_weight, valnum = [], [], [], []
@@ -478,14 +490,12 @@ def tokenize_site(cfg: dict, site: str, base: Path, out: Path,
                 if hard_token is None and c in edges:
                     b = 0
                     key = fused_token(c, b)
-                    hard_token = vocab.get(key, SPECIAL["<pad>"])
+                    hard_token = vocab.get(key, SPECIAL["<unk>"])
             else:
                 key = fused_token(c, b)
-                hard_token = vocab.get(key, SPECIAL["<pad>"])
+                hard_token = vocab.get(key, SPECIAL["<unk>"])
             if hard_token is None:
-                raise KeyError(
-                    f"unknown token {key!r} — frozen vocab does not cover this concept+bin"
-                )
+                hard_token = SPECIAL["<unk>"]
             token.append(hard_token)
             assignments = (
                 _soft_bins(v_for_bin, c, edges, bin_cfg["soft_kernel_bins"])
@@ -495,7 +505,7 @@ def tokenize_site(cfg: dict, site: str, base: Path, out: Path,
             soft_tokens, weights = [], []
             for soft_bin, weight in assignments:
                 st_key = fused_token(c, soft_bin) if soft_bin is not None else fused_token(c, None)
-                soft_tokens.append(vocab.get(st_key, SPECIAL["<pad>"]))
+                soft_tokens.append(vocab.get(st_key, SPECIAL["<unk>"]))
                 weights.append(weight)
             soft_token.append(soft_tokens)
             soft_weight.append(weights)

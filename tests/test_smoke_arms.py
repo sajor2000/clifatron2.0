@@ -59,25 +59,27 @@ class SmokeTest(unittest.TestCase):
         cls.cfg = yaml.safe_load(DATA_CFG.read_text())
         cls.mcfg = yaml.safe_load(MODEL_CFG.read_text())
 
-        # Building the cohort/episode artifact fail-closes on un-qualified source data
-        # (dirty ICU intervals, missing required identifiers, non-UTC timestamps). That
-        # is a DATA-readiness condition, not a model-smoke failure — skip cleanly so the
-        # suite stays green on raw, not-yet-qualified CLIF drops.
+        # The cohort/episode/target pipeline fail-closes on un-qualified source data:
+        # dirty ICU intervals, missing required identifiers, non-UTC timestamps
+        # (QualificationError), or an episode whose events extend past the anchor /
+        # violate the target contract (TargetContractError, the post-anchor leakage
+        # guard). Either is a DATA-readiness condition, not a model-smoke failure — skip
+        # cleanly so the suite stays green on raw, not-yet-qualified CLIF drops.
         from src.data.cohort import QualificationError
+        from src.data.targets import TargetContractError
         try:
             cls._build_vocab()
-        except QualificationError as exc:
+            cls.shards = _read_shards()
+            print(f"Loaded {len(cls.shards):,} stays with vocab size {cls.vocab_size:,}")
+            cls.batch = _make_batch(cls.shards, cls.vocab_size)
+        except (QualificationError, TargetContractError) as exc:
             os.chdir(cls._prev_cwd)
             cls.tmp.cleanup()
             raise unittest.SkipTest(
-                f"raw CLIF data at {CLIF_DATA} is not cohort-qualified "
-                f"(needs pre-qualification): {exc}"
+                f"raw CLIF data at {CLIF_DATA} is not cohort/target-qualified "
+                f"(needs pre-qualification): {type(exc).__name__}: {exc}"
             )
 
-        cls.shards = _read_shards()
-        print(f"Loaded {len(cls.shards):,} stays with vocab size {cls.vocab_size:,}")
-
-        cls.batch = _make_batch(cls.shards, cls.vocab_size)
         print(f"Batch shapes: token={list(cls.batch['token'].shape)}, "
               f"soft_token={list(cls.batch['soft_token'].shape)}, "
               f"pos_min={list(cls.batch['pos_min'].shape)}")

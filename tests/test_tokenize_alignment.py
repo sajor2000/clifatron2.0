@@ -8,6 +8,7 @@ synthetic site, nulls one MAP measurement so the skip path fires, tokenizes, and
 asserts every per-stay array is the same length.
 """
 
+import json
 import os
 import tempfile
 import unittest
@@ -80,6 +81,72 @@ class TokenizeAlignmentTest(unittest.TestCase):
                 if row["hosp_id"] == "synth-000":
                     saw_skip = True
             self.assertTrue(saw_skip, "the nulled-measurement stay was not tokenized")
+
+
+class UnkReservedTokenGuardTest(unittest.TestCase):
+    def test_imported_vocab_must_reserve_unk_id(self):
+        """An imported vocab whose <unk> id is wrong is rejected before the unknown-
+        concept fallback can emit an incorrect/out-of-range token (CodeRabbit PR #13)."""
+        import copy
+
+        import polars as pl
+
+        from src.data.cohort import QualificationError
+        from src.eval.synthetic_bundle import (
+            FIXTURE_COHORT,
+            FIXTURE_DATA_CONFIG,
+            FIXTURE_POLICY,
+            SYNTHETIC_SITE,
+            build_synthetic_site,
+        )
+
+        with tempfile.TemporaryDirectory() as td:
+            work = Path(td)
+            old_cwd = os.getcwd()
+            os.chdir(work)
+            try:
+                import yaml
+
+                site = work / "site"
+                episode_path = build_synthetic_site(site)
+                (work / "cohort.yaml").write_text(yaml.safe_dump(FIXTURE_COHORT))
+                (work / "artifact_policy.yaml").write_text(yaml.safe_dump(FIXTURE_POLICY))
+                cfg = copy.deepcopy(FIXTURE_DATA_CONFIG)
+                cfg["cohort_contract"] = str((work / "cohort.yaml").resolve())
+                cfg["artifact_policy"] = str((work / "artifact_policy.yaml").resolve())
+
+                from src.data.tokenize import (
+                    SPECIAL,
+                    _json_sha256,
+                    tokenize_site,
+                )
+
+                episodes = pl.read_parquet(episode_path)
+                # First build a valid frozen vocab (writes vocab.json with its manifest).
+                out = Path("output/intermediate_phi/unk_build")
+                tokenize_site(
+                    cfg, SYNTHETIC_SITE, site, out, None, None,
+                    episodes=episodes, artifact_policy=FIXTURE_POLICY,
+                )
+                blob = json.loads((out / "vocab.json").read_text())
+                vocab, edges, manifest = blob["vocab"], blob["edges"], blob["manifest"]
+
+                # Corrupt the reserved <unk> id and re-import with a manifest hash that
+                # still matches the corrupted vocab (so the <unk> guard — not the hash
+                # check — is what must reject it). Must fail closed.
+                bad_vocab = dict(vocab)
+                bad_vocab["<unk>"] = max(vocab.values()) + 999  # not SPECIAL["<unk>"]
+                self.assertNotEqual(bad_vocab["<unk>"], SPECIAL["<unk>"])
+                manifest["hashes"]["vocabulary"] = _json_sha256(bad_vocab)
+                out2 = Path("output/intermediate_phi/unk_reject")
+                with self.assertRaisesRegex(QualificationError, "<unk>"):
+                    tokenize_site(
+                        cfg, SYNTHETIC_SITE, site, out2, bad_vocab, edges,
+                        episodes=episodes, vocab_manifest=manifest,
+                        artifact_policy=FIXTURE_POLICY,
+                    )
+            finally:
+                os.chdir(old_cwd)
 
 
 class ReadTableEdgeCaseTest(unittest.TestCase):

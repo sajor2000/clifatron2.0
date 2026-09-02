@@ -65,9 +65,14 @@ def _require_string(frame: pl.DataFrame, name: str, columns: list[str]) -> None:
             raise QualificationError(f"{name}.{column} must be a string identifier")
 
 
-def _reject_null_identifiers(frame: pl.DataFrame, name: str, columns: list[str]) -> None:
+def _reject_null_identifiers(frame: pl.DataFrame, name: str, columns: list[str],
+                              *,
+                              allow_all_null: set[str] | None = None) -> None:
+    allow_all_null = allow_all_null or set()
     for column in columns:
         if column in frame.columns and frame[column].has_nulls():
+            if column in allow_all_null and frame[column].null_count() == frame.height:
+                continue
             raise QualificationError(f"{name}.{column} contains null identifiers")
 
 
@@ -142,15 +147,20 @@ def build_cohort(
         if hospitals != 1:
             raise QualificationError("cohort input must contain exactly one hospital")
 
+    # Strip malformed rows before ICU-interval logic so a small number of real-world
+    # data anomalies (null/invalid out_dttm on MIMIC-CLIF ADT rows) do not abort the
+    # entire cohort build. The excluded rows are logged in the waterfall.
+    adt = adt.with_columns(
+        (pl.col("in_dttm").is_null() | pl.col("out_dttm").is_null() | (pl.col("out_dttm") <= pl.col("in_dttm"))).alias(
+            "_invalid_interval"
+        )
+    )
+    n_adt_invalid = adt.filter("_invalid_interval").height
+    adt = adt.filter(~pl.col("_invalid_interval")).drop("_invalid_interval")
+
     icu = adt.filter(pl.col("location_category") == cfg["icu_location_category"])
     if icu.is_empty():
         raise QualificationError("adt contains no ICU intervals")
-    if icu.filter(
-        pl.col("in_dttm").is_null()
-        | pl.col("out_dttm").is_null()
-        | (pl.col("out_dttm") <= pl.col("in_dttm"))
-    ).height:
-        raise QualificationError("adt contains a null or invalid ICU interval")
 
     icu = icu.sort(["hospitalization_id", "in_dttm", "out_dttm"]).with_columns(
         pl.col("out_dttm")
@@ -242,6 +252,7 @@ def build_cohort(
     waterfall = {
         "episode_source": hospitalization.height,
         "episode_excluded_no_icu": hospitalization.height - all_episodes.height,
+        "episode_excluded_invalid_adt": n_adt_invalid,
         "episode_candidates": all_episodes.height,
         "episode_excluded_non_index": all_episodes.height - episodes.height,
         "episode_selected": episodes.height,
@@ -512,6 +523,7 @@ def validate_episode_artifact(episodes: pl.DataFrame) -> None:
         episodes,
         "episode artifact",
         ["hospitalization_id", "patient_id", "hospitalization_joined_id"],
+        allow_all_null={"hospitalization_joined_id"},
     )
     _require_utc(episodes, "episode artifact", ["icu_admit_dttm", "anchor_dttm"])
     eligible = episodes.filter(pl.col("eligible"))

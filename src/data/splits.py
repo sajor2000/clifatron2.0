@@ -62,7 +62,7 @@ def assign_grouped_splits(
     if missing:
         raise ValueError(f"episodes missing split keys: {', '.join(sorted(missing))}")
     _validate_identifiers(
-        episodes, ["hospitalization_id", "patient_id", "hospitalization_joined_id"]
+        episodes, ["hospitalization_id", "patient_id"]
     )
     if not ratios or any(value <= 0 for value in ratios.values()):
         raise ValueError("split ratios must all be positive")
@@ -148,10 +148,12 @@ def validate_grouped_splits(rows: pl.DataFrame) -> None:
     if missing:
         raise ValueError(f"split artifact missing columns: {', '.join(sorted(missing))}")
     _validate_identifiers(
-        rows, ["hospitalization_id", "patient_id", "hospitalization_joined_id", "partition"]
+        rows, ["hospitalization_id", "patient_id", "partition"]
     )
     for column in ["patient_id", "hospitalization_joined_id"]:
         if column not in rows.columns:
+            continue
+        if rows[column].null_count() == rows.height:
             continue
         leaked = rows.group_by(column).agg(pl.col("partition").n_unique().alias("n")).filter(
             pl.col("n") != 1

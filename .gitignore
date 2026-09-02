@@ -1,6 +1,7 @@
 # data & model artifacts — NEVER commit (PHI / large binaries)
 # NOTE: leading slash = repo-root only, so src/data/ source is NOT ignored
 /data/
+/output/
 /checkpoints/
 /benchmark/results/
 *.parquet
