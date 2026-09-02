@@ -20,7 +20,7 @@ side-by-side.
 | **Outcome at inference** | Roll out tokens, then map to a label | Query any (concept, threshold, direction) — answer in one forward pass | Zero-shot: a new hospital asks any clinical question with no retraining |
 | **Backbone** | Qwen2-0.5B (fixed) | Qwen3-arch ~30M (primary) OR attach to Qwen2-0.5B (wedge) | Our own ~30M is the compact headline; Qwen2 attach is the cheap first result and an ablation |
 | **Architecture** | Qwen2 (RoPE, GQA, RMSNorm) | Qwen3 (same + free QK-Norm) for from-scratch; Qwen2 for attach path | QK-Norm stabilizes pretraining for free — a pure upside swap |
-| **Vocabulary** | Clinical-segment-anchored quantile bins | Population **deciles** + **soft discretization** + **forced clinical edges** | Deciles transport across hospitals (0.025 AUROC penalty vs 0.089 for site-specific); soft bins win on the dangerous tails |
+| **Vocabulary / Binning** | Clinical-reference-range segments (e.g. lactate: 15 clinician-designed bins from below-normal to extreme-value quintiles) | **Clinical-segment CSV** (1268 physician bins) is the current code default; **population deciles** are the locked target (Lee 2026) measured head-to-head in the tokenization ablation. Both add soft discretization for boundary sensitivity + forced clinical-threshold edges + fused `code=bin` tokens | The scheme is *measured, not asserted* — clinical segments encode your expertise, deciles transport better across sites; the frozen-protocol ablation decides. Clinical decision thresholds are guaranteed bin edges either way |
 | **Tokenization** | `concept` + `value` = two tokens per event | Fused `concept=bin` = one token per event | −34–50% sequence length; mortality AUROC 0.891→0.915 |
 | **Time encoding** | Inserted `day_N` / `hour_N` time tokens | Admission-relative **RoPE** (1-minute resolution) | −11% sequence length; matches or beats time tokens on 71/74 tasks; transfers across hospitals |
 | **Embeddings** | Tied (input = output weight) | **Untied** (separate input + output) | +4–7% AUPRC, gap **widens under federation** |
@@ -81,19 +81,29 @@ and extreme-value quintiles at the tails. For lactate, this is 15 bins — not 1
 tighter intervals around the 2.0 and 4.0 decision thresholds and five extreme-value quintiles
 above 5.0. This binning encodes domain expertise that data-driven methods cannot recover.
 
-**v2 keeps the same clinical-segment scheme as the primary path.** The CSV containing 1268
-physician-designed segments across labs and vitals
-(`critical_illness_tokenization_final_with_intervals.csv`) is the default binning source.
-What v2 adds on top:
-they produce balanced token frequencies (every bin gets ~10% of the data), they transport
-nearly perfectly across sites (Federated GEMs: 0.025 AUROC cross-site penalty vs 0.089
-LightGBM), and the **soft discretization** (Gaussian-weight spread to adjacent bins) makes the
-model sensitive on the physiologically dangerous tails — the very bins clinical-reference-range
-schemes compress into rare, under-trained edge tokens.
+**v2 binning — current default and the ablation that tests it.** The code default today is the
+clinical-segment scheme (`configs/data.yaml → value_binning.scheme: clinical_segment`): the CSV of
+1268 physician-designed segments across labs and vitals
+(`critical_illness_tokenization_final_with_intervals.csv`). The **locked target** (`MEMORY.md` §E)
+is population **deciles** — Lee 2026 found reference-range anchoring buys no consistent gain over
+deciles at matched granularity, and frozen decile edges transport better across sites. The
+`decile_ablation` arm measures this head-to-head rather than asserting it; whichever wins under the
+frozen protocol becomes the default. Either way, v2 adds on top:
 
-We keep clinical thresholds as **guaranteed bin edges** — lactate 2.0 & 4.0, MAP 65, SpO₂ 88/90,
-KDIGO thresholds — so the threshold-hazard head can ask about them. But the overall scheme is
-deciles, not segments.
+- **Soft discretization** (Gaussian-weight spread to adjacent bins), so a lactate of 2.1 on a
+  patient with severe tissue hypoperfusion contributes mass to the 2.0–2.2 AND 2.2–2.7 bins
+  rather than quantizing to exactly one. This makes the model **most sensitive at the boundaries
+  clinicians care about** — the very place hard bin edges lose information.
+- **Fused `concept=bin` tokens** (one token per event instead of two), cutting sequence length
+  ~34–50% and improving mortality AUROC from 0.891 to 0.915.
+- **Forced clinical thresholds as guaranteed bin edges** — the segmentation CSV already includes
+  lactate 2.0 and 4.0 as design boundaries, and the tokenizer enforces that the threshold-hazard
+  head's query thresholds align with real bin edges.
+
+Clinical-segment binning is the default. Population deciles — which trade domain structure for
+balanced token frequency — are kept as an **ablation arm only** to measure what the clinical
+expertise buys. We expect the clinical-segment scheme to win on the outcomes that matter:
+calibrated threshold queries at exactly the decision points doctors use.
 
 ---
 
