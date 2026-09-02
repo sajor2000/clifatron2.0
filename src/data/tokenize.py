@@ -490,6 +490,14 @@ def tokenize_site(cfg: dict, site: str, base: Path, out: Path,
         bin_cfg = cfg["value_binning"]
         fit_events = fit_partition(events, bin_cfg.get("fit_partition", "train"))
         target_concepts = [t["name"] for t in cfg.get("target_concepts", [])]
+        # Fail closed on a missing/empty target_concepts under clinical_segment: an empty
+        # list would silently build no edges, so every numeric event would collapse to a
+        # bare categorical token — the configured clinical representation silently disabled.
+        if bin_cfg.get("scheme", "clinical_segment") == "clinical_segment" and not target_concepts:
+            raise QualificationError(
+                "value_binning.scheme=clinical_segment requires a non-empty cfg.target_concepts; "
+                "without it no clinical-segment edges are built and numeric events lose their value bins"
+            )
         edges = build_edges(bin_cfg, fit_events, target_concepts)
         vocab = build_vocab(fit_events, edges)
         cohort_cfg = yaml.safe_load((ROOT / cfg["cohort_contract"]).read_text())

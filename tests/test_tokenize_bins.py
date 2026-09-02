@@ -71,6 +71,13 @@ class ClinicalSegmentBinsTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             build_edges({"scheme": "decile"}, events, ["lactate"])  # no n_bins
 
+    def test_decile_ablation_scheme_uses_n_bins(self):
+        events = pl.DataFrame({"concept": ["lactate"] * 40,
+                               "value": [float(v) / 8 for v in range(40)]})
+        edges = build_edges({"scheme": "decile_ablation", "n_bins": 10}, events, ["lactate"])
+        self.assertIn("lactate", edges)
+        self.assertEqual(len(edges["lactate"]), 9)  # 10 bins -> 9 interior edges
+
 
 class TokenizeBinsTest(unittest.TestCase):
     def test_forced_edges_stay_if_outside_reference_range(self):
