@@ -51,7 +51,7 @@ states (requires per-task labels at every site).
 
 CLIFATRON 2.0 replaces the language-model objective with a **marked time-to-event** stack:
 
-```
+```text
 Threshold hazard:    P( MAP < 65  within 48h | H_t )   ← zero-shot at inference
 Competing-risk CIF:  P( death at bin t | H_t )          ← zero-shot at inference
 Value regression:    predict creatinine = μ ± σ          ← calibrated Gaussian mark
@@ -61,7 +61,7 @@ Next-event (aux):    P( token_t+1 | H_t )                ← low-weight, 20%
 The threshold head — ICareFM's core idea — is what makes one small model answer many outcomes
 without retraining. At inference you compose:
 
-```
+```text
 Circulatory failure risk = P(MAP < 65 within h) · P(Lactate > 2 within h)
 ```
 
@@ -70,16 +70,21 @@ only approximate with expensive Monte-Carlo token rollout and per-task classifie
 
 ---
 
-## Tokenization: fused deciles + soft bins vs clinical segments
+## Tokenization: clinical segments preserved as the primary scheme
 
-**v1** bins each concept by clinical-reference-range segments (e.g. "high K⁺ = 5.5–6.0 mEq/L").
-These are intuitively meaningful but **site-specific** — Rush's patient mix produces different
-segment occupancies than MIMIC's, so the token distribution shifts and the model degrades on
-transfer.
+This is the single most important detail that distinguishes CLIFATRON 2.0 from generic EHR
+foundation models — and the reason the v1 clinical team's work was not discarded.
 
-**v2** bins by **population deciles frozen on one reference site** (MIMIC). This is counter-
-intuitive — clinically arbitrary cutpoints — but Lee (arXiv:2604.16775) tested both at matched
-granularity and found **no consistent advantage for clinical anchoring**. What deciles win on:
+**v1** bins each concept by clinician-designed segments: normal range subdivided into
+measurement-density-aware intervals, above/below ranges with progressively wider intervals,
+and extreme-value quintiles at the tails. For lactate, this is 15 bins — not 10 — with
+tighter intervals around the 2.0 and 4.0 decision thresholds and five extreme-value quintiles
+above 5.0. This binning encodes domain expertise that data-driven methods cannot recover.
+
+**v2 keeps the same clinical-segment scheme as the primary path.** The CSV containing 1268
+physician-designed segments across labs and vitals
+(`critical_illness_tokenization_final_with_intervals.csv`) is the default binning source.
+What v2 adds on top:
 they produce balanced token frequencies (every bin gets ~10% of the data), they transport
 nearly perfectly across sites (Federated GEMs: 0.025 AUROC cross-site penalty vs 0.089
 LightGBM), and the **soft discretization** (Gaussian-weight spread to adjacent bins) makes the
