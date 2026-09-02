@@ -72,23 +72,24 @@ unit_normalization:
     temp_c: celsius
 
 value_binning:
-  # REVISED 2026-08-27 (tokenization thread a76bb9). Lee 2026 (arXiv:2604.16775): reference-range
-  # anchoring buys NO consistent gain over population deciles at matched granularity -> deciles win
-  # on simplicity + balanced token frequency + transport. Frozen decile EDGES transport across sites
-  # (Federated GEMs 2608.02939: only 0.025 AUROC cross-site penalty). So: deciles, frozen, NOT clinical bins.
-  scheme: "decile"                        # {decile | clinical_segment(CLIFATRON ablation arm) | continuous_fused(McCann ablation)}
-  n_bins: 10                              # per-concept deciles -> fused value-bin tokens
-  build_from_site: "mimic"                # freeze bin EDGES on reference site, apply identically to all sites
-  fit_partition: "train"                  # never fit vocabulary/edges on validation, calibration, or test
-  # SOFT DISCRETIZATION (Lee's one encoder that WINS on the dangerous tails we care about: severe
-  # hypokalemia/hypernatremia/hypotension/CRRT/K-extremes). Spread mass to adjacent bins. This is how
-  # we honor "most sensitive where it's most dangerous for the patient" WITHOUT hard clinical bins.
+  # PRIMARY SCHEME: physician-designed clinical-segment bins with measurement-density
+  # granularity (critical_illness_tokenization_final_with_intervals.csv, 1268 segments
+  # across labs/vitals). These bins were designed by CLIF consortium clinicians who defined
+  # both the clinical thresholds AND the sub-segment density: tighter intervals in decision
+  # zones, wider above/below ranges, and extreme-value quintiles at the tails.
+  # THIS is the default — it encodes clinical domain expertise that data-driven binning
+  # cannot recover, and it is what differentiates this model from an auto-regressive token
+  # predictor on EHR sequences.
+  scheme: "clinical_segment"               # {clinical_segment | decile_ablation | continuous_fused_ablation}
+  segment_source: "external/clifatron/tokenETL/config/critical_illness_tokenization_final_with_intervals.csv"
+  n_bins: null                             # not used in clinical_segment mode
+  build_from_site: "mimic"                 # freeze bin edges on reference site, apply identically everywhere
+  fit_partition: "train"                   # never fit vocabulary/edges on validation, calibration, or test
+  # SOFT DISCRETIZATION: applied ON TOP of clinical segments to smooth hard bin boundaries
+  # while preserving the physician-designed segment edges. Adjacent-bin mass prevents
+  # quantization jitter at boundary crossings, especially on dangerous tails.
   soft_discretization: true
   soft_kernel_bins: 1                     # +/- neighbor bins to receive soft mass
-  # tokenizer output keeps `token` as the hard NTP target and adds `soft_token` +
-  # `soft_weight` as the weighted encoder input. The same frozen edges are the
-  # numeric-binning override for the default tokenETL path; packing remains upstream.
-  # Clinical derivation as a CONSTRAINT (not the base scheme): force ICU DECISION thresholds to be
   # guaranteed bin edges so tokens are legible at decision points AND boundaries align with the
   # threshold-hazard head's queries. Does not contradict Lee (he anchored the WHOLE scheme; we only
   # pin a few cutpoints on top of the decile grid).

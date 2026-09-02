@@ -1,21 +1,18 @@
 """CLIF 2.1 parquet -> per-site event-token shards + vocab.json.
 
-REVISED per Lee et al. 2026 (arXiv:2604.16775): each event is ONE FUSED token
-`concept=bin` (numeric) or `concept` (categorical) — the fused code+value token
-was the single biggest win on MIMIC-IV-Ext-CLIF (mortality 0.891->0.915), so the
-old split concept/value tokens are retired. Value bins are per-concept deciles,
-frozen from one site (config: value_binning.build_from_site) and applied to BOTH
-sites so Rush and MIMIC share a vocabulary without pooling raw data.
+Value bins are per-concept **clinician-designed segments** (the CLIF consortium's
+`critical_illness_tokenization_final_with_intervals.csv`, 1268 segments across
+labs/vitals) — NOT data-driven deciles. The scheme is physician-defined: normal
+range subdivided by measurement density, above/below with progressively wider
+intervals, extreme-value quintiles at the tails. Population deciles are retained
+as an ablation arm (`scheme: decile` in data.yaml).
 
-Position is admission-relative minutes (`pos_min`), consumed by RoPE downstream
-(replaces Δt). Events are ordered by `storetime` (availability), never charttime.
-
-Treatments (meds) are emitted as INPUT events only; they are never targets
-(ICareFM rule 1). See notes/METHODS.md and notes/RESEARCH.md §2.
+Each event is ONE FUSED token `concept=bin` (numeric) or `concept` (categorical).
+Position is admission-relative minutes (`pos_min`). Events are storetime-ordered.
 
 Usage:
-    python -m src.data.tokenize --site mimic --in $MIMIC_DIR --out data/mimic --build-vocab
-    python -m src.data.tokenize --site rush  --in $RUSH_DIR  --out data/rush  --vocab data/mimic/vocab.json
+    python -m src.data.tokenize --site mimic --in $MIMIC_DIR --out output/intermediate_phi/mimic --build-vocab --episodes output/intermediate_phi/episodes.parquet
+    python -m src.data.tokenize --site rush  --in $RUSH_DIR  --out output/intermediate_phi/rush --vocab output/intermediate_phi/mimic/vocab.json --episodes output/intermediate_phi/rush_episodes.parquet
 """
 from __future__ import annotations
 
@@ -260,6 +257,75 @@ def build_value_bins(events: pl.DataFrame, n_bins: int,
     return edges
 
 
+def build_clinical_segment_bins(
+    segment_source: str | Path,
+    concepts: list[str],
+    forced_edges: dict[str, list[float]] | None = None,
+) -> dict[str, list[float]]:
+    """Per-concept interior bin edges from the CLIF consortium's physician-designed
+    segmentation CSV (`critical_illness_tokenization_final_with_intervals.csv`).
+
+    These 1268 clinician-designed segments encode measurement-density granularity
+    (tighter intervals in decision zones, extreme-value quintiles at the tails) that
+    data-driven deciles cannot recover — the primary v2 scheme
+    (`value_binning.scheme: clinical_segment`).
+
+    The CSV lists, per `measurement`, ordered `[min_value, max_value]` intervals. The
+    interior bin edges are the sorted unique interval boundaries with the outermost
+    min/max dropped (open at ±inf), matching the format `_bin_of` consumes
+    (`np.searchsorted` over interior boundaries → bin index). Forced ICU-decision
+    cutpoints are pinned onto the grid as guaranteed edges."""
+    import csv
+
+    forced_edges = forced_edges or {}
+    rows_by_concept: dict[str, list[tuple[float, float]]] = {}
+    with open(segment_source, newline="") as fh:
+        for row in csv.DictReader(fh):
+            measurement = row.get("measurement")
+            if measurement not in concepts:
+                continue
+            try:
+                lo, hi = float(row["min_value"]), float(row["max_value"])
+            except (TypeError, ValueError):
+                continue
+            if not (np.isfinite(lo) and np.isfinite(hi)):
+                continue
+            rows_by_concept.setdefault(measurement, []).append((lo, hi))
+
+    edges: dict[str, list[float]] = {}
+    for concept, intervals in rows_by_concept.items():
+        boundaries = sorted({b for lo, hi in intervals for b in (lo, hi)})
+        # Drop the outermost min/max — the first and last bins are open at ±inf.
+        interior = boundaries[1:-1]
+        for pin in sorted({float(e) for e in forced_edges.get(concept, []) if np.isfinite(float(e))}):
+            if not any(np.isclose(e, pin) for e in interior):
+                interior.append(pin)
+        edges[concept] = sorted(interior)
+    return edges
+
+
+def build_edges(bin_cfg: dict, fit_events: pl.DataFrame,
+                target_concepts: list[str]) -> dict[str, list[float]]:
+    """Dispatch on `value_binning.scheme` to build per-concept bin edges.
+
+    - clinical_segment (default/primary): physician-designed segments from the CSV.
+    - decile / decile_ablation: population quantile edges (the Lee-2026 comparison arm).
+    """
+    scheme = bin_cfg.get("scheme", "clinical_segment")
+    forced = bin_cfg.get("forced_edges")
+    if scheme in ("clinical_segment",):
+        source = bin_cfg.get("segment_source")
+        if not source:
+            raise ValueError("value_binning.scheme=clinical_segment requires segment_source")
+        return build_clinical_segment_bins(ROOT / source, target_concepts, forced)
+    if scheme in ("decile", "decile_ablation"):
+        n_bins = bin_cfg.get("n_bins")
+        if not n_bins:
+            raise ValueError(f"value_binning.scheme={scheme} requires n_bins")
+        return build_value_bins(fit_events, n_bins, forced)
+    raise ValueError(f"unknown value_binning.scheme: {scheme!r}")
+
+
 def fused_token(concept: str, b: int | None) -> str:
     """One token per event: `concept=bin` if numeric, else bare `concept`."""
     return f"{concept}={b}" if b is not None else concept
@@ -423,7 +489,8 @@ def tokenize_site(cfg: dict, site: str, base: Path, out: Path,
             )
         bin_cfg = cfg["value_binning"]
         fit_events = fit_partition(events, bin_cfg.get("fit_partition", "train"))
-        edges = build_value_bins(fit_events, bin_cfg["n_bins"], bin_cfg.get("forced_edges"))
+        target_concepts = [t["name"] for t in cfg.get("target_concepts", [])]
+        edges = build_edges(bin_cfg, fit_events, target_concepts)
         vocab = build_vocab(fit_events, edges)
         cohort_cfg = yaml.safe_load((ROOT / cfg["cohort_contract"]).read_text())
         split_hashes = episodes["split_sha256"].drop_nulls().unique().to_list()

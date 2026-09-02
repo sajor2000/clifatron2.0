@@ -78,20 +78,21 @@ trainable**; joint arm = **34.9M trainable**. Gradients flow in every arm (smoke
 
 ## Tokenization ablation (recap)
 
-The five representation arms from **[Data & Tokenization](./data-tokenization.md)** run through
-the same trunk. Lee 2026 predicts **deciles + soft** wins, especially on tail/threshold AUPRC.
+The representation arms from **[Data & Tokenization](./data-tokenization.md)** run through the same
+trunk. Physician-designed **clinical segments** are the primary scheme (clinical-relevance default);
+population deciles are the `decile_ablation` measured head-to-head against it.
 
 ```mermaid
 flowchart LR
-    B["clinical bins<br/>(CLIFATRON baseline)"] --> R
-    D["global deciles"] --> R
-    S["deciles + soft<br/>(predicted winner)"] --> R
+    B["clinical segments + soft<br/>(PRIMARY — physician-designed)"] --> R
+    D["population deciles<br/>(decile_ablation)"] --> R
+    S["deciles + soft"] --> R
     C["continuous-fused<br/>(McCann)"] --> R
     T["textcode<br/>(frozen BERT / PORTER)"] --> R
     R["run_tokenization_ablation<br/>same backbone + tasks"] --> OUT["tail/threshold AUPRC + calibration"]
 
     classDef win fill:#e8f5e9,stroke:#2e7d32,color:#0d1b2a;
-    class S win;
+    class B win;
 ```
 
 ---
