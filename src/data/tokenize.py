@@ -452,6 +452,18 @@ def tokenize_site(cfg: dict, site: str, base: Path, out: Path,
     elif vocab_manifest is None:
         raise QualificationError("an imported vocabulary requires a validated manifest")
 
+    # The unknown-concept fallback below emits SPECIAL["<unk>"] for a concept+bin the
+    # frozen vocab does not cover (cross-site coverage). That is only safe if the vocab
+    # actually reserves that id for <unk>. A freshly built vocab always does (build_vocab
+    # starts from dict(SPECIAL)); a legacy IMPORTED vocab predating the <unk> token would
+    # map id 3 to a real token, so an unknown concept would silently become a valid token.
+    # Fail closed rather than emit an incorrect or out-of-range id.
+    if vocab.get("<unk>") != SPECIAL["<unk>"]:
+        raise QualificationError(
+            f"vocabulary must reserve id {SPECIAL['<unk>']} for '<unk>' "
+            f"(found {vocab.get('<unk>')!r}); the unknown-concept fallback is unsafe otherwise"
+        )
+
     # Map each event using positions derived from canonical ICU admission.
     def encode(group: pl.DataFrame) -> pl.DataFrame:
         token, soft_token, soft_weight, valnum = [], [], [], []
