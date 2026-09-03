@@ -47,7 +47,7 @@ flowchart TB
 
     subgraph GATES["🔑 Blockers (not code)"]
         G1["Governance:<br/>may a pre-selection v0 bundle<br/>run at an external site?"]
-        G2["External-site onboarding<br/>(Rush · UChicago · federation)"]
+        G2["External-site onboarding<br/>(Site 2 · Site 3 · federation)"]
         G3["Real CLIF data staged<br/>+ ce-data-qa per site"]
         G4["2× L40 GPU qualification<br/>(driver reboot; FA2 + DDP)"]
         G5["Derived-model transfer approval<br/>(PHI weights cross sites)"]
@@ -110,8 +110,8 @@ flowchart LR
 | Gate | What it is | Action |
 |---|---|---|
 | **G1 — pre-selection governance** | May a non-final v0 bundle run at an external site? **Longest-lead item; still unasked.** A "no" reshapes sequencing. | Ask the consortium / IRB **now**. |
-| **G2 — site onboarding** | Rush + UChicago + federation running the turnkey `clif-validate` package locally. | Coordinate enrollment + DUAs. |
-| **G3 — real data + QA** | Real CLIF tables per site + `ce-data-qa`. MIMIC is staged (546,028 stays / ~134M events); Rush + UChicago are not. | Stage data; run QA. |
+| **G2 — site onboarding** | Site 2 + Site 3 + federation running the turnkey `clif-validate` package locally. | Coordinate enrollment + DUAs. |
+| **G3 — real data + QA** | Real CLIF tables per site + `ce-data-qa`. Site 1 is staged (546,028 stays / ~134M events); Site 2 + Site 3 are not. | Stage data; run QA. |
 | **G4 — GPU qualification** | 2× L40 report: FA2 packed attention, DDP scaling, memory, matrix cost. **`nvidia-smi` driver mismatch — reboot first.** | Reboot; run U13-FA2 + U14. |
 | **G5 — transfer approval** | Written approval to reuse PHI-derived weights for transport across sites. | Obtain + record, else U6/U7 run same-site only. |
 

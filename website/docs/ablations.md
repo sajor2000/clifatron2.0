@@ -45,7 +45,7 @@ flowchart TB
 | No-pretrain | random encoder (frozen) | head only | negative control (floor) |
 
 :::tip Why frozen-probe is the expected winner
-At ~30M on data-constrained MIMIC (utility saturates ~28M, arXiv:2505.22964), unfreezing risks catastrophic
+At ~30M on data-constrained Site 1 (utility saturates ~28M, arXiv:2505.22964), unfreezing risks catastrophic
 forgetting, and the task-aligned survival objective *is* the supervision. Frozen-probe is also
 the **only** mode that supports label-free federated validation — a new site never trains.
 :::
@@ -71,7 +71,7 @@ flowchart LR
     class FH,JB,JH train;
 ```
 
-*Measured on real MIMIC:* the model builds at **34.9M params**; frozen arm = **0.7M
+*Measured on the development site:* the model builds at **34.9M params**; frozen arm = **0.7M
 trainable**; joint arm = **34.9M trainable**. Gradients flow in every arm (smoke-tested).
 
 ---

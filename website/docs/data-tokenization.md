@@ -114,7 +114,7 @@ every event (numeric or not) so batching stays dense.
 
 The ORA value-regression head predicts the continuous *value* of the next event. Raw ICU values span
 ~5 orders of magnitude per concept (creatinine ~1, platelets ~2×10⁵), so an un-normalized Gaussian NLL
-is dominated by high-magnitude concepts and never trains (observed `val≈46000` on real MIMIC). The fix:
+is dominated by high-magnitude concepts and never trains (observed `val≈46000` on the development site). The fix:
 standardize each numeric event to ~N(0,1) using per-**token** center/scale frozen from a reference site
 — the same freeze-on-reference-site pattern used for clinical-segment edges.
 
@@ -162,9 +162,9 @@ flowchart LR
     CSV["Physician-designed segments<br/>(1268 clinical bins, CLIF consortium CSV)"] --> EDGES["Per-concept interior edges<br/>build_clinical_segment_bins()"]
     EDGES --> FORCE["Force clinical edges onto grid:<br/>lactate 2/4 · MAP 65 · SpO₂ 88/90<br/>KDIGO · P/F Berlin"]
     FORCE --> FROZEN["Frozen edges (vocab.json)"]
-    FROZEN -->|"applied identically, no refit"| MIMIC["MIMIC tokens"]
-    FROZEN -->|"applied identically, no refit"| RUSH["Rush tokens"]
-    FROZEN -->|"applied identically, no refit"| UC["UChicago tokens"]
+    FROZEN -->|"applied identically, no refit"| S1["Site 1 tokens"]
+    FROZEN -->|"applied identically, no refit"| S2["Site 2 tokens"]
+    FROZEN -->|"applied identically, no refit"| S3["Site 3 tokens"]
     CSV -. "decile_ablation arm" .-> DEC["Population deciles<br/>(the measured comparison)"]
 
     classDef ref fill:#e3f2fd,stroke:#1565c0,color:#0d1b2a;

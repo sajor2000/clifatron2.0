@@ -36,7 +36,7 @@ side-by-side.
 | **Modality** | Structured events only | Structured events + (v2) **pre-anchor notes** via frozen BioClinical ModernBERT → in-stream soft token | Notes recover 97.1% cross-site AUROC vs 69% drop for frozen-vocab-only models (PORTER 2026) |
 | **Selective prediction** | Not supported | Per-outcome deferral confidence — defers uncertain predictions to human review | A safety requirement for clinical deployment |
 | **Size** | Qwen2-0.5B (500M params) | **~30M** (d512 × 8L × 8H) with untied embeddings + 4 heads = 33–37M | Fits on one node (2× L40), no cluster — the original compact thesis realized |
-| **Data sites** | Developed on MIMIC only | **3-site** (MIMIC, Rush, UChicago) development → **all-CLIF-federation** external validation | External validation across real consortium hospitals, not just a held-out test split |
+| **Data sites** | Developed on Site 1 only | **3-site** (Site 1, Site 2, Site 3) development → **all-CLIF-federation** external validation | External validation across real consortium hospitals, not just a held-out test split |
 
 ---
 

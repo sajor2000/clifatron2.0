@@ -132,7 +132,7 @@ FSDP is *not* used (only pays off past ~2.3B params and is worse without NVLink)
 arms.
 
 :::tip Value-head normalization — resolved
-The value-regression loss was unnormalized on real MIMIC (raw lab magnitudes — creatinine ~1,
+The value-regression loss was unnormalized on real Site 1 (raw lab magnitudes — creatinine ~1,
 platelet counts ~2×10⁵ — made it dominate, `val≈46000`). **Fixed:** `src/data/value_stats.py`
 freezes per-token robust (median/IQR) value statistics from a reference site, vocab-hash-bound;
 training standardizes `(value − center) / scale` and fails closed on a missing/stale map.

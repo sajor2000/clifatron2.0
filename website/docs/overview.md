@@ -50,7 +50,7 @@ GPU / governance, not code. See **[Governance, Trust & Reproducibility](./govern
 flowchart TB
     subgraph DEV["DEVELOPMENT (data we hold — 3 sites)"]
         direction TB
-        A["CLIF 2.1 parquet<br/>MIMIC · Rush · UChicago"] --> B["Tokenization<br/>fused code=bin · deciles<br/>soft discretization · RoPE"]
+        A["CLIF 2.1 parquet<br/>Site 1 · Site 2 · Site 3"] --> B["Tokenization<br/>fused code=bin · deciles<br/>soft discretization · RoPE"]
         B --> C["Backbone<br/>from-scratch Qwen3 ~30M (primary)<br/>· CLIFATRON Qwen2 0.5B wedge<br/>8192 ctx · untied emb"]
         C --> D["Our heads<br/>threshold-hazard · competing-risk<br/>value-regression · next-event"]
         D --> E["Joint pretrain<br/>NTP → TTE curriculum<br/>uncertainty + grad-norm balancing"]
@@ -94,7 +94,7 @@ mindmap
       vitals / labs / meds as events
       pre-anchor notes only
     ~30M efficient
-      utility saturates ~28M on MIMIC (arXiv:2505.22964)
+      utility saturates ~28M on Site 1 (arXiv:2505.22964)
       one node, 2× L40
     Federated real-data
       model-to-data validation
@@ -139,9 +139,9 @@ flowchart LR
 ```mermaid
 flowchart TB
     subgraph HOLD["We hold the data (development)"]
-        M["MIMIC-IV-Ext-CLIF 2.1"]
-        R["Rush"]
-        U["UChicago (CLIF origin site)"]
+        M["Site 1"]
+        R["Site 2"]
+        U["Site 3"]
     end
     HOLD -->|"3×3 train-A / test-B matrix<br/>+ adaptation ladder + LPE + ensemble"| INT["Internal transportability"]
 
@@ -171,7 +171,7 @@ These constrain every stage of the pipeline.
 | 2 | **Vocab = frozen CLIF mCIDE, applied identically to all sites — no cross-site raw pooling** | Tokenization, federation |
 | 3 | **Retrospective reports / discharge summaries = label source only; only pre-anchor notes are features** | Notes modality, eval labeling |
 | 4 | **`storetime`/availability ordering, not `charttime`** | Tokenization (no look-ahead) |
-| 5 | **MIMIC is PhysioNet-credentialed; Rush + UChicago institutional — no data leaves its node** | Federation, compute |
+| 5 | **Development sites are governed-study-credentialed; no data leaves its node** | Federation, compute |
 
 ---
 

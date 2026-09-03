@@ -4,7 +4,7 @@ Global memory: ~/.claude/CLAUDE.md (rules) + ~/.claude/memory/memory.md (index).
 
 ## What this is
 Compact (~30M-param) multimodal ICU foundation model on **federated CLIF 2.1**
-(dev cohort = MIMIC-IV-Ext-CLIF + Rush + UChicago; **only MIMIC is currently staged on the L40
+(dev cohort = Site 1 + Site 2 + Site 3; **only Site 1 is currently staged on the L40
 box** — see LOCKED DECISIONS G2), pretrained with a **threshold-conditioned
 time-to-event** objective. Thesis: one small model → many outcomes → many
 hospitals → one node (2× L40, no cluster). Nature-Medicine framing: efficiency +
@@ -60,7 +60,7 @@ Five-thread deep research + 2 focused 2026-preprint threads (tokenization a76bb9
 - **Cadence** (medRxiv 2026) — small-beats-big; temperature scaling; dual-sex TRIPOD+AI reporting.
 
 ## Sites & federated design (2026-08-27) — DEVELOP on 3, VALIDATE on the whole CLIF federation
-DEVELOPMENT cohort (data we hold): MIMIC-IV-Ext-CLIF + Rush + UChicago. EXTERNAL VALIDATION:
+DEVELOPMENT cohort (data we hold): Site 1 + Site 2 + Site 3. EXTERNAL VALIDATION:
 ALL OTHER CLIF consortium sites via model-to-data — ship the frozen model + a turnkey clifpy/
 tokenETL eval script; each site runs it on its LOCAL CLIF tables and returns ONLY aggregate
 metrics. No raw data, labels, or gradients ever leave any node. This IS the thesis
@@ -89,7 +89,7 @@ metrics. No raw data, labels, or gradients ever leave any node. This IS the thes
 - **Internal eval (3 held sites):** 3×3 train-A/test-B matrix + adaptation ladder
   (as-is/recalibrate/finetune) + LPE + Elemento ensemble column.
 - **HEADLINE FIGURE:** forest/box plot of AUROC/AUPRC/calibration across N external CLIF sites per
-  outcome — the "does it travel" result. UChicago = CLIF origin site (Bhavani).
+  outcome — the "does it travel" result. Site 3 = CLIF origin site (Bhavani).
 
 ## STEERING PRINCIPLE (2026-08-27) — clinically derived: encode "good vs bad for doctors"
 > **⚠️ BINNING DECISION BELOW REVERSED 2026-09-02 — see LOCKED DECISIONS §E1a.** This section argued
@@ -116,7 +116,7 @@ clinical bins are NOT how you achieve it. CORRECTED tokenization decision (SUPER
 1. Treatments = model inputs, NEVER prediction targets.
 2. Vocab = CLIFATRON frozen mCIDE, applied identically to all 3 sites — no cross-site pooling of raw data.
 3. Retrospective reports/discharge summaries = LABEL source only; only pre-anchor notes may be features.
-4. MIMIC-IV-Ext-CLIF is PhysioNet credentialed; Rush + UChicago institutional — none leave their node.
+4. Site 1 is governance-credentialed; Site 2 + Site 3 institutional — none leave their node.
    Compute = 3 tiers: MacBook (dev, MPS), 2× L40 Linux box (default training, DDP), and Azure hourly GPU
    (burst) — Azure ONLY inside a BAA/DUA-covered lab tenant (never an ad-hoc personal sub for real PHI).
 
@@ -128,7 +128,7 @@ These resolve every open design question as of this date. Change only with new e
   The 2026 literature owns every *method* piece: ORA (arXiv:2602.00541) owns marked-TTE; ICareFM
   (medRxiv 2025.07.25.25331635) owns threshold-directional dual-zero-shot BUT on **ricu, not CLIF**, and
   its **weights are DUA-gated**; SurvivEHR owns competing-risk (UK primary care, not ICU); EveryQuery/ETHOS
-  own query-conditioned zero-shot; Elemento owns no-data-sharing ensembling (on MIMIC partitions, not real
+  own query-conditioned zero-shot; Elemento owns no-data-sharing ensembling (on Site 1 partitions, not real
   hospitals). **Unclaimed = the first OPEN, CLIF-native ICU FM with a threshold-TTE objective validated by
   model-to-data across REAL CLIF-consortium hospitals.** Novelty = integration + open tooling + deployment,
   which is the stronger axis for a Nature-Medicine clinical framing. Do NOT claim method invention.
@@ -158,8 +158,8 @@ These resolve every open design question as of this date. Change only with new e
 
 **D. Objective (LOCKED — where the novelty lives)**
 - D1. Loss weights CR 1.0 · threshold 1.0 · value 0.5 · NTP 0.2 (in code). D2. NTP→TTE curriculum
-  (15% warmup / 5% transition). D3. **RESOLVED (was: value-head loss unnormalized, val≈46000 on real
-  MIMIC).** `src/data/value_stats.py` now freezes per-**token** robust (median/IQR) value stats from a
+  (15% warmup / 5% transition). D3. **RESOLVED (was: value-head loss unnormalized, val≈46000 on the
+  development site).** `src/data/value_stats.py` now freezes per-**token** robust (median/IQR) value stats from a
   reference site, vocab-hash-bound; `pretrain.py --value-stats` applies `(value−center)/scale` and
   fails closed on a missing/stale map. Verified: standardization collapses mean raw value² from ~1.4e10
   to ~0.95 (O(1) NLL). Landed via PR #3.
@@ -194,9 +194,13 @@ These resolve every open design question as of this date. Change only with new e
 - F3. **Add a small-cell suppression rule** (e.g. suppress subgroup metrics with n<10) before shipping.
 
 **G. Practical blockers (not design decisions — must clear before real runs)**
-- G1. Locate a CLIFATRON checkpoint (needed for the Method-3 wedge). G2. Rush + UChicago data not staged
-  on the L40 box (only MIMIC: 546,028 stays / ~134M events) — the 3-site claim needs them. G3. Verify
+- G1. Locate a CLIFATRON checkpoint (needed for the Method-3 wedge). G2. Site 2 + Site 3 data not staged
+  on the L40 box (only Site 1: 546,028 stays / ~134M events) — the 3-site claim needs them. G3. Verify
   `head_adapter.anchor_state` against a real checkpoint on transformers v5 (output_hidden_states API drift).
+
+> **Site ID mapping (public docs use these IDs):** Site 1 = MIMIC-IV-Ext-CLIF (PhysioNet), Site 2 = Rush
+> (institutional), Site 3 = UChicago (institutional, CLIF origin site). Website docs refer to sites by
+> generic ID only. Internal notes, configs, and code use the real names.
 
 ## HANDOFF → notes/NEXT_STEPS.md (2026-08-27)
 Full agent-handoff written: finalized token+arch decisions (with the 2026 evidence tables + citations
@@ -217,7 +221,7 @@ via `uv run --with numpy --with scikit-learn`):
 - src/eval/matrix.py slimmed to re-export shim. pyproject += xgboost, transformers.
 Heads.py (ThresholdHazard/CompetingRisk/ValueRegression) unchanged = the keeper.
 NEXT: (1) confirm CLIFATRON benchmark parquet column names (seq/label/subgroup) + which sites
-its checkpoint is trained on. (2) Run method3 on a real checkpoint across MIMIC/Rush/UChicago (L40).
+its checkpoint is trained on. (2) Run method3 on a real checkpoint across Site 1/Site 2/Site 3 (L40).
 (3) Phase 2: joint-pretrain the heads on CLIFATRON backbone → enables zero-shot survival for the
 external CLIF-federation validation. (4) clif-validate/ shippable package (model-to-data). (5) tokenization
 ablation: CLIFATRON clinical bins vs Lee-2026 deciles. (6) notes modality (BioClinical ModernBERT).

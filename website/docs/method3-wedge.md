@@ -9,7 +9,7 @@ sidebar_position: 5
 Attach our calibrated survival/probe heads to a **released CLIFATRON checkpoint's** hour-24
 anchor hidden state, and beat their **Method 1** (XGBoost-on-embeddings) on AUPRC/calibration
 and **Method 2** (Monte-Carlo rollout) on cost — on CLIFATRON's own 4-task benchmark, across
-MIMIC / Rush / UChicago. Implemented in `src/eval/method3.py`.
+Site 1 / Site 2 / Site 3. Implemented in `src/eval/method3.py`.
 
 :::tip Why this is the wedge
 It runs on **any released checkpoint today** in frozen-probe mode — no retraining, minimal
@@ -83,15 +83,15 @@ sites** — each site fits locally and the matrix is assembled from per-site met
 flowchart TB
     subgraph MAT["3×3 matrix — AUROC / AUPRC / calibration-slope per cell"]
         direction TB
-        R1["train MIMIC → test MIMIC (internal)"]
-        R2["train MIMIC → test Rush (transport)"]
-        R3["train MIMIC → test UChicago (transport)"]
-        R4["train Rush → test MIMIC (transport)"]
-        R5["train Rush → test Rush (internal)"]
-        R6["train Rush → test UChicago (transport)"]
-        R7["train UChicago → test MIMIC (transport)"]
-        R8["train UChicago → test Rush (transport)"]
-        R9["train UChicago → test UChicago (internal)"]
+        R1["train Site 1 → test Site 1 (internal)"]
+        R2["train Site 1 → test Site 2 (transport)"]
+        R3["train Site 1 → test Site 3 (transport)"]
+        R4["train Site 2 → test Site 1 (transport)"]
+        R5["train Site 2 → test Site 2 (internal)"]
+        R6["train Site 2 → test Site 3 (transport)"]
+        R7["train Site 3 → test Site 1 (transport)"]
+        R8["train Site 3 → test Site 2 (transport)"]
+        R9["train Site 3 → test Site 3 (internal)"]
     end
     MAT --> ENS["Elemento ensemble column<br/>mean of the 3 site models' probs"]
     MAT --> LADDER["Adaptation ladder per off-diagonal cell"]
