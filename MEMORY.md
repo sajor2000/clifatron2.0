@@ -97,21 +97,15 @@ metrics. No raw data, labels, or gradients ever leave any node. This IS the thes
 > **physician-designed clinical segments the PRIMARY scheme** on clinical-relevance grounds, with
 > deciles as the `decile_ablation` arm that measures the two head-to-head. The GOAL (sensitive where
 > danger is, legible to a doctor) is unchanged; only the mechanism was reversed. §E1a is authoritative.
+> Every bullet below that argues for deciles as the correct choice is superseded by the 2026-09-02 reversal.
 
 GOAL (unchanged, correct): the model must be most sensitive where clinical DANGER is, and be legible
 to a doctor. But the MECHANISM matters — the 2026 evidence (both research threads landed) says hard
-clinical bins are NOT how you achieve it. CORRECTED tokenization decision:
-- **Base bins = population DECILES, frozen from a reference site — NOT clinical-reference-range bins.**
-  Lee 2026 (arXiv:2604.16775) tested reference-range anchoring vs deciles at matched granularity →
-  NO consistent advantage. My earlier "clinical bins beat deciles / deciles don't transport" was WRONG:
-  you freeze the bin EDGES (physical cutpoints) across sites → deciles transport (Federated GEMs
-  2608.02939: 0.025 AUROC cross-site penalty vs 0.079 LightGBM). data.yaml already used frozen deciles.
-- **Soft discretization = the clinical-derivation win.** Lee's one encoder that beats discrete on
-  exactly the dangerous tails (severe hypokalemia/hypernatremia/hypotension/CRRT/K-extremes). "Most
-  sensitive where most dangerous" achieved by the encoder the evidence backs, not by hard bins.
-- **Clinical thresholds enter as a CONSTRAINT, not the base:** force ICU decision cutpoints (lactate 2/4,
-  MAP 65, SpO2 88/90, KDIGO, P/F Berlin) to be guaranteed bin EDGES on the decile grid → legible at
-  decision points + aligns with threshold-hazard head. Doesn't contradict Lee (he anchored the WHOLE scheme).
+clinical bins are NOT how you achieve it. CORRECTED tokenization decision (SUPERSEDED 2026-09-02):
+- **Base bins = population DECILES** — superseded. We now use physician-designed clinical-segment bins as primary.
+- **Soft discretization** — retained. Applied on top of clinical segments for boundary sensitivity.
+- **Clinical thresholds as a CONSTRAINT** — retained. Forced edges (lactate 2/4, MAP 65, etc.) guaranteed on the clinical-segment grid.
+- **Deciles transport** — academic finding, superseded by clinical-team judgment that domain-expert bins are more important than transportability.
 - **Continuous-fused value channel (McCann 2026.08.04) = ABLATION, not default:** +30% numeric acc, −34%
   seq len, but WORSE calibration than discrete; calibration is our headline. Naive unfused xVal collapses
   to median (Lee) → never. This resolves the previously-open value-channel question: discrete+soft ships.

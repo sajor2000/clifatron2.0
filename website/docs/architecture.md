@@ -15,6 +15,10 @@ context, **untied** embeddings. Two backbone paths, run as a ladder:
   CLIFATRON's Qwen2 is **0.5B** — a *larger comparator*, never our ~30M model. This is the fast first
   rung (Method 3) and half of the finetune-vs-scratch ablation.
 
+From CLIFATRON v1 we **keep** the Qwen2 architecture for the wedge path, the fused `code=bin`
+token format, the mCIDE vocabulary, and the document-isolation packing approach. The from-scratch
+Qwen3 path is new and fully independent.
+
 We attach the same four heads to either backbone's per-token hidden states. "Qwen2 vs Qwen3" is itself
 a **measured ablation row**, not an assertion.
 

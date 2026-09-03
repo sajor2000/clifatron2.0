@@ -8,15 +8,29 @@
 
 ## The goal (one paragraph)
 
-CLIFATRON 2.0 is a **methods-upgrade layer** on
-[CLIFATRON](https://github.com/Common-Longitudinal-ICU-data-Format/CLIFATRON) — the CLIF
-consortium's compact (~30M-param) CLIF-native ICU foundation model. We keep CLIFATRON's
-tokenizer / packing / trained backbone and add the pieces that make a small ICU model
-**transportable and clinically deployable**: a **threshold-conditioned time-to-event**
-objective (ICareFM) + **competing-risk CIF** (SurvivEHR) + a **value-regression "mark"**
-head (ORA), replacing pure next-token prediction; **zero-shot, training-free** survival heads;
-and **federated external validation by model-to-data** across the whole CLIF consortium, with a
-full **TRIPOD+AI** calibration / decision-curve / fairness eval panel.
+CLIFATRON 2.0 has two paths, run as a ladder to de-risk the headline contribution:
+
+- **Primary — a from-scratch ~30M-param Qwen3-architecture decoder with a marked time-to-event
+  objective** (threshold-hazard + competing-risk CIF + value-regression mark), replacing pure
+  next-token prediction. This is the novel headline: a fully ours, compact CLIF-native ICU
+  model trained from scratch.
+- **Wedge / attach path — bolt our survival heads onto the released CLIFATRON Qwen2 checkpoint**
+  (0.5B, a larger comparator). This cheap first result de-risks the objective before the
+  from-scratch run lands, and serves as half of the finetune-vs-scratch ablation.
+
+From CLIFATRON we **keep**: the fused `code=bin` token format, the 1268-row physician-designed
+clinical-segment CSV (the bin boundaries you built), the mCIDE vocabulary, the CLIF 2.1 data
+format, the treatment-as-input (never-target) rule, the Qwen2 backbone for the attach path, and
+the document-isolation sequence-packing approach. The tokenization ETL was rewritten from a
+multi-file pandas pipeline to a single-file polars pipeline supporting soft discretization,
+admission-relative RoPE, and `build_edges` dispatch — the binning data (segmentation CSV) and
+fused-token concept are preserved.
+
+What we **add** that makes this new: a **threshold-conditioned time-to-event** objective (ICareFM)
++ **competing-risk CIF** (SurvivEHR) + a **value-regression "mark"** head (ORA), replacing pure
+next-token prediction; **zero-shot, training-free** survival heads; and **federated external
+validation by model-to-data** across the whole CLIF consortium, with a full **TRIPOD+AI**
+calibration / decision-curve / fairness eval panel.
 
 **Thesis:** *one small model → many outcomes → many hospitals → one node (2× L40, no cluster).*
 

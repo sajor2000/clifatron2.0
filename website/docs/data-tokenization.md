@@ -59,7 +59,7 @@ where a value token can attach to the wrong concept.
 
 ```mermaid
 flowchart LR
-    RAW["creatinine = 1.4 mg/dL<br/>(decile bin 7)"]
+    RAW["creatinine = 1.4 mg/dL<br/>(segment bin 7)"]
 
     subgraph SPLIT["Split (rejected)"]
         S1["token: C::creatinine"]
@@ -116,7 +116,7 @@ The ORA value-regression head predicts the continuous *value* of the next event.
 ~5 orders of magnitude per concept (creatinine ~1, platelets ~2×10⁵), so an un-normalized Gaussian NLL
 is dominated by high-magnitude concepts and never trains (observed `val≈46000` on real MIMIC). The fix:
 standardize each numeric event to ~N(0,1) using per-**token** center/scale frozen from a reference site
-— the same freeze-on-MIMIC pattern as the decile edges.
+— the same freeze-on-reference-site pattern used for clinical-segment edges.
 
 ```mermaid
 flowchart TB

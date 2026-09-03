@@ -9,9 +9,17 @@ sidebar_position: 1
 
 CLIFATRON 2.0 is a **methods-upgrade layer** on
 [CLIFATRON](https://github.com/Common-Longitudinal-ICU-data-Format/CLIFATRON), the CLIF
-consortium's compact (~30M-parameter) CLIF-native ICU foundation model. We keep CLIFATRON's
-tokenizer, sequence packing, and trained backbone, and add the pieces that make a small ICU
-model **transportable and clinically deployable**.
+consortium's compact (~30M-parameter) CLIF-native ICU foundation model. Two paths:
+
+- **Primary — from-scratch ~30M Qwen3 decoder** with marked time-to-event objective, fully
+  ours, no upstream dependency. This is the novel headline.
+- **Wedge — attach our survival heads to CLIFATRON's released Qwen2 checkpoint** (0.5B, a
+  larger comparator) for a cheap first result that de-risks the objective.
+
+From CLIFATRON we **keep**: the fused `code=bin` token format, the physician-designed
+clinical-segment CSV (1268 bins), the mCIDE vocabulary, CLIF 2.1 data format, treatment-as-input
+rule, and document-isolation packing. What we add: threshold-conditioned time-to-event + CR CIF
++ value-regression heads, zero-shot survival, model-to-data federation, and full TRIPOD+AI eval.
 
 > **Thesis:** *one small model → many outcomes → many hospitals → one node (2× L40, no cluster).*
 
