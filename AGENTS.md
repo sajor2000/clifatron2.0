@@ -10,17 +10,18 @@
 
 CLIFATRON 2.0 has two paths, run as a ladder to de-risk the headline contribution:
 
-- **Primary — a from-scratch ~30M-param Qwen3-architecture decoder with a marked time-to-event
+- **Primary — a from-scratch ~30M-param Qwen2-architecture decoder with a marked time-to-event
   objective** (threshold-hazard + competing-risk CIF + value-regression mark), replacing pure
   next-token prediction. This is the novel headline: a fully ours, compact CLIF-native ICU
-  model trained from scratch.
+  model trained from scratch. Qwen3-arch (free QK-Norm) is a measured ablation row, not the
+  primary path — see the locked design decisions below for when Qwen3 enters.
 - **Wedge / attach path — bolt our survival heads onto the released CLIFATRON Qwen2 checkpoint**
   (0.5B, a larger comparator). This cheap first result de-risks the objective before the
   from-scratch run lands, and serves as half of the finetune-vs-scratch ablation.
 
 From CLIFATRON we **keep**: the fused `code=bin` token format, the 1268-row physician-designed
 clinical-segment CSV (the bin boundaries you built), the mCIDE vocabulary, the CLIF 2.1 data
-format, the treatment-as-input (never-target) rule, the Qwen2 backbone for the attach path, and
+format, the treatment-as-input (never-target) rule, the Qwen2 backbone for both paths, and
 the document-isolation sequence-packing approach. The tokenization ETL was rewritten from a
 multi-file pandas pipeline to a single-file polars pipeline supporting soft discretization,
 admission-relative RoPE, and `build_edges` dispatch — the binning data (segmentation CSV) and
@@ -67,12 +68,12 @@ DUA-gated ICareFM — treat it as a deliverable, not plumbing.
 - **Objective (where the novelty lives):** threshold-hazard (primary) + competing-risk CIF +
   value-regression (ORA mark) + low-weight next-event (0.2). NTP→TTE curriculum. This is the lever;
   the backbone is a footnote.
-- **Primary paper = from-scratch Qwen3-arch decoder + the objective, ~30M, fully ours.** Run as a
+- **Primary paper = from-scratch Qwen2-arch decoder + the objective, ~30M, fully ours.** Run as a
   ladder: (1) frozen-probe **Method-3 wedge** on a CLIFATRON Qwen2 checkpoint (cheap first result) →
-  (2) from-scratch **Qwen3** pretrain (novel headline) → (3) the two = the finetune-vs-scratch ablation.
-- **Backbone:** Qwen-family transformer. **From-scratch → Qwen3-arch** (free QK-Norm); **attach/wedge
-  path → Qwen2** (must match CLIFATRON's checkpoint). Keep a Qwen2-arch from-scratch arm so
-  "Qwen2 vs Qwen3" is a *measured* ablation row, not an assertion.
+  (2) from-scratch **Qwen2** pretrain (novel headline) → (3) the two = the finetune-vs-scratch ablation.
+- **Backbone:** Qwen-family transformer. **From-scratch → Qwen2-arch** (standard pre-norm, no QK-Norm);
+  **attach/wedge path → Qwen2** (must match CLIFATRON's checkpoint). Qwen3-arch (free QK-Norm) is
+  a measured ablation row so "Qwen2 vs Qwen3" is a quantified finding, not an assertion.
 - **Size:** our own model targets **~30M** (d512×8L×8H). CLIFATRON's Qwen2 checkpoint we attach to is
   **0.5B** — always state it as a *larger comparator*, never as our compact model.
 - **Tokenizer:** fused `code=bin`, **physician-designed clinical-segment bins** (primary, revised 2026-09-02;

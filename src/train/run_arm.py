@@ -79,7 +79,7 @@ class FromScratchModel(torch.nn.Module):
         self.enc = CLIFEncoder(vocab_size, mcfg)
         d = self.enc.d_model
         h = mcfg["heads"]
-        self.cr = CompetingRiskHead(d, n_targets, h["competing_risk"]["n_time_bins"])
+        self.cr = CompetingRiskHead(d, n_targets + 1, h["competing_risk"]["n_time_bins"])
         self.th = ThresholdHazardHead(
             d, n_targets, h["threshold_hazard"]["n_time_bins"],
             n_value_bins=10, thr_dim=h["threshold_hazard"]["threshold_embed_dim"],

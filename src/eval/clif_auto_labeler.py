@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import logging
 from pathlib import Path
 from typing import Any
 
@@ -19,6 +20,8 @@ from src.data.cohort import (
 ROOT = Path(__file__).parents[2]
 DEFAULT_COHORT_CONFIG = ROOT / "configs/cohort.yaml"
 DEFAULT_DATA_CONFIG = ROOT / "configs/data.yaml"
+
+logger = logging.getLogger(__name__)
 
 
 def _load_yaml(path: str | Path) -> dict[str, Any]:
@@ -42,6 +45,14 @@ def _outcome_events(base: Path, table_spec: dict[str, Any]) -> pl.DataFrame | No
             f"{table_spec['file']} is missing required columns: {', '.join(sorted(missing))}"
         )
     unit_col = table_spec.get("unit_col")
+    if unit_col is None:
+        logger.warning(
+            "table %s has no unit_col — all unit values will be null; "
+            "outcome unit validation (against spec['unit']) is silently skipped. "
+            "This is acceptable when the source table does not carry unit metadata, "
+            "but verify that spec['unit'] is still documented in the cohort contract.",
+            table_spec["file"],
+        )
     if frame.schema["hospitalization_id"] != pl.String:
         raise QualificationError(
             f"{table_spec['file']}.hospitalization_id must be a string identifier"
@@ -58,7 +69,7 @@ def _outcome_events(base: Path, table_spec: dict[str, Any]) -> pl.DataFrame | No
         (
             pl.col(unit_col).cast(pl.String)
             if unit_col
-            else pl.lit("").cast(pl.String)
+            else pl.lit(None, dtype=pl.String)
         ).alias("unit"),
     )
 

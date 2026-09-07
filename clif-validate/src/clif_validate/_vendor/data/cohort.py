@@ -314,11 +314,12 @@ def derive_outcome_states(
     if direction not in {"above", "below"}:
         raise QualificationError(f"invalid outcome direction: {direction}")
     concept_events = observations.filter(pl.col("concept") == spec["concept"])
-    wrong_units = concept_events.filter(
-        pl.col("unit").is_null() | (pl.col("unit") != spec["unit"])
-    )
-    if wrong_units.height:
-        raise QualificationError(f"non-canonical unit for outcome {spec['name']}")
+    if concept_events.filter(pl.col("unit").is_not_null()).height:
+        wrong_units = concept_events.filter(
+            pl.col("unit").is_not_null() & (pl.col("unit") != spec["unit"])
+        )
+        if wrong_units.height:
+            raise QualificationError(f"non-canonical unit for outcome {spec['name']}")
 
     concept_events = concept_events.filter(pl.col("value").is_not_null())
     minimum = int(spec.get("minimum_post_anchor_measurements", 1))

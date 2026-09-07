@@ -111,11 +111,12 @@ class TargetBuilder:
             max(0, math.ceil(observed_hours / self.horizon_hours * self.n_time_bins)),
         )
         event_bin = max(0, observed_bins - 1) if status in {"positive", "competing_event"} else -1
-        cause = int(row.get("cause_idx", target_idx)) if status == "positive" else -1
+        cause_raw = row.get("cause_idx")
+        cause = int(cause_raw if cause_raw is not None else target_idx) if status == "positive" else -1
         if status == "competing_event":
-            if "cause_idx" not in row:
+            if cause_raw is None:
                 raise TargetContractError("competing event requires an explicit cause_idx")
-            cause = int(row["cause_idx"])
+            cause = int(cause_raw)
         direction = row.get("direction")
         if direction not in {"below", "above"}:
             raise TargetContractError("outcome direction must be 'below' or 'above'")

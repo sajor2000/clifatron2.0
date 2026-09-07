@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import math
 import os
 from pathlib import Path
@@ -34,6 +35,8 @@ from src.data.dataset import ModelDataset
 from src.data.collate import collate_model_samples
 from src.data.targets import TargetBuilder
 from src.train.engine import setup_ddp, is_distributed, TrainConfig, train
+
+logger = logging.getLogger(__name__)
 
 
 def _load_decile_records(path: Path, *, drop_values_without_stats: bool = False) -> list[dict]:
@@ -100,10 +103,11 @@ def _has_supervised_outcomes(records: list[dict]) -> bool:
 class Model(torch.nn.Module):
     def __init__(self, vocab_size, n_targets, mcfg):
         super().__init__()
+        n_causes = n_targets + 1  # +1 for global death competing-cause slot
         self.enc = CLIFEncoder(vocab_size, mcfg)
         d = self.enc.d_model
         h = mcfg["heads"]
-        self.cr = CompetingRiskHead(d, n_targets, h["competing_risk"]["n_time_bins"])
+        self.cr = CompetingRiskHead(d, n_causes, h["competing_risk"]["n_time_bins"])
         self.th = ThresholdHazardHead(
             d, n_targets, h["threshold_hazard"]["n_time_bins"],
             n_value_bins=10, thr_dim=h["threshold_hazard"]["threshold_embed_dim"],
@@ -177,6 +181,7 @@ def main():
     mcfg = yaml.safe_load(Path(args.model_config).read_text())
     dcfg = yaml.safe_load(Path("configs/data.yaml").read_text())
     n_targets = len(dcfg["target_concepts"])
+    n_causes = n_targets + 1  # +1 for the global death competing-cause slot
     vocab_size = mcfg["trunk"].get("target_vocab", 10000)
 
     model = Model(vocab_size, n_targets, mcfg).to(dev)
@@ -192,8 +197,35 @@ def main():
         vblob = json.loads(vocab_path.read_text())
         expected_vocab_hash = vocab_hash(vblob.get("vocab", vblob))
     value_stats = _load_value_stats(args.value_stats, expected_vocab_hash=expected_vocab_hash)
-    data_path = Path(args.data) / "events.parquet"
+    data_dir = Path(args.data)
+    data_path = data_dir / "events.parquet"
     records = _load_decile_records(data_path, drop_values_without_stats=args.dry_run and not value_stats)
+    if not _has_supervised_outcomes(records):
+        augmented_path = data_dir / "events_with_outcomes.parquet"
+        if augmented_path.exists():
+            data_mtime = data_path.stat().st_mtime if data_path.exists() else 0
+            augmented_mtime = augmented_path.stat().st_mtime
+            if augmented_mtime < data_mtime:
+                msg = (
+                    f"Stale events_with_outcomes.parquet detected: augmented mtime "
+                    f"({augmented_mtime}) < events.parquet mtime ({data_mtime}). "
+                    f"Re-run outcome_join.py to regenerate."
+                )
+                if is_main:
+                    logger.error(msg)
+                raise SystemExit(msg)
+            records = _load_decile_records(
+                augmented_path, drop_values_without_stats=args.dry_run and not value_stats
+            )
+            logger.info("using augmented events: %s", augmented_path)
+            if is_main:
+                print(f"  using augmented events: {augmented_path}")
+        elif is_main:
+            logger.warning(
+                "events.parquet has no supervised outcomes and "
+                "events_with_outcomes.parquet does not exist. "
+                "Dry-run will proceed without TTE supervision; real training will fail."
+            )
     if not args.dry_run and not value_stats and _has_numeric_values(records):
         raise SystemExit(
             "value-head normalization is required before real training; pass --value-stats. "

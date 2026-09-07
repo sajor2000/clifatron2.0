@@ -1,0 +1,49 @@
+# Smoke test — 10 steps only
+optimizer:
+  name: adamw
+  lr: 3.0e-4
+  weight_decay: 0.1
+  betas: [0.9, 0.95]
+  grad_clip: 1.0
+
+schedule:
+  warmup_steps: 3
+  total_steps: 10
+  cosine_decay: true
+
+batch:
+  per_gpu: 2
+  grad_accum: 1
+
+runtime:
+  precision: bf16
+  compile: false
+  ddp: true
+  num_workers: 0
+  ckpt_every: 10
+  ckpt_dir: "checkpoints"
+
+data_contract:
+  cohort: "configs/cohort.yaml"
+  artifact_policy: "configs/artifact_policy.yaml"
+  split_seed: 42
+  partitions:
+    train: 0.60
+    validation: 0.15
+    calibration: 0.10
+    internal_test: 0.15
+  required_partitions: [train, validation, calibration, internal_test]
+  artifact_fit_partition: train
+  sealed_partitions: [internal_test, external_confirmation]
+  sealed_access_log: "output/intermediate_phi/sealed_access.parquet"
+  role_permissions:
+    train: [fit_model, fit_vocabulary, fit_numeric_edges, fit_target_map]
+    validation: [model_selection]
+    calibration: [fit_calibration]
+    internal_test: [final_evaluation_once_frozen]
+    transport: [development_site_evaluation]
+    external_confirmation: [confirmation_once_frozen]
+  site_roles:
+    development: [mimic, rush, uchicago]
+    external_confirmation: []
+  compatibility_families: [clifatron_checkpoint, experimental_representation]

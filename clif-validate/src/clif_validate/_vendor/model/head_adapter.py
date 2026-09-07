@@ -71,7 +71,7 @@ class CLIFATRONHeads(nn.Module):
                         self.next_event.projection.weight.copy_(pretrained.weight)
             except Exception:
                 pass
-        self.cr = CompetingRiskHead(d, n_targets, cr_bins)
+        self.cr = CompetingRiskHead(d, n_targets + 1, cr_bins)  # +1 for global death cause
         self.th = ThresholdHazardHead(d, n_targets, th_bins, n_value_bins=n_value_bins)
         self.vr = ValueRegressionHead(d, backbone.config.vocab_size) if enable_value else None
 
