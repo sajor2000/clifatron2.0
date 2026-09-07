@@ -27,6 +27,8 @@ from pathlib import Path
 
 import numpy as np
 
+from src.data.splits import fit_partition
+
 # 1.349 = IQR of a standard normal (Φ⁻¹(0.75) − Φ⁻¹(0.25)); makes robust scale
 # comparable to a standard deviation for well-behaved concepts.
 _IQR_TO_SIGMA = 1.349
@@ -98,6 +100,7 @@ def compute_value_stats(
 def compute_value_stats_from_events(
     events_path: str | Path,
     *,
+    partition: str = "train",
     min_count: int = _MIN_COUNT,
     robust: bool = True,
 ) -> dict[int, tuple[float, float]]:
@@ -111,6 +114,7 @@ def compute_value_stats_from_events(
     for col in ("token", "value"):
         if col not in df.columns:
             raise ValueError(f"{events_path} missing required column {col!r}")
+    df = fit_partition(df, partition)
     tokens = df["token"].to_list()
     values = df["value"].to_list()
     return compute_value_stats(tokens, values, min_count=min_count, robust=robust)
@@ -132,6 +136,7 @@ def write_value_stats(
     *,
     vocab: dict | None = None,
     vocab_sha: str | None = None,
+    fit_partition_name: str | None = None,
     min_count: int = _MIN_COUNT,
     robust: bool = True,
 ) -> Path:
@@ -147,6 +152,7 @@ def write_value_stats(
     blob = {
         "schema": 2,
         "vocab_hash": vocab_sha,
+        "fit_partition": fit_partition_name,
         "min_count": int(min_count),
         "robust": bool(robust),
         "stats": {str(tok): [center, scale] for tok, (center, scale) in sorted(stats.items())},
@@ -156,7 +162,10 @@ def write_value_stats(
 
 
 def load_value_stats(
-    path: str | Path, *, expected_vocab_hash: str | None = None
+    path: str | Path,
+    *,
+    expected_vocab_hash: str | None = None,
+    expected_fit_partition: str | None = None,
 ) -> dict[int, tuple[float, float]]:
     """Load a value-stats artifact, verifying vocabulary identity when available.
 
@@ -174,6 +183,13 @@ def load_value_stats(
                 raise ValueError(
                     f"value-stats vocabulary hash mismatch: artifact {stored[:12]}… != "
                     f"expected {expected_vocab_hash[:12]}… (stale or cross-vocabulary stats)"
+                )
+        if expected_fit_partition is not None:
+            stored_partition = blob.get("fit_partition")
+            if stored_partition != expected_fit_partition:
+                raise ValueError(
+                    "value-stats fit partition mismatch: artifact "
+                    f"{stored_partition!r} != expected {expected_fit_partition!r}"
                 )
         raw = blob["stats"]
     else:  # legacy bare map — no identity to verify
@@ -196,14 +212,16 @@ def _main() -> None:
                     help="vocab.json to bind stats to (defaults to a sibling of --events)")
     ap.add_argument("--min-count", type=int, default=_MIN_COUNT,
                     help="observations below which a token uses a wider fallback scale "
-                         "(NOT a drop threshold — every numeric token still gets stats)")
+                          "(NOT a drop threshold — every numeric token still gets stats)")
+    ap.add_argument("--partition", default="train",
+                    help="partition used to fit normalization statistics (default: train)")
     ap.add_argument("--mean-std", action="store_true",
                     help="use mean/std instead of robust median/IQR")
     args = ap.parse_args()
 
     robust = not args.mean_std
     stats = compute_value_stats_from_events(
-        args.events, min_count=args.min_count, robust=robust
+        args.events, partition=args.partition, min_count=args.min_count, robust=robust
     )
 
     # Bind to the fused vocabulary so a stale/cross-vocab artifact is detectable.
@@ -217,7 +235,12 @@ def _main() -> None:
         print(f"warning: no vocab.json at {vocab_path} — artifact will be UNBOUND (no identity check)")
 
     path = write_value_stats(
-        stats, args.out, vocab_sha=vsha, min_count=args.min_count, robust=robust
+        stats,
+        args.out,
+        vocab_sha=vsha,
+        fit_partition_name=args.partition,
+        min_count=args.min_count,
+        robust=robust,
     )
     print(f"wrote {len(stats):,} per-token value stats -> {path}"
           + (f" (vocab {vsha[:12]}…)" if vsha else " (unbound)"))

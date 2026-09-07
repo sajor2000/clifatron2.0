@@ -137,7 +137,11 @@ class DataConfigTest(unittest.TestCase):
                 "outcome_spec": digest(cohort_cfg["outcomes"]),
                 "clif_version": digest(cfg["schema_version"]),
             },
-            "provenance": {"source_site": "synthetic-reference", "immutable": True},
+            "provenance": {
+                "source_site": "synthetic-reference",
+                "fit_partition": "train",
+                "immutable": True,
+            },
         }
         loaded_vocab, loaded_edges, loaded_manifest = validate_vocabulary_artifact(
             {"vocab": vocab, "edges": edges, "manifest": manifest}, cfg, policy

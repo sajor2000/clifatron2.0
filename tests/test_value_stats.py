@@ -13,9 +13,11 @@ import unittest
 from pathlib import Path
 
 import numpy as np
+import polars as pl
 
 from src.data.value_stats import (
     compute_value_stats,
+    compute_value_stats_from_events,
     load_value_stats,
     vocab_hash,
     write_value_stats,
@@ -60,6 +62,20 @@ class ValueStatsTest(unittest.TestCase):
                 std_sq.append(((val - c) / s) ** 2)
         self.assertGreater(np.mean(raw_sq), 1e6)      # unnormalized NLL driver is huge
         self.assertLess(np.mean(std_sq), 3.0)          # standardized NLL driver is O(1)
+
+    def test_event_stats_fit_training_partition_only(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "events.parquet"
+            pl.DataFrame({
+                "token": [[10], [10], [10]],
+                "value": [[1.0], [3.0], [999999.0]],
+                "partition": ["train", "train", "internal_test"],
+            }).write_parquet(path)
+
+            stats = compute_value_stats_from_events(path, min_count=1)
+
+        self.assertEqual(stats[10][0], 2.0)
+        self.assertLess(stats[10][1], 10.0)
 
     def test_rare_tokens_still_get_stats_coverage_contract(self):
         """Rare numeric tokens must NOT be dropped — TargetBuilder aborts without them.
@@ -160,6 +176,20 @@ class ValueStatsTest(unittest.TestCase):
             # a different vocab's hash is rejected (stale / cross-vocabulary artifact)
             with self.assertRaises(ValueError):
                 load_value_stats(p, expected_vocab_hash="deadbeef" * 8)
+
+    def test_fit_partition_provenance_is_enforced(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = write_value_stats(
+                {10: (1.0, 0.5)},
+                Path(directory) / "value_stats.json",
+                fit_partition_name="train",
+            )
+            self.assertEqual(
+                load_value_stats(path, expected_fit_partition="train"),
+                {10: (1.0, 0.5)},
+            )
+            with self.assertRaisesRegex(ValueError, "fit partition mismatch"):
+                load_value_stats(path, expected_fit_partition="calibration")
 
     def test_stats_accepted_by_target_builder(self):
         """Frozen stats must satisfy TargetBuilder's value_stats contract end to end."""

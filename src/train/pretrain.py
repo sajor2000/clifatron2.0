@@ -39,14 +39,26 @@ from src.train.engine import setup_ddp, is_distributed, TrainConfig, train
 logger = logging.getLogger(__name__)
 
 
-def _load_decile_records(path: Path, *, drop_values_without_stats: bool = False) -> list[dict]:
+def _load_decile_records(
+    path: Path,
+    *,
+    partition: str | None = None,
+    drop_values_without_stats: bool = False,
+) -> list[dict]:
     """Normalize tokenizer `events.parquet` rows into ModelDataset records.
 
     The tokenizer produces context-only event shards. Until a cohort/outcome
     artifact is joined in, these records are valid for dry-run/NTP plumbing but
     carry no TTE outcomes.
     """
-    rows = pl.read_parquet(path).to_dicts()
+    frame = pl.read_parquet(path)
+    if partition is not None:
+        if "partition" not in frame.columns:
+            raise ValueError("partition column is required before model fitting")
+        frame = frame.filter(pl.col("partition") == partition)
+        if frame.is_empty():
+            raise ValueError(f"model fit partition {partition!r} has zero rows")
+    rows = frame.to_dicts()
     records = []
     for row in rows:
         token = list(row["token"])
@@ -60,6 +72,7 @@ def _load_decile_records(path: Path, *, drop_values_without_stats: bool = False)
         records.append({
             "episode_key": episode_key,
             "artifact_hashes": dict(row.get("artifact_hashes") or {}),
+            "partition": row.get("partition"),
             "token": token,
             "pos_min": pos_min,
             "value": values,
@@ -76,12 +89,19 @@ def _load_decile_records(path: Path, *, drop_values_without_stats: bool = False)
 
 
 def _load_value_stats(
-    path: str | None, *, expected_vocab_hash: str | None = None
+    path: str | None,
+    *,
+    expected_vocab_hash: str | None = None,
+    expected_fit_partition: str | None = None,
 ) -> dict[int, tuple[float, float]]:
     if path is None:
         return {}
     from src.data.value_stats import load_value_stats
-    return load_value_stats(path, expected_vocab_hash=expected_vocab_hash)
+    return load_value_stats(
+        path,
+        expected_vocab_hash=expected_vocab_hash,
+        expected_fit_partition=expected_fit_partition,
+    )
 
 
 def _has_numeric_values(records: list[dict]) -> bool:
@@ -196,10 +216,18 @@ def main():
         from src.data.value_stats import vocab_hash
         vblob = json.loads(vocab_path.read_text())
         expected_vocab_hash = vocab_hash(vblob.get("vocab", vblob))
-    value_stats = _load_value_stats(args.value_stats, expected_vocab_hash=expected_vocab_hash)
+    value_stats = _load_value_stats(
+        args.value_stats,
+        expected_vocab_hash=expected_vocab_hash,
+        expected_fit_partition="train",
+    )
     data_dir = Path(args.data)
     data_path = data_dir / "events.parquet"
-    records = _load_decile_records(data_path, drop_values_without_stats=args.dry_run and not value_stats)
+    records = _load_decile_records(
+        data_path,
+        partition="train",
+        drop_values_without_stats=args.dry_run and not value_stats,
+    )
     if not _has_supervised_outcomes(records):
         augmented_path = data_dir / "events_with_outcomes.parquet"
         if augmented_path.exists():
@@ -215,7 +243,9 @@ def main():
                     logger.error(msg)
                 raise SystemExit(msg)
             records = _load_decile_records(
-                augmented_path, drop_values_without_stats=args.dry_run and not value_stats
+                augmented_path,
+                partition="train",
+                drop_values_without_stats=args.dry_run and not value_stats,
             )
             logger.info("using augmented events: %s", augmented_path)
             if is_main:

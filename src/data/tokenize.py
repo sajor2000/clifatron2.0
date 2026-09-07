@@ -80,6 +80,12 @@ def validate_vocabulary_artifact(
         raise QualificationError("CLIF-version compatibility hash mismatch")
     if hashes.get("target_map") != _json_sha256(cfg["target_concepts"]):
         raise QualificationError("target-map compatibility hash mismatch")
+    expected_fit_partition = cfg["value_binning"].get("fit_partition", "train")
+    provenance = manifest.get("provenance")
+    if not isinstance(provenance, dict) or provenance.get("fit_partition") != expected_fit_partition:
+        raise QualificationError(
+            "vocabulary artifact was not fitted on the configured training partition"
+        )
     cohort_cfg = yaml.safe_load((ROOT / cfg["cohort_contract"]).read_text())
     if hashes.get("outcome_spec") != _json_sha256(cohort_cfg["outcomes"]):
         raise QualificationError("outcome-spec compatibility hash mismatch")

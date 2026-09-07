@@ -204,6 +204,37 @@ class TestTrainingEngine(unittest.TestCase):
         self.assertEqual(records[0]["value"], [None, None])
         self.assertFalse(_has_supervised_outcomes(records))
 
+    def test_load_decile_records_filters_to_training_partition(self):
+        import polars as pl
+        tmp = Path(tempfile.mkdtemp()) / "events.parquet"
+        pl.DataFrame({
+            "hosp_id": ["train-stay", "sealed-stay"],
+            "token": [[3, 4], [5, 6]],
+            "pos_min": [[0, 60], [0, 60]],
+            "value": [[1.0, 2.0], [999999.0, 999999.0]],
+            "target_eligible": [[True, True], [True, True]],
+            "partition": ["train", "internal_test"],
+        }).write_parquet(tmp)
+
+        records = _load_decile_records(tmp, partition="train")
+
+        self.assertEqual([record["episode_key"] for record in records], ["train-stay"])
+        self.assertEqual(records[0]["partition"], "train")
+
+    def test_training_partition_filter_fails_closed_without_partition_column(self):
+        import polars as pl
+        tmp = Path(tempfile.mkdtemp()) / "events.parquet"
+        pl.DataFrame({
+            "hosp_id": ["stay-a"],
+            "token": [[3, 4]],
+            "pos_min": [[0, 60]],
+            "value": [[1.0, 2.0]],
+            "target_eligible": [[True, True]],
+        }).write_parquet(tmp)
+
+        with self.assertRaisesRegex(ValueError, "partition column"):
+            _load_decile_records(tmp, partition="train")
+
     def test_pretrain_model_masks_unlabeled_tte_losses(self):
         from src.data.collate import collate_model_samples
         from src.data.dataset import ModelDataset
