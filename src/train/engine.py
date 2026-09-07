@@ -178,6 +178,20 @@ def _train_one_epoch(
             losses = model(batch)
             loss = losses["total"]
 
+        nonfinite = [
+            name for name, value in losses.items()
+            if isinstance(value, torch.Tensor) and not bool(torch.isfinite(value).all())
+        ]
+        failed = torch.tensor(bool(nonfinite), dtype=torch.int32, device=dev)
+        if is_distributed():
+            dist.all_reduce(failed, op=dist.ReduceOp.MAX)
+        if failed.item():
+            detail = ", ".join(nonfinite) if nonfinite else "another rank"
+            raise FloatingPointError(
+                f"non-finite training loss at epoch {epoch}, batch {batch_idx}, "
+                f"rank {rank}: {detail}"
+            )
+
         loss.backward()
         micro += 1
         samples_seen += batch["input_ids"].size(0)

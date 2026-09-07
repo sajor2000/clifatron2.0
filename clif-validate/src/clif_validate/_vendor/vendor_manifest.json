@@ -13,6 +13,6 @@
   "src/eval/synthetic_bundle.py": "a804a308875b44907c149702c2012c6ad24cb40008ffd93f1f21cb9f7743b946",
   "src/eval/trust.py": "ca206619aa6e019f90e957e99b265f984aa3a1a585f0a8ac8d760d9ce9807325",
   "src/model/head_adapter.py": "9fa5457a67c74a0b449e57211b2530eabdc0c2fc31941d83aeb19098358e0944",
-  "src/model/heads.py": "c8959dd1d772c614b8e1c5571a9c27247307ac34eefd4d742eb4fb282232b965",
+  "src/model/heads.py": "79308392a2cf8da10e428634566732e71ded71cbf227b8dca048bf22bd22f76a",
   "src/model/varlen_attention.py": "60cf5cf782f6500472c51644f9132b2f97a2754f51b1795cc4cce3e7d5a086d6"
 }

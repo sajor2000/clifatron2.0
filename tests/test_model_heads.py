@@ -3,7 +3,12 @@ import unittest
 import torch
 from torch import nn
 
-from src.model.heads import NextEventHead, ValueRegressionHead, next_event_loss
+from src.model.heads import (
+    NextEventHead,
+    ThresholdHazardHead,
+    ValueRegressionHead,
+    next_event_loss,
+)
 
 
 class NextEventHeadTest(unittest.TestCase):
@@ -36,6 +41,38 @@ class NextEventHeadTest(unittest.TestCase):
         loss = head.loss_aligned(h, target_tok, target_val, mask)
         self.assertTrue(torch.isfinite(loss))
         self.assertEqual(float(loss.detach()), 0.0)
+
+    def test_value_loss_is_finite_for_extreme_negative_log_variance(self):
+        head = ValueRegressionHead(4, 8)
+        for parameter in head.parameters():
+            parameter.data.zero_()
+        head.mlp[-1].bias.data[1] = -100.0
+
+        loss = head.loss_aligned(
+            torch.zeros(1, 2, 4),
+            torch.ones(1, 2, dtype=torch.long),
+            torch.ones(1, 2),
+            torch.ones(1, 2, dtype=torch.bool),
+        )
+
+        self.assertTrue(torch.isfinite(loss))
+
+    def test_threshold_loss_is_finite_for_saturated_hazard(self):
+        head = ThresholdHazardHead(4, 1, 4, 2)
+        for parameter in head.parameters():
+            parameter.data.zero_()
+        head.mlp[-1].bias.data.fill_(20.0)
+
+        loss = head.loss(
+            torch.zeros(1, 4),
+            torch.zeros(1, dtype=torch.long),
+            torch.zeros(1, dtype=torch.long),
+            torch.zeros(1, dtype=torch.long),
+            torch.tensor([-1]),
+            torch.tensor([4]),
+        )
+
+        self.assertTrue(torch.isfinite(loss))
 
 
 if __name__ == "__main__":

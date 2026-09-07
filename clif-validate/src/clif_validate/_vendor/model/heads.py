@@ -78,7 +78,9 @@ class ValueRegressionHead(nn.Module):
         # h[t] predicts value at t+1; align by dropping last position.
         q = torch.cat([h[:, :-1], self.next_emb(next_tok[:, 1:])], dim=-1)
         mu, logvar = self.mlp(q).unbind(-1)                 # [B, T-1]
-        y = next_val[:, 1:]
+        mu = mu.float()
+        logvar = logvar.float().clamp(-10.0, 10.0)
+        y = next_val[:, 1:].float()
         m = val_mask[:, 1:].float()
         nll = 0.5 * (logvar + (y - mu) ** 2 / logvar.exp())  # Gaussian NLL (drop const)
         return (nll * m).sum() / m.sum().clamp_min(1)
@@ -88,6 +90,9 @@ class ValueRegressionHead(nn.Module):
         """Gaussian mark loss for precomputed target tensors aligned at state[t]."""
         q = torch.cat([h, self.next_emb(target_tok)], dim=-1)
         mu, logvar = self.mlp(q).unbind(-1)
+        mu = mu.float()
+        logvar = logvar.float().clamp(-10.0, 10.0)
+        target_val = target_val.float()
         m = val_mask.float()
         nll = 0.5 * (logvar + (target_val - mu) ** 2 / logvar.exp())
         return (nll * m).sum() / m.sum().clamp_min(1)
@@ -176,11 +181,16 @@ class ThresholdHazardHead(nn.Module):
             nn.Linear(d + 3 * thr_dim, d), nn.GELU(), nn.Linear(d, n_time_bins)
         )
 
-    def hazard(self, h_last, target_idx, tau_bin, direction) -> torch.Tensor:
+    def _logits(self, h_last, target_idx, tau_bin, direction) -> torch.Tensor:
         q = torch.cat(
             [h_last, self.target_emb(target_idx), self.thr_emb(tau_bin), self.dir_emb(direction)], dim=-1
         )
-        return torch.sigmoid(self.mlp(q))  # [N, n_time_bins] discrete hazard
+        return self.mlp(q)
+
+    def hazard(self, h_last, target_idx, tau_bin, direction) -> torch.Tensor:
+        return torch.sigmoid(
+            self._logits(h_last, target_idx, tau_bin, direction).float()
+        )  # [N, n_time_bins] discrete hazard
 
     def cumulative_failure(self, h_last, target_idx, tau_bin, direction) -> torch.Tensor:
         """F(h|H_t,τ) = 1 - prod(1 - hazard) over time bins. Used zero-shot."""
@@ -190,9 +200,9 @@ class ThresholdHazardHead(nn.Module):
     def loss(self, h_last, target_idx, tau_bin, direction, crossed_bin, observed_bin=None) -> torch.Tensor:
         """crossed_bin: first hour the target crossed τ within horizon, or -1 if never.
         Discrete-time hazard NLL with random τ sampled by the trainer."""
-        haz = self.hazard(h_last, target_idx, tau_bin, direction).clamp(1e-6, 1 - 1e-6)
-        N, Bn = haz.shape
-        t = torch.arange(Bn, device=haz.device)[None].expand(N, Bn)
+        logits = self._logits(h_last, target_idx, tau_bin, direction).float()
+        N, Bn = logits.shape
+        t = torch.arange(Bn, device=logits.device)[None].expand(N, Bn)
         crossed = crossed_bin[:, None]
         if observed_bin is None:
             observed = torch.full_like(crossed, Bn)
@@ -202,9 +212,15 @@ class ThresholdHazardHead(nn.Module):
         # survival only through the observed at-risk interval, not necessarily the
         # full horizon when follow-up is censored early.
         observed_until = torch.where(crossed >= 0, crossed.clamp(min=0), observed)
-        surv_ll = torch.where(t < observed_until, torch.log(1 - haz), torch.zeros_like(haz))
+        surv_ll = torch.where(
+            t < observed_until,
+            F.logsigmoid(-logits),
+            torch.zeros_like(logits),
+        )
         event_ll = torch.where(
-            (t == crossed) & (crossed >= 0), torch.log(haz), torch.zeros_like(haz)
+            (t == crossed) & (crossed >= 0),
+            F.logsigmoid(logits),
+            torch.zeros_like(logits),
         )
         return -(surv_ll + event_ll).sum(-1).mean()
 
