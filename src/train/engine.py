@@ -49,6 +49,7 @@ class TrainConfig:
         self.grad_accum = tcfg["batch"].get("grad_accum", 1)
         self.val_every = tcfg.get("eval_schedule", {}).get("val_every", 2000)
         self.ckpt_every = tcfg["runtime"].get("ckpt_every", 2000)
+        self.log_every = max(1, int(tcfg["runtime"].get("log_every", 10)))
         self.ckpt_dir = Path(tcfg["runtime"].get("ckpt_dir", "checkpoints"))
         self.warmup_steps = tcfg["schedule"].get("warmup_steps", 2000)
         self.total_steps = total_steps
@@ -167,6 +168,7 @@ def _train_one_epoch(
     opt.zero_grad(set_to_none=True)
     micro = 0
     updates = 0
+    started_at = time.monotonic()
     samples_seen, tokens_seen, ntp_tokens = 0, 0, 0
 
     for batch_idx, batch in enumerate(dl):
@@ -192,6 +194,19 @@ def _train_one_epoch(
             opt.zero_grad(set_to_none=True)
             updates += 1
             ml.record(micro // tcfg.grad_accum, losses, scheduler.get_last_lr()[0])
+            if rank == 0 and (updates <= 5 or updates % tcfg.log_every == 0):
+                elapsed = max(time.monotonic() - started_at, 1e-6)
+                print(
+                    f"epoch={epoch} update={updates} "
+                    f"loss={_as_float(losses['total']):.4f} "
+                    f"ntp={_as_float(losses.get('ntp', 0)):.4f} "
+                    f"cr={_as_float(losses.get('cr', 0)):.4f} "
+                    f"th={_as_float(losses.get('th', 0)):.4f} "
+                    f"val={_as_float(losses.get('val', 0)):.4f} "
+                    f"lr={scheduler.get_last_lr()[0]:.3e} "
+                    f"updates_per_min={updates / elapsed * 60:.2f}",
+                    flush=True,
+                )
             if max_updates is not None and updates >= max_updates:
                 return ml, samples_seen, int(tokens_seen), int(ntp_tokens), updates
 

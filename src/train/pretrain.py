@@ -267,6 +267,8 @@ def main():
             for k, v in batch.items():
                 if isinstance(v, torch.Tensor):
                     print(f"  {k}: {list(v.shape)}")
+        if is_distributed():
+            dist.destroy_process_group()
         return
 
     compile_enabled = tcfg["runtime"].get("compile", mcfg.get("compile", False))
@@ -295,6 +297,8 @@ def main():
 
     if is_main:
         print(f"Training complete. Run ID: {manifest.run_id}")
+    if is_distributed():
+        dist.destroy_process_group()
 
 
 if __name__ == "__main__":

@@ -20,6 +20,7 @@ runtime:
   compile: false         # Stabilize the first production run before benchmarking compile.
   ddp: true
   num_workers: 0         # Avoid extra per-rank dataset copies on this shared node.
+  log_every: 10          # Rank-0 optimizer updates between progress messages.
   ckpt_every: 2000
   ckpt_dir: "checkpoints"
   # trunk saved separately from heads so probes/finetune reuse it
