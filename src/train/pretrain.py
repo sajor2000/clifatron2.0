@@ -223,6 +223,7 @@ def main():
     )
     data_dir = Path(args.data)
     data_path = data_dir / "events.parquet"
+    model_data_path = data_path
     records = _load_decile_records(
         data_path,
         partition="train",
@@ -247,6 +248,7 @@ def main():
                 partition="train",
                 drop_values_without_stats=args.dry_run and not value_stats,
             )
+            model_data_path = augmented_path
             logger.info("using augmented events: %s", augmented_path)
             if is_main:
                 print(f"  using augmented events: {augmented_path}")
@@ -279,6 +281,18 @@ def main():
         expected_hashes=expected_hashes,
         epoch=0,
     )
+    validation_records = _load_decile_records(
+        model_data_path,
+        partition="validation",
+        drop_values_without_stats=args.dry_run and not value_stats,
+    )
+    validation_dataset = ModelDataset(
+        validation_records,
+        representation="decile",
+        target_builder=target_builder,
+        expected_hashes=expected_hashes,
+        epoch=0,
+    )
 
     sampler = DistributedSampler(dataset) if is_distributed() else None
     dl = DataLoader(
@@ -286,6 +300,14 @@ def main():
         batch_size=tcfg["batch"]["per_gpu"],
         sampler=sampler,
         shuffle=(sampler is None),
+        collate_fn=collate_model_samples,
+        num_workers=tcfg["runtime"].get("num_workers", 0),
+        pin_memory=torch.cuda.is_available(),
+    )
+    validation_dl = DataLoader(
+        validation_dataset,
+        batch_size=tcfg["batch"]["per_gpu"],
+        shuffle=False,
         collate_fn=collate_model_samples,
         num_workers=tcfg["runtime"].get("num_workers", 0),
         pin_memory=torch.cuda.is_available(),
@@ -321,7 +343,7 @@ def main():
     train_cfg = TrainConfig({}, tcfg, mcfg, total_steps)
 
     model, manifest = train(
-        model, dl, None, opt, scheduler, train_cfg, dev,
+        model, dl, validation_dl, opt, scheduler, train_cfg, dev,
         resume_ckpt=args.resume, seed=42,
     )
 

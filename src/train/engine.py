@@ -292,13 +292,29 @@ def train(model, train_dl, val_dl, opt, scheduler, tcfg: TrainConfig, dev, *,
         global_step += updates
 
         if val_dl is not None and is_main and global_step >= next_val_step:
-            model.eval()
+            validation_model = (
+                model.module
+                if is_distributed() and hasattr(model, "module")
+                else model
+            )
+            validation_model.eval()
             with torch.no_grad(), torch.autocast("cuda" if torch.cuda.is_available() else "cpu", dtype=torch.bfloat16):
                 vlosses = []
                 for vb in val_dl:
                     vb = _prepare_batch(vb, dev)
-                    vlosses.append(model(vb)["total"].item())
-                manifest.record_validation(epoch, sum(vlosses) / len(vlosses))
+                    value = validation_model(vb)["total"]
+                    if not bool(torch.isfinite(value)):
+                        raise FloatingPointError(
+                            f"non-finite validation loss at epoch {epoch}, rank {local_rank}"
+                        )
+                    vlosses.append(value.item())
+                validation_loss = sum(vlosses) / len(vlosses)
+                manifest.record_validation(epoch, validation_loss)
+                print(
+                    f"validation epoch={epoch} global_step={global_step} "
+                    f"loss={validation_loss:.4f}",
+                    flush=True,
+                )
             model.train()
             while next_val_step <= global_step:
                 next_val_step += tcfg.val_every

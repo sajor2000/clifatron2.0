@@ -1,3 +1,4 @@
+import math
 import os
 import tempfile
 import unittest
@@ -611,6 +612,37 @@ class ResumeEquivalenceTest(unittest.TestCase):
                         "optimizer state diverged after train() resume")
         self.assertTrue(_state_dicts_equal(straight_sched, resumed_sched),
                         "scheduler state diverged after train() resume")
+
+    def test_production_train_records_validation_loss(self):
+        from src.train.engine import train
+
+        dev = torch.device("cpu")
+        model = _DropoutModel()
+        optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
+        scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=1)
+        loader = torch.utils.data.DataLoader(_FixedDS(), batch_size=2, shuffle=False)
+
+        with tempfile.TemporaryDirectory() as directory:
+            config = TrainConfig({}, {
+                "batch": {"per_gpu": 2, "grad_accum": 1},
+                "runtime": {"ckpt_dir": directory, "ckpt_every": 999},
+                "schedule": {"warmup_steps": 0, "total_steps": 1},
+                "eval_schedule": {"val_every": 1},
+                "optimizer": {"grad_clip": 1.0},
+            }, {"compile": False}, total_steps=1)
+            _, manifest = train(
+                model,
+                loader,
+                loader,
+                optimizer,
+                scheduler,
+                config,
+                dev,
+                seed=7,
+            )
+
+        self.assertEqual(len(manifest.validation), 1)
+        self.assertTrue(math.isfinite(manifest.validation[0]["val_loss"]))
 
 
 if __name__ == "__main__":
