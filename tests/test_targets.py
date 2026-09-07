@@ -52,6 +52,14 @@ class TargetBuilderTest(unittest.TestCase):
         self.assertEqual(result["value_target"], [2.0, 0.0, 0.0])
         self.assertEqual(result["value_mask"], [True, False, False])
 
+    def test_extreme_normalized_mark_is_excluded_but_event_remains_target(self):
+        result = self.builder.build(episode(value=[70.0, None, 999999.0]))
+
+        self.assertEqual(result["ntp_target"], [4, 0, 0])
+        self.assertEqual(result["ntp_mask"], [True, False, False])
+        self.assertEqual(result["value_target"], [0.0, 0.0, 0.0])
+        self.assertEqual(result["value_mask"], [False, False, False])
+
     def test_censoring_records_observed_risk_without_inventing_a_cause(self):
         labels = self.builder.build(episode())["outcome_labels"]
 

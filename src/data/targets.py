@@ -31,10 +31,13 @@ class TargetBuilder:
     horizon_hours: float
     value_stats: Mapping[int, tuple[float, float]]
     run_seed: int = 0
+    max_abs_value_z: float = 20.0
 
     def __post_init__(self) -> None:
         if self.vocab_size <= 0 or self.n_time_bins <= 0 or self.horizon_hours <= 0:
             raise TargetContractError("vocabulary, time-bin count, and horizon must be positive")
+        if not math.isfinite(self.max_abs_value_z) or self.max_abs_value_z <= 0:
+            raise TargetContractError("maximum absolute normalized value must be positive and finite")
         for token_id, (_, scale) in self.value_stats.items():
             if not 0 <= int(token_id) < self.vocab_size or not math.isfinite(scale) or scale <= 0:
                 raise TargetContractError("value statistics contain an invalid token or scale")
@@ -76,8 +79,13 @@ class TargetBuilder:
                 if token[target] not in self.value_stats:
                     raise TargetContractError("numeric target is missing frozen normalization statistics")
                 center, scale = self.value_stats[token[target]]
-                value_target[source] = (float(value) - center) / scale
-                value_mask[source] = True
+                normalized = (float(value) - center) / scale
+                # CLIF source extracts can contain finite sentinel-like values (for
+                # example, 999999 for arterial pH). Keep the event token as context,
+                # but do not let an implausible mark target dominate the Gaussian NLL.
+                if abs(normalized) <= self.max_abs_value_z:
+                    value_target[source] = normalized
+                    value_mask[source] = True
 
         labels = [self._outcome_label(row) for row in episode.get("outcomes", [])]
         query = self._threshold_query(episode_key, labels, epoch)
