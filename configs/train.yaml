@@ -12,14 +12,14 @@ schedule:
   cosine_decay: true
 
 batch:
-  per_gpu: 128          # 2 GPUs -> global 256 sequences x 512 events
-  grad_accum: 1
+  per_gpu: 4            # Safe for rare long stays on 46 GB L40S GPUs.
+  grad_accum: 32        # 4 sequences × 32 microbatches × 2 GPUs = effective batch 256.
 
 runtime:
   precision: bf16
-  compile: true
+  compile: false         # Stabilize the first production run before benchmarking compile.
   ddp: true
-  num_workers: 8
+  num_workers: 0         # Avoid extra per-rank dataset copies on this shared node.
   ckpt_every: 2000
   ckpt_dir: "checkpoints"
   # trunk saved separately from heads so probes/finetune reuse it

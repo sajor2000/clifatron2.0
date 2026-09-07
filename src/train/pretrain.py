@@ -257,7 +257,7 @@ def main():
         sampler=sampler,
         shuffle=(sampler is None),
         collate_fn=collate_model_samples,
-        num_workers=0,
+        num_workers=tcfg["runtime"].get("num_workers", 0),
         pin_memory=torch.cuda.is_available(),
     )
 
@@ -269,7 +269,8 @@ def main():
                     print(f"  {k}: {list(v.shape)}")
         return
 
-    if mcfg.get("compile") and torch.cuda.is_available():
+    compile_enabled = tcfg["runtime"].get("compile", mcfg.get("compile", False))
+    if compile_enabled and torch.cuda.is_available():
         model = torch.compile(model, dynamic=True)
     if is_distributed():
         model = DDP(model, device_ids=[local])
