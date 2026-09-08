@@ -1,0 +1,51 @@
+{
+  "partition": "validation",
+  "selection_metric": "total_loss",
+  "results": [
+    {
+      "checkpoint": "ckpt_ep17_step2040.pt",
+      "checkpoint_sha256": "a4c7820e0bbfacd303d71a2514674aff68edefb8990088278ecc7109ff01de55",
+      "step": 2040,
+      "epoch": 17,
+      "validation_batches": 1910,
+      "losses": {
+        "ntp": 3.0927245741739324,
+        "cr": 3.2374314441321252,
+        "th": 1.371910298243447,
+        "val": -0.11809025630780867,
+        "total": 5.168841525584615
+      }
+    },
+    {
+      "checkpoint": "ckpt_ep34_step4080.pt",
+      "checkpoint_sha256": "2b5bac6fe501d2578292c152eb8f44b47bfd1073b94d51837b33f2208ac94294",
+      "step": 4080,
+      "epoch": 34,
+      "validation_batches": 1910,
+      "losses": {
+        "ntp": 2.864341916963068,
+        "cr": 3.9095199314309483,
+        "th": 1.9486776196046633,
+        "val": -0.3253483051905306,
+        "total": 6.268391797664278
+      }
+    },
+    {
+      "checkpoint": "ckpt_ep50_step6000.pt",
+      "checkpoint_sha256": "f9fbc50cb37a8baae89ff2730d36a5817a51e0db248327905c6abfc153c3dab3",
+      "step": 6000,
+      "epoch": 50,
+      "validation_batches": 1910,
+      "losses": {
+        "ntp": 2.77869371157042,
+        "cr": 4.1521122222005635,
+        "th": 2.2729101691999145,
+        "val": -0.36831528269661423,
+        "total": 6.796603501233131
+      }
+    }
+  ],
+  "selected_checkpoint": "ckpt_ep17_step2040.pt",
+  "selected_checkpoint_sha256": "a4c7820e0bbfacd303d71a2514674aff68edefb8990088278ecc7109ff01de55",
+  "selected_step": 2040
+}
