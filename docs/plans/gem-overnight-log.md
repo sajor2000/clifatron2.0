@@ -270,3 +270,38 @@ rates, key-event recall, distance, distinct-2, val perplexity); (4) suites +
 commit + push. If still training: just log progress and stop.
 
 **Suites**: tests/ 422 passed 4 skipped (+2), clif-validate/ 32.
+
+### 2026-09-26 07:45 — experiment result: calibration closes with steps; loss plateaus
+
+**Continuation complete** (Run ID `098cb6e619ec`, step 6000, 24 rollouts from
+`ckpt_ep5_step6000` with identical prompts/sampling, report at
+`output/intermediate_phi/gem_eval_mps6k.json`). The 3000-vs-6000 comparison:
+
+| metric | 3000 steps | 6000 steps | real | reading |
+|---|---|---|---|---|
+| JS divergence | 0.425 | **0.358** | 0 | improves with steps |
+| top-8 / top-32 overlap | 0.0 / 0.5 | **0.125 / 0.594** | 1.0 | improves |
+| vitals rate | 0.141 | **0.276** | 0.538 | gap halves (4x → 2x under) |
+| categoricals rate | 0.823 | **0.691** | 0.436 | moving toward real |
+| labs rate | 0.036 | 0.032 | 0.026 | calibrated both scales |
+| gen-only mass | 0.000163 | 0.000163 | 0 | closed-world airtight |
+| val loss | 2.4138 | 2.4211 | — | **plateaued** |
+| key-event recall (unigram/cat) | 0.359 / 0.424 | 0.318 / 0.352 | 1.0 | slightly worse |
+| distance-to-observed mean | 0.195 | 0.224 | 0 | slightly worse |
+| distinct-2 | 0.361 | 0.388 | — | less repetitive |
+
+**Three findings for the L40 decision:**
+1. **Event-rate calibration closes with steps even as loss plateaus** — JS 0.425 →
+   0.358 (-16%) on 2x steps, vitals gap halved, while val loss sat at ~2.41
+   throughout. The marginal distribution matures after the loss saturates; the
+   L40's 60k steps on full 546k MIMIC should close most of the remaining gap.
+2. **The staged 64.9k subset is exhausted** at this scale (val 2.41 plateau):
+   loss gains live on the L40's full data, not more local steps.
+3. **Rollout anchoring does NOT improve with NTP steps** — key-event recall and
+   distance-to-observed slightly WORSE at 6000 (more diverse, less anchored to
+   the prompt's real continuation). That is evidence FOR the plan's sequencing:
+   pure NTP for the marginal, then G4 prefix conditioning + G5 RL for anchoring
+   — more NTP alone won't make rollouts locally faithful.
+
+**Suites**: tests/ 422 passed 4 skipped, clif-validate/ 32 (no code changed in
+this step; comparison is data-side).
