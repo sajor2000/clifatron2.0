@@ -448,3 +448,12 @@ suites green — tests/ 429 passed 4 skipped, clif-validate/ 32. No new user
 instructions; nothing agent-actionable remains. State unchanged: user
 decisions (L40 launch per `docs/plans/l40-g2-runbook.md`, checkpoint prune)
 or G4/G5 (conditioning/RL per runbook §6).
+
+### 2026-09-26 15:00 — Idle-verify: all green, no new instructions
+
+origin/main in sync at `3d5a5cd` after fetch; artifacts unchanged; viewer
+alive at 127.0.0.1:8042 with all five sources; suites green — tests/ 429
+passed 4 skipped, clif-validate/ 32. No new user instructions; nothing
+agent-actionable remains. State unchanged: user decisions (L40 launch per
+`docs/plans/l40-g2-runbook.md`, checkpoint prune) or G4/G5 (conditioning/RL
+per runbook §6).
