@@ -466,3 +466,29 @@ passed 4 skipped, clif-validate/ 32. No new user instructions; nothing
 agent-actionable remains. State unchanged: user decisions (L40 launch per
 `docs/plans/l40-g2-runbook.md`, checkpoint prune) or G4/G5 (conditioning/RL
 per runbook §6).
+
+### 2026-09-26 17:00 — Idle-verify + repo finalization logged
+
+Idle-verify: origin/main in sync at `a73ef24` after fetch; artifacts
+unchanged; viewer alive; suites green — tests/ 429 passed 4 skipped,
+clif-validate/ 32.
+
+Repo finalization since the 16:00 entry (user-requested, docs-only, both
+pushed): `7d27cf3` — README layout gains dataset/value_stats/generate/
+checkpoint/generative/plausibility/viewer plus a "Local GEM validation
+stack" section (guarded-generate + viewer commands, G3 baselines, runbook
+pointers); project-status synced to the GEM track; MEMORY.md §Status
+refreshed to 2026-09-26 (stale NEXT list replaced). `a73ef24` — new website
+page "GEM Local Validation (MPS)" (the proven loop, guarded generation,
+plausibility, G3 baselines, the anchoring finding, the viewer, what
+remains), sidebar entry after Ablations; `npm run build` verified (page
+emitted, mermaid wired; incidental package-lock churn reverted).
+
+**Model architecture verified untouched** since `4962f82`: the diff to
+heads/encoder/adapter, pretrain/checkpoint, tokenize/dataset/value_stats,
+and all configs is empty; the only src/ changes were viewer/eval tools and
+generate.py sampling tooling (frozen-checkpoint inference, no model changes).
+
+**State**: unchanged — user decisions (L40 launch per
+`docs/plans/l40-g2-runbook.md`, checkpoint prune) or G4/G5 (conditioning/RL
+per runbook §6).
