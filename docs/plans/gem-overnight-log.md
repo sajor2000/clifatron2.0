@@ -166,3 +166,41 @@ Proven: 60-step boundary smoke with token budget 4096 — validations at
 continuity, cosine-tail LR) at 03:15 with token budget + clear-every-1;
 ~74 updates/min; ~660 steps to 3000. Mid-epoch resume replays epoch 2
 (documented approximation — ~380 updates of duplicate exposure, noted).
+
+### 2026-09-26 04:20 — 3000-step run COMPLETE + rollouts generated
+
+**Training complete. Run ID `f819f7013fa2`.** Validation trajectory across the
+full run: 2.7462 (step 250) → 2.4174 (2500) → 2.4147 (2750) → **2.4138 (3000)**
+— val perplexity ≈ **11.2** on ~2 epochs of the 64.9k-stay staged extract at
+effective batch 32 (a smoke-scale run; the L40 G2 recipe is 60k steps on the
+full 546k-stay data). 30 checkpoints on disk
+(`checkpoints_mps/ckpt_ep0..2_step100..3000.pt`).
+
+**Rollouts from the final checkpoint** (`sims_mps.parquet`): 3 real-sequence
+prompts × 8 sims × 256 tokens on MPS, temperature 1.0 / top-p 0.95,
+closed-world sampling — 6,144 tokens, 1 `<unk>` (a legitimately sampled vocab
+token, not a leak), 0 `<eos>` (expected at this scale). Qualitative: local
+structure learned (ABG panels ph/pco2/po2 and chemistry panels
+potassium/bun/sodium recur together), but the marginal event mix is not yet
+calibrated — gen top-8 = labs, real top-8 = vitals + meds (dextrose, D5W),
+0/8 overlap. Expected at 3000 steps; this is exactly what G3's event-rate
+calibration + distance-to-observed metrics are for. Recorded for G3 baselining.
+
+**Viewer live on 127.0.0.1:8042**: events (50,986 real stays) + sims_mps (24) +
+sims_smoke (12), vocab lock 292, previews legible.
+
+**Night totals**: 8 commits pushed (9934a25 → 8978d95 + this one); three OOMs
+found, root-caused, and fixed (length grouping → cache guard → token budgets);
+engine step-granular ckpt/val; viewer raw-parquet + id decoding; suites green
+throughout (final: tests/ 411 + clif-validate/ 32).
+
+**Morning state / what remains (user decisions, not agent-blocking)**:
+- G2 real run is an L40 decision: full 546k MIMIC restage + `configs/train.yaml`
+  (uniform per_gpu on CUDA — flash attention needs none of the MPS guards;
+  token_budget/cache_clear stay off) + `configs/model.gem-ntp.yaml`.
+- 30 checkpoints to prune before any sync (531 MB each — keep step 3000 +
+  best-val; best-val = last (2.4138)).
+- G3 eval harness (perplexity done; event-rate calibration, key-event recall,
+  distance-to-observed) — baselined by tonight's sims_mps rollouts.
+- Optional: raise overnight steps/epochs on this box (the 3000-step recipe now
+  runs stably end-to-end).
