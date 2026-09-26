@@ -519,3 +519,12 @@ qualification of FA2/DDP/throughput on synthetic shards, engine burn-in); the
 real-data paths remain the lab box `rudu-hpcg004` (tailnet/VPN/alias needed)
 or governed-tenant Azure. Revisit only with new governance evidence (a
 compliant Lambda BAA) — a user decision, not an agent one.
+
+### 2026-09-26 18:00 — Idle-verify: all green, no new instructions
+
+origin/main in sync at `19f4490` after fetch; artifacts unchanged; viewer
+alive at 127.0.0.1:8042 with all five sources; suites green — tests/ 429
+passed 4 skipped, clif-validate/ 32. No new user instructions. State
+unchanged: all seven GEM units proven on this Mac; next step (L40 G2 run)
+blocked on user infrastructure (lab box connectivity, governed-tenant
+Azure, or a compliant Lambda BAA) — see the 17:20 and 17:35 entries.
