@@ -506,3 +506,16 @@ to beat; prerequisites are the reboot-first for the nvidia-smi mismatch and
 the full 546k-stay restage — the Mac extract was a 64.9k-stay subset).
 Everything Mac-side is complete: all seven units proven, repo finalized,
 website built and pushed through `a73ef24`.
+
+### 2026-09-26 17:35 — Lambda cloud proposed for training; rejected per hard rule 5
+
+User asked whether the L40 G2 base run could train on rented Lambda Labs
+cloud (cloud.lambda.ai workspace). No: AGENTS.md hard rule 5 — no rented cloud
+without a compliant BAA/DUA, Azure only inside the lab's governed tenant. The
+MIMIC tables are PhysioNet-credentialed and everything downstream (events
+parquet, shards, checkpoints) is PHI-derived, so none of it may be uploaded
+to Lambda. Rented cloud is legitimate only for DATA-FREE work (GPU
+qualification of FA2/DDP/throughput on synthetic shards, engine burn-in); the
+real-data paths remain the lab box `rudu-hpcg004` (tailnet/VPN/alias needed)
+or governed-tenant Azure. Revisit only with new governance evidence (a
+compliant Lambda BAA) — a user decision, not an agent one.
