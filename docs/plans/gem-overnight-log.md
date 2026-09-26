@@ -204,3 +204,37 @@ throughout (final: tests/ 411 + clif-validate/ 32).
   distance-to-observed) — baselined by tonight's sims_mps rollouts.
 - Optional: raise overnight steps/epochs on this box (the 3000-step recipe now
   runs stably end-to-end).
+
+### 2026-09-26 05:15 — G3 generative eval harness built + baseline recorded
+
+**src/eval/generative.py** (unit G3, plan 2026-09-25-001): event-rate calibration
+(JS divergence base-2, top-k overlap, closed-world gen-only mass, per-group
+rates via data.yaml target_concepts), key-event recall (unigram + categorical
+focus), distance-to-observed (nearest-neighbor Jaccard over concept sets), and
+rollout hygiene (lengths, <eos>, <unk>, distinct-2). CLI scores a sims parquet
+against the tokenizer events.parquet; reports are site-local under output/
+(PHI-derived, never committed). `--prompt-source head:N` documents the sims'
+prompt convention (a prefix column in the sims parquet supersedes it in G4).
+9 unit tests (tests/test_generative_eval.py).
+
+**G3 baseline on the 3000-step checkpoint's rollouts** (sims_mps vs the full
+real corpus, report at output/intermediate_phi/gem_eval_mps.json):
+
+| metric | value |
+|---|---|
+| JS divergence (real vs gen token rates) | 0.425 |
+| top-8 / top-32 overlap | 0.0 / 0.5 |
+| gen-only mass (closed world) | 0.000163 (airtight) |
+| vitals rate real vs gen | 0.538 vs 0.141 (4x under-generated) |
+| categoricals rate real vs gen | 0.436 vs 0.823 (2x over-generated) |
+| labs rate real vs gen | 0.026 vs 0.036 |
+| key-event recall (unigram / categorical) | 0.359 / 0.424 |
+| distance-to-observed (mean / best) | 0.195 / 0.083 |
+| hygiene: eos / unk / distinct-2 | 0.0 / 0.0 / 0.361 |
+
+These are the L40 G2 run's numbers to beat. The 04:20 qualitative finding
+(labs-heavy rollouts) refines to: vitals under-generated ~4x, categoricals
+over-generated ~2x, labs calibrated. Perplexity lives in the trainer's val
+loop (2.4138 / ppl ~11.2 at step 3000).
+
+**Suites**: tests/ 420 passed 4 skipped (+9), clif-validate/ 32.
