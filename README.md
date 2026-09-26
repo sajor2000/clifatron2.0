@@ -48,13 +48,20 @@ outcomes are states doctors *act on* (never treatments — those are inputs only
 external/clifatron/      vendored upstream CLIFATRON (tokenETL, AR trainers, benchmark) — see its VENDORED.md
 configs/                data.yaml · model.yaml · train.yaml
 src/data/tokenize.py     CLIF parquet → fused event-token shards + vocab (decile ablation arm)
+src/data/dataset.py       8192-row document-isolated sequence packing → shards (MPS/CUDA loaders)
+src/data/value_stats.py   per-token robust value stats, vocab-hash-bound (training fails closed if missing)
 src/model/encoder.py     from-scratch time-aware decoder (ablation arm; default = CLIFATRON Qwen2)
 src/model/heads.py       threshold-hazard · competing-risk · value-regression · task heads   [KEEPER]
 src/model/head_adapter.py  attach our heads to a CLIFATRON checkpoint's hidden states          [KEEPER]
+src/model/generate.py     guarded rollout generation: observed-transition masks · repetition penalty · closed-world sampling
 src/train/pretrain.py    torchrun DDP self-supervised pretraining (NTP→TTE curriculum)
+src/train/checkpoint.py   step-granular checkpoint / resume (fresh-schedule restore)
 src/eval/metrics.py      TRIPOD+AI panel: AUROC/AUPRC/ECE/Brier/calib-slope/ICI/DCA/LPE/subgroup  [KEEPER]
 src/eval/method3.py      the wedge: anchor states → our probe vs XGBoost → 3×3 transport matrix   [KEEPER]
+src/eval/generative.py    G3 rollout eval: event-rate calibration vs the real corpus · key-event recall · distance-to-observed
+src/eval/clinical_plausibility.py  explainable rollout plausibility (OOV · invalid bins · special-token placement · loops)
 src/eval/matrix.py       stable re-export surface
+src/viewer/sequence_viewer.py  local token-sequence viewer: plausibility score · concept timeline · observed-vs-generated compare
 ```
 
 ## Validation & release-trust infrastructure (landed, data-free)
@@ -94,6 +101,37 @@ uv run --frozen --group dev pytest clif-validate/tests/ -q   # the site-package 
 
 CI (`.github/workflows/ci.yml`) runs both suites on every push and pull request across Python 3.11 and
 3.13, installing from the committed `uv.lock` with `--frozen` for reproducibility.
+
+## Local GEM validation stack — proven on real MIMIC
+
+The full generative path is proven end-to-end on the dev Mac against the real staged MIMIC CLIF
+tables: ETL (fused `code=bin` tokens + frozen vocab lock) → 8192-row document-isolated shards →
+pure-NTP MPS smoke train (6,000 steps, fp32, step-granular checkpoints) → **guarded** rollout
+generation → explainable plausibility + viewer inspection. Full evidence trail:
+[`docs/plans/gem-overnight-log.md`](docs/plans/gem-overnight-log.md).
+
+```bash
+# guarded closed-world rollouts — hard candidate-list sampling + observed-transition
+# masks + repetition penalty, so OOV / out-of-vocab tokens cannot leak
+python -m src.model.generate --checkpoint <ckpt> \
+  --vocab output/intermediate_phi/mimic/vocab.json \
+  --reference-events output/intermediate_phi/mimic/events.parquet \
+  --n-simulations 6 --max-new-tokens 128 --device mps \
+  --output output/intermediate_phi/sims.parquet
+
+# inspect real + generated sequences: plausibility warnings, concept timelines,
+# and observed-vs-generated comparison
+python -m src.viewer.sequence_viewer \
+  --parquet output/intermediate_phi/mimic/events.parquet \
+  --parquet output/intermediate_phi/sims.parquet \
+  --vocab-lock output/intermediate_phi/mimic/vocab.json --port 8042
+```
+
+G3 baselines (6k-step MPS checkpoint, guarded): JS divergence 0.43 vs the real corpus, top-32
+overlap 0.47, **0 OOV / 0 gen-only tokens**, every rollout `good` on the plausibility panel.
+Key-event recall (~0.30) does **not** improve with more NTP steps — G4 prefix conditioning and
+G5 RL on the L40 base are the anchoring levers. The L40 handoff (exact commands, gates, gotchas)
+is frozen in [`docs/plans/l40-g2-runbook.md`](docs/plans/l40-g2-runbook.md).
 
 ## Method 3 — the wedge (smallest publishable unit)
 Attach our calibrated survival/probe heads to a CLIFATRON checkpoint's hour-24 anchor hidden state and

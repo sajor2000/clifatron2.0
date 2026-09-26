@@ -6,8 +6,9 @@ sidebar_position: 10
 
 # Project Status & Roadmap
 
-Where the project stands and exactly what is left to finish it. Synced to `main` @ `e7c35b7`
-(PR #12 merged). The deep per-unit charter lives in
+Where the project stands and exactly what is left to finish it. Synced to `main` @ `e307038`
+(2026-09-26 — GEM local-validation track complete; evidence trail in
+`docs/plans/gem-overnight-log.md`). The deep per-unit charter lives in
 `docs/plans/2026-08-27-001-feat-evidence-ready-model-experiments-plan.md`; this page is the
 finish-line synopsis.
 
@@ -34,6 +35,8 @@ GPU hardware, and one governance decision.**
 | **U13 / U14** varlen attention + resume/DDP (CPU-qualified) | |
 | **U15** synthetic federation harness (releaser→site→aggregator) | |
 | **U16–U19** CI · reproducible lock · model card · one-command repro | |
+| **GEM stack** ETL → 8192-row shards → MPS smoke train (6k steps) → guarded closed-world generate → plausibility/viewer — proven end-to-end on real MIMIC on the dev Mac | **G2** L40 base run — exact commands frozen in `docs/plans/l40-g2-runbook.md`; launch is a user decision |
+| **G3** generative eval + baselines (JS 0.43 · top-32 overlap 0.47 · 0 OOV / 0 gen-only under guarded sampling) | **G4/G5** prefix conditioning + RL — the anchoring levers (NTP steps alone don't improve key-event recall) |
 
 ---
 

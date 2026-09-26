@@ -208,20 +208,23 @@ from research threads a76bb9/aeb4d2), ordered file-level next steps (config↔co
 on real ckpt → phase-2 head pretrain → tokenization ablation → clif-validate/ → notes modality), open
 items to verify, hard rules, env mechanics. A fresh agent should read notes/NEXT_STEPS.md first.
 
-## Status (2026-08-27)
-Deep research (notes/RESEARCH.md) + PIVOT to build-on-CLIFATRON (notes/INTEGRATION.md).
-METHOD-3 WEDGE BUILT (keeper methods layer, all py_compile clean; panel numerically validated
-via `uv run --with numpy --with scikit-learn`):
-- src/model/head_adapter.py — attach our heads to a CLIFATRON HF checkpoint's hidden states
-  (frozen-probe or joint fine-tune; zero-shot threshold_prob()).
-- src/eval/metrics.py — full TRIPOD+AI panel: auroc/auprc/ece/brier/calib-slope+intercept/ICI/
-  net-benefit(DCA)/temperature/LPE/subgroup. Validated on synthetic imbalanced data.
-- src/eval/method3.py — driver: anchor states → probe(TaskHead) vs xgboost(Method 1) →
-  3×3 transportability matrix (per-site local fit, no pooling) + Elemento ensemble + LPE.
-- src/eval/matrix.py slimmed to re-export shim. pyproject += xgboost, transformers.
-Heads.py (ThresholdHazard/CompetingRisk/ValueRegression) unchanged = the keeper.
-NEXT: (1) confirm CLIFATRON benchmark parquet column names (seq/label/subgroup) + which sites
-its checkpoint is trained on. (2) Run method3 on a real checkpoint across Site 1/Site 2/Site 3 (L40).
-(3) Phase 2: joint-pretrain the heads on CLIFATRON backbone → enables zero-shot survival for the
-external CLIF-federation validation. (4) clif-validate/ shippable package (model-to-data). (5) tokenization
-ablation: CLIFATRON clinical bins vs Lee-2026 deciles. (6) notes modality (BioClinical ModernBERT).
+## Status (2026-09-26)
+Supersedes the 2026-08-27 status (wedge built; that detail lives in git history and the U-charter).
+- **Data-free U1–U19 landed and CI-enforced** (federation harness, release trust, resume/DDP,
+  model card, one-command repro) — see `website/docs/project-status.md`.
+- **GEM local-validation track proven end-to-end on real MIMIC on the dev Mac** (evidence
+  trail: `docs/plans/gem-overnight-log.md`): tokenize → frozen vocab lock → 8192-row
+  document-isolated shards → pure-NTP MPS smoke train (6k steps, fp32, step-granular
+  checkpoints + fresh-schedule resume) → guarded closed-world generation (hard
+  candidate-list sampling + observed-transition masks + repetition penalty → 0 OOV /
+  0 gen-only tokens) → explainable plausibility (all rollouts `good`) → audit-clean
+  sequence viewer (20/20, keyboard-operable, both themes).
+- **G3 baselines** (6k-step MPS ckpt, guarded): JS 0.43 vs real corpus, top-32 overlap
+  0.47, vitals/labs/categoricals group-rate gaps narrowed vs unguarded. **Key-event recall
+  ~0.30 does NOT improve with NTP steps** (calibration-vs-steps experiment) — anchoring
+  needs G4 prefix conditioning + G5 RL, on the L40 base.
+NEXT: (1) L40 G2 base run per `docs/plans/l40-g2-runbook.md` — user decision (reboot-first for
+the nvidia-smi mismatch, full 546,028-stay restage, torchrun configs/train.yaml +
+configs/model.gem-ntp.yaml, MPS guards off on CUDA). (2) G4 conditioning → G5 RL for
+anchoring. (3) Local checkpoint prune — user decision. (4) G1 pre-selection governance ask
+remains the longest-lead federation item (see project-status).
