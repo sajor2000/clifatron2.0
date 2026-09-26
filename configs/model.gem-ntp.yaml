@@ -1,0 +1,48 @@
+# GEM generative base — PURE next-token prediction (plan D-G1, unit G2).
+# Variant of model.yaml: identical trunk (state-dict compatible with the TTE recipe,
+# so a GEM base checkpoint can later take prediction heads), only the objective
+# mixture changes. Trains via src/train/pretrain.py, generates via src/model/generate.py.
+#
+# Evidence: pure-NTP base then RL post-training (Xiao 2026, arXiv:2609.12277 — 9M NTP
+# + RL beats 56M NTP alone); SFT-on-trajectories underperforms pretraining, so the
+# base stays self-supervised. NTP-only also matches how the vendored HF checkpoints
+# were trained, keeping pre/post-RL comparisons apples-to-apples.
+#
+# NOTE: `loss_balancing: uncertainty` and `curriculum: ntp_then_tte` are read by
+# run_arm/joint paths, NOT pretrain.py — inert here; pretrain uses fixed weights
+# from heads.*.weight (objective_weights()).
+
+trunk:
+  d_model: 512
+  n_layers: 8
+  n_heads: 8
+  ffn_mult: 4
+  dropout: 0.1
+  max_tokens: 8192
+  rope_base: 10000.0
+  rope_position: "admission_minutes"
+  rope_time_alibi: false
+  tied_embeddings: false
+  target_vocab: 10000
+
+heads:
+  # (A) next-event token — THE objective for the generative base.
+  next_event: {enabled: true, weight: 1.0}
+  # (B)-(D) prediction heads: instantiated (state-dict compatible) but weighted to 0,
+  # and the trainer's fail-to-zero guards skip their losses entirely.
+  competing_risk: {enabled: true, weight: 0.0, n_time_bins: 16, horizon_hours: 48}
+  threshold_hazard:
+    enabled: true
+    weight: 0.0
+    horizon_hours: 48
+    n_time_bins: 48
+    tau_sampling: "empirical_bins"
+    direction_embed: true
+    threshold_embed_dim: 32
+  value_regression: {enabled: true, weight: 0.0}
+
+loss_balancing: "fixed"            # heads.*.weight is the source of truth
+curriculum: "none"                 # pure NTP from step 0
+
+precision: "bf16"                   # L40; inert on MPS smoke (autocast targets cuda/cpu only)
+compile: false                     # stabilize first production run before benchmarking compile

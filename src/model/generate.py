@@ -98,13 +98,17 @@ def _cached_forward(enc: CLIFEncoder, token_ids: torch.Tensor, pos_min: torch.Te
 
 def sample_logits(logits: torch.Tensor, *, temperature: float = 1.0, top_k: int | None = None,
                   top_p: float | None = 1.0, min_token_ids: tuple[int, ...] = (),
+                  allowed_token_ids: tuple[int, ...] | None = None,
                   generator: torch.Generator | None = None) -> torch.Tensor:
     """Sample [B] token ids from [B, V] logits.
 
     temperature <= 0 → greedy argmax (deterministic). top_k keeps the k most likely
     tokens; top_p keeps the smallest set whose cumulative mass >= top_p (nucleus).
     `min_token_ids` are forbidden (used for stop-token suppression before
-    min_new_tokens). Mirrors the vendored pipeline's parameters (temperature=1.0,
+    min_new_tokens). `allowed_token_ids` closes the world to the frozen CLIF vocab
+    (hard rule 2: vocab is frozen mCIDE) — the trunk embeds `target_vocab` slots but
+    the real vocab is far smaller, and untrained slot rows would otherwise leak as
+    `<unk:N>` decodes. Mirrors the vendored pipeline's parameters (temperature=1.0,
     top_p=0.95) for apples-to-apples pre/post-RL comparison.
     """
     # Forbidden ids are masked in BOTH branches — greedy must respect
@@ -113,6 +117,10 @@ def sample_logits(logits: torch.Tensor, *, temperature: float = 1.0, top_k: int 
         for tid in min_token_ids:
             logits = logits.index_fill(-1, torch.tensor([tid], device=logits.device),
                                        float("-inf"))
+    if allowed_token_ids is not None:
+        keep = torch.zeros(logits.size(-1), dtype=torch.bool, device=logits.device)
+        keep[list(allowed_token_ids)] = True
+        logits = logits.masked_fill(~keep, float("-inf"))
     if temperature <= 0:
         return logits.argmax(dim=-1)
     logits = logits / float(temperature)
@@ -140,6 +148,7 @@ def generate(model: CLIFEncoder, input_ids: torch.Tensor, pos_min: torch.Tensor,
              max_new_tokens: int, temperature: float = 1.0, top_k: int | None = None,
              top_p: float | None = 1.0, stop_token_ids: tuple[int, ...] = (),
              min_new_tokens: int = 0, pos_step_min: int = 60, pad_token_id: int = 0,
+             allowed_token_ids: tuple[int, ...] | None = None,
              generator: torch.Generator | None = None) -> dict[str, torch.Tensor]:
     """Batched autoregressive continuation of a from-scratch trunk, with KV caching.
 
@@ -173,7 +182,8 @@ def generate(model: CLIFEncoder, input_ids: torch.Tensor, pos_min: torch.Tensor,
     for step in range(max_new_tokens):
         forbid = tuple(stop_token_ids) if step < min_new_tokens else ()
         next_id = sample_logits(logits, temperature=temperature, top_k=top_k, top_p=top_p,
-                                min_token_ids=forbid, generator=generator)
+                                min_token_ids=forbid, allowed_token_ids=allowed_token_ids,
+                                generator=generator)
         active = ~stopped
         out[active, step] = next_id[active]
         lengths[active] += 1
@@ -336,6 +346,7 @@ def main(argv: list[str] | None = None) -> None:
     generator.manual_seed(args.seed)
 
     writer = SimulationWriter(dataset="gem")
+    allowed = tuple(sorted(vocab.values())) if vocab else None
     for hosp, pids in zip(hosp_ids, prompt_ids):
         n = args.n_simulations
         ids = torch.tensor([pids] * n, dtype=torch.long, device=device)
@@ -348,6 +359,7 @@ def main(argv: list[str] | None = None) -> None:
             stop_token_ids=stop_ids, min_new_tokens=args.min_new_tokens,
             pos_step_min=args.pos_step_min,
             pad_token_id=tok2id.get("<pad>", 0),
+            allowed_token_ids=allowed,
             generator=generator,
         )
         for sim in range(n):

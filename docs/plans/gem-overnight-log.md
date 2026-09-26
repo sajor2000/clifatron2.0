@@ -10,16 +10,58 @@ files) on THIS Mac, so the code is proven before it moves to the L40 box.
 
 ## Checklist
 
-- [ ] U1. ETL dry-run on staged tables (schema/config mismatches fixed)
-- [ ] U2. Cohort artifact (`src.data.cohort` → `output/intermediate_phi/episodes.parquet`)
-- [ ] U3. Full tokenize, first site builds vocab (stats → log)
-- [ ] U4. Packed shards (8192-row spec) + loader smoke batch on MPS
-- [ ] U5. MPS smoke train: short pure-NTP run (fp32, small scale) → checkpoint
-- [ ] U6. Smoke generate via `src.model.generate` CLI → sims parquet → viewer-verified
-- [ ] Suites green after each unit; code-only commits pushed
+- [x] U1. ETL dry-run on staged tables (all 5 tables read clean)
+- [x] U2. Cohort artifact (`src.data.cohort` → `output/intermediate_phi/episodes.parquet`)
+- [x] U3. Full tokenize, first site builds vocab (stats → log)
+- [x] U4. Auto-label → outcome_join → value_stats (packed-loader smoke happens inside U5 dry-run)
+- [x] U5. MPS smoke train: short pure-NTP run (fp32, small scale) → checkpoint
+- [x] U6. Smoke generate via `src.model.generate` CLI → sims parquet → viewer-verified
+- [x] Suites green after each unit; code-only commits pushed
 
 ## Entries
 
-_No entries yet — first firing starts here. Reconstructed state at loop creation: G0
-committed (ec77527 viewer commit e8b7eba + import cleanup 2060803), both suites green
-(407 + 32), no artifacts under output/ yet._
+### 2026-09-26 00:15 — U1–U6 complete, full GEM loop proven on this Mac (real MIMIC)
+
+**U1 ETL dry-run** — all 5 staged tables read clean, zero schema fixes needed:
+vitals 55.5M / labs 44.9M / resp_support 1.6M / meds 7.6M / adt 1.5M raw events
+(111M total; 9/45/8/53/8 concepts — all mCIDE).
+
+**U2 cohort** — 64,940 staged stays → 50,986 eligible with clean splits
+(train 30,696 / validation 7,640 / calibration 5,009 / internal_test 7,641).
+NOTE: staged extract is 64.9k stays, not the full 546k MIMIC — L40 numbers
+will differ.
+
+**U3 tokenize** — 50,986 stays, 13,824,973 tokens; mean 271 / median 247 /
+p95 471 / max 6,413 tokens per stay (max < 8192 context ✓).
+Vocab: **292 tokens**, 10 numeric concepts, clinical-segment bins + forced edges.
+Manifest hashes: vocabulary `eb02faa…`, numeric_edges `6ab0d24…`
+(full set in `output/intermediate_phi/mimic/vocab.json`).
+
+**U4 labels + outcomes + value stats** — auto-labeler: 50,986 outcome rows
+(vitals unit_col warning is expected/benign); outcome_join: 28,209
+positive-outcome instances across 3 outcomes; value_stats: 223 per-token stats,
+vocab-hash-bound (`eb02faa…`).
+
+**U5 MPS smoke train (pure NTP, configs/model.gem-ntp.yaml + configs/train.smoke.yaml)**
+— 45.2M params, 40 optimizer steps, ~186 updates/min on MPS, loss 5.1→~4.3,
+cr/th/val exactly 0.0000 (fail-to-zero guards verified live on real data).
+Run ID `51403cf50a85`, checkpoint `output/intermediate_phi/checkpoints_smoke/ckpt_ep1_step40.pt`.
+Found + fixed en route: pretrain device selection was CUDA-or-CPU only — never
+MPS, contradicting the AGENTS.md dev workflow. Now cuda → mps → cpu.
+
+**U6 smoke generate + viewer** — 3 real-sequence prompts × 4 sims, 128 tokens each,
+on MPS. Found + fixed: sampling was open-world over the 10k embedding slots while
+the real frozen vocab is 292 tokens — weakly-trained slot rows leaked as `<unk:N>`
+decodes. Added `allowed_token_ids` closed-world masking (hard rule 2: frozen mCIDE
+vocab); regenerated: **0 unks**, all tokens in-vocab, clinically legible rollouts.
+Viewer verified on 127.0.0.1:8042: `sims_smoke` (12 rows, parquet) + 200 real
+stays (txt) + vocab-lock OOV panel, root 200, previews legible.
+
+**Suites**: tests/ 408 passed 4 skipped (+1 closed-world sampler test);
+clif-validate/ 32 passed.
+
+**Ready for the L40 box (G2)**: configs/model.gem-ntp.yaml + configs/train.yaml
++ `python -m src.train.pretrain --config configs/train.yaml --model-config
+configs/model.gem-ntp.yaml --data <site dir> --site mimic --value-stats
+<value_stats.json>`. Same data dir must contain events_with_outcomes.parquet +
+vocab.json + value_stats.json. Suggest full 546k MIMIC restage before the run.

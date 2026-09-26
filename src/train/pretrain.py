@@ -242,7 +242,15 @@ def main():
     args = ap.parse_args()
 
     local, is_main = setup_ddp()
-    dev = torch.device(f"cuda:{local}" if torch.cuda.is_available() else "cpu")
+    # CUDA for the L40 box; MPS for Mac smoke tests (AGENTS.md dev workflow); CPU last.
+    if torch.cuda.is_available():
+        dev = torch.device(f"cuda:{local}")
+    elif torch.backends.mps.is_available():
+        dev = torch.device("mps")
+        if is_main:
+            print("device: mps (Mac smoke-test path)")
+    else:
+        dev = torch.device("cpu")
     tcfg = yaml.safe_load(Path(args.config).read_text())
     mcfg = yaml.safe_load(Path(args.model_config).read_text())
     dcfg = yaml.safe_load(Path("configs/data.yaml").read_text())

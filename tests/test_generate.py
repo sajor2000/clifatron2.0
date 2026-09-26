@@ -83,6 +83,19 @@ class TestSampler:
                                                  min_token_ids=(5,)),
                                    torch.tensor([5])).any())
 
+    def test_allowed_ids_close_the_world(self):
+        # The trunk embeds target_vocab slots; the frozen CLIF vocab is far smaller.
+        # Untrained slot rows (or spikes on out-of-world ids) must never leak.
+        logits = torch.full((4, VOCAB), -1.0)
+        logits[:, 10] = 60.0           # in-world spike
+        logits[:, VOCAB - 1] = 500.0   # overwhelming out-of-world spike
+        allowed = tuple(range(32))
+        for _ in range(10):
+            sampled = sample_logits(logits, temperature=1.0, allowed_token_ids=allowed)
+            assert bool((sampled < 32).all())
+        greedy = sample_logits(logits, temperature=0.0, allowed_token_ids=allowed)
+        assert torch.equal(greedy, torch.full((4,), 10, dtype=torch.long))
+
     def test_deterministic_with_generator(self):
         logits = torch.randn(4, VOCAB)
         g1, g2 = torch.Generator().manual_seed(7), torch.Generator().manual_seed(7)
