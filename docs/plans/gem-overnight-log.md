@@ -305,3 +305,25 @@ commit + push. If still training: just log progress and stop.
 
 **Suites**: tests/ 422 passed 4 skipped, clif-validate/ 32 (no code changed in
 this step; comparison is data-side).
+
+### 2026-09-26 08:15 — L40 G2 runbook finalized + viewer refreshed
+
+**`docs/plans/l40-g2-runbook.md`** — the operational handoff, everything proven
+on this Mac converted to exact L40 commands: prerequisites (reboot-first for the
+nvidia-smi mismatch, full 546k restage, git pull), ETL in the correct order
+(cohort → labeler → tokenize → outcome_join AFTER tokenize → value_stats, and
+the hard gates that are correct not bugs), the torchrun launch with
+`configs/train.yaml` + `configs/model.gem-ntp.yaml` (and why the MPS guards stay
+OFF on CUDA), resume/continuation semantics (`--fresh-schedule` restores
+configured LRs), post-train generate + eval commands (closed-world sampling,
+prompt provenance column), the Mac baseline numbers to beat, and the gotcha
+list (sync_vendor guard, step-granular ckpt/val, DDP val epoch-boundary).
+
+**Viewer refreshed** on 127.0.0.1:8042 with all four sources: events (50,986
+real stays), sims_mps6k (24), sims_mps (24), sims_smoke (12), vocab lock 292.
+
+**State**: loop goal fully achieved (stack proven end-to-end on real MIMIC
+locally); remaining items are user decisions (L40 launch, checkpoint prune) or
+G4/G5 (conditioning/RL — follow the L40 base per the runbook §6). No further
+agent-actionable units without user input; subsequent loop firings idle-verify
+unless the user leaves new instructions.
