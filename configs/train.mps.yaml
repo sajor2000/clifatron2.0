@@ -27,6 +27,9 @@ runtime:
   log_every: 10
   ckpt_every: 100        # the 2026-09-26 OOM crash lost 200 updates with no checkpoint
   ckpt_dir: "output/intermediate_phi/checkpoints_mps"
+  cache_clear_every: 10  # MPS ratchet guard (math-path attention T^2 buffers on long
+                        # batches ratchet the caching-allocator watermark to OOM);
+                        # engine clears every N updates on MPS only
 
 eval_schedule:
   val_every: 250        # validation perplexity every 250 updates

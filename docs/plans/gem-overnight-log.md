@@ -101,3 +101,34 @@ no checkpoint had fired). 3000-step run relaunched at 00:55, ~91 updates/min.
 
 **Live for the morning**: viewer on 127.0.0.1:8042 (events.parquet 50,986 rows +
 sims_smoke 12 rows + vocab lock). Relaunch with /tmp/run_viewer.sh if it dies.
+
+### 2026-09-26 01:55 — second OOM + engine step-granularity fixed
+
+**Second OOM** (overnight run #2, length-grouped): died at update ~410, same
+signature (85 GiB held, 4.9 GiB math-path attention attempt). Grouping narrows
+shape diversity but the real ratchet is the math-path attention's saved-for-
+backward T² buffers per layer on long batches (~40 GiB for one 4×6413 batch):
+the MPS allocator caches those blocks at lengths that never recur, so the
+watermark ratchets up over the first couple of long batches and the next one
+dies. Fix: `runtime.cache_clear_every` (engine calls `torch.mps.empty_cache()`
+every N updates on MPS only; opt-in, set to 10 in train.mps.yaml). CUDA is
+unaffected (caching allocator + real flash attention) — this is an MPS-local
+guard.
+
+**Engine step-granularity (the bigger fix)**: validation and checkpointing
+previously fired at EPOCH BOUNDARIES ONLY — ckpt_every/val_every promised step
+granularity they never delivered (run #1's crash lost all 200 updates; the
+first epoch at effective batch 32 is ~959 updates). Now `_train_one_epoch` takes
+a per-update `boundary_cb` (all ranks, same update):
+- mid-epoch checkpoints — DDP-safe (synchronized updates + all-gather RNG);
+  end-of-epoch saves record epochs-consumed (epoch+1) so resume never replays
+  a completed epoch (the resume-equivalence test caught the off-by-one);
+  mid-epoch saves replay the partial epoch on resume (documented).
+- mid-epoch validation — single-process only (rank-0-only eval would desync
+  DDP ranks mid-epoch; DDP keeps epoch-boundary val).
+Proven live: 60-step boundary smoke → validation at steps 15/30/45/60
+(loss 5.93 → 4.04), checkpoints `ckpt_ep0_step20/40` mid-epoch.
+
+Overnight run #3 relaunched 01:55 with cache guard + ckpt_every 100.
+
+**Suites**: tests/ 410 passed 4 skipped; clif-validate/ 32.

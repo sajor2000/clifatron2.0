@@ -51,6 +51,7 @@ class TrainConfig:
         self.ckpt_every = tcfg["runtime"].get("ckpt_every", 2000)
         self.log_every = max(1, int(tcfg["runtime"].get("log_every", 10)))
         self.ckpt_dir = Path(tcfg["runtime"].get("ckpt_dir", "checkpoints"))
+        self.cache_clear_every = int(tcfg["runtime"].get("cache_clear_every", 0) or 0)
         self.warmup_steps = tcfg["schedule"].get("warmup_steps", 2000)
         self.total_steps = total_steps
         self.grad_clip = tcfg["optimizer"].get("grad_clip", 1.0)
@@ -161,7 +162,7 @@ def _scale_grads(model, denom: int) -> None:
 
 def _train_one_epoch(
     model, dl, opt, scheduler, epoch, tcfg: TrainConfig, dev, *, rank,
-    max_updates: int | None = None,
+    max_updates: int | None = None, boundary_cb=None,
 ):
     model.train()
     ml = MetricsLog()
@@ -221,6 +222,15 @@ def _train_one_epoch(
                     f"updates_per_min={updates / elapsed * 60:.2f}",
                     flush=True,
                 )
+            if boundary_cb is not None:
+                # Step-granular validation + checkpointing (see train()); fires on
+                # every rank at the same update, before any max_updates early return.
+                # epoch_done: at this update the dataloader is exhausted, so the
+                # checkpoint's epoch+1 = epochs fully consumed (resume must NOT
+                # replay this epoch). Mid-epoch saves keep the current epoch and
+                # resume replays it from the start (documented approximation).
+                epoch_done = updates >= -(-len(dl) // tcfg.grad_accum)
+                boundary_cb(updates, epoch_done)
             if max_updates is not None and updates >= max_updates:
                 return ml, samples_seen, int(tokens_seen), int(ntp_tokens), updates
 
@@ -275,15 +285,100 @@ def train(model, train_dl, val_dl, opt, scheduler, tcfg: TrainConfig, dev, *,
     next_ckpt_step = ((global_step // tcfg.ckpt_every) + 1) * tcfg.ckpt_every
     epoch = start_epoch
 
+    def _maybe_checkpoint(epoch_n: int, gs: int) -> None:
+        """Save at step-granular boundaries. DDP-safe: fires on every rank at the
+        same update (synchronized update counts + _all_gather). The ledger totals
+        lag within an epoch (running totals land at epoch end). `epoch_n` is
+        EPOCHS FULLY CONSUMED (end-of-epoch saves get epoch+1, so resume never
+        replays a completed epoch; mid-epoch saves replay the partial epoch)."""
+        nonlocal next_ckpt_step
+        if gs < next_ckpt_step:
+            return
+        local = int(os.environ.get("LOCAL_RANK", torch.cuda.current_device())) if torch.cuda.is_available() else 0
+        per_rank_rng = {
+            f"cuda_{local}": torch.cuda.get_rng_state(local).cpu().tolist() if torch.cuda.is_available() else None,
+            "cuda_current": torch.cuda.get_rng_state().cpu().tolist() if torch.cuda.is_available() else None,
+        }
+        all_rng = _all_gather({"cpu": torch.get_rng_state().tolist(), "cuda": per_rank_rng})
+        if is_main:
+            manifest.record_ledger(total_sm, total_tok, total_ntp, gs)
+            save_checkpoint(
+                tcfg.ckpt_dir / f"ckpt_ep{epoch_n}_step{gs}.pt",
+                model=model.module if is_distributed() else model,
+                optimizer=opt,
+                scheduler=scheduler,
+                epoch=epoch_n,
+                step=gs,
+                rng_states=all_rng,
+                manifest=manifest,
+            )
+        while next_ckpt_step <= gs:
+            next_ckpt_step += tcfg.ckpt_every
+
+    def _maybe_validate(epoch_n: int, gs: int) -> None:
+        """Step-granular validation. Single-process only: a rank-0-only eval
+        mid-epoch would desync DDP ranks (epoch-boundary val covers DDP, below)."""
+        nonlocal next_val_step
+        if val_dl is None or not is_main or gs < next_val_step or is_distributed():
+            return
+        validation_model = (
+            model.module
+            if is_distributed() and hasattr(model, "module")
+            else model
+        )
+        validation_model.eval()
+        with torch.no_grad(), torch.autocast("cuda" if torch.cuda.is_available() else "cpu", dtype=torch.bfloat16):
+            vlosses = []
+            for vb in val_dl:
+                vb = _prepare_batch(vb, dev)
+                value = validation_model(vb)["total"]
+                if not bool(torch.isfinite(value)):
+                    raise FloatingPointError(
+                        f"non-finite validation loss at epoch {epoch_n}, rank {local_rank}"
+                    )
+                vlosses.append(value.item())
+            validation_loss = sum(vlosses) / len(vlosses)
+            manifest.record_validation(epoch_n, validation_loss)
+            print(
+                f"validation epoch={epoch_n} global_step={gs} "
+                f"loss={validation_loss:.4f}",
+                flush=True,
+            )
+        model.train()
+        while next_val_step <= gs:
+            next_val_step += tcfg.val_every
+
+    def _maybe_clear_cache(gs: int) -> None:
+        """MPS ratchet guard: math-path attention saves T^2 buffers per layer for
+        backward on long batches (~40 GiB for a 4x6413 batch); the MPS caching
+        allocator retains those blocks at lengths that never recur, so the
+        watermark ratchets to the ceiling and the next long batch OOMs (two
+        crashes overnight 2026-09-26, at updates ~205 and ~410). Periodic
+        empty_cache() flattens it. Opt-in via runtime.cache_clear_every (MPS
+        smoke runs); no-op on CUDA/CPU."""
+        if tcfg.cache_clear_every <= 0 or gs % tcfg.cache_clear_every:
+            return
+        mps = getattr(torch, "mps", None)
+        if mps is not None and mps.is_available() and dev.type == "mps":
+            mps.empty_cache()
+
     while global_step < tcfg.total_steps:
         if hasattr(train_dl, "sampler") and hasattr(train_dl.sampler, "set_epoch"):
             train_dl.sampler.set_epoch(epoch)
         if hasattr(train_dl, "dataset") and hasattr(train_dl.dataset, "set_epoch"):
             train_dl.dataset.set_epoch(epoch)
 
+        epoch_start = global_step
+
+        def _boundary(epoch_updates: int, epoch_done: bool, _start=epoch_start, _epoch=epoch):
+            gs = _start + epoch_updates
+            _maybe_clear_cache(gs)
+            _maybe_validate(_epoch, gs)
+            _maybe_checkpoint(_epoch + 1 if epoch_done else _epoch, gs)
+
         ml, sm, tok, ntp, updates = _train_one_epoch(
             model, train_dl, opt, scheduler, epoch, tcfg, dev, rank=local_rank,
-            max_updates=tcfg.total_steps - global_step,
+            max_updates=tcfg.total_steps - global_step, boundary_cb=_boundary,
         )
         total_sm += sm
         total_tok += tok
