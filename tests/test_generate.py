@@ -24,6 +24,7 @@ from src.model.generate import (
     SimulationWriter,
     _cached_forward,
     generate,
+    load_transition_index,
     load_vocab,
     make_decoder,
     sample_logits,
@@ -95,6 +96,26 @@ class TestSampler:
             assert bool((sampled < 32).all())
         greedy = sample_logits(logits, temperature=0.0, allowed_token_ids=allowed)
         assert torch.equal(greedy, torch.full((4,), 10, dtype=torch.long))
+
+    def test_allowed_ids_can_vary_by_batch_row(self):
+        logits = torch.full((2, VOCAB), -1.0)
+        logits[0, 7] = 50.0
+        logits[1, 8] = 50.0
+        sampled = sample_logits(
+            logits,
+            temperature=0.0,
+            allowed_token_ids_per_row=((7,), (8,)),
+        )
+        assert sampled.tolist() == [7, 8]
+        logits[:, VOCAB - 1] = 500.0
+        for _ in range(10):
+            sampled = sample_logits(
+                logits,
+                temperature=1.0,
+                allowed_token_ids=tuple(range(32)),
+                allowed_token_ids_per_row=((7,), (8,)),
+            )
+            assert sampled.tolist() == [7, 8]
 
     def test_deterministic_with_generator(self):
         logits = torch.randn(4, VOCAB)
@@ -223,14 +244,14 @@ class TestVocabAndWriter:
 
         df = pl.read_parquet(out)
         for col in ("simulation_id", "hospitalization_id", "simulation_number",
-                    "generated_sequence", "dataset"):
+                    "generated_sequence", "generated_tokens", "dataset"):
             assert col in df.columns
         assert df["simulation_id"].to_list() == [0, 1]
         assert df["dataset"].unique().to_list() == ["gem"]
 
         # The viewer must consume the file unchanged.
         src = ParquetSource(path=out, name="gem")
-        assert src.seq_col == "generated_sequence"
+        assert src.seq_col == "generated_tokens"
         rows = src.list_rows(offset=0, limit=10, search=None)
         assert len(rows) == 2
         assert all("hr=60_70" in r["preview"] for r in rows)
@@ -244,3 +265,8 @@ class TestVocabAndWriter:
         df = pl.read_parquet(out)
         assert df.sort("simulation_number")["arm"].to_list() == [None, "grpo"]
         assert df.sort("simulation_number")["temperature"].to_list() == [1.0, 0.8]
+
+    def test_transition_index_reads_local_event_shards(self, tmp_path):
+        events = tmp_path / "events.parquet"
+        pl.DataFrame({"token": [[1, 4, 5], [1, 4, 6], [2]]}).write_parquet(events)
+        assert load_transition_index(events) == {1: (4,), 4: (5, 6)}

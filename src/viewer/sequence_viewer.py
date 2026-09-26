@@ -27,9 +27,12 @@ import polars as pl
 import pyarrow as pa
 import pyarrow.parquet as pq
 
+from src.eval.clinical_plausibility import assess_sequence, split_sequence
+
 _ROW_IDX_COL = "__row_idx"
 
 _SEQ_COL_CANDIDATES = [
+    "generated_tokens",
     "generated_sequence",
     "sequence",
     "filtered_clif_text",
@@ -51,6 +54,11 @@ _ID_COL_CANDIDATES = [
 _META_COL_PREFER = [
     "hospitalization_id",
     "simulation_number",
+    "prompt",
+    "prompt_tokens",
+    "plausibility_score",
+    "plausibility_status",
+    "plausibility_warning_count",
     "dataset",
     "label_home",
     "label_ltach",
@@ -62,6 +70,7 @@ _META_COL_PREFER = [
 _NUM = r"-?\d+(?:\.\d+)?"
 _RANGE_RE = re.compile(rf"^(?P<concept>.+)_(?P<low>{_NUM})_(?P<high>{_NUM})$")
 _VALUE_RE = re.compile(rf"^(?P<concept>.+)_(?P<value>{_NUM})$")
+_FUSED_BIN_RE = re.compile(r"^(?P<concept>.+)=(?P<bin>\d+)$")
 
 _DEFAULT_HIGHLIGHT_RE = re.compile(
     r"(disposition_|expired|death|mort|lactate|map|spo2|kdigo|pf|pao2|fio2|crrt|"
@@ -98,6 +107,32 @@ def load_vocab_lock(path: Path) -> set[str]:
     return set(vocab.keys())
 
 
+def load_vocab_edges(path: Path) -> dict[str, list[float]]:
+    """Load frozen numeric-bin edges from a tokenizer vocab artifact."""
+    blob = json.loads(path.read_text())
+    edges = blob.get("edges", {})
+    if not isinstance(edges, dict):
+        return {}
+    return {
+        str(concept): [float(edge) for edge in values]
+        for concept, values in edges.items()
+        if isinstance(values, list)
+    }
+
+
+def load_vocab_edges(path: Path) -> dict[str, list[float]]:
+    """Load frozen numeric-bin edges from a tokenizer vocab artifact."""
+    blob = json.loads(path.read_text())
+    edges = blob.get("edges", {})
+    if not isinstance(edges, dict):
+        return {}
+    return {
+        str(concept): [float(edge) for edge in values]
+        for concept, values in edges.items()
+        if isinstance(values, list)
+    }
+
+
 def load_id_to_token(path: Path) -> dict[int, str]:
     """id -> token map from a tokenizer vocab.json (for int token-id decoding)."""
     blob = json.loads(path.read_text())
@@ -107,20 +142,57 @@ def load_id_to_token(path: Path) -> dict[int, str]:
     return {int(i): t for t, i in vocab.items()}
 
 
-def parse_token(token: str) -> dict[str, Any]:
+def parse_token(token: str, *, edges: dict[str, list[float]] | None = None) -> dict[str, Any]:
     """Best-effort parse of a fused clinical token."""
     raw = token
-    if raw.startswith("[") and raw.endswith("]"):
+    if (
+        (raw.startswith("[") and raw.endswith("]"))
+        or raw in {"<pad>", "<bos>", "<eos>", "<unk>"}
+        or raw.startswith("<unk:")
+    ):
         return {
             "raw": raw,
             "group": "special",
             "kind": "special",
             "concept": raw,
             "category": None,
+            "bin": None,
             "low": None,
             "high": None,
             "value": None,
             "highlight": False,
+        }
+
+    m = _FUSED_BIN_RE.match(raw)
+    if m is not None:
+        concept = m.group("concept")
+        bin_index = int(m.group("bin"))
+        boundaries = (edges or {}).get(concept, [])
+        return {
+            "raw": raw,
+            "group": concept.split("_", 1)[0],
+            "kind": "bin",
+            "concept": concept,
+            "category": None,
+            "bin": bin_index,
+            "low": boundaries[bin_index - 1] if 0 < bin_index <= len(boundaries) else None,
+            "high": boundaries[bin_index] if bin_index < len(boundaries) else None,
+            "value": None,
+            "highlight": bool(_DEFAULT_HIGHLIGHT_RE.search(raw)),
+        }
+
+    if " " in raw:
+        return {
+            "raw": raw,
+            "group": raw.split(" ", 1)[0],
+            "kind": "categorical",
+            "concept": raw,
+            "category": None,
+            "bin": None,
+            "low": None,
+            "high": None,
+            "value": None,
+            "highlight": bool(_DEFAULT_HIGHLIGHT_RE.search(raw)),
         }
 
     parts = raw.split("_")
@@ -135,6 +207,7 @@ def parse_token(token: str) -> dict[str, Any]:
             "kind": "range",
             "concept": concept,
             "category": None,
+            "bin": None,
             "low": float(m.group("low")),
             "high": float(m.group("high")),
             "value": None,
@@ -150,6 +223,7 @@ def parse_token(token: str) -> dict[str, Any]:
             "kind": "value",
             "concept": concept,
             "category": None,
+            "bin": None,
             "low": None,
             "high": None,
             "value": float(m.group("value")),
@@ -169,6 +243,7 @@ def parse_token(token: str) -> dict[str, Any]:
         "kind": "categorical",
         "concept": concept,
         "category": category,
+        "bin": None,
         "low": None,
         "high": None,
         "value": None,
@@ -176,8 +251,14 @@ def parse_token(token: str) -> dict[str, Any]:
     }
 
 
-def summarize_sequence(tokens: list[str], *, vocab: set[str] | None = None) -> dict[str, Any]:
-    parsed = [parse_token(t) for t in tokens]
+def summarize_sequence(
+    tokens: list[str],
+    *,
+    vocab: set[str] | None = None,
+    edges: dict[str, list[float]] | None = None,
+    prompt_tokens: list[str] | None = None,
+) -> dict[str, Any]:
+    parsed = [parse_token(t, edges=edges) for t in tokens]
 
     group_counts: dict[str, int] = {}
     concept_counts: dict[str, int] = {}
@@ -208,6 +289,12 @@ def summarize_sequence(tokens: list[str], *, vocab: set[str] | None = None) -> d
         if vocab is not None
         else None,
         "parsed_tokens": parsed,
+        "plausibility": assess_sequence(
+            tokens,
+            vocab=vocab,
+            edges=edges,
+            prompt_tokens=prompt_tokens,
+        ),
     }
 
 
@@ -233,6 +320,7 @@ class ParquetSource(SequenceSource):
     output. Unknown ids stay numeric (never silent)."""
 
     id_to_token: dict[int, str] | None = None
+    token_vocab: set[str] | None = None
 
     def __post_init__(self):
         schema = pq.read_schema(self.path)
@@ -284,7 +372,7 @@ class ParquetSource(SequenceSource):
         out: list[dict[str, Any]] = []
         for row in df.iter_rows(named=True):
             seq = (row.get(self.seq_col) or "").strip()
-            tokens = seq.split()
+            tokens = split_sequence(seq, vocab=self.token_vocab)
             preview = " ".join(tokens[:50])
             rid = str(row[self.id_col]) if self.id_col and (row.get(self.id_col) is not None) else str(row[_ROW_IDX_COL])
             meta = {k: row.get(k) for k in self.meta_cols if k in row}
@@ -314,6 +402,22 @@ class ParquetSource(SequenceSource):
             raise KeyError(row_id)
         row = df.to_dicts()[0]
         return row
+
+    def find_by_prefix(self, prefix: str) -> tuple[str, dict[str, Any]] | None:
+        """Find an observed row whose decoded sequence starts with a prompt."""
+        if not prefix.strip():
+            return None
+        lf = self._base_lazy().filter(pl.col(self.seq_col).str.starts_with(prefix.strip()))
+        df = lf.limit(1).collect(streaming=True)
+        if df.height == 0:
+            return None
+        row = df.to_dicts()[0]
+        row_id = (
+            str(row[self.id_col])
+            if self.id_col and row.get(self.id_col) is not None
+            else str(row[_ROW_IDX_COL])
+        )
+        return row_id, row
 
 
 @dataclass
@@ -357,7 +461,7 @@ class TextSource(SequenceSource):
                 if search and search not in seq:
                     idx += 1
                     continue
-                tokens = seq.split()
+                tokens = split_sequence(seq)
                 out.append({
                     "id": str(idx),
                     "row_idx": idx,
@@ -381,6 +485,7 @@ class TextSource(SequenceSource):
 class ViewerState:
     sources: dict[str, SequenceSource]
     vocab: set[str] | None = None
+    edges: dict[str, list[float]] | None = None
 
 
 _INDEX_HTML = r"""<!doctype html>
@@ -390,39 +495,84 @@ _INDEX_HTML = r"""<!doctype html>
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Token Sequence Viewer</title>
     <style>
-      :root { --bg: #0b1020; --panel: #111a33; --text: #e8eefc; --muted: #9bb0e5; --line: #22305a; }
+      :root { --bg: #091217; --panel: #0f1d22; --panel-2: #13252b; --text: #e9f1ee; --muted: #8da39f; --line: #253b40; --accent: #63d6c2; --warn: #e7b86b; --bad: #f18484; --good: #75d69b; }
+      * { box-sizing: border-box; }
       body { margin: 0; font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial; background: var(--bg); color: var(--text); }
-      header { padding: 12px 16px; border-bottom: 1px solid var(--line); display: flex; gap: 10px; align-items: center; }
-      header .title { font-weight: 650; }
-      header select, header input, header button { background: var(--panel); color: var(--text); border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; }
-      header input { width: 320px; }
+      header { min-height: 64px; padding: 12px 18px; border-bottom: 1px solid var(--line); display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+      header .title { font-size: 15px; font-weight: 700; letter-spacing: -0.01em; margin-right: 8px; }
+      header .subtitle { color: var(--muted); font-size: 12px; }
+      header select, header input, header button { background: var(--panel); color: var(--text); border: 1px solid var(--line); border-radius: 6px; padding: 8px 10px; }
+      header input { width: min(320px, 28vw); }
       header button { cursor: pointer; }
-      main { display: flex; height: calc(100vh - 58px); }
-      #list { width: 440px; border-right: 1px solid var(--line); overflow: auto; }
+      header button:hover { border-color: var(--accent); color: var(--accent); }
+      main { display: flex; height: calc(100vh - 64px); min-height: 520px; }
+      #list { width: 390px; flex: 0 0 390px; border-right: 1px solid var(--line); overflow: auto; }
       #detail { flex: 1; overflow: auto; }
-      .row { padding: 12px 14px; border-bottom: 1px solid var(--line); cursor: pointer; }
-      .row:hover { background: rgba(255,255,255,0.03); }
-      .row .meta { color: var(--muted); font-size: 12px; margin-top: 6px; }
-      .row .preview { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; font-size: 12px; opacity: 0.95; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-      .section { padding: 14px 16px; border-bottom: 1px solid var(--line); }
-      .section h2 { margin: 0 0 10px 0; font-size: 14px; color: var(--muted); font-weight: 600; }
+      .row { padding: 13px 16px; border-bottom: 1px solid var(--line); cursor: pointer; }
+      .row:hover { background: rgba(99,214,194,0.06); }
+      .row .meta { color: var(--muted); font-size: 11px; margin-top: 7px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+      .row .preview { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; font-size: 11px; color: #c6d7d2; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; margin-top: 7px; }
+      .section { padding: 16px 20px; border-bottom: 1px solid var(--line); }
+      .section h2 { margin: 0 0 11px 0; font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.12em; font-weight: 700; }
+      .section h3 { margin: 0 0 8px 0; font-size: 13px; font-weight: 650; }
       .kv { display: grid; grid-template-columns: 180px 1fr; gap: 8px; font-size: 13px; }
       .kv div { padding: 6px 0; border-bottom: 1px dotted rgba(255,255,255,0.08); }
-      .kv code { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; font-size: 12px; }
-      #tokens { padding: 12px 16px; line-height: 1.85; }
-      .token { display: inline-block; margin: 2px 4px 2px 0; padding: 3px 6px; border-radius: 8px; border: 1px solid rgba(255,255,255,0.10); font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; font-size: 12px; }
-      .token.highlight { border-color: rgba(255, 100, 100, 0.8); box-shadow: 0 0 0 1px rgba(255,100,100,0.20) inset; }
-      .pill { display: inline-block; padding: 2px 8px; border-radius: 999px; background: rgba(255,255,255,0.06); border: 1px solid rgba(255,255,255,0.10); font-size: 12px; color: var(--muted); }
-      .controls { display:flex; gap: 10px; align-items: center; margin-left: auto; }
+      .kv code, code { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; font-size: 11px; }
+      #tokens { padding: 0; line-height: 1.85; }
+      .token { display: inline-block; margin: 2px 4px 2px 0; padding: 4px 7px; border-radius: 5px; border: 1px solid rgba(255,255,255,0.10); font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; font-size: 11px; }
+      .token.highlight { border-color: rgba(241,132,132,0.85); box-shadow: 0 0 0 1px rgba(241,132,132,0.16) inset; }
+      .pill { display: inline-block; padding: 3px 8px; border-radius: 999px; background: rgba(255,255,255,0.05); border: 1px solid rgba(255,255,255,0.10); font-size: 11px; color: var(--muted); }
+      .controls { display:flex; gap: 8px; align-items: center; margin-left: auto; }
       .muted { color: var(--muted); }
       .small { font-size: 12px; }
+      .sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0,0,0,0); white-space: nowrap; border: 0; }
+      .score { display: inline-flex; align-items: center; gap: 8px; font-size: 13px; font-weight: 700; }
+      .score strong { font-size: 20px; letter-spacing: -0.04em; }
+      .score.good strong { color: var(--good); }
+      .score.review strong { color: var(--warn); }
+      .score.poor strong { color: var(--bad); }
+      .warning-list { display: grid; gap: 8px; }
+      .warning { border: 1px solid rgba(231,184,107,0.55); border-radius: 6px; padding: 8px 10px; background: rgba(231,184,107,0.07); font-size: 12px; }
+      .warning.error { border-color: rgba(241,132,132,0.65); background: rgba(241,132,132,0.08); }
+      .warning.info { border-color: rgba(99,214,194,0.55); background: rgba(99,214,194,0.06); }
+      .warning code { color: #dbe8e4; }
+      .timeline { display: grid; gap: 10px; }
+      .timeline-row { display: grid; grid-template-columns: 100px 1fr; gap: 12px; align-items: start; }
+      .timeline-label { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .08em; padding-top: 7px; }
+      .timeline-events { padding: 6px 10px; border-left: 1px solid var(--line); background: rgba(255,255,255,0.02); }
+      .compare-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; }
+      .compare-col { min-width: 0; }
+      .compare-col h3 { color: var(--accent); }
+      .bar { display: flex; height: 7px; margin: 5px 0 8px; background: #1b3034; border-radius: 3px; overflow: hidden; }
+      .bar > span { background: var(--accent); }
+      .bar.real > span { background: #c7a66c; }
+      .empty { padding: 24px 16px; color: var(--muted); font-size: 12px; }
+      @media (max-width: 900px) {
+        #list { width: 320px; flex-basis: 320px; }
+        .timeline-row { grid-template-columns: 80px 1fr; }
+      }
+      @media (max-width: 700px) {
+        header { padding: 10px 12px; }
+        header .subtitle { width: 100%; order: 3; }
+        header select, header input { width: 100%; }
+        header .controls { margin-left: 0; }
+        main { display: block; height: calc(100vh - 132px); }
+        #list { width: 100%; height: 38%; border-right: 0; border-bottom: 1px solid var(--line); }
+        #detail { width: 100%; height: 62%; }
+        .section { padding: 14px 16px; }
+        .kv { grid-template-columns: 112px 1fr; }
+        .timeline-row { grid-template-columns: 72px 1fr; gap: 8px; }
+      }
     </style>
   </head>
   <body>
     <header>
-      <div class="title">Token Sequence Viewer</div>
-      <select id="source"></select>
-      <input id="search" placeholder="filter sequences (substring)" />
+      <h1 class="title">Token Sequence Viewer</h1>
+      <div class="subtitle">local inspection · heuristic plausibility only</div>
+      <label class="sr-only" for="source">Sequence source</label>
+      <select id="source" aria-label="Sequence source"></select>
+      <label class="sr-only" for="search">Filter sequences</label>
+      <input id="search" aria-label="Filter sequences" placeholder="filter sequences (substring)" />
       <button id="refresh">Refresh</button>
       <div class="controls">
         <button id="prev">Prev</button>
@@ -431,8 +581,8 @@ _INDEX_HTML = r"""<!doctype html>
       </div>
     </header>
     <main>
-      <div id="list"></div>
-      <div id="detail">
+      <div id="list" role="region" tabindex="0" aria-label="Sequence records"></div>
+      <div id="detail" role="region" tabindex="0" aria-label="Sequence detail">
         <div class="section">
           <h2>How to use</h2>
           <div class="small muted">Select a source, then click a row to render tokens + summary.</div>
@@ -498,11 +648,63 @@ _INDEX_HTML = r"""<!doctype html>
         }
       }
 
+      function renderToken(t) {
+        const span = document.createElement('span');
+        span.className = 'token' + (t.highlight ? ' highlight' : '');
+        const group = (t.group || 'other');
+        span.style.background = `rgba(255,255,255,0.03)`;
+        span.style.borderColor = `rgba(255,255,255,0.10)`;
+        span.style.boxShadow = `0 0 0 1px ${colorForGroup(group)}33 inset`;
+        const tip = [
+          `group=${group}`,
+          `kind=${t.kind}`,
+          `concept=${t.concept}`,
+          t.category ? `category=${t.category}` : null,
+          t.bin != null ? `bin=${t.bin}` : null,
+          t.low != null ? `low=${t.low}` : null,
+          t.high != null ? `high=${t.high}` : null,
+          t.value != null ? `value=${t.value}` : null,
+        ].filter(Boolean).join('\n');
+        span.title = tip;
+        span.textContent = t.raw;
+        return span;
+      }
+
+      function renderTimeline(parsed) {
+        const rows = [];
+        for (const token of parsed || []) {
+          const group = token.group || 'other';
+          const previous = rows[rows.length - 1];
+          if (!previous || previous.group !== group) rows.push({ group, tokens: [] });
+          rows[rows.length - 1].tokens.push(token);
+        }
+        return rows.slice(0, 120).map((row, index) => {
+          const tokens = row.tokens.map(renderToken);
+          const holder = document.createElement('div');
+          holder.className = 'timeline-events';
+          tokens.forEach(token => holder.appendChild(token));
+          return `<div class="timeline-row"><div class="timeline-label">${index + 1} · ${esc(row.group)}</div><div class="timeline-events">${holder.innerHTML}</div></div>`;
+        }).join('');
+      }
+
+      function renderWarnings(plausibility) {
+        if (!plausibility) return '<div class="muted small">No plausibility diagnostics available.</div>';
+        const warnings = (plausibility.warnings || []).map(w =>
+          `<div class="warning ${esc(w.severity)}"><strong>${esc(w.code)}</strong> · ${esc(w.message)}`
+          + (w.sample?.length ? `<div class="muted small"><code>${esc(w.sample.join(' '))}</code></div>` : '')
+          + `</div>`
+        ).join('');
+        return warnings || '<div class="small" style="color:var(--good)">No structural warnings detected.</div>';
+      }
+
       function renderDetail(data) {
         const el = document.getElementById('detail');
         const summary = data.summary;
         const meta = data.meta || {};
         const unknown = summary.unknown;
+        const plausibility = summary.plausibility;
+        const score = plausibility?.score;
+        const status = plausibility?.status || 'review';
 
         let unknownHtml = '<div class="muted small">(no vocab provided)</div>';
         if (unknown) {
@@ -510,8 +712,12 @@ _INDEX_HTML = r"""<!doctype html>
             + (unknown.sample?.length ? `<div class="small muted">sample: <code>${esc(unknown.sample.slice(0, 10).join(' '))}</code></div>` : '');
         }
 
-        const groups = (summary.groups || []).slice(0, 20).map(([g,c]) => `<span class="pill" style="border-color: rgba(255,255,255,0.15);">${esc(g)}=${c}</span>`).join(' ');
+        const groups = (summary.groups || []).slice(0, 20).map(([g,c]) => `<span class="pill">${esc(g)}=${c}</span>`).join(' ');
         const topConcepts = (summary.top_concepts || []).slice(0, 25).map(([c,n]) => `<div><code>${esc(c)}</code></div><div>${n}</div>`).join('');
+        const compareSource = state.sources.find(source => source.name === 'events');
+        const compareHtml = compareSource && data.source !== compareSource.name
+          ? `<button id="compareButton">Compare with observed data</button><div id="comparePanel" class="small muted" style="margin-top:10px">Uses prompt-prefix matching when provenance is available.</div>`
+          : '';
 
         el.innerHTML = `
           <div class="section">
@@ -524,8 +730,17 @@ _INDEX_HTML = r"""<!doctype html>
             </div>
           </div>
           <div class="section">
+            <h2>Clinical plausibility review</h2>
+            <div class="score ${esc(status)}"><strong>${score == null ? '—' : (score * 100).toFixed(0) + '%'}</strong> <span>${esc(status)} <span class="muted small">· heuristic structural review, not clinical validation</span></span></div>
+            <div class="warning-list" style="margin-top:12px">${renderWarnings(plausibility)}</div>
+          </div>
+          <div class="section">
             <h2>Groups</h2>
             <div>${groups || '<span class="muted small">(none)</span>'}</div>
+          </div>
+          <div class="section">
+            <h2>Timeline</h2>
+            <div class="timeline">${renderTimeline(summary.parsed_tokens)}</div>
           </div>
           <div class="section">
             <h2>Vocab coverage</h2>
@@ -536,52 +751,72 @@ _INDEX_HTML = r"""<!doctype html>
             <div class="kv">${topConcepts || '<div class="muted small">(none)</div>'}</div>
           </div>
           <div class="section">
-            <h2>Tokens</h2>
+            <h2>Raw sequence</h2>
             <div id="tokens"></div>
           </div>
+          ${compareHtml ? `<div class="section"><h2>Observed comparison</h2>${compareHtml}</div>` : ''}
         `;
 
         const tokEl = document.getElementById('tokens');
-        tokEl.innerHTML = '';
-        for (const t of summary.parsed_tokens || []) {
-          const span = document.createElement('span');
-          span.className = 'token' + (t.highlight ? ' highlight' : '');
-          const group = (t.group || 'other');
-          span.style.background = `rgba(255,255,255,0.03)`;
-          span.style.borderColor = `rgba(255,255,255,0.10)`;
-          span.style.boxShadow = `0 0 0 1px ${colorForGroup(group)}33 inset`;
-          const tip = [
-            `group=${group}`,
-            `kind=${t.kind}`,
-            `concept=${t.concept}`,
-            t.category ? `category=${t.category}` : null,
-            t.low != null ? `low=${t.low}` : null,
-            t.high != null ? `high=${t.high}` : null,
-            t.value != null ? `value=${t.value}` : null,
-          ].filter(Boolean).join('\n');
-          span.title = tip;
-          span.textContent = t.raw;
-          tokEl.appendChild(span);
+        (summary.parsed_tokens || []).forEach(t => tokEl.appendChild(renderToken(t)));
+        const compareButton = document.getElementById('compareButton');
+        if (compareButton) {
+          compareButton.onclick = async () => {
+            compareButton.disabled = true;
+            compareButton.textContent = 'Comparing…';
+            try {
+              const target = state.sources.find(source => source.name === 'events');
+              const q = new URLSearchParams({ source: data.source, id: data.id, against: target.name });
+              const comparison = await api('/api/compare?' + q.toString());
+              document.getElementById('comparePanel').innerHTML = renderComparison(comparison);
+              compareButton.textContent = 'Compared';
+            } catch (error) {
+              document.getElementById('comparePanel').innerHTML = `<span style="color:var(--warn)">No observed match: ${esc(error.message)}</span>`;
+              compareButton.disabled = false;
+              compareButton.textContent = 'Try comparison again';
+            }
+          };
         }
+      }
+
+      function renderComparison(data) {
+        const left = data.generated;
+        const right = data.observed;
+        const rows = (summary) => (summary.groups || []).slice(0, 8).map(([group, count]) => {
+          const pct = Math.min(100, (count / Math.max(summary.n_tokens, 1)) * 100);
+          return `<div class="small">${esc(group)} · ${count}<div class="bar"><span style="width:${pct}%"></span></div></div>`;
+        }).join('');
+        return `<div class="compare-grid">
+          <div class="compare-col"><h3>${esc(data.generated_id)} · generated</h3>${rows(left)}</div>
+          <div class="compare-col"><h3>${esc(data.observed_id)} · observed</h3>${rows(right)}</div>
+        </div><div class="muted small" style="margin-top:12px">${esc(data.match_method)}</div>`;
       }
 
       async function loadRows() {
         if (!state.source) return;
-        const q = new URLSearchParams({
-          source: state.source,
-          offset: state.offset.toString(),
-          limit: state.limit.toString(),
-          search: state.search,
-        });
-        const data = await api('/api/rows?' + q.toString());
-        renderList(data.rows || []);
-        setPageBadge(data.total || 0);
+        try {
+          const q = new URLSearchParams({
+            source: state.source,
+            offset: state.offset.toString(),
+            limit: state.limit.toString(),
+            search: state.search,
+          });
+          const data = await api('/api/rows?' + q.toString());
+          renderList(data.rows || []);
+          setPageBadge(data.total || 0);
+        } catch (error) {
+          document.getElementById('list').innerHTML = `<div class="empty">Could not load rows.<br><span class="muted">${esc(error.message)}</span></div>`;
+        }
       }
 
       async function loadRecord(id) {
-        const q = new URLSearchParams({ source: state.source, id: id.toString() });
-        const data = await api('/api/record?' + q.toString());
-        renderDetail(data);
+        try {
+          const q = new URLSearchParams({ source: state.source, id: id.toString() });
+          const data = await api('/api/record?' + q.toString());
+          renderDetail(data);
+        } catch (error) {
+          document.getElementById('detail').innerHTML = `<div class="section"><h2>Could not load record</h2><div class="small muted">${esc(error.message)}</div></div>`;
+        }
       }
 
       function bindUI() {
@@ -691,10 +926,76 @@ def _make_handler(state: ViewerState):
                         or row.get("filtered_clif_text")
                         or ""
                     ).strip()
-                    tokens = [t for t in seq.split() if t]
-                    summary = summarize_sequence(tokens, vocab=state.vocab)
+                    tokens = split_sequence(seq, vocab=state.vocab)
+                    prompt = row.get("prompt")
+                    prompt_tokens = (
+                        str(prompt).split() if isinstance(prompt, str) else None
+                    )
+                    summary = summarize_sequence(
+                        tokens,
+                        vocab=state.vocab,
+                        edges=state.edges,
+                        prompt_tokens=prompt_tokens,
+                    )
                     meta = {k: v for k, v in row.items() if k not in {getattr(src, "seq_col", "generated_sequence"), "generated_sequence", "sequence", "filtered_clif_text"}}
                     self._send_json({"source": source, "id": rid, "sequence": seq, "meta": meta, "summary": summary})
+                    return
+
+                if path == "/api/compare":
+                    source = (qs.get("source") or [""])[0]
+                    rid = (qs.get("id") or [""])[0]
+                    against = (qs.get("against") or [""])[0]
+                    if source not in state.sources or against not in state.sources:
+                        self._send_json(
+                            {"error": "source and against must name known sources"},
+                            status=HTTPStatus.BAD_REQUEST,
+                        )
+                        return
+                    generated_src = state.sources[source]
+                    observed_src = state.sources[against]
+                    generated_row = generated_src.get_row(row_id=rid)
+                    generated_seq = (
+                        generated_row.get(getattr(generated_src, "seq_col", "generated_sequence"))
+                        or generated_row.get("generated_sequence")
+                        or generated_row.get("sequence")
+                        or ""
+                    ).strip()
+                    prompt = generated_row.get("prompt")
+                    match = (
+                        observed_src.find_by_prefix(str(prompt))
+                        if prompt and hasattr(observed_src, "find_by_prefix")
+                        else None
+                    )
+                    if match is None:
+                        self._send_json({
+                            "error": "no observed sequence matched the rollout prompt",
+                            "generated_id": rid,
+                        }, status=HTTPStatus.NOT_FOUND)
+                        return
+                    observed_id, observed_row = match
+                    observed_seq = (
+                        observed_row.get(getattr(observed_src, "seq_col", "token"))
+                        or observed_row.get("sequence")
+                        or ""
+                    ).strip()
+                    generated_tokens = split_sequence(generated_seq, vocab=state.vocab)
+                    observed_tokens = split_sequence(observed_seq, vocab=state.vocab)
+                    self._send_json({
+                        "generated_id": rid,
+                        "observed_id": observed_id,
+                        "match_method": "observed prefix starts with exact rollout prompt",
+                        "generated": summarize_sequence(
+                            generated_tokens,
+                            vocab=state.vocab,
+                            edges=state.edges,
+                            prompt_tokens=str(prompt).split(),
+                        ),
+                        "observed": summarize_sequence(
+                            observed_tokens,
+                            vocab=state.vocab,
+                            edges=state.edges,
+                        ),
+                    })
                     return
 
                 self._send_text("not found", status=HTTPStatus.NOT_FOUND)
@@ -717,16 +1018,26 @@ def main(argv: list[str] | None = None) -> None:
     args = ap.parse_args(argv)
 
     sources: dict[str, SequenceSource] = {}
+    vocab_path = Path(args.vocab_lock).expanduser().resolve() if args.vocab_lock else None
+    vocab = load_vocab_lock(vocab_path) if vocab_path else None
     id_to_token: dict[int, str] | None = None
-    if args.vocab_lock:
-        vl = Path(args.vocab_lock).expanduser().resolve()
-        id_to_token = load_id_to_token(vl)
+    if vocab_path:
+        id_to_token = load_id_to_token(vocab_path)
     for p in args.parquet:
         path = Path(p).expanduser().resolve()
-        src = ParquetSource(path=path, name=path.stem, id_to_token=id_to_token)
+        src = ParquetSource(
+            path=path,
+            name=path.stem,
+            id_to_token=id_to_token,
+            token_vocab=vocab,
+        )
         if src.name in sources:
-            src = ParquetSource(path=path, name=f"{path.stem}-{len(sources)}",
-                                id_to_token=id_to_token)
+            src = ParquetSource(
+                path=path,
+                name=f"{path.stem}-{len(sources)}",
+                id_to_token=id_to_token,
+                token_vocab=vocab,
+            )
         sources[src.name] = src
 
     for t in args.txt:
@@ -739,8 +1050,8 @@ def main(argv: list[str] | None = None) -> None:
     if not sources:
         ap.error("Provide at least one --parquet or --txt input")
 
-    vocab = load_vocab_lock(Path(args.vocab_lock).expanduser().resolve()) if args.vocab_lock else None
-    state = ViewerState(sources=sources, vocab=vocab)
+    edges = load_vocab_edges(vocab_path) if vocab_path else None
+    state = ViewerState(sources=sources, vocab=vocab, edges=edges)
 
     handler = _make_handler(state)
     server = ThreadingHTTPServer((args.host, args.port), handler)

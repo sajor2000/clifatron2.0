@@ -42,6 +42,8 @@ from pathlib import Path
 
 import polars as pl
 
+from src.eval.clinical_plausibility import split_sequence
+
 
 _SPECIALS = {"<pad>", "<bos>", "<eos>", "<unk>"}
 
@@ -169,20 +171,32 @@ def rollout_hygiene(sequences: list[list[str]]) -> dict:
     }
 
 
-def _load_sims(path: str | Path) -> list[dict]:
+def _load_sims(
+    path: str | Path,
+    *,
+    vocab: set[str] | None = None,
+) -> list[dict]:
     df = pl.read_parquet(path)
-    if "generated_sequence" not in df.columns:
-        raise ValueError(f"sims parquet has no generated_sequence column: {path}")
+    if "generated_sequence" not in df.columns and "generated_tokens" not in df.columns:
+        raise ValueError(f"sims parquet has no generated token column: {path}")
     has_prompt = "prompt" in df.columns
     rows = df.sort(["hospitalization_id", "simulation_number"]).to_dicts()
     out = []
     for row in rows:
-        tokens = (row.get("generated_sequence") or "").split()
+        raw_tokens = row.get("generated_tokens")
+        tokens = (
+            [str(token) for token in raw_tokens]
+            if isinstance(raw_tokens, list)
+            else split_sequence(row.get("generated_sequence") or "", vocab=vocab)
+        )
         out.append({
             "hospitalization_id": str(row.get("hospitalization_id")),
             "simulation_number": int(row.get("simulation_number", 0)),
             "tokens": tokens,
-            "prompt": (row.get("prompt") or "").split() if has_prompt else [],
+            "prompt": (
+                split_sequence(row.get("prompt") or "", vocab=vocab)
+                if has_prompt else []
+            ),
         })
     return out
 
@@ -290,7 +304,7 @@ def main(argv: list[str] | None = None) -> None:
     data_config = yaml.safe_load(Path(args.data_config).read_text())
     groups = concept_groups(data_config)
 
-    sims = _load_sims(args.sims)
+    sims = _load_sims(args.sims, vocab=set(vocab))
     real = _load_real(args.events, id_to_token)
 
     prompt_source = None

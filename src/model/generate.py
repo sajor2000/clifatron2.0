@@ -29,11 +29,13 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
+from collections.abc import Mapping, Sequence
 
 import torch
 import torch.nn.functional as F
 
 from src.model.encoder import CLIFEncoder, apply_rope, build_rope_cache
+from src.eval.clinical_plausibility import assess_sequence, split_sequence
 
 
 # --------------------------------------------------------------------- KV cache
@@ -99,6 +101,9 @@ def _cached_forward(enc: CLIFEncoder, token_ids: torch.Tensor, pos_min: torch.Te
 def sample_logits(logits: torch.Tensor, *, temperature: float = 1.0, top_k: int | None = None,
                   top_p: float | None = 1.0, min_token_ids: tuple[int, ...] = (),
                   allowed_token_ids: tuple[int, ...] | None = None,
+                  allowed_token_ids_per_row: Sequence[tuple[int, ...]] | None = None,
+                  recent_token_ids_per_row: Sequence[Sequence[int]] | None = None,
+                  repetition_penalty: float = 1.0,
                   generator: torch.Generator | None = None) -> torch.Tensor:
     """Sample [B] token ids from [B, V] logits.
 
@@ -119,10 +124,92 @@ def sample_logits(logits: torch.Tensor, *, temperature: float = 1.0, top_k: int 
                                        float("-inf"))
     if allowed_token_ids is not None:
         keep = torch.zeros(logits.size(-1), dtype=torch.bool, device=logits.device)
-        keep[list(allowed_token_ids)] = True
+        keep.index_fill_(
+            0,
+            torch.tensor(list(allowed_token_ids), dtype=torch.long, device=logits.device),
+            True,
+        )
         logits = logits.masked_fill(~keep, float("-inf"))
+    if allowed_token_ids_per_row is not None:
+        if len(allowed_token_ids_per_row) != logits.size(0):
+            raise ValueError("allowed_token_ids_per_row must have one entry per batch row")
+        base_logits = logits
+        masked_rows = []
+        for row, allowed in enumerate(allowed_token_ids_per_row):
+            if allowed:
+                row_keep = torch.zeros(logits.size(-1), dtype=torch.bool, device=logits.device)
+                row_keep.index_fill_(
+                    0,
+                    torch.tensor(list(allowed), dtype=torch.long, device=logits.device),
+                    True,
+                )
+                row_logits = base_logits[row].masked_fill(~row_keep, float("-inf"))
+            else:
+                row_logits = base_logits[row]
+            if not bool(torch.isfinite(row_logits).any()):
+                if allowed_token_ids is None:
+                    raise ValueError("transition mask removed every candidate token")
+                fallback = torch.zeros(logits.size(-1), dtype=torch.bool, device=logits.device)
+                fallback.index_fill_(
+                    0,
+                    torch.tensor(list(allowed_token_ids), dtype=torch.long, device=logits.device),
+                    True,
+                )
+                row_logits = base_logits[row].masked_fill(~fallback, float("-inf"))
+            masked_rows.append(row_logits)
+        logits = torch.stack(masked_rows, dim=0)
+    if recent_token_ids_per_row is not None and repetition_penalty > 1.0:
+        if len(recent_token_ids_per_row) != logits.size(0):
+            raise ValueError("recent_token_ids_per_row must have one entry per batch row")
+        penalized_rows = []
+        for row, recent in enumerate(recent_token_ids_per_row):
+            row_logits = logits[row]
+            recent_ids = tuple(set(int(token_id) for token_id in recent))
+            if recent_ids:
+                recent_mask = torch.zeros(
+                    logits.size(-1), dtype=torch.bool, device=logits.device
+                )
+                recent_mask.index_fill_(
+                    0,
+                    torch.tensor(recent_ids, dtype=torch.long, device=logits.device),
+                    True,
+                )
+                penalized = torch.where(
+                    row_logits < 0,
+                    row_logits * repetition_penalty,
+                    row_logits / repetition_penalty,
+                )
+                row_logits = torch.where(recent_mask, penalized, row_logits)
+            penalized_rows.append(row_logits)
+        logits = torch.stack(penalized_rows, dim=0)
+    global_allowed = set(allowed_token_ids) if allowed_token_ids is not None else None
+
+    def candidate_ids(row: int) -> tuple[int, ...] | None:
+        if allowed_token_ids_per_row is None and global_allowed is None:
+            return None
+        if allowed_token_ids_per_row is None:
+            candidates = tuple(sorted(global_allowed or ()))
+        else:
+            candidates = tuple(allowed_token_ids_per_row[row])
+            if global_allowed is not None:
+                candidates = tuple(token_id for token_id in candidates if token_id in global_allowed)
+        if not candidates:
+            raise ValueError("allowed-token intersection is empty")
+        return candidates
+
     if temperature <= 0:
-        return logits.argmax(dim=-1)
+        greedy = []
+        for row in range(logits.size(0)):
+            candidates = candidate_ids(row)
+            if candidates is None:
+                greedy.append(logits[row].argmax())
+            else:
+                candidate_tensor = torch.tensor(
+                    candidates, dtype=torch.long, device=logits.device
+                )
+                values = logits[row].index_select(0, candidate_tensor)
+                greedy.append(candidate_tensor[values.argmax()])
+        return torch.stack(greedy)
     logits = logits / float(temperature)
     if top_k is not None and top_k >= 1:
         kth = logits.topk(min(int(top_k), logits.size(-1)), dim=-1).values[..., -1:]
@@ -137,7 +224,28 @@ def sample_logits(logits: torch.Tensor, *, temperature: float = 1.0, top_k: int 
         remove = torch.zeros_like(logits, dtype=torch.bool).scatter(-1, sorted_idx, remove_sorted)
         logits = logits.masked_fill(remove, float("-inf"))
     probs = torch.softmax(logits, dim=-1)
-    return torch.multinomial(probs, num_samples=1, generator=generator).squeeze(-1)
+    sampled = []
+    for row in range(logits.size(0)):
+        candidates = candidate_ids(row)
+        if candidates is None:
+            sampled.append(torch.multinomial(probs[row], num_samples=1, generator=generator).squeeze(0))
+            continue
+        candidate_tensor = torch.tensor(
+            candidates, dtype=torch.long, device=logits.device
+        )
+        candidate_probs = probs[row].index_select(0, candidate_tensor)
+        candidate_probs = torch.nan_to_num(candidate_probs, nan=0.0, posinf=0.0, neginf=0.0)
+        total = candidate_probs.sum()
+        if not bool(torch.isfinite(total)) or float(total) <= 0:
+            candidate_probs = torch.ones_like(candidate_probs) / len(candidates)
+        else:
+            candidate_probs = candidate_probs / total
+        sampled.append(
+            candidate_tensor[
+                torch.multinomial(candidate_probs, num_samples=1, generator=generator).squeeze(0)
+            ]
+        )
+    return torch.stack(sampled)
 
 
 # --------------------------------------------------------------------- generate
@@ -149,6 +257,8 @@ def generate(model: CLIFEncoder, input_ids: torch.Tensor, pos_min: torch.Tensor,
              top_p: float | None = 1.0, stop_token_ids: tuple[int, ...] = (),
              min_new_tokens: int = 0, pos_step_min: int = 60, pad_token_id: int = 0,
              allowed_token_ids: tuple[int, ...] | None = None,
+             transition_allowed_token_ids: Mapping[int, tuple[int, ...]] | None = None,
+             repetition_penalty: float = 1.0,
              generator: torch.Generator | None = None) -> dict[str, torch.Tensor]:
     """Batched autoregressive continuation of a from-scratch trunk, with KV caching.
 
@@ -178,15 +288,45 @@ def generate(model: CLIFEncoder, input_ids: torch.Tensor, pos_min: torch.Tensor,
     lengths = torch.zeros(B, dtype=torch.long, device=device)
     stopped = torch.zeros(B, dtype=torch.bool, device=device)
     last_pos = pos_min[:, -1]
+    previous_ids = input_ids[:, -1]
+    history = [
+        input_ids[row, max(0, T - 8):].tolist()
+        for row in range(B)
+    ]
 
     for step in range(max_new_tokens):
         forbid = tuple(stop_token_ids) if step < min_new_tokens else ()
+        transition_allowed = None
+        if transition_allowed_token_ids is not None:
+            fallback_allowed = (
+                allowed_token_ids
+                if allowed_token_ids is not None
+                else tuple(range(logits.size(-1)))
+            )
+            transition_allowed = []
+            for token_id in previous_ids.tolist():
+                candidate = transition_allowed_token_ids.get(
+                    int(token_id), fallback_allowed
+                )
+                if step < min_new_tokens and candidate:
+                    candidate = tuple(
+                        value for value in candidate if value not in stop_token_ids
+                    ) or fallback_allowed
+                transition_allowed.append(candidate)
         next_id = sample_logits(logits, temperature=temperature, top_k=top_k, top_p=top_p,
                                 min_token_ids=forbid, allowed_token_ids=allowed_token_ids,
+                                allowed_token_ids_per_row=transition_allowed,
+                                recent_token_ids_per_row=history,
+                                repetition_penalty=repetition_penalty,
                                 generator=generator)
         active = ~stopped
         out[active, step] = next_id[active]
         lengths[active] += 1
+        for row in range(B):
+            if bool(active[row]):
+                history[row].append(int(next_id[row]))
+                history[row] = history[row][-8:]
+        previous_ids = next_id
         if stop_t is not None:
             hit = torch.isin(next_id, stop_t)
             stopped = stopped | (hit & active)
@@ -216,6 +356,39 @@ def load_vocab(path: str | Path) -> dict[str, int]:
     return vocab
 
 
+def load_vocab_artifact(path: str | Path) -> dict:
+    """Load the full frozen vocab artifact, including numeric bin edges."""
+    blob = json.loads(Path(path).read_text())
+    if "vocab" not in blob:
+        blob = {"vocab": blob}
+    return blob
+
+
+def load_transition_index(
+    events_path: str | Path,
+    *,
+    max_successors: int | None = None,
+) -> dict[int, tuple[int, ...]]:
+    """Build an observed next-token index from local tokenizer shards.
+
+    This is an optional generation guard, not a learned clinical grammar. A
+    missing predecessor backs off to the frozen vocabulary in ``generate``.
+    """
+    import polars as pl
+
+    successors: dict[int, set[int]] = {}
+    frame = pl.read_parquet(events_path, columns=["token"])
+    for sequence in frame["token"].to_list():
+        for current, following in zip(sequence, sequence[1:]):
+            successors.setdefault(int(current), set()).add(int(following))
+    if max_successors is None:
+        return {key: tuple(sorted(values)) for key, values in successors.items()}
+    return {
+        key: tuple(sorted(values)[:max_successors])
+        for key, values in successors.items()
+    }
+
+
 def make_decoder(vocab: dict[str, int]) -> "callable":
     """ids -> token strings; unknown ids become '<unk:N>' (never silent)."""
     id_to_token = {i: t for t, i in vocab.items()}
@@ -243,6 +416,9 @@ class SimulationWriter:
             "hospitalization_id": hospitalization_id,
             "simulation_number": int(simulation_number),
             "generated_sequence": seq,
+            "generated_tokens": (
+                list(tokens) if not isinstance(tokens, str) else tokens.split()
+            ),
             **labels,
         })
 
@@ -261,6 +437,7 @@ class SimulationWriter:
         df = pl.DataFrame(records) if records else pl.DataFrame(
             schema={"simulation_id": pl.Int64, "hospitalization_id": pl.Utf8,
                     "simulation_number": pl.Int64, "generated_sequence": pl.Utf8,
+                    "generated_tokens": pl.List(pl.Utf8),
                     "dataset": pl.Utf8})
         out = Path(path)
         out.parent.mkdir(parents=True, exist_ok=True)
@@ -313,6 +490,10 @@ def main(argv: list[str] | None = None) -> None:
     ap.add_argument("--top-p", type=float, default=0.95)
     ap.add_argument("--top-k", type=int, default=None)
     ap.add_argument("--min-new-tokens", type=int, default=1)
+    ap.add_argument("--repetition-penalty", type=float, default=1.05,
+                    help="penalize recently emitted tokens; 1 disables the guard")
+    ap.add_argument("--reference-events", default=None,
+                    help="optional local events.parquet for an observed-transition guard")
     ap.add_argument("--pos-step-min", type=int, default=60,
                     help="minutes assigned per generated token (hourly clock)")
     ap.add_argument("--stop-token-ids", type=int, nargs="*", default=None,
@@ -324,6 +505,7 @@ def main(argv: list[str] | None = None) -> None:
 
     device = torch.device(args.device)
     vocab = load_vocab(args.vocab) if args.vocab else None
+    vocab_artifact = load_vocab_artifact(args.vocab) if args.vocab else {}
     tok2id = vocab or {}
     bos = tok2id.get("<bos>", 1)
 
@@ -332,7 +514,14 @@ def main(argv: list[str] | None = None) -> None:
             ap.error("--prompts requires --vocab (prompt lines are token strings)")
         unk = tok2id.get("<unk>", 3)
         lines = [ln for ln in Path(args.prompts).read_text().splitlines() if ln.strip()]
-        prompt_ids = [[tok2id.get(tok, unk) for tok in ln.split()] or [bos] for ln in lines]
+        prompt_tokens = [
+            split_sequence(line, vocab=set(tok2id))
+            for line in lines
+        ]
+        prompt_ids = [
+            [tok2id.get(tok, unk) for tok in tokens] or [bos]
+            for tokens in prompt_tokens
+        ]
         hosp_ids = [f"prompt-{i + 1}" for i in range(len(lines))]
     else:
         prompt_ids, hosp_ids = [[bos]], ["prompt-1"]
@@ -344,12 +533,18 @@ def main(argv: list[str] | None = None) -> None:
     decoder = make_decoder(vocab) if vocab else (lambda ids: [str(i) for i in ids])
     generator = torch.Generator(device=device)
     generator.manual_seed(args.seed)
+    transitions = (
+        load_transition_index(args.reference_events)
+        if args.reference_events
+        else None
+    )
 
     writer = SimulationWriter(dataset="gem")
     allowed = tuple(sorted(vocab.values())) if vocab else None
     for hosp, pids in zip(hosp_ids, prompt_ids):
         n = args.n_simulations
-        prompt_text = " ".join(decoder(list(pids)))
+        prompt_tokens = decoder(list(pids))
+        prompt_text = " ".join(prompt_tokens)
         ids = torch.tensor([pids] * n, dtype=torch.long, device=device)
         pos = (torch.arange(len(pids), device=device, dtype=torch.long).unsqueeze(0)
                .expand(n, -1) * args.pos_step_min)
@@ -361,6 +556,8 @@ def main(argv: list[str] | None = None) -> None:
             pos_step_min=args.pos_step_min,
             pad_token_id=tok2id.get("<pad>", 0),
             allowed_token_ids=allowed,
+            transition_allowed_token_ids=transitions,
+            repetition_penalty=args.repetition_penalty,
             generator=generator,
         )
         for sim in range(n):
@@ -369,7 +566,22 @@ def main(argv: list[str] | None = None) -> None:
             # `prompt` column: rollout provenance (the exact prefix tokens) so
             # downstream evals pair rollouts with their real continuations
             # without positional conventions (used by src/eval/generative.py).
-            writer.add(hosp, sim + 1, tokens, prompt=prompt_text)
+            review = assess_sequence(
+                tokens,
+                vocab=set(tok2id) if tok2id else None,
+                edges=vocab_artifact.get("edges"),
+                prompt_tokens=prompt_text.split(),
+            )
+            writer.add(
+                hosp,
+                sim + 1,
+                tokens,
+                prompt=prompt_text,
+                prompt_tokens=prompt_tokens,
+                plausibility_score=review["score"],
+                plausibility_status=review["status"],
+                plausibility_warning_count=review["warning_count"],
+            )
     n_rows = writer.write(args.output)
     print(f"Wrote {n_rows} simulations to {args.output} (viewer-compatible schema)")
 
