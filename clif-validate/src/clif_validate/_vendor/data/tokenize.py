@@ -265,53 +265,6 @@ def build_value_bins(events: pl.DataFrame, n_bins: int,
 
 
 def build_clinical_segment_bins(
-    segment_source: str | Path,
-    concepts: list[str],
-    forced_edges: dict[str, list[float]] | None = None,
-) -> dict[str, list[float]]:
-    """Per-concept interior bin edges from the CLIF consortium's physician-designed
-    segmentation CSV (`critical_illness_tokenization_final_with_intervals.csv`).
-
-    These 1268 clinician-designed segments encode measurement-density granularity
-    (tighter intervals in decision zones, extreme-value quintiles at the tails) that
-    data-driven deciles cannot recover — the primary v2 scheme
-    (`value_binning.scheme: clinical_segment`).
-
-    The CSV lists, per `measurement`, ordered `[min_value, max_value]` intervals. The
-    interior bin edges are the sorted unique interval boundaries with the outermost
-    min/max dropped (open at ±inf), matching the format `_bin_of` consumes
-    (`np.searchsorted` over interior boundaries → bin index). Forced ICU-decision
-    cutpoints are pinned onto the grid as guaranteed edges."""
-    import csv
-
-    forced_edges = forced_edges or {}
-    rows_by_concept: dict[str, list[tuple[float, float]]] = {}
-    with open(segment_source, newline="") as fh:
-        for row in csv.DictReader(fh):
-            measurement = row.get("measurement")
-            if measurement not in concepts:
-                continue
-            try:
-                lo, hi = float(row["min_value"]), float(row["max_value"])
-            except (TypeError, ValueError):
-                continue
-            if not (np.isfinite(lo) and np.isfinite(hi)):
-                continue
-            rows_by_concept.setdefault(measurement, []).append((lo, hi))
-
-    edges: dict[str, list[float]] = {}
-    for concept, intervals in rows_by_concept.items():
-        boundaries = sorted({b for lo, hi in intervals for b in (lo, hi)})
-        # Drop the outermost min/max — the first and last bins are open at ±inf.
-        interior = boundaries[1:-1]
-        for pin in sorted({float(e) for e in forced_edges.get(concept, []) if np.isfinite(float(e))}):
-            if not any(np.isclose(e, pin) for e in interior):
-                interior.append(pin)
-        edges[concept] = sorted(interior)
-    return edges
-
-
-def build_clinical_segment_bins(
     csv_path: str | Path,
     target_concepts: list[str],
     forced_edges: dict[str, list[float]] | None = None,

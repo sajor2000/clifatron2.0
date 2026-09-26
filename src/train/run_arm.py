@@ -41,6 +41,7 @@ from src.model.heads import (
 )
 from src.model.head_adapter import CLIFATRONHeads, load_backbone
 from src.train.curriculum import curriculum_weights
+from src.train.pretrain import objective_weights
 
 
 @dataclass
@@ -74,8 +75,13 @@ def setup_ddp():
 
 # -------------------------------------------------------------------- models
 class FromScratchModel(torch.nn.Module):
+    """From-scratch arm: the same objective wiring as pretrain.Model — config-driven
+    `heads.*.weight`, fail-to-zero guards for absent head targets — so a real total
+    loss reaches the training engine instead of `None` (which crashed engine.train)."""
+
     def __init__(self, vocab_size: int, n_targets: int, mcfg: dict):
         super().__init__()
+        self.w = objective_weights(mcfg)
         self.enc = CLIFEncoder(vocab_size, mcfg)
         d = self.enc.d_model
         h = mcfg["heads"]
@@ -90,12 +96,32 @@ class FromScratchModel(torch.nn.Module):
         enc_token = batch.get("soft_token", batch["token"])
         H = self.enc(enc_token, batch["pos_min"], batch.get("soft_weight"))
         h_last = H[torch.arange(H.size(0)), batch["last_idx"]]
-        ntp = next_event_loss(self.enc.lm_logits(H), batch["token"])
-        cr = self.cr.loss(h_last, batch["cr_type"], batch["cr_bin"])
-        th = self.th.loss(h_last, batch["th_target"], batch["th_tau"],
-                          batch["th_dir"], batch["th_crossed"])
-        val = self.vr.loss(H, batch["token"], batch["value"], batch["val_mask"]) if self.vr else None
-        return {"ntp": ntp, "cr": cr, "th": th, "val": val, "total": None}
+        ntp = next_event_loss(
+            self.enc.lm_logits(H),
+            batch.get("ntp_target", batch["token"]),
+            batch.get("ntp_mask"),
+        )
+        cr = (
+            self.cr.loss(h_last, batch["cr_type"], batch["cr_bin"])
+            if self.w["competing_risk"] and "cr_type" in batch and "cr_bin" in batch
+            else H.new_tensor(0.0)
+        )
+        th = (
+            self.th.loss(h_last, batch["th_target"], batch["th_tau"],
+                         batch["th_dir"], batch["th_crossed"])
+            if self.w["threshold_hazard"] and "th_target" in batch
+            else H.new_tensor(0.0)
+        )
+        val = (
+            self.vr.loss_aligned(H, batch.get("ntp_target", batch["token"]),
+                                 batch["value"], batch["val_mask"])
+            if (self.vr is not None and self.w["value_regression"]
+                 and "value" in batch and "val_mask" in batch)
+            else H.new_tensor(0.0)
+        )
+        total = (self.w["next_event"] * ntp + self.w["competing_risk"] * cr
+                 + self.w["threshold_hazard"] * th + self.w["value_regression"] * val)
+        return {"ntp": ntp, "cr": cr, "th": th, "val": val, "total": total}
 
 
 class AdapterModel(torch.nn.Module):

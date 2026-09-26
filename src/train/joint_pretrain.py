@@ -40,7 +40,8 @@ def setup_ddp():
 
 
 class JointModel(torch.nn.Module):
-    def __init__(self, backbone, n_targets: int, freeze_backbone: bool = False):
+    def __init__(self, backbone, n_targets: int, freeze_backbone: bool = False,
+                 total_steps: int = 1):
         super().__init__()
         self.adapter = CLIFATRONHeads(
             backbone,
@@ -52,31 +53,34 @@ class JointModel(torch.nn.Module):
             enable_value=True,
             tie_weights=False,
         )
+        # Curriculum state: one step per forward, so the model satisfies the training
+        # engine's model(batch) contract and still advances the NTP->TTE curriculum.
+        self._step = 0
+        self._total_steps = max(int(total_steps), 1)
+        self._heads_frozen_for_warmup = False
 
-    def forward(self, batch, step: int, total_steps: int):
-        mix = curriculum_weights(step, total_steps)
-        if not mix.train_heads and self.adapter.frozen is False:
-            self.adapter.frozen = True
-            for p in self.adapter.backbone.parameters():
-                p.requires_grad = True
-            for p in self.adapter.cr.parameters():
-                p.requires_grad = False
-            for p in self.adapter.th.parameters():
-                p.requires_grad = False
-            if self.adapter.vr is not None:
-                for p in self.adapter.vr.parameters():
-                    p.requires_grad = False
-        if mix.train_heads and self.adapter.frozen is True:
-            self.adapter.frozen = False
-            for p in self.adapter.backbone.parameters():
-                p.requires_grad = True
-            for p in self.adapter.cr.parameters():
-                p.requires_grad = True
-            for p in self.adapter.th.parameters():
-                p.requires_grad = True
-            if self.adapter.vr is not None:
-                for p in self.adapter.vr.parameters():
+    def forward(self, batch):
+        mix = curriculum_weights(self._step, self._total_steps)
+        self._step += 1
+        # Freeze/train via requires_grad ONLY, and never flip `adapter.frozen`: that
+        # flag switches hidden_states() to torch.no_grad(), which silently killed ALL
+        # trunk gradients during the NTP warmup (the whole point of the warmup phase).
+        if not self.adapter.frozen:
+            if not mix.train_heads and not self._heads_frozen_for_warmup:
+                for p in self.adapter.backbone.parameters():
                     p.requires_grad = True
+                for p in self.adapter.cr.parameters():
+                    p.requires_grad = False
+                for p in self.adapter.th.parameters():
+                    p.requires_grad = False
+                if self.adapter.vr is not None:
+                    for p in self.adapter.vr.parameters():
+                        p.requires_grad = False
+                self._heads_frozen_for_warmup = True
+            elif mix.train_heads and self._heads_frozen_for_warmup:
+                for p in self.adapter.parameters():
+                    p.requires_grad = True
+                self._heads_frozen_for_warmup = False
 
         loss_dict = self.adapter.loss(
             batch,

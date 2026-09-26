@@ -120,6 +120,32 @@ def _has_supervised_outcomes(records: list[dict]) -> bool:
     )
 
 
+def objective_weights(mcfg: dict) -> dict[str, float]:
+    """Objective mixture weights from `configs/model.yaml` `heads.*.weight`.
+
+    These keys existed in the config but were dead — the trainer hardcoded its own
+    values. Wiring them makes objective selection config-driven: the GEM pure-NTP base
+    (docs/plans/2026-09-25-001-feat-icu-gem-generative-model-plan.md, D-G1) runs with
+    ntp=1.0 and every TTE head at 0.0, with no code edits. `enabled: false` forces a
+    weight to 0 regardless of the configured value.
+    """
+    h = mcfg.get("heads", {})
+    defaults = {
+        "next_event": 0.2,
+        "competing_risk": 1.0,
+        "threshold_hazard": 1.0,
+        "value_regression": 0.5,
+    }
+    weights: dict[str, float] = {}
+    for name, default in defaults.items():
+        spec = h.get(name, {})
+        weight = float(spec.get("weight", default)) if isinstance(spec, dict) else default
+        if isinstance(spec, dict) and not spec.get("enabled", True):
+            weight = 0.0
+        weights[name] = weight
+    return weights
+
+
 class Model(torch.nn.Module):
     def __init__(self, vocab_size, n_targets, mcfg):
         super().__init__()
@@ -127,6 +153,7 @@ class Model(torch.nn.Module):
         self.enc = CLIFEncoder(vocab_size, mcfg)
         d = self.enc.d_model
         h = mcfg["heads"]
+        self.w = objective_weights(mcfg)
         self.cr = CompetingRiskHead(d, n_causes, h["competing_risk"]["n_time_bins"])
         self.th = ThresholdHazardHead(
             d, n_targets, h["threshold_hazard"]["n_time_bins"],
@@ -151,37 +178,56 @@ class Model(torch.nn.Module):
                 h_last = H.new_zeros((0, H.size(-1)))
         else:
             h_last = H[torch.arange(H.size(0), device=H.device), batch["last_idx"]]
-        w = {"next_event": 0.2, "competing_risk": 1.0, "threshold_hazard": 1.0, "value_regression": 0.5}
         ntp = next_event_loss(self.enc.lm_logits(H), batch.get("ntp_target", batch["token"]), batch.get("ntp_mask"))
+        cr = self._cr_loss(batch, h_last, H)
+        th = self._th_loss(batch, h_last, H)
+        val = self._val_loss(batch, H)
+        w = self.w
+        total = w["next_event"] * ntp + w["competing_risk"] * cr + w["threshold_hazard"] * th + w["value_regression"] * val
+        return {"ntp": ntp, "cr": cr, "th": th, "val": val, "total": total}
+
+    def _cr_loss(self, batch, h_last, H):
+        """CR loss; 0 when the head is disabled/unweighted or the batch carries no CR
+        targets (pure-NTP batches from shards without an outcome join)."""
+        if self.w["competing_risk"] == 0.0 or "cr_type" not in batch or "cr_bin" not in batch:
+            return H.new_tensor(0.0)
         cr_mask = batch.get("cr_mask")
         if cr_mask is not None and not bool(cr_mask.any()):
-            cr = H.new_tensor(0.0)
-        else:
-            cr_h = h_last[cr_mask] if cr_mask is not None else h_last
-            cr_type = batch["cr_type"][cr_mask] if cr_mask is not None else batch["cr_type"]
-            cr_bin = batch["cr_bin"][cr_mask] if cr_mask is not None else batch["cr_bin"]
-            cr = self.cr.loss(cr_h, cr_type, cr_bin)
+            return H.new_tensor(0.0)
+        cr_h = h_last[cr_mask] if cr_mask is not None else h_last
+        cr_type = batch["cr_type"][cr_mask] if cr_mask is not None else batch["cr_type"]
+        cr_bin = batch["cr_bin"][cr_mask] if cr_mask is not None else batch["cr_bin"]
+        return self.cr.loss(cr_h, cr_type, cr_bin)
+
+    def _th_loss(self, batch, h_last, H):
+        """Threshold-hazard loss with the same fail-to-zero guard as _cr_loss."""
+        if self.w["threshold_hazard"] == 0.0 or "th_target" not in batch:
+            return H.new_tensor(0.0)
         th_mask = batch.get("th_mask")
         if th_mask is not None and not bool(th_mask.any()):
-            th = H.new_tensor(0.0)
-        else:
-            th_h = h_last[th_mask] if th_mask is not None else h_last
-            th = self.th.loss(
-                th_h,
-                batch["th_target"][th_mask] if th_mask is not None else batch["th_target"],
-                batch["th_tau"][th_mask] if th_mask is not None else batch["th_tau"],
-                batch["th_dir"][th_mask] if th_mask is not None else batch["th_dir"],
-                batch["th_crossed"][th_mask] if th_mask is not None else batch["th_crossed"],
-                batch["th_observed_bin"][th_mask] if th_mask is not None and "th_observed_bin" in batch else batch.get("th_observed_bin"),
-            )
-        val = self.vr.loss_aligned(
+            return H.new_tensor(0.0)
+        th_h = h_last[th_mask] if th_mask is not None else h_last
+        return self.th.loss(
+            th_h,
+            batch["th_target"][th_mask] if th_mask is not None else batch["th_target"],
+            batch["th_tau"][th_mask] if th_mask is not None else batch["th_tau"],
+            batch["th_dir"][th_mask] if th_mask is not None else batch["th_dir"],
+            batch["th_crossed"][th_mask] if th_mask is not None else batch["th_crossed"],
+            batch["th_observed_bin"][th_mask] if th_mask is not None and "th_observed_bin" in batch else batch.get("th_observed_bin"),
+        )
+
+    def _val_loss(self, batch, H):
+        """Value-regression (ORA mark) loss; 0 when disabled or no values present."""
+        if self.vr is None or self.w["value_regression"] == 0.0:
+            return H.new_tensor(0.0)
+        if "value" not in batch or "val_mask" not in batch:
+            return H.new_tensor(0.0)
+        return self.vr.loss_aligned(
             H,
             batch.get("ntp_target", batch["token"]),
             batch["value"],
             batch["val_mask"],
-        ) if self.vr is not None else H.new_tensor(0.0)
-        total = w["next_event"] * ntp + w["competing_risk"] * cr + w["threshold_hazard"] * th + w["value_regression"] * val
-        return {"ntp": ntp, "cr": cr, "th": th, "val": val, "total": total}
+        )
 
 
 def main():

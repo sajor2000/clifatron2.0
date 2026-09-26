@@ -119,7 +119,7 @@ DUA-gated ICareFM — treat it as a deliverable, not plumbing.
 - **Compute:** dev on Mac (MPS, smoke tests) or this **2× L40 Linux box `rudu-hpcg004`** (48GB each, no
   NVLink, bf16, DDP via `torchrun`). Note: `nvidia-smi` currently fails on a driver/library mismatch —
   torch CUDA still allocates, but reboot before long multi-GPU runs.
-- **Tests:** `CLIF_DATA_DIR=~/Data/clif-source/CLIF_MIMIC uv run --with pytest python -m pytest tests/ -q`
+- **Tests:** `CLIF_DATA_DIR=~/Data/clif-source uv run --with pytest python -m pytest tests/ -q`
   (data-gated tests skip cleanly when no CLIF data is present).
 - **Docs site:** `website/` (Docusaurus, Mermaid). `cd website && npm run build`. Auto-deploys to
   GitHub Pages on push to `main` (when the repo is public / Pages is enabled).
