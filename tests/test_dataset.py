@@ -230,6 +230,60 @@ class ModelDatasetTest(unittest.TestCase):
         for left, right in pairs:
             self.assertLessEqual(lengths[left], lengths[right])
 
+    def test_token_budget_batch_sampler_packs_to_budget(self):
+        from src.data.dataset import TokenBudgetBatchSampler
+
+        lengths = [100, 6413, 90, 471, 12, 6300, 3, 900]
+        sampler = TokenBudgetBatchSampler(
+            lengths, max_batch_tokens=1024, max_batch_size=8, seed=7, mega_batch_mult=1,
+        )
+        batches = list(iter(sampler))
+
+        # full coverage, exactly once
+        seen = [i for b in batches for i in b]
+        self.assertEqual(sorted(seen), list(range(len(lengths))))
+
+        # budget holds: B x max_len_in_batch <= 1024, except a lone oversize item
+        for batch in batches:
+            longest = max(lengths[i] for i in batch)
+            if len(batch) > 1:
+                self.assertLessEqual(len(batch) * longest, 1024)
+            else:
+                # a single item may exceed the budget only when alone
+                self.assertTrue(longest <= 1024 or len(batch) == 1)
+        # the long stays batch alone (6413, 6300 > 1024)
+        self.assertIn([1], batches)
+        self.assertIn([5], batches)
+        # short stays pack together: 3 + 12 + 90 + 100 all fit one batch (100 x 4 = 400)
+        self.assertIn([6, 4, 2, 0], batches)
+
+        # max_batch_size caps even when the token budget would allow more
+        capped = list(iter(TokenBudgetBatchSampler(
+            [10] * 20, max_batch_tokens=100000, max_batch_size=4, seed=3,
+            mega_batch_mult=1,
+        )))
+        self.assertTrue(all(len(b) <= 4 for b in capped))
+
+        # determinism + epoch rotation
+        self.assertEqual(
+            batches,
+            list(iter(TokenBudgetBatchSampler(
+                lengths, max_batch_tokens=1024, max_batch_size=8, seed=7, mega_batch_mult=1,
+            ))),
+        )
+        s2 = TokenBudgetBatchSampler(
+            lengths, max_batch_tokens=1024, max_batch_size=8, seed=7, mega_batch_mult=1,
+        )
+        s2.set_epoch(1)
+        self.assertEqual(sorted(i for b in s2 for i in b), list(range(len(lengths))))
+
+        # shuffle=False: deterministic sorted order (validation path)
+        seq = TokenBudgetBatchSampler(
+            lengths, max_batch_tokens=1024, seed=7, shuffle=False, mega_batch_mult=1,
+        )
+        flat = [i for b in seq for i in b]
+        self.assertEqual(flat, sorted(flat))
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -140,3 +140,29 @@ ckpt_ep0_step100/200/300/400 on disk, first mid-epoch validation
 cost ~15%). ETA to 3000 steps: ~40 min. Next loop firing: monitor to
 completion, then generate rollouts from the best checkpoint (val metric
 manifest) into sims_mps.parquet, inspect in the viewer, and log final numbers.
+
+### 2026-09-26 03:15 — OOM #3 + the real fix: token-budget batches
+
+**OOM #3** (run #3, length-grouped + cache clears every 10): died at update
+~2300 mid-BACKWARD (86.4 GiB held, 4.9 GiB attempt). The clear bounds CACHED
+junk between updates, but one long batch's LIVE backward transients are ~40 GiB
+across 8 layers (math-path attention saves T² per layer for backward) — plus
+junk since the last clear, it crossed the ceiling anyway. 2,300 updates and 23
+checkpoints survived on disk.
+
+**Fix: TokenBudgetBatchSampler** (src/data/dataset.py) — length-grouped batches
+packed to B × max_len ≤ `runtime.token_budget` (8192): a 6,413-token stay
+batches ALONE, short stays pack tight. Live transients bounded, padding waste
+~zero. Opt-in (CUDA flash attention doesn't need it; DDP/CUDA keeps uniform
+per_gpu). Wired for train (shuffled) + validation (deterministic sorted);
+engine's set_epoch hook now reaches batch samplers (DataLoader.sampler is None
+when batch_sampler is used). cache_clear_every 10 → 1 in train.mps.yaml.
+
+Proven: 60-step boundary smoke with token budget 4096 — validations at
+15/30/45, RSS flat ~8.8 GiB, Training complete. Both suites green
+(tests/ 411, clif-validate/ 32).
+
+**Run #4 (resume)**: resumed from ckpt_ep2_step2300 (epoch 2, loss ~2.4
+continuity, cosine-tail LR) at 03:15 with token budget + clear-every-1;
+~74 updates/min; ~660 steps to 3000. Mid-epoch resume replays epoch 2
+(documented approximation — ~380 updates of duplicate exposure, noted).

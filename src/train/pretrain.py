@@ -31,7 +31,7 @@ from src.model.heads import (
     ValueRegressionHead,
     next_event_loss,
 )
-from src.data.dataset import LengthGroupedSampler, ModelDataset
+from src.data.dataset import LengthGroupedSampler, ModelDataset, TokenBudgetBatchSampler
 from src.data.collate import collate_model_samples
 from src.data.targets import TargetBuilder
 from src.train.engine import setup_ddp, is_distributed, TrainConfig, train
@@ -348,8 +348,34 @@ def main():
         epoch=0,
     )
 
+    token_budget = int(tcfg["runtime"].get("token_budget", 0) or 0)
     if is_distributed():
         sampler = DistributedSampler(dataset)
+        dl = DataLoader(
+            dataset,
+            batch_size=tcfg["batch"]["per_gpu"],
+            sampler=sampler,
+            collate_fn=collate_model_samples,
+            num_workers=tcfg["runtime"].get("num_workers", 0),
+            pin_memory=torch.cuda.is_available(),
+        )
+    elif token_budget > 0:
+        # Token-budget batches: B x max_len <= budget — long stays batch alone,
+        # short stays pack tight. Bounds MPS math-path attention transients (three
+        # 86 GiB OOMs overnight) and cuts padding waste; CUDA flash doesn't need it.
+        train_sampler = TokenBudgetBatchSampler(
+            [len(r["token"]) for r in records],
+            max_batch_tokens=token_budget,
+            max_batch_size=tcfg["batch"]["per_gpu"],
+            seed=42,
+        )
+        dl = DataLoader(
+            dataset,
+            batch_sampler=train_sampler,
+            collate_fn=collate_model_samples,
+            num_workers=tcfg["runtime"].get("num_workers", 0),
+            pin_memory=torch.cuda.is_available(),
+        )
     else:
         # Length-grouped batches keep the padded shape (and its attention buffers)
         # recycling; uniform shuffle OOM'd the MPS watermark at 84 GiB overnight.
@@ -358,23 +384,41 @@ def main():
             tcfg["batch"]["per_gpu"],
             seed=42,
         )
-    dl = DataLoader(
-        dataset,
-        batch_size=tcfg["batch"]["per_gpu"],
-        sampler=sampler,
-        shuffle=(sampler is None),
-        collate_fn=collate_model_samples,
-        num_workers=tcfg["runtime"].get("num_workers", 0),
-        pin_memory=torch.cuda.is_available(),
-    )
-    validation_dl = DataLoader(
-        validation_dataset,
-        batch_size=tcfg["batch"]["per_gpu"],
-        shuffle=False,
-        collate_fn=collate_model_samples,
-        num_workers=tcfg["runtime"].get("num_workers", 0),
-        pin_memory=torch.cuda.is_available(),
-    )
+        dl = DataLoader(
+            dataset,
+            batch_size=tcfg["batch"]["per_gpu"],
+            sampler=sampler,
+            shuffle=(sampler is None),
+            collate_fn=collate_model_samples,
+            num_workers=tcfg["runtime"].get("num_workers", 0),
+            pin_memory=torch.cuda.is_available(),
+        )
+    if token_budget > 0 and not is_distributed():
+        # Deterministic (sorted, unshuffled) token-budget val batches — same
+        # memory bounds as training.
+        val_sampler = TokenBudgetBatchSampler(
+            [len(r["token"]) for r in validation_records],
+            max_batch_tokens=token_budget,
+            max_batch_size=tcfg["batch"]["per_gpu"],
+            seed=42,
+            shuffle=False,
+        )
+        validation_dl = DataLoader(
+            validation_dataset,
+            batch_sampler=val_sampler,
+            collate_fn=collate_model_samples,
+            num_workers=tcfg["runtime"].get("num_workers", 0),
+            pin_memory=torch.cuda.is_available(),
+        )
+    else:
+        validation_dl = DataLoader(
+            validation_dataset,
+            batch_size=tcfg["batch"]["per_gpu"],
+            shuffle=False,
+            collate_fn=collate_model_samples,
+            num_workers=tcfg["runtime"].get("num_workers", 0),
+            pin_memory=torch.cuda.is_available(),
+        )
 
     if args.dry_run:
         if is_main:

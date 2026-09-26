@@ -363,8 +363,12 @@ def train(model, train_dl, val_dl, opt, scheduler, tcfg: TrainConfig, dev, *,
             mps.empty_cache()
 
     while global_step < tcfg.total_steps:
-        if hasattr(train_dl, "sampler") and hasattr(train_dl.sampler, "set_epoch"):
-            train_dl.sampler.set_epoch(epoch)
+        # set_epoch must reach custom samplers, including batch samplers
+        # (TokenBudgetBatchSampler) — DataLoader.sampler is None when batch_sampler
+        # is used.
+        for sm in (getattr(train_dl, "sampler", None), getattr(train_dl, "batch_sampler", None)):
+            if sm is not None and hasattr(sm, "set_epoch"):
+                sm.set_epoch(epoch)
         if hasattr(train_dl, "dataset") and hasattr(train_dl.dataset, "set_epoch"):
             train_dl.dataset.set_epoch(epoch)
 

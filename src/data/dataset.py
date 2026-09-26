@@ -212,6 +212,80 @@ class LengthGroupedSampler(Sampler):
             yield from batches[b]
 
 
+class TokenBudgetBatchSampler(Sampler):
+    """Batch sampler (yields index LISTS; use as DataLoader(batch_sampler=...)):
+    length-groups like LengthGroupedSampler, then packs each batch to a token budget
+    — B x max_len_in_batch <= max_batch_tokens. A 6,413-token stay batches ALONE;
+    short stays pack tight. MPS math-path attention materializes T^2 buffers per
+    layer for backward (~40 GiB for one 4x6413 batch), and uniform per_gpu batching
+    over heavy-tailed CLIF lengths OOM'd three overnight runs (86 GiB watermark,
+    updates ~205/~410/~2300 — gem-overnight-log). Token budgets bound the live
+    transients AND cut padding waste to ~zero. opt-in via runtime.token_budget
+    (CUDA flash attention doesn't need it; keep uniform per_gpu batches there).
+
+    A single sequence longer than the budget still forms its own batch (allowed
+    oversize; nothing is dropped).
+    """
+
+    def __init__(self, lengths, *, max_batch_tokens, max_batch_size=None,
+                 seed=42, mega_batch_mult=50, shuffle=True):
+        self.lengths = [int(length) for length in lengths]
+        self.max_batch_tokens = int(max_batch_tokens)
+        self.max_batch_size = int(max_batch_size) if max_batch_size else None
+        self.seed = int(seed)
+        self.mega_batch_mult = int(mega_batch_mult)
+        self.shuffle = bool(shuffle)
+        self.epoch = 0
+
+    def set_epoch(self, epoch: int) -> None:
+        self.epoch = int(epoch)
+
+    def __len__(self) -> int:
+        return len(self.lengths)
+
+    def _batches(self) -> list[list[int]]:
+        if self.shuffle:
+            g = torch.Generator().manual_seed(self.seed + self.epoch)
+            order = torch.randperm(len(self.lengths), generator=g).tolist()
+        else:
+            order = list(range(len(self.lengths)))  # deterministic (validation)
+        mega = max((self.max_batch_size or 1) * self.mega_batch_mult, 1)
+        batches: list[list[int]] = []
+        for start in range(0, len(order), mega):
+            chunk = sorted(order[start:start + mega], key=lambda i: self.lengths[i])
+            batch: list[int] = []
+            longest = 0
+            for idx in chunk:
+                cand = max(longest, self.lengths[idx])
+                too_big = (
+                    batch
+                    and cand * (len(batch) + 1) > self.max_batch_tokens
+                )
+                too_many = (
+                    self.max_batch_size is not None
+                    and batch
+                    and len(batch) + 1 > self.max_batch_size
+                )
+                if too_big or too_many:
+                    batches.append(batch)
+                    batch, longest = [], 0
+                batch.append(idx)
+                longest = max(longest, self.lengths[idx])
+            if batch:
+                batches.append(batch)
+        return batches
+
+    def __iter__(self):
+        batches = self._batches()
+        if self.shuffle:
+            g = torch.Generator().manual_seed(self.seed + self.epoch)
+            batch_order = torch.randperm(len(batches), generator=g).tolist()
+        else:
+            batch_order = list(range(len(batches)))
+        for b in batch_order:
+            yield batches[b]
+
+
 def make_dataloader(
     dataset: Dataset,
     *,
