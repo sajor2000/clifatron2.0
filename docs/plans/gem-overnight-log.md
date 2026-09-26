@@ -492,3 +492,17 @@ generate.py sampling tooling (frozen-checkpoint inference, no model changes).
 **State**: unchanged — user decisions (L40 launch per
 `docs/plans/l40-g2-runbook.md`, checkpoint prune) or G4/G5 (conditioning/RL
 per runbook §6).
+
+### 2026-09-26 17:20 — Next-step probe: L40 box unreachable from this Mac
+
+The next project step is the L40 G2 base run. Probed from this machine
+(jcs-mac-studio): `rudu-hpcg004` does not resolve (no DNS/SSH alias), is not
+on the tailnet (fleet = macbook, omarchy, mac-studio, iphone, mateopc), and
+has no SSH config entry. Blocked on user infrastructure, not code:
+(a) join the box to the tailnet — then the runbook can be driven remotely
+end to end, (b) provide a reachable address/VPN alias, or (c) run the
+runbook manually on the box (it is copy-paste complete, phases 0–3 + numbers
+to beat; prerequisites are the reboot-first for the nvidia-smi mismatch and
+the full 546k-stay restage — the Mac extract was a 64.9k-stay subset).
+Everything Mac-side is complete: all seven units proven, repo finalized,
+website built and pushed through `a73ef24`.
