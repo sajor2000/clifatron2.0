@@ -65,3 +65,39 @@ clif-validate/ 32 passed.
 configs/model.gem-ntp.yaml --data <site dir> --site mimic --value-stats
 <value_stats.json>`. Same data dir must contain events_with_outcomes.parquet +
 vocab.json + value_stats.json. Suggest full 546k MIMIC restage before the run.
+
+### 2026-09-26 00:55 — MPS OOM found + fixed; viewer loads events.parquet natively
+
+**Viewer upgrades** (src/viewer/sequence_viewer.py): ParquetSource now ingests
+LIST-typed token columns directly (tokenizer events.parquet `token`: Int64 ids,
+joined at read time), decodes integer ids to vocab token strings when a
+vocab lock is passed (unknown ids stay numeric — never silent), and accepts
+`hospitalization_id`/`hosp_id` as id columns. Real check: 50,986-row
+events.parquet served on 127.0.0.1:8042 with legible previews; no txt export
+needed anymore.
+
+**MPS OOM crash — the real bug of the night.** The 3000-step overnight run
+(configs/train.mps.yaml, effective batch 32) died at update ~205 (loss 2.71,
+descending; no validation involved — val_every 250 not reached):
+`MPS backend out of memory (allocated 83.94 GiB, tried 4.90 GiB more)`.
+Root cause: uniform shuffling over heavy-tailed lengths (mean 271 / p95 471 /
+max 6,413) pads every batch to its longest member — the math-path attention
+for a 4×6413 batch needs ~4.9 GiB, and every distinct padded shape gets
+cached by the MPS allocator, so the watermark climbed to 84 GiB over ~200
+updates and the next long batch killed it.
+
+**Fix: LengthGroupedSampler** (src/data/dataset.py, HF group_by_length style):
+shuffle, sort by length within mega-batches, regroup, shuffle batch order.
+Padded shapes recycle (flat watermark), long stays only meet long stays, and
+padding waste collapses — the 40-step sanity smoke went 186 → 296 updates/min
+(1.6x). Wired into pretrain.py for single-process runs; DDP ranks keep
+DistributedSampler until G2 L40 bring-up (fold world-awareness in there —
+the L40s will want grouping for the same throughput reason, bf16 or not).
+
+Also: ckpt_every 500 → 100 in train.mps.yaml (the crash lost all 200 updates —
+no checkpoint had fired). 3000-step run relaunched at 00:55, ~91 updates/min.
+
+**Suites**: tests/ green after each change (dataset 32, viewer 6, generate 19).
+
+**Live for the morning**: viewer on 127.0.0.1:8042 (events.parquet 50,986 rows +
+sims_smoke 12 rows + vocab lock). Relaunch with /tmp/run_viewer.sh if it dies.

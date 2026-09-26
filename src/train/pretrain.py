@@ -31,7 +31,7 @@ from src.model.heads import (
     ValueRegressionHead,
     next_event_loss,
 )
-from src.data.dataset import ModelDataset
+from src.data.dataset import LengthGroupedSampler, ModelDataset
 from src.data.collate import collate_model_samples
 from src.data.targets import TargetBuilder
 from src.train.engine import setup_ddp, is_distributed, TrainConfig, train
@@ -348,7 +348,16 @@ def main():
         epoch=0,
     )
 
-    sampler = DistributedSampler(dataset) if is_distributed() else None
+    if is_distributed():
+        sampler = DistributedSampler(dataset)
+    else:
+        # Length-grouped batches keep the padded shape (and its attention buffers)
+        # recycling; uniform shuffle OOM'd the MPS watermark at 84 GiB overnight.
+        sampler = LengthGroupedSampler(
+            [len(r["token"]) for r in records],
+            tcfg["batch"]["per_gpu"],
+            seed=42,
+        )
     dl = DataLoader(
         dataset,
         batch_size=tcfg["batch"]["per_gpu"],

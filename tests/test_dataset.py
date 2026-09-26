@@ -210,6 +210,26 @@ class ModelDatasetTest(unittest.TestCase):
                 dataset, batch_size=1, collate_fn=ModelCollator(), sampler=sampler, shuffle=True,
             )
 
+    def test_length_grouped_sampler_covers_and_groups(self):
+        from src.data.dataset import LengthGroupedSampler
+
+        lengths = [5, 6413, 471, 12, 271, 247, 6300, 3, 900, 150]
+        sampler = LengthGroupedSampler(lengths, batch_size=2, seed=7, mega_batch_mult=1)
+        order = list(iter(sampler))
+        # full coverage, exactly once
+        self.assertEqual(sorted(order), list(range(len(lengths))))
+        # determinism: same seed -> same order
+        self.assertEqual(order, list(iter(LengthGroupedSampler(lengths, 2, seed=7, mega_batch_mult=1))))
+        # epoch changes the order but keeps coverage
+        s2 = LengthGroupedSampler(lengths, batch_size=2, seed=7, mega_batch_mult=1)
+        s2.set_epoch(1)
+        self.assertEqual(sorted(iter(s2)), list(range(len(lengths))))
+        # grouping: with mega_batch_mult=1 the whole set is one sorted chunk, so
+        # consecutive pairs are non-decreasing in length -> similar-length batches
+        pairs = [order[i:i + 2] for i in range(0, len(order), 2)]
+        for left, right in pairs:
+            self.assertLessEqual(lengths[left], lengths[right])
+
 
 if __name__ == "__main__":
     unittest.main()

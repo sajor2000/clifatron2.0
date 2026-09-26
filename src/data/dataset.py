@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 import polars as pl
+import torch
 from torch.utils.data import DataLoader, Dataset, Sampler
 
 import logging
@@ -169,6 +170,46 @@ class ModelDataset(Dataset):
         if not output["segments"]:
             raise TargetContractError("packed row contains no document segments")
         return output
+
+
+class LengthGroupedSampler(Sampler):
+    """Shuffle, then group similar-length documents into each batch (HF
+    group_by_length). Uniform shuffling over heavy-tailed CLIF lengths (mean 271,
+    p95 471, max 6,413) pads every batch to its longest member — ~10x wasted
+    compute and unbounded per-batch attention shape diversity, which drove the
+    MPS caching-allocator watermark to 84 GiB and OOM'd an overnight run
+    (gem-overnight-log 2026-09-26). Grouping bounds both: padded shapes recycle
+    across batches and long stays only ever share a batch with other long stays.
+
+    Single-process sampler (dev boxes). DDP ranks keep DistributedSampler for
+    now; fold world-awareness in during G2 L40 bring-up.
+    """
+
+    def __init__(self, lengths, batch_size, *, seed=42, mega_batch_mult=50):
+        self.lengths = [int(length) for length in lengths]
+        self.batch_size = int(batch_size)
+        self.seed = int(seed)
+        self.mega_batch_mult = int(mega_batch_mult)
+        self.epoch = 0
+
+    def set_epoch(self, epoch: int) -> None:
+        self.epoch = int(epoch)
+
+    def __len__(self) -> int:
+        return len(self.lengths)
+
+    def __iter__(self):
+        g = torch.Generator().manual_seed(self.seed + self.epoch)
+        order = torch.randperm(len(self.lengths), generator=g).tolist()
+        mega = max(self.batch_size * self.mega_batch_mult, self.batch_size)
+        batches = []
+        for start in range(0, len(order), mega):
+            chunk = sorted(order[start:start + mega], key=lambda i: self.lengths[i])
+            for k in range(0, len(chunk), self.batch_size):
+                batches.append(chunk[k:k + self.batch_size])
+        batch_order = torch.randperm(len(batches), generator=g).tolist()
+        for b in batch_order:
+            yield from batches[b]
 
 
 def make_dataloader(

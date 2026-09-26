@@ -1,0 +1,71 @@
+# Mac (MPS) overnight schedule — the longer local pure-NTP run that produces a
+# semi-trained GEM base for rollout inspection. NOT the L40 recipe (that is
+# configs/train.yaml); this documents exactly what this Mac ran so the run is
+# reproducible and its checkpoints interpretable. ~3000 steps x effective batch
+# 32 ~ 2 epochs over the staged 64.9k-stay extract at ~186 updates/min/effective-4.
+optimizer:
+  name: adamw
+  lr: 3.0e-4
+  weight_decay: 0.1
+  betas: [0.9, 0.95]
+  grad_clip: 1.0
+
+schedule:
+  warmup_steps: 150
+  total_steps: 3000
+  cosine_decay: true
+
+batch:
+  per_gpu: 4            # worst-case long-stay batches stay within MPS unified memory
+  grad_accum: 8         # effective batch 32
+
+runtime:
+  precision: bf16       # inert on MPS (engine autocast is cuda/cpu-scoped) — fp32 actual
+  compile: false
+  ddp: false
+  num_workers: 0
+  log_every: 10
+  ckpt_every: 100        # the 2026-09-26 OOM crash lost 200 updates with no checkpoint
+  ckpt_dir: "output/intermediate_phi/checkpoints_mps"
+
+eval_schedule:
+  val_every: 250        # validation perplexity every 250 updates
+
+data_contract:
+  cohort: "configs/cohort.yaml"
+  artifact_policy: "configs/artifact_policy.yaml"
+  split_seed: 42
+  partitions:
+    train: 0.60
+    validation: 0.15
+    calibration: 0.10
+    internal_test: 0.15
+  required_partitions: [train, validation, calibration, internal_test]
+  artifact_fit_partition: train
+  sealed_partitions: [internal_test, external_confirmation]
+  sealed_access_log: "output/intermediate_phi/sealed_access.parquet"
+  role_permissions:
+    train: [fit_model, fit_vocabulary, fit_numeric_edges, fit_target_map]
+    validation: [model_selection]
+    calibration: [fit_calibration]
+    internal_test: [final_evaluation_once_frozen]
+    transport: [development_site_evaluation]
+    external_confirmation: [confirmation_once_frozen]
+  site_roles:
+    development: [mimic, rush, uchicago]
+    external_confirmation: []
+  compatibility_families: [clifatron_checkpoint, experimental_representation]
+
+finetune:
+  freeze_trunk: true
+  tasks: []
+  zero_shot_holdout: []
+  lr: 1.0e-3
+  epochs: 20
+
+eval:
+  sites: [mimic]
+  ensemble: mean
+  calibration: temperature_scaling
+  slices: [sex_category, race_category]
+  size_ablation: [10_000_000, 30_000_000, 100_000_000]

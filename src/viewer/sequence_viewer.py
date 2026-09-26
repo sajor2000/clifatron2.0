@@ -24,6 +24,7 @@ from typing import Any
 from urllib.parse import parse_qs, urlparse
 
 import polars as pl
+import pyarrow as pa
 import pyarrow.parquet as pq
 
 _ROW_IDX_COL = "__row_idx"
@@ -35,12 +36,16 @@ _SEQ_COL_CANDIDATES = [
     "clif_text",
     "text",
     "tokens",
+    "token",        # tokenizer events.parquet (list-typed; joined at read time)
+    "input_ids",
 ]
 
 _ID_COL_CANDIDATES = [
     "simulation_id",
     "id",
     "row_id",
+    "hospitalization_id",
+    "hosp_id",
 ]
 
 _META_COL_PREFER = [
@@ -91,6 +96,15 @@ def load_vocab_lock(path: Path) -> set[str]:
     if not isinstance(vocab, dict):
         raise ValueError(f"vocab_lock missing 'vocab' dict: {path}")
     return set(vocab.keys())
+
+
+def load_id_to_token(path: Path) -> dict[int, str]:
+    """id -> token map from a tokenizer vocab.json (for int token-id decoding)."""
+    blob = json.loads(path.read_text())
+    vocab = blob.get("vocab")
+    if not isinstance(vocab, dict):
+        raise ValueError(f"vocab_lock missing 'vocab' dict: {path}")
+    return {int(i): t for t, i in vocab.items()}
 
 
 def parse_token(token: str) -> dict[str, Any]:
@@ -214,6 +228,11 @@ class ParquetSource(SequenceSource):
     path: Path
     name: str
     kind: str = "parquet"
+    """`id_to_token` decodes INTEGER token-id lists (tokenizer events.parquet) into
+    vocab token strings so previews, search, summaries, and OOV work on real ETL
+    output. Unknown ids stay numeric (never silent)."""
+
+    id_to_token: dict[int, str] | None = None
 
     def __post_init__(self):
         schema = pq.read_schema(self.path)
@@ -224,6 +243,13 @@ class ParquetSource(SequenceSource):
                 f"No sequence column found in {self.path}. "
                 f"Tried: {', '.join(_SEQ_COL_CANDIDATES)}"
             )
+        # List-typed sequence columns (tokenizer events.parquet `token`: Int64 ids)
+        # are joined into a space-separated string at read time so every downstream
+        # path (search, preview, summaries, OOV) works unchanged.
+        seq_field = schema.field(self.seq_col)
+        self._seq_is_list = pa.types.is_list(seq_field.type) or pa.types.is_large_list(seq_field.type)
+        self._seq_is_int = self._seq_is_list and pa.types.is_integer(seq_field.type.value_type)
+        self._id_str_to_token = {str(i): t for i, t in (self.id_to_token or {}).items()}
         self.id_col = _first_existing(_ID_COL_CANDIDATES, self._columns)
 
         meta = [c for c in _META_COL_PREFER if c in self._columns]
@@ -238,7 +264,17 @@ class ParquetSource(SequenceSource):
         cols.extend(self.meta_cols)
         if self.id_col is not None:
             cols.append(self.id_col)
-        return pl.scan_parquet(str(self.path)).with_row_index(_ROW_IDX_COL).select(cols + [_ROW_IDX_COL])
+        lf = pl.scan_parquet(str(self.path)).with_row_index(_ROW_IDX_COL)
+        if self._seq_is_list:
+            if self._seq_is_int and self._id_str_to_token:
+                # Decode int token ids to vocab strings; unknown ids stay numeric.
+                seq_expr = pl.col(self.seq_col).list.eval(
+                    pl.element().cast(pl.Utf8).replace(self._id_str_to_token)
+                )
+            else:
+                seq_expr = pl.col(self.seq_col).cast(pl.List(pl.Utf8))
+            lf = lf.with_columns(seq_expr.list.join(" ").alias(self.seq_col))
+        return lf.select(cols + [_ROW_IDX_COL])
 
     def list_rows(self, *, offset: int, limit: int, search: str | None) -> list[dict[str, Any]]:
         lf = self._base_lazy()
@@ -681,11 +717,16 @@ def main(argv: list[str] | None = None) -> None:
     args = ap.parse_args(argv)
 
     sources: dict[str, SequenceSource] = {}
+    id_to_token: dict[int, str] | None = None
+    if args.vocab_lock:
+        vl = Path(args.vocab_lock).expanduser().resolve()
+        id_to_token = load_id_to_token(vl)
     for p in args.parquet:
         path = Path(p).expanduser().resolve()
-        src = ParquetSource(path=path, name=path.stem)
+        src = ParquetSource(path=path, name=path.stem, id_to_token=id_to_token)
         if src.name in sources:
-            src = ParquetSource(path=path, name=f"{path.stem}-{len(sources)}")
+            src = ParquetSource(path=path, name=f"{path.stem}-{len(sources)}",
+                                id_to_token=id_to_token)
         sources[src.name] = src
 
     for t in args.txt:
