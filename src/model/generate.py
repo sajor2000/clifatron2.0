@@ -349,6 +349,7 @@ def main(argv: list[str] | None = None) -> None:
     allowed = tuple(sorted(vocab.values())) if vocab else None
     for hosp, pids in zip(hosp_ids, prompt_ids):
         n = args.n_simulations
+        prompt_text = " ".join(decoder(list(pids)))
         ids = torch.tensor([pids] * n, dtype=torch.long, device=device)
         pos = (torch.arange(len(pids), device=device, dtype=torch.long).unsqueeze(0)
                .expand(n, -1) * args.pos_step_min)
@@ -365,7 +366,10 @@ def main(argv: list[str] | None = None) -> None:
         for sim in range(n):
             length = int(result["lengths"][sim])
             tokens = decoder(result["tokens"][sim, :length].tolist())
-            writer.add(hosp, sim + 1, tokens)
+            # `prompt` column: rollout provenance (the exact prefix tokens) so
+            # downstream evals pair rollouts with their real continuations
+            # without positional conventions (used by src/eval/generative.py).
+            writer.add(hosp, sim + 1, tokens, prompt=prompt_text)
     n_rows = writer.write(args.output)
     print(f"Wrote {n_rows} simulations to {args.output} (viewer-compatible schema)")
 

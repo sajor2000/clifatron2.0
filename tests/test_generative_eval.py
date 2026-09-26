@@ -131,3 +131,42 @@ def test_evaluate_end_to_end(tmp_path, monkeypatch):
     assert report["key_event_recall"]["mean_unigram_recall"] == 1.0
     assert "distance_to_observed" in report
     assert report["rollout_hygiene"]["n_rollouts"] == 2
+
+
+def test_evaluate_uses_prompt_column_pairing(tmp_path):
+    """The sims `prompt` provenance column (emitted by the generate CLI) pairs
+    rollouts with their real continuations by exact prefix match — no head:N
+    convention needed."""
+    import polars as pl
+
+    from src.eval import generative as genmod
+
+    sims = [
+        {"hospitalization_id": "prompt-1", "simulation_number": 1,
+         "generated_sequence": "dbp icu", "prompt": "<bos> spo2=10"},
+        {"hospitalization_id": "prompt-1", "simulation_number": 2,
+         "generated_sequence": "norepinephrine dbp", "prompt": "<bos> spo2=10"},
+        {"hospitalization_id": "prompt-2", "simulation_number": 1,
+         "generated_sequence": "icu", "prompt": "<bos> dbp"},
+    ]
+    pl.DataFrame(sims).write_parquet(tmp_path / "sims.parquet")
+    events = [
+        {"hosp_id": "h1", "token": [1, 10, 11, 12]},  # <bos> spo2=10 dbp norepinephrine
+        {"hosp_id": "h2", "token": [1, 11, 13]},      # <bos> dbp icu
+    ]
+    pl.DataFrame(events).write_parquet(tmp_path / "events.parquet")
+
+    id2tok = {1: "<bos>", 10: "spo2=10", 11: "dbp", 12: "norepinephrine", 13: "icu"}
+    sims_rows = genmod._load_sims(tmp_path / "sims.parquet")
+    real_rows = genmod._load_real(tmp_path / "events.parquet", id2tok)
+
+    # prompt_source is IGNORED when the prompt column is present
+    report = evaluate(sims_rows, real_rows, GROUPS, prompt_source=(9, 9))
+    ker = report["key_event_recall"]
+    assert ker["prompt_convention"] == "sims `prompt` column (exact prefix match)"
+    per = {r["hospitalization_id"]: r for r in ker["per_prompt"]}
+    # prompt-1 -> h1 continuation [dbp, norepinephrine]; rollout 1 [dbp, icu] hits dbp
+    assert per["h1"]["unigram_recall"] == pytest.approx(0.5)
+    # prompt-2 -> h2 continuation [icu]; rollout [icu] hits it
+    assert per["h2"]["unigram_recall"] == 1.0
+    assert ker["mean_unigram_recall"] == pytest.approx(0.75)

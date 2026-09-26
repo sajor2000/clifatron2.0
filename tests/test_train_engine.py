@@ -474,6 +474,57 @@ def _state_dicts_equal(a: dict, b: dict) -> bool:
     return a == b
 
 
+class FreshScheduleResumeTest(unittest.TestCase):
+    """--fresh-schedule: continuation runs keep the NEW config LR schedule — the
+    saved, fully-decayed schedule would pin LR at its tail value forever (the
+    3000-step continuation experiment, gem-overnight-log 2026-09-26)."""
+
+    def _cfg(self, ckpt_dir, total_steps):
+        return TrainConfig({}, {
+            "batch": {"per_gpu": 2, "grad_accum": 1},
+            "runtime": {"ckpt_dir": ckpt_dir, "ckpt_every": 3},
+            "schedule": {"warmup_steps": 2, "total_steps": 100},
+            "optimizer": {"grad_clip": 1.0},
+        }, {"compile": False}, total_steps=total_steps)
+
+    def test_fresh_schedule_keeps_new_lr_and_default_pins_old(self):
+        from src.train.engine import train
+
+        dev = torch.device("cpu")
+
+        def loader():
+            return torch.utils.data.DataLoader(_FixedDS(), batch_size=2, shuffle=False)
+
+        # Run A: 3 steps under a schedule that decays to ~zero (0.5 x 0.01^3 = 5e-7).
+        torch.manual_seed(7)
+        m_a = _DropoutModel()
+        o_a = torch.optim.SGD(m_a.parameters(), lr=0.5, momentum=0.9)
+        s_a = torch.optim.lr_scheduler.ExponentialLR(o_a, gamma=0.01)
+        with tempfile.TemporaryDirectory() as td:
+            train(m_a, loader(), None, o_a, s_a, self._cfg(td, 3), dev)
+            ckpts = sorted(Path(td).glob("ckpt_*.pt"))
+            self.assertTrue(ckpts, "train() did not checkpoint")
+            ckpt = ckpts[-1]
+
+            # fresh_schedule: the new CONSTANT schedule drives LR, not the decayed one.
+            torch.manual_seed(99)
+            m_b = _DropoutModel()
+            o_b = torch.optim.SGD(m_b.parameters(), lr=0.5, momentum=0.9)
+            s_b = torch.optim.lr_scheduler.StepLR(o_b, step_size=1000)
+            train(m_b, loader(), None, o_b, s_b, self._cfg(td, 6), dev,
+                  resume_ckpt=ckpt, fresh_schedule=True)
+            self.assertAlmostEqual(o_b.param_groups[0]["lr"], 0.5, places=6)
+
+            # Control: default resume LOADS the decayed schedule — LR stays pinned.
+            torch.manual_seed(99)
+            m_c = _DropoutModel()
+            o_c = torch.optim.SGD(m_c.parameters(), lr=0.5, momentum=0.9)
+            s_c = torch.optim.lr_scheduler.StepLR(o_c, step_size=1000)
+            train(m_c, loader(), None, o_c, s_c, self._cfg(td, 6), dev,
+                  resume_ckpt=ckpt)
+            self.assertLess(o_c.param_groups[0]["lr"], 1e-4)
+
+
 class ResumeEquivalenceTest(unittest.TestCase):
     """The load-bearing U4 claim: resume from an epoch-boundary checkpoint yields the
     SAME final parameters as training straight through. Proves the model/optimizer/

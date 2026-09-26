@@ -238,3 +238,35 @@ over-generated ~2x, labs calibrated. Perplexity lives in the trainer's val
 loop (2.4138 / ppl ~11.2 at step 3000).
 
 **Suites**: tests/ 420 passed 4 skipped (+9), clif-validate/ 32.
+
+### 2026-09-26 06:15 — fresh-schedule resume + prompt provenance + 6000-step experiment
+
+**The experiment this enables**: does event-rate calibration close with steps (the
+plan's G2→G3 assumption) — testable locally BEFORE the L40 spend by continuing
+3000 → 6000 steps and re-running the G3 eval. Plain resume was dead-end: the saved
+cosine is fully decayed (LR 0 at step 3000), and resume also loads the OPTIMIZER
+state, which pins param-group LRs at save time.
+
+- engine `train(..., fresh_schedule=False)`: loads model + optimizer (Adam moments)
+  but keeps THIS run's config schedule, and restores the configured group LRs
+  (the optimizer state pins them at save time — caught by the new engine test).
+  pretrain `--fresh-schedule` flag. Continuation semantics: the fresh schedule is
+  a RE-WARMED 6000-step cosine ridden from its midpoint (brief 150-step re-warmup,
+  ends ~mid-cosine, not 0) — schedule-shaped, not straight-through-exact; noted.
+- generate CLI: `prompt` column in the sims parquet (the exact prefix tokens) —
+  rollout provenance. eval pairs rollouts with real continuations by exact prefix
+  match (the `head:N` convention is now fallback-only).
+
+**Launched 06:15**: continuation from `ckpt_ep2_step3000` with `--fresh-schedule`
+(configs/train.mps.yaml → total_steps 6000), ~73 updates/min, ETA ~75 min with
+~12 validations. NEXT FIRING: when `/tmp/mps_continuation.log` shows
+`Training complete` — (1) regenerate rollouts from `checkpoints_mps/ckpt_*_step6000.pt`
+with the SAME prompts (`/tmp/prompts.txt`, 8 sims × 256 tokens, temp 1.0, top-p
+0.95, closed-world) into `output/intermediate_phi/sims_mps6k.parquet`; (2) rerun
+`src.eval.generative` on it (`--events .../mimic/events.parquet --vocab
+.../mimic/vocab.json` — the prompt column pairs it now, no --prompt-source);
+(3) record the 3000-vs-6000 comparison table in this log (JS, top-32, group
+rates, key-event recall, distance, distinct-2, val perplexity); (4) suites +
+commit + push. If still training: just log progress and stop.
+
+**Suites**: tests/ 422 passed 4 skipped (+2), clif-validate/ 32.

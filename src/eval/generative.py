@@ -173,6 +173,7 @@ def _load_sims(path: str | Path) -> list[dict]:
     df = pl.read_parquet(path)
     if "generated_sequence" not in df.columns:
         raise ValueError(f"sims parquet has no generated_sequence column: {path}")
+    has_prompt = "prompt" in df.columns
     rows = df.sort(["hospitalization_id", "simulation_number"]).to_dicts()
     out = []
     for row in rows:
@@ -181,6 +182,7 @@ def _load_sims(path: str | Path) -> list[dict]:
             "hospitalization_id": str(row.get("hospitalization_id")),
             "simulation_number": int(row.get("simulation_number", 0)),
             "tokens": tokens,
+            "prompt": (row.get("prompt") or "").split() if has_prompt else [],
         })
     return out
 
@@ -211,9 +213,34 @@ def evaluate(sims: list[dict], real: list[dict], groups: dict[str, str], *,
         "rollout_hygiene": rollout_hygiene([s["tokens"] for s in sims]),
     }
 
-    if prompt_source is not None and sims:
+    # Prompt pairing: prefer the sims' `prompt` provenance column (exact prefix
+    # match against the real corpus); fall back to the head:N convention.
+    prompt_groups: dict[tuple[str, ...], list[dict]] = {}
+    for s in sims:
+        prefix = tuple(s.get("prompt") or ())
+        if prefix:
+            prompt_groups.setdefault(prefix, []).append(s)
+    recalls = []
+    if prompt_groups:
+        for prefix, group in sorted(prompt_groups.items()):
+            match = next((r for r in real if tuple(r["tokens"][:len(prefix)]) == prefix), None)
+            if match is None:
+                continue  # prompt not found in the real corpus (prefix mismatch)
+            continuation = match["tokens"][len(prefix):]
+            recall = key_event_recall(continuation, group[0]["tokens"], groups)
+            recall["hospitalization_id"] = match["hosp_id"]
+            recalls.append(recall)
+        if recalls:
+            report["key_event_recall"] = {
+                "prompt_convention": "sims `prompt` column (exact prefix match)",
+                "mean_unigram_recall": round(
+                    sum(r["unigram_recall"] for r in recalls) / len(recalls), 4),
+                "mean_categorical_recall": round(
+                    sum(r["categorical_recall"] for r in recalls) / len(recalls), 4),
+                "per_prompt": recalls,
+            }
+    elif prompt_source is not None and sims:
         n_prompts, prompt_len = prompt_source
-        recalls = []
         for prompt_idx in range(n_prompts):
             group = [s for s in sims if s["hospitalization_id"].endswith(f"-{prompt_idx + 1}")]
             if not group or prompt_idx >= len(real):

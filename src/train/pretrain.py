@@ -237,6 +237,10 @@ def main():
     ap.add_argument("--data", required=True)
     ap.add_argument("--site", required=True)
     ap.add_argument("--resume", default=None, help="path to checkpoint to resume")
+    ap.add_argument("--fresh-schedule", action="store_true",
+                    help="with --resume: load model+optimizer but keep THIS run's "
+                         "config LR schedule (continuation runs; the saved decayed "
+                         "schedule would pin LR at its tail value)")
     ap.add_argument("--dry-run", action="store_true", help="print model + loader info and exit")
     ap.add_argument("--value-stats", default=None, help="JSON token_id -> [center, scale] for value-head normalization")
     args = ap.parse_args()
@@ -451,7 +455,7 @@ def main():
 
     model, manifest = train(
         model, dl, validation_dl, opt, scheduler, train_cfg, dev,
-        resume_ckpt=args.resume, seed=42,
+        resume_ckpt=args.resume, seed=42, fresh_schedule=args.fresh_schedule,
     )
 
     if is_main:

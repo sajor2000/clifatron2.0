@@ -248,7 +248,7 @@ def _train_one_epoch(
 
 
 def train(model, train_dl, val_dl, opt, scheduler, tcfg: TrainConfig, dev, *,
-          resume_ckpt=None, seed=42):
+          resume_ckpt=None, seed=42, fresh_schedule=False):
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
     is_main = local_rank == 0
 
@@ -267,8 +267,18 @@ def train(model, train_dl, val_dl, opt, scheduler, tcfg: TrainConfig, dev, *,
         loaded = load_checkpoint(resume_ckpt, dev)
         target_model = model.module if is_distributed() and hasattr(model, "module") else model
         target_model.load_state_dict(loaded["model"])
+        # fresh_schedule: keep the model + optimizer (Adam moments) but NOT the
+        # saved LR schedule — for continuation runs with a NEW config schedule
+        # (e.g. extending a finished cosine; a loaded decayed schedule would pin
+        # LR at its tail value forever). The optimizer state also pins group LRs
+        # at save time, so a fresh schedule restores THIS run's configured LRs.
+        saved_lrs = [group["lr"] for group in opt.param_groups]
         opt.load_state_dict(loaded["optimizer"])
-        scheduler.load_state_dict(loaded["scheduler"])
+        if fresh_schedule:
+            for group, lr in zip(opt.param_groups, saved_lrs):
+                group["lr"] = lr
+        else:
+            scheduler.load_state_dict(loaded["scheduler"])
         start_epoch = loaded.get("epoch", 0)
         start_step = loaded.get("step", 0)
         _restore_rng_states(loaded.get("rng_states"))
