@@ -495,23 +495,27 @@ _INDEX_HTML = r"""<!doctype html>
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Token Sequence Viewer</title>
     <style>
-      :root { --bg: #091217; --panel: #0f1d22; --panel-2: #13252b; --text: #e9f1ee; --muted: #8da39f; --line: #253b40; --accent: #63d6c2; --warn: #e7b86b; --bad: #f18484; --good: #75d69b; }
+      :root { --bg: #091217; --panel: #0f1d22; --panel-2: #13252b; --text: #e9f1ee; --muted: #8da39f; --line: #253b40; --accent: #63d6c2; --warn: #e7b86b; --bad: #f18484; --good: #75d69b; --bar-bg: #1b3034; --bar-real: #c7a66c; --token-bg: rgba(255,255,255,0.03); --preview: #c6d7d2; --code: #dbe8e4; }
+      :root[data-theme="light"] { --bg: #f3f7f5; --panel: #ffffff; --panel-2: #e8f0ed; --text: #142120; --muted: #4f6661; --line: #c7d7d2; --accent: #087f70; --warn: #8a5a00; --bad: #a83c3c; --good: #176c43; --bar-bg: #d8e5e1; --bar-real: #8a651c; --token-bg: rgba(20,33,32,0.03); --preview: #28514b; --code: #23403a; }
+      @media (prefers-color-scheme: light) {
+        :root:not([data-theme="dark"]) { --bg: #f3f7f5; --panel: #ffffff; --panel-2: #e8f0ed; --text: #142120; --muted: #4f6661; --line: #c7d7d2; --accent: #087f70; --warn: #8a5a00; --bad: #a83c3c; --good: #176c43; --bar-bg: #d8e5e1; --bar-real: #8a651c; --token-bg: rgba(20,33,32,0.03); --preview: #28514b; --code: #23403a; }
+      }
       * { box-sizing: border-box; }
-      body { margin: 0; font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial; background: var(--bg); color: var(--text); }
-      header { min-height: 64px; padding: 12px 18px; border-bottom: 1px solid var(--line); display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+      body { margin: 0; width: 100vw; height: 100vh; overflow: hidden; display: flex; flex-direction: column; font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial; background: var(--bg); color: var(--text); }
+      header { min-height: 64px; flex-shrink: 0; padding: 12px 18px; border-bottom: 1px solid var(--line); display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
       header .title { font-size: 15px; font-weight: 700; letter-spacing: -0.01em; margin-right: 8px; }
       header .subtitle { color: var(--muted); font-size: 12px; }
-      header select, header input, header button { background: var(--panel); color: var(--text); border: 1px solid var(--line); border-radius: 6px; padding: 8px 10px; }
+      header select, header input, header button { min-height: 44px; background: var(--panel); color: var(--text); border: 1px solid var(--line); border-radius: 6px; padding: 8px 10px; }
       header input { width: min(320px, 28vw); }
       header button { cursor: pointer; }
       header button:hover { border-color: var(--accent); color: var(--accent); }
-      main { display: flex; height: calc(100vh - 64px); min-height: 520px; }
-      #list { width: 390px; flex: 0 0 390px; border-right: 1px solid var(--line); overflow: auto; }
-      #detail { flex: 1; overflow: auto; }
+      main { display: flex; flex: 1 1 auto; min-height: 0; }
+      #list { width: 390px; min-height: 0; flex: 0 0 390px; border-right: 1px solid var(--line); overflow: auto; }
+      #detail { min-height: 0; flex: 1; overflow: auto; }
       .row { padding: 13px 16px; border-bottom: 1px solid var(--line); cursor: pointer; }
       .row:hover { background: rgba(99,214,194,0.06); }
       .row .meta { color: var(--muted); font-size: 11px; margin-top: 7px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-      .row .preview { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; font-size: 11px; color: #c6d7d2; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; margin-top: 7px; }
+      .row .preview { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; font-size: 11px; color: var(--preview); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; margin-top: 7px; }
       .section { padding: 16px 20px; border-bottom: 1px solid var(--line); }
       .section h2 { margin: 0 0 11px 0; font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.12em; font-weight: 700; }
       .section h3 { margin: 0 0 8px 0; font-size: 13px; font-weight: 650; }
@@ -519,7 +523,7 @@ _INDEX_HTML = r"""<!doctype html>
       .kv div { padding: 6px 0; border-bottom: 1px dotted rgba(255,255,255,0.08); }
       .kv code, code { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; font-size: 11px; }
       #tokens { padding: 0; line-height: 1.85; }
-      .token { display: inline-block; margin: 2px 4px 2px 0; padding: 4px 7px; border-radius: 5px; border: 1px solid rgba(255,255,255,0.10); font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; font-size: 11px; }
+      .token { display: inline-block; margin: 2px 4px 2px 0; padding: 4px 7px; border-radius: 5px; border: 1px solid rgba(255,255,255,0.10); background: var(--token-bg); font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; font-size: 11px; }
       .token.highlight { border-color: rgba(241,132,132,0.85); box-shadow: 0 0 0 1px rgba(241,132,132,0.16) inset; }
       .pill { display: inline-block; padding: 3px 8px; border-radius: 999px; background: rgba(255,255,255,0.05); border: 1px solid rgba(255,255,255,0.10); font-size: 11px; color: var(--muted); }
       .controls { display:flex; gap: 8px; align-items: center; margin-left: auto; }
@@ -531,11 +535,13 @@ _INDEX_HTML = r"""<!doctype html>
       .score.good strong { color: var(--good); }
       .score.review strong { color: var(--warn); }
       .score.poor strong { color: var(--bad); }
+      .status-good { color: var(--good); }
+      .status-warn { color: var(--warn); }
       .warning-list { display: grid; gap: 8px; }
       .warning { border: 1px solid rgba(231,184,107,0.55); border-radius: 6px; padding: 8px 10px; background: rgba(231,184,107,0.07); font-size: 12px; }
       .warning.error { border-color: rgba(241,132,132,0.65); background: rgba(241,132,132,0.08); }
       .warning.info { border-color: rgba(99,214,194,0.55); background: rgba(99,214,194,0.06); }
-      .warning code { color: #dbe8e4; }
+      .warning code { color: var(--code); }
       .timeline { display: grid; gap: 10px; }
       .timeline-row { display: grid; grid-template-columns: 100px 1fr; gap: 12px; align-items: start; }
       .timeline-label { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .08em; padding-top: 7px; }
@@ -543,9 +549,9 @@ _INDEX_HTML = r"""<!doctype html>
       .compare-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; }
       .compare-col { min-width: 0; }
       .compare-col h3 { color: var(--accent); }
-      .bar { display: flex; height: 7px; margin: 5px 0 8px; background: #1b3034; border-radius: 3px; overflow: hidden; }
+      .bar { display: flex; height: 7px; margin: 5px 0 8px; background: var(--bar-bg); border-radius: 3px; overflow: hidden; }
       .bar > span { background: var(--accent); }
-      .bar.real > span { background: #c7a66c; }
+      .bar.real > span { background: var(--bar-real); }
       .empty { padding: 24px 16px; color: var(--muted); font-size: 12px; }
       @media (max-width: 900px) {
         #list { width: 320px; flex-basis: 320px; }
@@ -556,9 +562,9 @@ _INDEX_HTML = r"""<!doctype html>
         header .subtitle { width: 100%; order: 3; }
         header select, header input { width: 100%; }
         header .controls { margin-left: 0; }
-        main { display: block; height: calc(100vh - 132px); }
-        #list { width: 100%; height: 38%; border-right: 0; border-bottom: 1px solid var(--line); }
-        #detail { width: 100%; height: 62%; }
+        main { display: flex; flex-direction: column; height: auto; }
+        #list { width: 100%; height: 38%; flex: 0 0 38%; border-right: 0; border-bottom: 1px solid var(--line); }
+        #detail { width: 100%; height: auto; flex: 1 1 auto; }
         .section { padding: 14px 16px; }
         .kv { grid-template-columns: 112px 1fr; }
         .timeline-row { grid-template-columns: 72px 1fr; gap: 8px; }
@@ -574,6 +580,7 @@ _INDEX_HTML = r"""<!doctype html>
       <label class="sr-only" for="search">Filter sequences</label>
       <input id="search" aria-label="Filter sequences" placeholder="filter sequences (substring)" />
       <button id="refresh">Refresh</button>
+      <button id="themeToggle" type="button" aria-label="Toggle color theme"></button>
       <div class="controls">
         <button id="prev">Prev</button>
         <span id="page" class="pill"></span>
@@ -590,7 +597,7 @@ _INDEX_HTML = r"""<!doctype html>
       </div>
     </main>
     <script>
-      const state = { sources: [], source: null, offset: 0, limit: 100, search: "" };
+      const state = { sources: [], source: null, offset: 0, limit: 100, search: "", searchTimer: null };
 
       function esc(s) {
         return (s ?? "").toString().replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
@@ -614,6 +621,16 @@ _INDEX_HTML = r"""<!doctype html>
         const lo = state.offset + 1;
         const hi = Math.min(state.offset + state.limit, total);
         page.textContent = `${lo}-${hi} / ${total}`;
+      }
+
+      function applyTheme(theme, persist = true) {
+        document.documentElement.dataset.theme = theme;
+        if (persist) localStorage.setItem('gem-viewer-theme', theme);
+        const button = document.getElementById('themeToggle');
+        if (button) {
+          button.textContent = theme === 'dark' ? 'Use light theme' : 'Use dark theme';
+          button.setAttribute('aria-label', `Switch to ${theme === 'dark' ? 'light' : 'dark'} theme`);
+        }
       }
 
       async function loadSources() {
@@ -652,7 +669,7 @@ _INDEX_HTML = r"""<!doctype html>
         const span = document.createElement('span');
         span.className = 'token' + (t.highlight ? ' highlight' : '');
         const group = (t.group || 'other');
-        span.style.background = `rgba(255,255,255,0.03)`;
+        span.style.background = `var(--token-bg)`;
         span.style.borderColor = `rgba(255,255,255,0.10)`;
         span.style.boxShadow = `0 0 0 1px ${colorForGroup(group)}33 inset`;
         const tip = [
@@ -694,7 +711,7 @@ _INDEX_HTML = r"""<!doctype html>
           + (w.sample?.length ? `<div class="muted small"><code>${esc(w.sample.join(' '))}</code></div>` : '')
           + `</div>`
         ).join('');
-        return warnings || '<div class="small" style="color:var(--good)">No structural warnings detected.</div>';
+        return warnings || '<div class="small status-good">No structural warnings detected.</div>';
       }
 
       function renderDetail(data) {
@@ -771,7 +788,7 @@ _INDEX_HTML = r"""<!doctype html>
               document.getElementById('comparePanel').innerHTML = renderComparison(comparison);
               compareButton.textContent = 'Compared';
             } catch (error) {
-              document.getElementById('comparePanel').innerHTML = `<span style="color:var(--warn)">No observed match: ${esc(error.message)}</span>`;
+              document.getElementById('comparePanel').innerHTML = `<span class="status-warn">No observed match: ${esc(error.message)}</span>`;
               compareButton.disabled = false;
               compareButton.textContent = 'Try comparison again';
             }
@@ -820,6 +837,13 @@ _INDEX_HTML = r"""<!doctype html>
       }
 
       function bindUI() {
+        const savedTheme = localStorage.getItem('gem-viewer-theme');
+        if (savedTheme === 'light' || savedTheme === 'dark') applyTheme(savedTheme, false);
+        else applyTheme(window.matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark', false);
+        document.getElementById('themeToggle').addEventListener('click', () => {
+          const current = document.documentElement.dataset.theme || 'dark';
+          applyTheme(current === 'dark' ? 'light' : 'dark');
+        });
         document.getElementById('source').addEventListener('change', async (e) => {
           state.source = e.target.value;
           state.offset = 0;
@@ -828,7 +852,8 @@ _INDEX_HTML = r"""<!doctype html>
         document.getElementById('search').addEventListener('input', async (e) => {
           state.search = e.target.value || '';
           state.offset = 0;
-          await loadRows();
+          clearTimeout(state.searchTimer);
+          state.searchTimer = setTimeout(() => loadRows(), 180);
         });
         document.getElementById('refresh').addEventListener('click', async () => {
           await loadRows();
