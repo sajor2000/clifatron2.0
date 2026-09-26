@@ -376,3 +376,42 @@ vocab lock 292); pushed `3166fe8` + `04d274f` + this entry.
 
 **State**: unchanged from 08:15 — remaining items are user decisions (L40
 launch, checkpoint prune) or G4/G5 (conditioning/RL per runbook §6).
+
+### 2026-09-26 12:05 — Impeccable re-audit: P0 record-API fix + audit remediation closed
+
+User-requested re-audit of the live viewer (detector + axe at 1440×900 /
+390×844 / 320×700, both themes, WITH a record loaded this time) scored it
+16/20 (Good) and caught what every previous pass had missed, because nothing
+had ever clicked a row:
+
+1. **P0 (fixed, `78bcde8`)** — `/api/record` 500ed on every click for the
+   50,986-row events source: `get_row` coerced numeric-looking ids to int, but
+   events.parquet stores hospitalization ids as Utf8, so polars raised
+   "cannot compare string with numeric type". The handler also swallowed
+   tracebacks, so the server log showed nothing. Fix: dtype-aware id
+   comparison (int columns reject non-numeric ids via the existing
+   KeyError→404 path), a regression test covering both id dtypes through
+   list_rows/get_row, and tracebacks now printed to stderr. Verified
+   end-to-end: record loads (361 parsed tokens, plausibility `good`).
+2. **P1 keyboard access (fixed this firing)** — rows were mouse-only
+   (WCAG 2.1.1). Now tabindex 0 + role=button + aria-label + Enter/Space
+   activation; verified by tab-through onto a real row and Enter opening it
+   (417 tokens rendered). Accent-token `:focus-visible` rings added for rows
+   and header controls (default UA outline previously only).
+3. **P3 theme chrome (fixed this firing)** — token/pill borders, kv dotted
+   separators, timeline-event background, and row hover used white-alpha
+   values that are invisible on light panels, and the hover tint used the
+   dark-theme accent. New `--token-line` / `--hover` tokens with per-theme
+   values; computed light borders now `rgba(20,33,32,0.14)` and hover
+   `rgba(8,127,112,0.08)`.
+
+**Verification**: detector clean; axe 0 violations across desktop light +
+dark and mobile with a loaded record (37 passes per run, the button-role rows
+included); 320px still contained with no horizontal overflow; all controls
+44px; tests/ 429 passed 4 skipped, clif-validate/ 32. Audit score after
+remediation: Accessibility 2→4 path closed, Theming 3→4 path closed —
+expected re-audit ≥ 19/20.
+
+**State**: audit remediation complete and pushed; otherwise unchanged —
+remaining items are user decisions (L40 launch, checkpoint prune) or G4/G5
+(conditioning/RL per runbook §6).

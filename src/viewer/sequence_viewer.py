@@ -14,7 +14,9 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import sys
 import threading
+import traceback
 import webbrowser
 from dataclasses import dataclass
 from http import HTTPStatus
@@ -505,10 +507,10 @@ _INDEX_HTML = r"""<!doctype html>
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Token Sequence Viewer</title>
     <style>
-      :root { --bg: #091217; --panel: #0f1d22; --panel-2: #13252b; --text: #e9f1ee; --muted: #8da39f; --line: #253b40; --accent: #63d6c2; --warn: #e7b86b; --bad: #f18484; --good: #75d69b; --bar-bg: #1b3034; --bar-real: #c7a66c; --token-bg: rgba(255,255,255,0.03); --preview: #c6d7d2; --code: #dbe8e4; }
-      :root[data-theme="light"] { --bg: #f3f7f5; --panel: #ffffff; --panel-2: #e8f0ed; --text: #142120; --muted: #4f6661; --line: #c7d7d2; --accent: #087f70; --warn: #8a5a00; --bad: #a83c3c; --good: #176c43; --bar-bg: #d8e5e1; --bar-real: #8a651c; --token-bg: rgba(20,33,32,0.03); --preview: #28514b; --code: #23403a; }
+      :root { --bg: #091217; --panel: #0f1d22; --panel-2: #13252b; --text: #e9f1ee; --muted: #8da39f; --line: #253b40; --accent: #63d6c2; --warn: #e7b86b; --bad: #f18484; --good: #75d69b; --bar-bg: #1b3034; --bar-real: #c7a66c; --token-bg: rgba(255,255,255,0.03); --token-line: rgba(255,255,255,0.10); --hover: rgba(99,214,194,0.06); --preview: #c6d7d2; --code: #dbe8e4; }
+      :root[data-theme="light"] { --bg: #f3f7f5; --panel: #ffffff; --panel-2: #e8f0ed; --text: #142120; --muted: #4f6661; --line: #c7d7d2; --accent: #087f70; --warn: #8a5a00; --bad: #a83c3c; --good: #176c43; --bar-bg: #d8e5e1; --bar-real: #8a651c; --token-bg: rgba(20,33,32,0.03); --token-line: rgba(20,33,32,0.14); --hover: rgba(8,127,112,0.08); --preview: #28514b; --code: #23403a; }
       @media (prefers-color-scheme: light) {
-        :root:not([data-theme="dark"]) { --bg: #f3f7f5; --panel: #ffffff; --panel-2: #e8f0ed; --text: #142120; --muted: #4f6661; --line: #c7d7d2; --accent: #087f70; --warn: #8a5a00; --bad: #a83c3c; --good: #176c43; --bar-bg: #d8e5e1; --bar-real: #8a651c; --token-bg: rgba(20,33,32,0.03); --preview: #28514b; --code: #23403a; }
+        :root:not([data-theme="dark"]) { --bg: #f3f7f5; --panel: #ffffff; --panel-2: #e8f0ed; --text: #142120; --muted: #4f6661; --line: #c7d7d2; --accent: #087f70; --warn: #8a5a00; --bad: #a83c3c; --good: #176c43; --bar-bg: #d8e5e1; --bar-real: #8a651c; --token-bg: rgba(20,33,32,0.03); --token-line: rgba(20,33,32,0.14); --hover: rgba(8,127,112,0.08); --preview: #28514b; --code: #23403a; }
       }
       * { box-sizing: border-box; }
       body { margin: 0; width: 100vw; height: 100vh; overflow: hidden; display: flex; flex-direction: column; font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial; background: var(--bg); color: var(--text); }
@@ -519,23 +521,25 @@ _INDEX_HTML = r"""<!doctype html>
       header input { width: min(320px, 28vw); }
       header button { cursor: pointer; }
       header button:hover { border-color: var(--accent); color: var(--accent); }
+      header select:focus-visible, header input:focus-visible, header button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
       main { display: flex; flex: 1 1 auto; min-height: 0; }
       #list { width: 390px; min-height: 0; flex: 0 0 390px; border-right: 1px solid var(--line); overflow: auto; }
       #detail { min-height: 0; flex: 1; overflow: auto; }
       .row { padding: 13px 16px; border-bottom: 1px solid var(--line); cursor: pointer; }
-      .row:hover { background: rgba(99,214,194,0.06); }
+      .row:hover { background: var(--hover); }
+      .row:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
       .row .meta { color: var(--muted); font-size: 11px; margin-top: 7px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
       .row .preview { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; font-size: 11px; color: var(--preview); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; margin-top: 7px; }
       .section { padding: 16px 20px; border-bottom: 1px solid var(--line); }
       .section h2 { margin: 0 0 11px 0; font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.12em; font-weight: 700; }
       .section h3 { margin: 0 0 8px 0; font-size: 13px; font-weight: 650; }
       .kv { display: grid; grid-template-columns: 180px 1fr; gap: 8px; font-size: 13px; }
-      .kv div { padding: 6px 0; border-bottom: 1px dotted rgba(255,255,255,0.08); }
+      .kv div { padding: 6px 0; border-bottom: 1px dotted var(--token-line); }
       .kv code, code { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; font-size: 11px; }
       #tokens { padding: 0; line-height: 1.85; }
-      .token { display: inline-block; margin: 2px 4px 2px 0; padding: 4px 7px; border-radius: 5px; border: 1px solid rgba(255,255,255,0.10); background: var(--token-bg); font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; font-size: 11px; }
+      .token { display: inline-block; margin: 2px 4px 2px 0; padding: 4px 7px; border-radius: 5px; border: 1px solid var(--token-line); background: var(--token-bg); font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; font-size: 11px; }
       .token.highlight { border-color: rgba(241,132,132,0.85); box-shadow: 0 0 0 1px rgba(241,132,132,0.16) inset; }
-      .pill { display: inline-block; padding: 3px 8px; border-radius: 999px; background: rgba(255,255,255,0.05); border: 1px solid rgba(255,255,255,0.10); font-size: 11px; color: var(--muted); }
+      .pill { display: inline-block; padding: 3px 8px; border-radius: 999px; background: var(--token-bg); border: 1px solid var(--token-line); font-size: 11px; color: var(--muted); }
       .controls { display:flex; gap: 8px; align-items: center; margin-left: auto; }
       .muted { color: var(--muted); }
       .small { font-size: 12px; }
@@ -555,7 +559,7 @@ _INDEX_HTML = r"""<!doctype html>
       .timeline { display: grid; gap: 10px; }
       .timeline-row { display: grid; grid-template-columns: 100px 1fr; gap: 12px; align-items: start; }
       .timeline-label { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .08em; padding-top: 7px; }
-      .timeline-events { padding: 6px 10px; border-left: 1px solid var(--line); background: rgba(255,255,255,0.02); }
+      .timeline-events { padding: 6px 10px; border-left: 1px solid var(--line); background: var(--token-bg); }
       .compare-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; }
       .compare-col { min-width: 0; }
       .compare-col h3 { color: var(--accent); }
@@ -664,7 +668,13 @@ _INDEX_HTML = r"""<!doctype html>
         for (const row of rows) {
           const div = document.createElement('div');
           div.className = 'row';
+          div.tabIndex = 0;
+          div.setAttribute('role', 'button');
+          div.setAttribute('aria-label', `Open sequence record ${row.id}`);
           div.onclick = () => loadRecord(row.id);
+          div.onkeydown = (e) => {
+            if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); loadRecord(row.id); }
+          };
           const meta = Object.entries(row.meta || {}).map(([k,v]) => `${k}=${v}`).join(' · ');
           div.innerHTML = `
             <div><span class="pill">id=${esc(row.id)}</span> <span class="pill">n=${row.n_tokens}</span></div>
@@ -680,7 +690,7 @@ _INDEX_HTML = r"""<!doctype html>
         span.className = 'token' + (t.highlight ? ' highlight' : '');
         const group = (t.group || 'other');
         span.style.background = `var(--token-bg)`;
-        span.style.borderColor = `rgba(255,255,255,0.10)`;
+        span.style.borderColor = `var(--token-line)`;
         span.style.boxShadow = `0 0 0 1px ${colorForGroup(group)}33 inset`;
         const tip = [
           `group=${group}`,
@@ -1037,6 +1047,7 @@ def _make_handler(state: ViewerState):
             except KeyError:
                 self._send_json({"error": "not found"}, status=HTTPStatus.NOT_FOUND)
             except Exception as e:
+                traceback.print_exc(file=sys.stderr)
                 self._send_json({"error": str(e)}, status=HTTPStatus.INTERNAL_SERVER_ERROR)
 
     return Handler
