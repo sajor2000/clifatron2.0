@@ -327,3 +327,52 @@ locally); remaining items are user decisions (L40 launch, checkpoint prune) or
 G4/G5 (conditioning/RL — follow the L40 base per the runbook §6). No further
 agent-actionable units without user input; subsequent loop firings idle-verify
 unless the user leaves new instructions.
+
+### 2026-09-26 11:01 — Guarded rollouts + plausibility + audit remediation (verified, logged, pushed)
+
+Three units completed in the interactive session after the 08:15 entry; this
+idle-verify firing checked them, recorded them, and pushed.
+
+1. **Guarded closed-world rollouts** (`sims_mps_guarded.parquet`, 6 rollouts ×
+   128 tokens) — hard candidate-list sampling in `src/model/generate.py` closed
+   the MPS sampler's `<unk>` leakage path found during per-row masking: the
+   guarded G3 report shows 0 gen-only tokens / 0 OOV / 0 EOS (vs 1 gen-only
+   token in the unguarded eval), and group rates closer to real (vitals gap to
+   real 0.538 narrows 0.397 → 0.246; categoricals gap to real 0.437 narrows
+   0.386 → 0.214). Marginal cost: JS 0.4316 vs 0.425 and top-32 overlap 0.4688
+   vs 0.5 — an acceptable trade for a provably closed vocabulary; calibration
+   is an L40-scale lever. The guarded eval uses the exact `prompt`-column
+   prefix convention (vs `head:3` for the unguarded one), so key-event recall
+   is not directly comparable across the two.
+
+2. **Clinical plausibility inspection** (`3166fe8`) — new
+   `src/eval/clinical_plausibility.py`: shared vocab-aware `split_sequence`
+   (multi-word tokens like `sodium chloride` stay intact) plus explainable
+   heuristics (OOV, invalid numeric bins, special-token placement, post-EOS
+   tokens, repeated runs, concept loops, missing ICU context). Generator gained
+   observed-transition masks, repetition penalty, per-row allowed-token masks,
+   hard candidate-list sampling, and list-typed `generated_tokens` /
+   `prompt_tokens` columns with plausibility metadata. Viewer gained the
+   concept-grouped timeline, per-sequence plausibility score + warning
+   explanations, and observed-vs-generated comparison via prompt-prefix
+   matching. All 6 guarded rollouts score `good`.
+
+3. **Impeccable audit remediation** (`04d274f`) — 44px interactive controls,
+   180ms search debounce, persistent light/dark theme tokens
+   (`prefers-color-scheme` aware), viewport-contained scroll panes (body
+   containment + `min-height: 0` flex fixes), semantic color variables replacing
+   hard-coded light-theme colors. Detector clean; axe 0 violations at 1440×900
+   and 390×844 in both themes; all controls exactly 44px on mobile; no
+   horizontal overflow. Wart noted: `.claude/skills/impeccable` is a symlink to
+   the git-ignored `.agents/skills/impeccable`, so it dangles on a fresh clone —
+   the committed copy lives at `agent/skills/impeccable`.
+
+**This firing**: origin/main unchanged after fetch (no cross-machine
+divergence); both commits verified code-only (skill files + `src/` + tests, no
+parquet/checkpoints); suites re-run — tests/ 428 passed 4 skipped,
+clif-validate/ 32; viewer alive at 127.0.0.1:8042 with all five sources (events
+50,986 stays, sims_mps_guarded 6, sims_mps6k 24, sims_mps 24, sims_smoke 12,
+vocab lock 292); pushed `3166fe8` + `04d274f` + this entry.
+
+**State**: unchanged from 08:15 — remaining items are user decisions (L40
+launch, checkpoint prune) or G4/G5 (conditioning/RL per runbook §6).
