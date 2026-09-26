@@ -19,9 +19,7 @@ Arms that use clif_encoder (from_scratch, no_pretrain) don't need --checkpoint.
 from __future__ import annotations
 
 import argparse
-import json
 import os
-import sys
 from pathlib import Path
 from dataclasses import dataclass, field
 
@@ -33,10 +31,8 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from src.model.encoder import CLIFEncoder, count_params
 from src.model.heads import (
     CompetingRiskHead,
-    NextEventHead,
     ThresholdHazardHead,
     ValueRegressionHead,
-    TaskHead,
     next_event_loss,
 )
 from src.model.head_adapter import CLIFATRONHeads, load_backbone
