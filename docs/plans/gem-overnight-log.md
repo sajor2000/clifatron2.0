@@ -132,3 +132,11 @@ Proven live: 60-step boundary smoke → validation at steps 15/30/45/60
 Overnight run #3 relaunched 01:55 with cache guard + ckpt_every 100.
 
 **Suites**: tests/ 410 passed 4 skipped; clif-validate/ 32.
+
+**Run #3 status at 02:10 (all fixes live)**: update 410+ (past both prior crash
+points), loss ~2.0-2.7, RSS flat ~9.5 GiB (was ratcheting to 85), checkpoints
+ckpt_ep0_step100/200/300/400 on disk, first mid-epoch validation
+`global_step=250 loss=2.7462`. Throughput ~68-82 updates/min (cache clears
+cost ~15%). ETA to 3000 steps: ~40 min. Next loop firing: monitor to
+completion, then generate rollouts from the best checkpoint (val metric
+manifest) into sims_mps.parquet, inspect in the viewer, and log final numbers.
