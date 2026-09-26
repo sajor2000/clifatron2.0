@@ -73,3 +73,41 @@ def test_parquet_source_ingests_list_typed_token_column(tmp_path):
     assert len(hits) == 1
     row = src.get_row(row_id="h2")
     assert "spo2=88_90" in row["token"]
+
+
+def test_parquet_source_id_column_dtype_roundtrip(tmp_path):
+    """Ids round-trip through list_rows/get_row for BOTH id dtypes. Real
+    events.parquet stores hospitalization ids as numeric strings; coercing a
+    numeric-looking id to int made polars compare a Utf8 column with an int
+    literal, so every record click on the real source 500ed."""
+    import polars as pl
+
+    from src.viewer.sequence_viewer import ParquetSource
+
+    string_ids = pl.DataFrame({
+        "hosp_id": ["20000147", "20001361"],
+        "token": ["hr=80_90 spo2=88_90", "map=60_65"],
+    })
+    path = tmp_path / "events.parquet"
+    string_ids.write_parquet(path)
+    src = ParquetSource(path=path, name="events")
+    assert src.id_col == "hosp_id"
+    assert not src._id_is_int
+    rows = src.list_rows(offset=0, limit=10, search=None)
+    assert [r["id"] for r in rows] == ["20000147", "20001361"]
+    for r in rows:
+        assert src.get_row(row_id=r["id"])["hosp_id"] == r["id"]
+
+    int_ids = pl.DataFrame({
+        "simulation_id": [7, 11],
+        "token": ["hr=80_90", "spo2=88_90"],
+    })
+    path2 = tmp_path / "sims.parquet"
+    int_ids.write_parquet(path2)
+    src2 = ParquetSource(path=path2, name="sims")
+    assert src2.id_col == "simulation_id"
+    assert src2._id_is_int
+    rows2 = src2.list_rows(offset=0, limit=10, search=None)
+    assert [r["id"] for r in rows2] == ["7", "11"]
+    for r in rows2:
+        assert src2.get_row(row_id=r["id"])["simulation_id"] == int(r["id"])

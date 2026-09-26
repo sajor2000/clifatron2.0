@@ -339,6 +339,10 @@ class ParquetSource(SequenceSource):
         self._seq_is_int = self._seq_is_list and pa.types.is_integer(seq_field.type.value_type)
         self._id_str_to_token = {str(i): t for i, t in (self.id_to_token or {}).items()}
         self.id_col = _first_existing(_ID_COL_CANDIDATES, self._columns)
+        self._id_is_int = (
+            self.id_col is not None
+            and pa.types.is_integer(schema.field(self.id_col).type)
+        )
 
         meta = [c for c in _META_COL_PREFER if c in self._columns]
         extra = sorted((self._columns - set(meta) - {self.seq_col}) & set(_META_COL_PREFER))
@@ -388,10 +392,16 @@ class ParquetSource(SequenceSource):
     def get_row(self, *, row_id: str) -> dict[str, Any]:
         lf = self._base_lazy()
         if self.id_col is not None:
-            # simulation_id is typically int; accept numeric strings.
-            try:
-                want: Any = int(row_id)
-            except ValueError:
+            # Compare against the id column's real dtype: numeric-looking ids stay
+            # strings for Utf8 id columns (real events.parquet stores hospitalization
+            # ids as strings; an int literal makes polars raise "cannot compare
+            # string with numeric type"), and integer columns reject non-numeric ids.
+            if self._id_is_int:
+                try:
+                    want: Any = int(row_id)
+                except ValueError:
+                    raise KeyError(row_id) from None
+            else:
                 want = row_id
             lf = lf.filter(pl.col(self.id_col) == want)
         else:
