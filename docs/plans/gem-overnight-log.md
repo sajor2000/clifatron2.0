@@ -439,3 +439,12 @@ is audit-clean. Remaining items are user decisions (L40 launch per
 `docs/plans/l40-g2-runbook.md`, checkpoint prune) or G4/G5 (conditioning/RL
 per runbook §6). Subsequent firings idle-verify unless the user leaves new
 instructions.
+
+### 2026-09-26 14:00 — Idle-verify: all green, no new instructions
+
+origin/main in sync at `ba6d018` after fetch (no cross-machine divergence);
+artifacts unchanged; viewer alive at 127.0.0.1:8042 with all five sources;
+suites green — tests/ 429 passed 4 skipped, clif-validate/ 32. No new user
+instructions; nothing agent-actionable remains. State unchanged: user
+decisions (L40 launch per `docs/plans/l40-g2-runbook.md`, checkpoint prune)
+or G4/G5 (conditioning/RL per runbook §6).
