@@ -415,3 +415,27 @@ expected re-audit ≥ 19/20.
 **State**: audit remediation complete and pushed; otherwise unchanged —
 remaining items are user decisions (L40 launch, checkpoint prune) or G4/G5
 (conditioning/RL per runbook §6).
+
+### 2026-09-26 13:00 — Idle-verify + re-audit close-out: 20/20
+
+Idle-verify firing: origin/main in sync at `e7e2502` after fetch (no
+cross-machine divergence); artifacts unchanged; viewer alive at 127.0.0.1:8042
+with all five sources; suites green — tests/ 429 passed 4 skipped,
+clif-validate/ 32.
+
+**Re-audit close-out** (promised in the 12:05 entry): axe 0 violations across
+desktop light + dark (loaded record) and mobile dark, 37 passes per run;
+390×844 no overflow, controls 44px. Keyboard operation, accent focus rings,
+light-theme chrome, and a clean detector were verified post-fix in the 12:05
+firing. Final score: Accessibility 4, Performance 4, Responsive 4, Theming 4,
+Implementation Integrity 4 — **20/20, Excellent band**. Residual caveat,
+recorded honestly: text-only zoom was never instrumented (px-based layout;
+browser page zoom assumed per standard practice).
+
+**State**: no agent-actionable units remain in this loop's goal — the whole
+GEM stack (ETL → packed shards → MPS train → generate → viewer) is proven
+end-to-end on the real staged MIMIC CLIF tables on this Mac, and the viewer
+is audit-clean. Remaining items are user decisions (L40 launch per
+`docs/plans/l40-g2-runbook.md`, checkpoint prune) or G4/G5 (conditioning/RL
+per runbook §6). Subsequent firings idle-verify unless the user leaves new
+instructions.
