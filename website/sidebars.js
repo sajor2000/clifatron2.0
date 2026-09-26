@@ -13,6 +13,7 @@ const sidebars = {
     'federated-validation',
     'evaluation-panel',
     'ablations',
+    'gem-local-validation',
     {
       type: 'category',
       label: 'Engineering & governance',
