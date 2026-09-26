@@ -528,3 +528,31 @@ passed 4 skipped, clif-validate/ 32. No new user instructions. State
 unchanged: all seven GEM units proven on this Mac; next step (L40 G2 run)
 blocked on user infrastructure (lab box connectivity, governed-tenant
 Azure, or a compliant Lambda BAA) — see the 17:20 and 17:35 entries.
+
+### 2026-09-26 18:15 — Pre-launch readiness audit: READY
+
+Audited the exact training path the L40 G2 run will launch (user request):
+
+- **Runbook vs CLIs**: every command in `l40-g2-runbook.md` matches the real
+  argparse of cohort / clif_auto_labeler / tokenize / outcome_join /
+  value_stats / pretrain / generate / generative — no flag drift.
+- **Configs**: `train.yaml` is the L40 recipe (bf16, DDP, per_gpu 4 ×
+  grad_accum 32 × 2 GPUs = effective batch 256, ckpt_every 2000, val_every
+  defaults to 2000 when `eval_schedule` is absent, NO MPS guards — correct
+  for CUDA); `model.gem-ntp.yaml` is pure NTP (next_event 1.0, others 0.0,
+  state-dict-compatible trunk, fixed weights, no curriculum); the MPS
+  guards (`token_budget`, `cache_clear_every`) live only in `train.mps.yaml`.
+- **Fail-closed gates confirmed in pretrain.py**: `events_with_outcomes`
+  must exist (plus an augmented-mtime staleness check); value-stats must
+  cover numeric values; `--resume` / `--fresh-schedule` wired through.
+- **Preflights on this Mac**: focused train-path tests 107 passed; the exact
+  launch (train.yaml + model.gem-ntp.yaml + real data + value-stats) as
+  `--dry-run` built model + loaders cleanly — params 45.2M (includes the
+  untied 10k-slot embedding + head per the locked untied decision), ddp:true
+  no-ops without torchrun; the ETL dry-run read all five real CLIF tables
+  (~111M events).
+- Architecture untouched since `4962f82`; full suites green (429+4, 32).
+
+**Verdict: the code is READY for the L40 G2 launch.** Remaining items are
+box-side Phase 0 only (reboot-first for the nvidia-smi mismatch, full 546k
+restage, git pull ≥ `cb87cdf`, uv sync) — user infrastructure per 17:20.
