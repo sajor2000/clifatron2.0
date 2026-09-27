@@ -556,3 +556,11 @@ Audited the exact training path the L40 G2 run will launch (user request):
 **Verdict: the code is READY for the L40 G2 launch.** Remaining items are
 box-side Phase 0 only (reboot-first for the nvidia-smi mismatch, full 546k
 restage, git pull ≥ `cb87cdf`, uv sync) — user infrastructure per 17:20.
+
+### 2026-09-26 19:00 — Idle-verify: all green, no new instructions
+
+origin/main in sync at `ac5537c` after fetch; artifacts unchanged; viewer
+alive at 127.0.0.1:8042 with all five sources; suites green — tests/ 429
+passed 4 skipped, clif-validate/ 32. No new user instructions. State
+unchanged: all seven units proven, code READY for the L40 G2 launch per the
+18:15 readiness audit; launch blocked only on user infrastructure (17:20).
