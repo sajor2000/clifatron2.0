@@ -884,3 +884,25 @@ origin/main in sync at `2a2434a` after fetch; artifacts unchanged; viewer
 alive at 127.0.0.1:8042 with all five sources; suites green — tests/ 429
 passed 4 skipped, clif-validate/ 32. No new user instructions. State
 unchanged; launch blocked only on user infrastructure (17:20).
+
+### 2026-09-28 16:00 — Idle-verify + live API spot check: all green
+
+origin/main in sync at `2bec0f3` after fetch; artifacts unchanged; suites
+green — tests/ 429 passed 4 skipped, clif-validate/ 32.
+
+Went one step past the suites and exercised the live viewer API end to end
+instead of only asserting it is "alive":
+
+- `/api/sources` reports all five sources with correct row counts (events
+  50,986; sims_mps_guarded 6; sims_mps6k 24; sims_mps 24; sims_smoke 12).
+- `/api/record` loads a real row from **every** source with HTTP 200 and
+  parses to tokens: events 361, sims_smoke 128, sims_mps_guarded 127,
+  sims_mps 252, sims_mps6k 254. This re-confirms the P0 fix (`78bcde8`)
+  in the live process, not just in tests.
+- Error paths stay clean, no 500s: missing string id on `events` → 404;
+  non-numeric id on an integer-id source → 404 (the dtype guard); unknown
+  source → 400.
+- Guardrail check: zero tracked `.parquet`/`.pt`/`.ckpt`/`.safetensors`;
+  `/output/` still ignored; working tree clean apart from this log edit.
+
+No new instructions; launch blocked only on user infrastructure (17:20).
