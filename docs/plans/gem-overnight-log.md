@@ -906,3 +906,11 @@ instead of only asserting it is "alive":
   `/output/` still ignored; working tree clean apart from this log edit.
 
 No new instructions; launch blocked only on user infrastructure (17:20).
+
+### 2026-09-28 17:00 — Idle-verify: all green, no new instructions
+
+origin/main in sync at `19142de` after fetch; artifacts unchanged; viewer
+alive at 127.0.0.1:8042 with all five sources (events 50,986; sims_smoke
+12); suites green — tests/ 429 passed 4 skipped, clif-validate/ 32. No new
+user instructions. State unchanged; launch blocked only on user
+infrastructure (17:20).
