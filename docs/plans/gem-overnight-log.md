@@ -928,3 +928,13 @@ origin/main in sync at `c164c8a` after fetch; artifacts unchanged; viewer
 alive at 127.0.0.1:8042 with all five sources; suites green — tests/ 429
 passed 4 skipped, clif-validate/ 32. No new user instructions. State
 unchanged; launch blocked only on user infrastructure (17:20).
+
+### 2026-09-28 20:00 — Idle-verify + guardrail check: all green
+
+origin/main in sync at `63e8215` after fetch; artifacts unchanged; viewer
+alive at 127.0.0.1:8042 with all five sources; suites green — tests/ 429
+passed 4 skipped, clif-validate/ 32. Periodic data/PHI guardrail check:
+zero tracked `.parquet`/`.pt`/`.ckpt`/`.safetensors` files; `/output/`
+still ignored (verified for `sims_smoke.parquet` and `mimic/vocab.json`);
+working tree clean. No new instructions; launch blocked only on user
+infrastructure (17:20).
