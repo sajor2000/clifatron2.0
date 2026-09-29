@@ -1054,3 +1054,15 @@ alive at 127.0.0.1:8042 with all five sources (events 50,986; sims_smoke
 12); suites green — tests/ 429 passed 4 skipped, clif-validate/ 32. No new
 user instructions. State unchanged; launch blocked only on user
 infrastructure (17:20).
+
+### 2026-09-29 13:00 — Idle-verify: all green, no new instructions
+
+origin/main in sync at `0854fb0` after fetch; artifacts unchanged; viewer
+alive at 127.0.0.1:8042 with all five sources; suites green — tests/ 429
+passed 4 skipped, clif-validate/ 32. No new user instructions. State
+unchanged; launch blocked only on user infrastructure (17:20).
+
+Note: the log now holds 86 dated entries, 74 of them idle-verify. The
+notice that this file "changed externally" fired again and is my own
+append, not a foreign edit (`git diff` vs HEAD for the log is empty). Not
+consolidating the idle entries — that is a call for the user, not the loop.
