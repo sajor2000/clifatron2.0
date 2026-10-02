@@ -15,7 +15,7 @@ and this page disagree, the code is right and this page is a bug.
 |---|---|
 | **Code** | `src/data/tokenize.py` (one file, polars + DuckDB) |
 | **Config** | `configs/data.yaml` (tables, targets, binning) · `configs/cohort.yaml` (episode, anchor, windows) |
-| **Bin source** | `external/clifatron/tokenETL/config/critical_illness_tokenization_final_with_intervals.csv`: the CLIF consortium's physician-designed segments (1268 rows, 92 measurements) |
+| **Bin source** | `external/clifatron/tokenETL/config/critical_illness_tokenization_final_with_intervals.csv`: the CLIF consortium's physician-designed segments (1267 segment rows, 92 measurements) |
 | **Output** | `events.parquet` (one row per ICU stay) + `vocab.json` (vocabulary, edges, signed-hash manifest) |
 | **Tests** | `tests/test_tokenize_bins.py`, `tests/test_tokenize_alignment.py`, `tests/test_value_stats.py` |
 
@@ -51,7 +51,7 @@ flowchart TB
     UNIT --> WIN["3 · Join canonical episodes;<br/>keep ICU admit ≤ dttm ≤ anchor (24h)"]
     WIN --> POS["4 · pos_min = minutes since ICU admit<br/>target_eligible = not a treatment table"]
     POS --> VOC{"5 · Reference site?"}
-    VOC -->|"mimic, --build-vocab"| BUILD["Build edges (clinical segments + forced edges)<br/>+ vocab on TRAIN partition only → manifest hashes"]
+    VOC -->|"Site 1 (reference), --build-vocab"| BUILD["Build edges (clinical segments + forced edges)<br/>+ vocab on TRAIN partition only → manifest hashes"]
     VOC -->|"other sites, --vocab"| LOAD["Load frozen vocab.json<br/>verify every hash; no refit"]
     BUILD & LOAD --> ENC["6 · Encode per stay:<br/>hard token · soft triple · pos_min · value"]
     ENC --> OUT["events.parquet (PHI, stays on node)<br/>+ vocab.json"]
@@ -140,7 +140,7 @@ flowchart LR
 ### Ordering and leakage (Rule 4)
 
 Events are ordered by their **availability** timestamp: when the value could be known, not
-when it was nominally measured. For labs that is `lab_result_dttm`, which is where MIMIC's
+when it was nominally measured. For labs that is `lab_result_dttm`, which is where Site 1's
 `storetime` lands in CLIF. **CLIF vitals have no separate store time**, so `recorded_dttm` is
 the best available proxy. Vitals are charted close to real time, so the residual look-ahead is
 small but not zero.
@@ -228,7 +228,7 @@ the threshold value on the "abnormal" side. This is an open decision; see
 ### Which numeric concepts get bins: only the 10 targets
 
 The clinical-segment builder reads CSV rows **only for `target_concepts`**. Every other numeric
-lab or vital (potassium, sodium, pH, hemoglobin, WBC and the rest, 28 more lab and vital
+lab or vital (potassium, sodium, pH, hemoglobin, WBC and the rest, 37 more lab and vital
 measurements that have CSV segments) has no edges, so it is emitted as a **bare concept token**.
 Its raw value is still written to the `value` column, so the value-regression head can learn to
 predict it. But the encoder **input** carries no information about its magnitude: "potassium"
@@ -275,12 +275,12 @@ count stays at `n_bins`.
 2. Every concept seen in the **train partition of the reference site**, in sorted order. A binned
    concept gets `len(edges)+1` ids (`concept=0` … `concept=k`); any other concept gets one id.
 
-Vocabulary size is therefore `4 + 185 + (number of distinct unbinned concepts in MIMIC train)`.
+Vocabulary size is therefore `4 + 185 + (number of distinct unbinned concepts in the Site 1 train partition)`.
 That is a few hundred ids, far below the 10k `target_vocab` budget in `configs/model.yaml`. This
 headroom is what would let us add bins for more concepts and med doses without breaking the
 untied-embedding parameter budget.
 
-**Freeze once, apply everywhere.** Only `value_binning.build_from_site` (`mimic`) may run
+**Freeze once, apply everywhere.** Only `value_binning.build_from_site` (the reference site, Site 1; config value `mimic`) may run
 `--build-vocab`, and edges and vocab are fit on `fit_partition: train` only. The resulting
 `vocab.json` carries a manifest:
 
@@ -404,7 +404,7 @@ flowchart TB
     class JSON,STD out;
 ```
 
-Before this normalization, the value head's NLL was about 46,000 on MIMIC. Standardizing
+Before this normalization, the value head's NLL was about 46,000 on Site 1. Standardizing
 collapses the mean squared target from about 1.4×10¹⁰ to **0.95**.
 
 ---
@@ -491,23 +491,23 @@ that difference on CLIF data rather than assert it.
 ## Run it
 
 ```bash
-# 1. Reference site: build the frozen vocab (train partition) and shards
-uv run python -m src.data.tokenize --site mimic --in "$MIMIC_DIR" \
-  --out output/intermediate_phi/mimic --build-vocab \
+# 1. Reference site (Site 1; --site must equal value_binning.build_from_site): build the frozen vocab and shards
+uv run python -m src.data.tokenize --site mimic --in "$SITE1_DIR" \
+  --out output/intermediate_phi/site1 --build-vocab \
   --episodes output/intermediate_phi/episodes.parquet
 
 # 2. Every other site: reuse the frozen vocab (hash-verified, no refit)
-uv run python -m src.data.tokenize --site rush --in "$RUSH_DIR" \
-  --out output/intermediate_phi/rush \
-  --vocab output/intermediate_phi/mimic/vocab.json \
-  --episodes output/intermediate_phi/rush_episodes.parquet
+uv run python -m src.data.tokenize --site site2 --in "$SITE2_DIR" \
+  --out output/intermediate_phi/site2 \
+  --vocab output/intermediate_phi/site1/vocab.json \
+  --episodes output/intermediate_phi/site2_episodes.parquet
 
 # 3. Value-head stats from the reference site's train partition
 uv run python -m src.data.value_stats \
-  --events output/intermediate_phi/mimic/events.parquet --out value_stats.json
+  --events output/intermediate_phi/site1/events.parquet --out value_stats.json
 
 # Inspect without writing anything
-uv run python -m src.data.tokenize --site mimic --in "$MIMIC_DIR" --out /tmp/x \
+uv run python -m src.data.tokenize --site mimic --in "$SITE1_DIR" --out /tmp/x \
   --build-vocab --episodes output/intermediate_phi/episodes.parquet --dry-run
 ```
 
