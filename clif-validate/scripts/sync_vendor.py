@@ -55,6 +55,7 @@ VENDOR_FILES = (
     "src/data/cohort.py",
     "src/data/segments.py",
     "src/data/units.py",
+    "src/data/tokenization_report.py",
     "src/data/tokenize.py",
     "src/model/heads.py",
     "src/model/varlen_attention.py",

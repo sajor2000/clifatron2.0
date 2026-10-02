@@ -33,4 +33,9 @@ class TextCodeEncoder(CLIFEncoder):
         self.text_proj = nn.Linear(table.shape[1], self.d_model, bias=False)
 
     def embed_tokens(self, token: torch.Tensor) -> torch.Tensor:
+        # proj(table)[token] == proj(table[token]): a batch with at least as many token
+        # slots as table rows (training, [B,T,K] soft ids) projects the table once and
+        # indexes it; a short batch (a generation step) projects only its own rows.
+        if token.numel() >= self.text_table.shape[0]:
+            return self.text_proj(self.text_table)[token]
         return self.text_proj(self.text_table[token])

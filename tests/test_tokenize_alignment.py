@@ -117,7 +117,7 @@ class UnkReservedTokenGuardTest(unittest.TestCase):
 
                 from src.data.tokenize import (
                     SPECIAL,
-                    _json_sha256,
+                    json_sha256,
                     tokenize_site,
                 )
 
@@ -137,7 +137,7 @@ class UnkReservedTokenGuardTest(unittest.TestCase):
                 bad_vocab = dict(vocab)
                 bad_vocab["<unk>"] = max(vocab.values()) + 999  # not SPECIAL["<unk>"]
                 self.assertNotEqual(bad_vocab["<unk>"], SPECIAL["<unk>"])
-                manifest["hashes"]["vocabulary"] = _json_sha256(bad_vocab)
+                manifest["hashes"]["vocabulary"] = json_sha256(bad_vocab)
                 out2 = Path("output/intermediate_phi/unk_reject")
                 with self.assertRaisesRegex(QualificationError, "<unk>"):
                     tokenize_site(
@@ -363,13 +363,13 @@ class FusedCategoricalAndCoverageTest(unittest.TestCase):
         )
 
     def test_binning_sources_cover_every_binned_concept_and_are_hashed(self):
-        from src.data.tokenize import _json_sha256
+        from src.data.tokenize import json_sha256
 
         sources = self.blob["binning_sources"]
         self.assertEqual(set(sources), set(self.blob["segments"]))
         self.assertEqual(sources["map"], "csv")
         self.assertEqual(
-            self.blob["manifest"]["hashes"]["binning_sources"], _json_sha256(sources)
+            self.blob["manifest"]["hashes"]["binning_sources"], json_sha256(sources)
         )
 
     def test_per_stay_arrays_stay_aligned_with_categorical_events(self):
@@ -626,9 +626,13 @@ def _write(frame_rows, schema, path):
     pl.DataFrame(frame_rows, schema=schema, orient="row").write_parquet(path)
 
 
-def _build_u4_site(work, name, *, static_tokens=None):
+def _build_u4_site(work, name, *, static_tokens=None, drop_columns=None, out_dir=None,
+                   table_overrides=None):
     """Synthetic site with every U4 source; tokenized with the repo's configs/data.yaml
-    table specs. Returns (events, vocab blob, stats, episodes)."""
+    table specs. `drop_columns` ({parquet file stem: [columns]}) removes configured
+    columns from the written site first (a site lacking optional CLIF columns);
+    `table_overrides` ({table: {key: value}}) patches the configs/data.yaml table specs.
+    Returns (events, vocab blob, stats, episodes)."""
     import copy
     from datetime import timedelta
 
@@ -739,9 +743,12 @@ def _build_u4_site(work, name, *, static_tokens=None):
 
     admission = dict(zip(hosp["patient_id"], hosp["admission_dttm"]))
     code = []
-    for ep in eps:
+    # Every categorical value must be charted in >= 10 train stays to enter the
+    # vocabulary (the minimum cell size), so the DNR -> DNR/DNI pattern of synth-000 is
+    # shared by every even stay (11 train stays) and Full by the odd ones.
+    for i, ep in enumerate(eps):
         pid = ep["patient_id"]
-        if pid == "synth-p-000":
+        if i % 2 == 0 and pid != "synth-p-002":
             code += [(pid, admission[pid] - timedelta(days=2), "DNR"),
                      (pid, h(ep, 12), "DNR/DNI")]
         elif pid == "synth-p-002":
@@ -756,14 +763,25 @@ def _build_u4_site(work, name, *, static_tokens=None):
     position = [("synth-000", h(ep0, 1) + timedelta(minutes=10 * k), "not_prone")
                 for k in range(100)]
     position.append(("synth-000", h(ep0, 18), "prone"))
+    # Both positions in >= 10 train stays (the vocabulary's minimum cell size): every
+    # other even stay is proned once too. Odd stays chart no position.
+    for ep in eps[2::2]:
+        position += [(ep["hospitalization_id"], h(ep, 2), "not_prone"),
+                     (ep["hospitalization_id"], h(ep, 16), "prone")]
     _write(position[::-1], {"hospitalization_id": pl.String, "recorded_dttm": utc,
                             "position_category": pl.String}, site / "clif_position.parquet")
+
+    for stem, columns in (drop_columns or {}).items():
+        path = site / f"{stem}.parquet"
+        pl.read_parquet(path).drop(columns).write_parquet(path)
 
     data_cfg = yaml.safe_load((ROOT / "configs/data.yaml").read_text())
     cfg = copy.deepcopy(FIXTURE_DATA_CONFIG)
     cfg["cohort_contract"] = str((work / "cohort.yaml").resolve())
     cfg["artifact_policy"] = str((work / "artifact_policy.yaml").resolve())
     cfg["tables"] = copy.deepcopy(data_cfg["tables"])
+    for table, patch in (table_overrides or {}).items():
+        cfg["tables"][table].update(patch)
     cfg["static_source"] = copy.deepcopy(data_cfg["static_source"])
     cfg["static_tokens"] = (list(data_cfg["static_tokens"]) if static_tokens is None
                             else static_tokens)
@@ -772,7 +790,7 @@ def _build_u4_site(work, name, *, static_tokens=None):
         "segment_source": str(ROOT / data_cfg["value_binning"]["segment_source"]),
         "coverage": "all",
     })
-    out = Path(f"output/intermediate_phi/u4_{name}")
+    out = Path(f"output/intermediate_phi/u4_{name}") if out_dir is None else out_dir
     stats: dict = {}
     tokenize_site(cfg, SYNTHETIC_SITE, site, out, None, episodes=episodes,
                   artifact_policy=FIXTURE_POLICY, stats=stats)
@@ -1027,6 +1045,108 @@ class NewEventSourcesTest(unittest.TestCase):
             for key in ("pos_min", "target_eligible", "value", "soft_token", "soft_weight"):
                 self.assertEqual(len(row[key]), n, key)
             self.assertEqual(row["pos_min"], sorted(row["pos_min"]))
+
+class DoseWeightAvailabilityLagTest(unittest.TestCase):
+    """Hard rule 4 for per-kg doses: the ASOF weight join compares AVAILABILITY times,
+    dose (admin + meds lag) >= weight (charted + vitals lag). Every stay's weight is
+    charted at ICU +1 h; its fentanyl starts at +3 h and stops at +8 h."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls._td = tempfile.TemporaryDirectory()
+        work = Path(cls._td.name)
+        old_cwd = os.getcwd()
+        os.chdir(work)
+        try:
+            # Weight knowable at +3.5 h: the +3 h dose (lag 0) predates it.
+            cls.late_weight = _build_u4_site(
+                work, "late_weight", table_overrides={
+                    "vitals": {"availability_lag_minutes": 150}})
+            # ...but a +3 h dose knowable only at +4 h (meds lag 60) sees it.
+            cls.late_dose = _build_u4_site(
+                work, "late_dose", table_overrides={
+                    "vitals": {"availability_lag_minutes": 150},
+                    "meds": {"availability_lag_minutes": 60}})
+        finally:
+            os.chdir(old_cwd)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls._td.cleanup()
+
+    @staticmethod
+    def _fentanyl(build, stay="synth-000"):
+        events, blob = build[0], build[1]
+        inv = {i: t for t, i in blob["vocab"].items()}
+        row = events.filter(events["hosp_id"] == stay).row(0, named=True)
+        return [(inv[t].split("=")[0], p, v)
+                for t, p, v in zip(row["token"], row["pos_min"], row["value"])
+                if inv[t].startswith("fentanyl_")]
+
+    def test_a_weight_not_yet_available_at_the_dose_falls_back_to_native_units(self):
+        self.assertEqual(self._fentanyl(self.late_weight),
+                         [("fentanyl_mcg_hr", 180, 100.0),       # weight not knowable yet
+                          ("fentanyl_mcg_kg_hr", 480, 0.0)])     # +8 h stop: converted
+        self.assertGreater(self.late_weight[2]["dose_conversion"]["meds"]["no_weight"],
+                           len(self.late_weight[3]) - 1)
+
+    def test_a_weight_available_by_the_doses_own_availability_converts(self):
+        # The meds lag also moves the dose events themselves (+60 min).
+        self.assertEqual(self._fentanyl(self.late_dose),
+                         [("fentanyl_mcg_kg_hr", 240, 1.25),
+                          ("fentanyl_mcg_kg_hr", 540, 0.0)])
+
+
+class MissingWideColumnsTest(unittest.TestCase):
+    """A site whose parquet lacks configured wide-table columns (synthetic CLIF releases
+    omit 11 resp_support columns, assessments.categorical_value and ecmo.fdO2) is
+    tokenized with those columns skipped, never a DuckDB binder error, and the skipped
+    columns are listed per table in the tokenization report."""
+
+    DROPPED = {"clif_respiratory_support": ["lpm_set", "mean_airway_pressure_obs"],
+               "clif_patient_assessments": ["categorical_value"],
+               "clif_ecmo_mcs": ["fdO2", "mcs_group"]}
+
+    @classmethod
+    def setUpClass(cls):
+        cls._td = tempfile.TemporaryDirectory()
+        work = Path(cls._td.name)
+        old_cwd = os.getcwd()
+        os.chdir(work)
+        try:
+            out = Path("output/intermediate_phi/u4_missing")
+            cls.events, cls.blob, cls.stats, _ = _build_u4_site(
+                work, "missing", drop_columns=cls.DROPPED, out_dir=out)
+            cls.report = json.loads((out / "tokenization_report.json").read_text())
+        finally:
+            os.chdir(old_cwd)
+        cls.inv = {i: t for t, i in cls.blob["vocab"].items()}
+
+    @classmethod
+    def tearDownClass(cls):
+        cls._td.cleanup()
+
+    def _concepts(self, stay="synth-000"):
+        row = self.events.filter(self.events["hosp_id"] == stay).row(0, named=True)
+        return [self.inv[t].split("=")[0] for t in row["token"]]
+
+    def test_missing_columns_are_reported_per_table(self):
+        self.assertEqual(self.report["missing_columns"], {
+            "resp_support": ["lpm_set", "mean_airway_pressure_obs"],
+            "assessments": ["categorical_value"],
+            "ecmo": ["fdO2", "mcs_group"],
+        })
+
+    def test_present_columns_still_melt(self):
+        concepts = self._concepts()
+        for concept in ("fio2_set", "peep_set", "mode_category", "gcs_total",
+                        "blood_flow_rate"):
+            self.assertIn(concept, concepts)
+        self.assertNotIn("lpm_set", self.blob["segments"])
+        # No qualifier column: device metrics fall under the `unknown` group.
+        self.assertIn("unknown_device_rate", concepts)
+        self.assertNotIn("ecmo_device_rate", concepts)
+
 
 if __name__ == "__main__":
     unittest.main()

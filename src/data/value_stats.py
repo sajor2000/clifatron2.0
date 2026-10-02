@@ -20,14 +20,13 @@ dangerous tails we most care about.
 
 from __future__ import annotations
 
-import hashlib
 import json
 import math
 from pathlib import Path
 
 import numpy as np
 
-from src.data.segments import segments_hash, vocab_segments
+from src.data.segments import json_sha256, segments_hash, vocab_segments
 from src.data.splits import fit_partition
 
 # 1.349 = IQR of a standard normal (Φ⁻¹(0.75) − Φ⁻¹(0.25)); makes robust scale
@@ -122,13 +121,12 @@ def compute_value_stats_from_events(
 
 
 def vocab_hash(vocab: dict) -> str:
-    """SHA-256 of the fused vocab (matches tokenize._json_sha256 canonicalization).
+    """SHA-256 of the fused vocab (`segments.json_sha256`, the manifest's hashing rule).
 
     Binds a value-stats artifact to the exact vocabulary whose token ids give it
     meaning, so a stale or cross-vocabulary file is rejected instead of silently
     applying unrelated centers/scales."""
-    payload = json.dumps(vocab, sort_keys=True, separators=(",", ":"))
-    return hashlib.sha256(payload.encode()).hexdigest()
+    return json_sha256(vocab)
 
 
 def write_value_stats(

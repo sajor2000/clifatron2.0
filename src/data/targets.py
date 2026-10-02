@@ -33,6 +33,9 @@ OUTCOME_STATUSES = {
 
 
 TARGET_MODES = ("icu_24h", "gem")
+# Plausibility bound on a normalized value: a finite sentinel (e.g. a 999999 pH) beyond
+# it is dropped as a value-head target (and masked as a continuous-fused input).
+MAX_ABS_Z = 20.0
 
 
 class TargetContractError(ValueError):
@@ -46,7 +49,7 @@ class TargetBuilder:
     horizon_hours: float
     value_stats: Mapping[int, tuple[float, float]]
     run_seed: int = 0
-    max_abs_value_z: float = 20.0
+    max_abs_value_z: float = MAX_ABS_Z
     mode: str = "icu_24h"
 
     def __post_init__(self) -> None:

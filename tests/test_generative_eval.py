@@ -368,3 +368,102 @@ def test_observed_gem_outcome_reads_the_terminal_after_the_anchor():
     ]
     assert observed_gem_outcome(windows, vocab) == {"disposition": "expired",
                                                     "minutes_after_anchor": 310}
+
+
+# ------------------------------------------------------------------ terminal-leakage guards
+
+def _gem_vocab():
+    return {"<bos>": 1, "<eos>": 2, "hr=1": 4, "ADMISSION//ed": 6,
+            **{f"DISCHARGE//{d}": 10 + i for i, d in enumerate(DISPOSITIONS)}}
+
+
+@pytest.mark.parametrize("windows, message", [
+    # no terminal token at all
+    ([{"continuation_index": 0, "source_start": 0, "token": [1, 6, 4, 2],
+       "pos_min": [0, 0, 30, 90], "anchor_idx": 2}], "found 0"),
+    # two terminal tokens (expired, then home)
+    ([{"continuation_index": 0, "source_start": 0, "token": [1, 6, 4, 13, 10, 2],
+       "pos_min": [0, 0, 30, 90, 95, 95], "anchor_idx": 2}], "found 2"),
+    # the terminal token sits AT the anchor (the outcome would be in the input)
+    ([{"continuation_index": 0, "source_start": 0, "token": [1, 6, 13, 2],
+       "pos_min": [0, 0, 30, 30], "anchor_idx": 2}], "at or before the anchor"),
+    # ... or before it
+    ([{"continuation_index": 0, "source_start": 0, "token": [1, 13, 4, 2],
+       "pos_min": [0, 10, 30, 30], "anchor_idx": 2}], "at or before the anchor"),
+])
+def test_observed_gem_outcome_refuses_a_leaky_or_ambiguous_terminal(windows, message):
+    with pytest.raises(ValueError, match=message):
+        observed_gem_outcome(windows, _gem_vocab())
+
+
+def test_stay_stream_refuses_missing_or_non_contiguous_windows():
+    from src.model.generate import stay_stream
+
+    with pytest.raises(ValueError, match="at least one"):
+        stay_stream([])
+    gap = [{"continuation_index": 0, "source_start": 0, "token": [1, 6], "pos_min": [0, 0],
+            "anchor_idx": 1},
+           {"continuation_index": 1, "source_start": 3, "token": [4, 2], "pos_min": [5, 9],
+            "anchor_idx": 1}]
+    with pytest.raises(ValueError, match="not contiguous"):
+        stay_stream(gap)
+
+
+# ------------------------------------------------------------------ --events binding (F5)
+
+def _v2_vocab_blob():
+    from src.data.segments import TOKENIZER_VERSION
+
+    return {"vocab": {"<pad>": 0, "<bos>": 1, "<eos>": 2, "<unk>": 3, "spo2=0": 10,
+                      "spo2=1": 11},
+            "segments": {"spo2": [
+                {"lo": None, "hi": 88.0, "lo_closed": False, "hi_closed": False},
+                {"lo": 88.0, "hi": None, "lo_closed": True, "hi_closed": False}]},
+            "manifest": {"tokenizer_version": TOKENIZER_VERSION}}
+
+
+def _write_eval_inputs(tmp_path, hashes):
+    from src.data.segments import binding_expr
+
+    blob = _v2_vocab_blob()
+    (tmp_path / "vocab.json").write_text(json.dumps(blob))
+    events = pl.DataFrame({"hosp_id": ["h1", "h2"], "token": [[1, 10, 11], [1, 11]]})
+    if hashes is not None:
+        events = events.with_columns(binding_expr(hashes))
+    events.write_parquet(tmp_path / "events.parquet")
+    pl.DataFrame([{"hospitalization_id": "prompt-1", "simulation_number": 1,
+                   "generated_sequence": "spo2=0 spo2=1"}]).write_parquet(
+        tmp_path / "sims.parquet")
+    cfg = tmp_path / "data.yaml"
+    cfg.write_text("target_concepts:\n  - {name: spo2, source: vitals}\n")
+    return ["--sims", str(tmp_path / "sims.parquet"), "--events",
+            str(tmp_path / "events.parquet"), "--vocab", str(tmp_path / "vocab.json"),
+            "--data-config", str(cfg)]
+
+
+def test_main_refuses_an_events_shard_bound_to_another_vocabulary(tmp_path):
+    from src.data.segments import ArtifactBindingError, artifact_binding
+    from src.eval import generative as genmod
+
+    other = dict(artifact_binding(_v2_vocab_blob()), vocabulary="0" * 64)
+    argv = _write_eval_inputs(tmp_path, other)
+    with pytest.raises(ArtifactBindingError, match="vocabulary mismatch"):
+        genmod.main(argv)
+
+
+def test_main_refuses_an_events_shard_with_no_binding(tmp_path):
+    from src.data.segments import ArtifactBindingError
+    from src.eval import generative as genmod
+
+    with pytest.raises(ArtifactBindingError, match="no tokenizer-v2"):
+        genmod.main(_write_eval_inputs(tmp_path, None))
+
+
+def test_main_scores_an_events_shard_bound_to_the_supplied_vocabulary(tmp_path):
+    from src.data.segments import artifact_binding
+    from src.eval import generative as genmod
+
+    argv = _write_eval_inputs(tmp_path, artifact_binding(_v2_vocab_blob()))
+    genmod.main([*argv, "--out", str(tmp_path / "report.json")])
+    report = json.loads((tmp_path / "report.json").read_text())
+    assert report["event_rate_calibration"]["n_gen_tokens"] == 2

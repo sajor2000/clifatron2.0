@@ -31,7 +31,8 @@ Three rules govern this module:
 
 3. **Verify before parse.** File hashes are checked before any bundled file's content
    is interpreted; the vocabulary then re-verifies its own compatibility hashes via
-   `validate_vocabulary_artifact`; and the manifest's identity fields are cross-checked
+   `validate_vocabulary_artifact` (a vocabulary fit on a `--sample-episodes`
+   verification sample is refused); and the manifest's identity fields are cross-checked
    against the vocabulary manifest so one bundle cannot carry two identities. Each
    outcome query's target_index/tau_bin/direction is re-derived from the bundled
    cohort contract and segments (`segments.threshold_bin`, the tokenizer's own binning
@@ -282,10 +283,11 @@ def _check_enum(where: str, field: str, value: object, allowed: tuple) -> None:
         )
 
 
-def _validate_dose_block(where: str, dose: object, tables: dict, enums: dict) -> None:
+def _validate_dose_block(where: str, dose: object, tables: dict,
+                         dose_kinds: tuple[str, ...]) -> None:
     if not isinstance(dose, dict):
         raise ArtifactMismatch(f"bundle {where} dose block is not a mapping")
-    _check_enum(where, "dose.kind", dose.get("kind"), enums["dose_kinds"])
+    _check_enum(where, "dose.kind", dose.get("kind"), dose_kinds)
     if dose.get("action_col") is not None:
         _check_identifier(where, "dose.action_col", dose["action_col"])
     stops = dose.get("stop_actions")
@@ -326,7 +328,6 @@ def _validate_data_config_identifiers(data_cfg: dict) -> None:
     """
     from src.data.tokenize import DOSE_KINDS, EMIT_MODES, STATIC_TOKENS, TABLE_KEYS
 
-    enums = {"dose_kinds": DOSE_KINDS}
     tables = data_cfg.get("tables")
     if not isinstance(tables, dict) or not tables:
         raise ArtifactMismatch("bundle data config declares no tables")
@@ -363,7 +364,7 @@ def _validate_data_config_identifiers(data_cfg: dict) -> None:
         if spec.get("key") is not None:
             _check_enum(where, "key", spec["key"], TABLE_KEYS)
         if spec.get("dose") is not None:
-            _validate_dose_block(where, spec["dose"], tables, enums)
+            _validate_dose_block(where, spec["dose"], tables, DOSE_KINDS)
     static = data_cfg.get("static_tokens")
     if static is not None:
         if not isinstance(static, list):
@@ -488,6 +489,12 @@ def load_bundle(path: str | Path, *, pin_policy: bool = True,
     from src.data.tokenize import validate_vocabulary_artifact
 
     vocab, segments, vocab_manifest = validate_vocabulary_artifact(blob, data_cfg, policy)
+    # KTD9: a vocabulary fit on a verification sample is smoke/dry-run only; training
+    # refuses it, and so does every site.
+    from src.data.segments import SAMPLE_VOCAB_REFUSAL, is_sample_vocab
+
+    if is_sample_vocab(blob):
+        raise ArtifactMismatch(f"bundle vocabulary {SAMPLE_VOCAB_REFUSAL}")
     check_outcome_queries(outcome_queries, data_cfg,
                           yaml.safe_load(cohort_path.read_text()), segments)
 

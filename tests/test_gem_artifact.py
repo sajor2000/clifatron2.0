@@ -420,6 +420,56 @@ class GemArtifactTest(unittest.TestCase):
             self._dataset([{**r, "value": [None] * len(r["token"])} for r in rows])
 
 
+    def test_model_dataset_refuses_gem_rows_outside_the_gem_representation(self):
+        """GEM rows through the 24 h path would skip the post-anchor relaxation's
+        coupling (and a 24 h shard through the gem path would relax it)."""
+        from src.data.dataset import ModelDataset
+        from src.data.segments import artifact_binding
+        from src.data.targets import TargetBuilder, TargetContractError
+
+        rows = [{**r, "value": [None] * len(r["token"])}
+                for r in pl.read_parquet(self.gem_path).to_dicts()]
+        with self.assertRaisesRegex(TargetContractError, "representation='gem'"):
+            ModelDataset(rows, representation="decile",
+                         target_builder=TargetBuilder(len(self.vocab), 4, 48, {}),
+                         expected_hashes=artifact_binding(self.blob))
+
+    def test_the_gem_representation_requires_a_gem_mode_target_builder(self):
+        from src.data.dataset import ModelDataset
+        from src.data.segments import artifact_binding
+        from src.data.targets import TargetBuilder, TargetContractError
+
+        rows = [{**r, "value": [None] * len(r["token"])}
+                for r in pl.read_parquet(self.gem_path).to_dicts()]
+        with self.assertRaisesRegex(TargetContractError, "mode='gem'"):
+            ModelDataset(rows, representation="gem",
+                         target_builder=TargetBuilder(len(self.vocab), 4, 48, {}),
+                         expected_hashes=artifact_binding(self.blob))
+
+
+class GemWindowBoundsTest(unittest.TestCase):
+    """The final `<eos>` is never alone in a window (`gem_window_bounds` tail branch)."""
+
+    def test_a_one_token_tail_moves_one_token_into_the_last_window(self):
+        from src.data.tokenize import gem_window_bounds
+
+        self.assertEqual(gem_window_bounds(65, 64), [(0, 63), (63, 65)])
+        self.assertEqual(gem_window_bounds(129, 64)[-2:], [(64, 127), (127, 129)])
+
+    def test_exact_and_short_streams_are_not_adjusted(self):
+        from src.data.tokenize import gem_window_bounds
+
+        self.assertEqual(gem_window_bounds(64, 64), [(0, 64)])
+        self.assertEqual(gem_window_bounds(1, 64), [(0, 1)])
+        self.assertEqual(gem_window_bounds(66, 64), [(0, 64), (64, 66)])
+
+    def test_a_window_must_hold_at_least_two_tokens(self):
+        from src.data.tokenize import gem_window_bounds
+
+        with self.assertRaises(ValueError):
+            gem_window_bounds(10, 1)
+
+
 class GemTargetBuilderTest(unittest.TestCase):
     """`TargetBuilder(mode="gem")` vs the default 24 h mode."""
 

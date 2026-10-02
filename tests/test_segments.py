@@ -229,7 +229,9 @@ def test_every_csv_measurement_loads_into_a_strict_partition(segs):
 
 
 def test_segments_and_policy_are_json_serializable(segs):
-    assert S.POLICY_VERSION == 1
+    # v2 (2026-10-02): dose concepts close the gap between the [0, 0] stop bin and
+    # their first positive segment (policy step 8).
+    assert S.POLICY_VERSION == 2
     assert json.loads(json.dumps(segs)) == segs
 
 
@@ -371,6 +373,57 @@ def test_dose_concepts_are_config_driven_and_csv_dose_zero_rows_are_not_duplicat
     assert segs3["zeroish_lab"][0] == S.make_segment(0.0, 0.0, True, True)
 
 
+def test_running_csv_dose_below_the_first_positive_segment_is_never_the_stop_bin():
+    """Policy v2 step 8: the physician CSV gives lorazepam_mg_hr only [0, 0] and [1, 1]
+    below 1 mg/hr. Under v1 the gap rule sent a running 0.25-0.5 mg/hr infusion to the
+    nearest segment, the stop bin; v2 inserts an open (0, 1) running-dose segment."""
+    fit = _fit_events({"lorazepam_mg_hr": ("meds", [0.0, 0.25, 0.5, 1.0, 2.0] * 10)})
+    segs, sources = _build_all(fit)
+    assert sources["lorazepam_mg_hr"] == "csv"
+    lzp = segs["lorazepam_mg_hr"]
+    S.validate_partition(lzp)
+    stop = S.bin_index(0.0, lzp)
+    assert lzp[stop] == S.make_segment(0.0, 0.0, True, True)
+    for running in (1e-9, 0.25, 0.5, 0.999):
+        assert S.bin_index(running, lzp) != stop, running
+    assert lzp[S.bin_index(0.25, lzp)] == S.make_segment(0.0, 1.0, False, False)
+    # The CSV's own [1, 1] point bin is unchanged, and so is every segment above it.
+    assert lzp[S.bin_index(1.0, lzp)] == S.make_segment(1.0, 1.0, True, True)
+    csv = S.load_csv_segments(CSV, ["lorazepam_mg_hr"])["lorazepam_mg_hr"]
+    assert lzp[S.bin_index(1.0, lzp):] == csv[S.bin_index(1.0, csv):]
+
+
+@pytest.mark.parametrize("values, source", [
+    ([0.0] * 30 + [0.25 * k for k in range(1, 200)], "quantile"),   # quantile-binned dose
+    ([0.0, 1.0, 2.0, 3.0, 4.0] * 10, "ordinal"),                     # integer-valued dose
+    ([0.0, 0.3, 0.6], "single"),                                    # too few to fit
+])
+def test_no_strictly_positive_dose_reaches_the_stop_bin(values, source):
+    fit = _fit_events({"synth_med_u_hr": ("meds", values)})
+    segs, sources = _build_all(fit)
+    assert sources["synth_med_u_hr"] == source
+    med = segs["synth_med_u_hr"]
+    S.validate_partition(med)
+    stop = S.bin_index(0.0, med)
+    assert med[stop] == S.make_segment(0.0, 0.0, True, True)
+    for running in (1e-9, 0.1, 0.25, 0.4, 0.5, 0.75, 1.0, 1.5):
+        assert S.bin_index(running, med) != stop, running
+
+
+def test_with_zero_point_closes_the_gap_to_the_first_positive_segment():
+    closed = S.with_zero_point([S.make_segment(1.0, 1.0, True, True),
+                                S.make_segment(1.0, 2.0, False, True)])
+    assert closed[:2] == [S.make_segment(0.0, 0.0, True, True),
+                          S.make_segment(0.0, 1.0, False, False)]
+    # The open segment takes the complementary closure of the next segment's lower end.
+    closed = S.with_zero_point([S.make_segment(0.0, 0.0, True, True),
+                                S.make_segment(2.0, 5.0, False, True)])
+    assert closed[1] == S.make_segment(0.0, 2.0, False, True)
+    # Already contiguous: unchanged.
+    tight = [S.make_segment(0.0, 0.0, True, True), S.make_segment(0.0, 3.0, False, True)]
+    assert S.with_zero_point(tight) == tight
+
+
 def test_decile_arm_forces_every_concept_to_quantile():
     import numpy as np
 
@@ -431,3 +484,44 @@ def test_categorical_values_are_normalized_into_fused_tokens():
     assert categorical_token("braden_mobility", "  Very Limited ") == "braden_mobility=very_limited"
     # A bare-integer category would collide with a bin index token; it is disambiguated.
     assert categorical_token("rass", "2") != "rass=2"
+
+
+# ---- categorical small-cell floor (the vocabulary ships to every site) ----------------------
+
+def _categorical_rows(spec: dict) -> pl.DataFrame:
+    """``{(concept, raw value): [stay ids]}`` -> fit rows, three charted events per stay."""
+    rows = {"hosp_id": [], "concept": [], "value": [], "cat_value": []}
+    for (concept, raw), stays in spec.items():
+        for stay in stays:
+            for _ in range(3):
+                rows["hosp_id"].append(stay)
+                rows["concept"].append(concept)
+                rows["value"].append(None)
+                rows["cat_value"].append(raw)
+    return pl.DataFrame(rows, schema={"hosp_id": pl.String, "concept": pl.String,
+                                      "value": pl.Float64, "cat_value": pl.String})
+
+
+def test_a_categorical_value_needs_ten_distinct_fit_stays_to_enter_the_vocabulary():
+    """vocab.json is a bundle file shipped to every site: a value charted for fewer than
+    `minimum_cell_size` patients must not leave the node as a verbatim token."""
+    from src.data.tokenize import build_vocab
+
+    stays = [f"s{i:02d}" for i in range(20)]
+    fit = _categorical_rows({
+        ("cam_total", "Rare Finding"): stays[:9],          # 9 stays (27 events) -> <unk>
+        ("cam_total", "Negative"): stays[:10],             # 10 stays -> a token
+        # Raw spellings normalizing to one token pool their stays: 5 + 5 = 10.
+        ("position", "Prone"): stays[:5],
+        ("position", " prone "): stays[5:10],
+        ("sex", "Other"): stays[:9],                       # controlled categories too
+        ("sex", "Female"): stays[:15],
+    })
+    vocab = build_vocab(fit, {})
+    assert "cam_total=negative" in vocab
+    assert "cam_total=rare_finding" not in vocab
+    assert "position=prone" in vocab
+    assert "sex=female" in vocab and "sex=other" not in vocab
+    # The concepts themselves stay; a pruned value encodes as <unk>.
+    assert {"cam_total", "position", "sex"} <= set(vocab)
+    assert "cam_total=rare_finding" in build_vocab(fit, {}, min_category_stays=9)

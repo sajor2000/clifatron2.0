@@ -17,7 +17,6 @@ attention_mask, and per-sample labels: in_hospital_mortality, aki_kdigo_48h, etc
 from __future__ import annotations
 
 import argparse
-import json
 import os
 from pathlib import Path
 
@@ -26,6 +25,7 @@ import torch.distributed as dist
 import yaml
 from torch.nn.parallel import DistributedDataParallel as DDP
 
+from src.data.segments import SAMPLE_VOCAB_REFUSAL, is_sample_vocab, load_vocab_blob
 from src.data.segments import n_value_bins as vocab_n_value_bins
 from src.model.head_adapter import CLIFATRONHeads, load_backbone
 from src.train.curriculum import curriculum_weights
@@ -119,11 +119,12 @@ def main():
     if is_main:
         print(f"Loading backbone from {args.checkpoint} ...")
     backbone = load_backbone(args.checkpoint)
-    vocab_path = Path(args.vocab) if args.vocab else Path(args.data) / "vocab.json"
-    if not vocab_path.exists():
-        raise SystemExit(f"{vocab_path} is required: n_value_bins is derived from the "
-                         "frozen vocabulary's segments")
-    value_bins = vocab_n_value_bins(json.loads(vocab_path.read_text()))
+    vocab_blob = load_vocab_blob(
+        Path(args.vocab) if args.vocab else Path(args.data) / "vocab.json",
+        required_for="n_value_bins is derived from the frozen vocabulary's segments")
+    if is_sample_vocab(vocab_blob):
+        raise SystemExit(f"refusing to train: the vocabulary {SAMPLE_VOCAB_REFUSAL}")
+    value_bins = vocab_n_value_bins(vocab_blob)
     model = JointModel(backbone, n_targets, freeze_backbone=False,
                        n_value_bins=value_bins).to(dev)
 

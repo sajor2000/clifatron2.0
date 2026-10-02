@@ -10,6 +10,10 @@ from src.train.pretrain import _has_supervised_outcomes, _load_decile_records
 from src.train.manifest import Manifest
 from src.train.checkpoint import save_checkpoint, load_checkpoint
 
+# engine.train requires the training vocabulary binding (segments.artifact_binding);
+# these data-free tests bind every run (and resume checkpoint) to one fixed binding.
+BINDING = {"tokenizer_version": "2", "vocabulary": "a" * 64, "numeric_edges": "b" * 64}
+
 
 class TinyModel(torch.nn.Module):
     def __init__(self):
@@ -378,7 +382,7 @@ class TestTrainingEngine(unittest.TestCase):
             "schedule": {"warmup_steps": 1, "total_steps": 1},
             "optimizer": {"grad_clip": 1.0},
         }, {"compile": False}, total_steps=1)
-        train(model, dl, None, opt, scheduler, cfg, self.dev)
+        train(model, dl, None, opt, scheduler, cfg, self.dev, vocab_binding=BINDING)
         self.assertEqual(ds.epoch, 0)
 
     def test_resume_carries_forward_manifest_ledger_counters(self):
@@ -396,7 +400,8 @@ class TestTrainingEngine(unittest.TestCase):
         manifest = Manifest("test", {}, seed=42, ckpt_dir=str(ckpt_dir))
         manifest.record_ledger(samples=10, tokens=20, ntp_tokens=12, optimizer_step=3)
         ckpt = ckpt_dir / "resume.pt"
-        save_checkpoint(ckpt, model=model, optimizer=opt, scheduler=scheduler, epoch=3, step=3, manifest=manifest)
+        save_checkpoint(ckpt, model=model, optimizer=opt, scheduler=scheduler, epoch=3, step=3,
+                        manifest=manifest, vocab_binding=BINDING)
 
         cfg = TrainConfig({}, {
             "batch": {"per_gpu": 1, "grad_accum": 1},
@@ -415,6 +420,7 @@ class TestTrainingEngine(unittest.TestCase):
             resumed_scheduler,
             cfg,
             self.dev,
+            vocab_binding=BINDING,
             resume_ckpt=ckpt,
         )
         self.assertGreaterEqual(resumed_manifest.ledger.get("samples_seen", 0), 10)
@@ -500,7 +506,7 @@ class FreshScheduleResumeTest(unittest.TestCase):
         o_a = torch.optim.SGD(m_a.parameters(), lr=0.5, momentum=0.9)
         s_a = torch.optim.lr_scheduler.ExponentialLR(o_a, gamma=0.01)
         with tempfile.TemporaryDirectory() as td:
-            train(m_a, loader(), None, o_a, s_a, self._cfg(td, 3), dev)
+            train(m_a, loader(), None, o_a, s_a, self._cfg(td, 3), dev, vocab_binding=BINDING)
             ckpts = sorted(Path(td).glob("ckpt_*.pt"))
             self.assertTrue(ckpts, "train() did not checkpoint")
             ckpt = ckpts[-1]
@@ -511,7 +517,7 @@ class FreshScheduleResumeTest(unittest.TestCase):
             o_b = torch.optim.SGD(m_b.parameters(), lr=0.5, momentum=0.9)
             s_b = torch.optim.lr_scheduler.StepLR(o_b, step_size=1000)
             train(m_b, loader(), None, o_b, s_b, self._cfg(td, 6), dev,
-                  resume_ckpt=ckpt, fresh_schedule=True)
+                  vocab_binding=BINDING, resume_ckpt=ckpt, fresh_schedule=True)
             self.assertAlmostEqual(o_b.param_groups[0]["lr"], 0.5, places=6)
 
             # Control: default resume LOADS the decayed schedule — LR stays pinned.
@@ -520,7 +526,7 @@ class FreshScheduleResumeTest(unittest.TestCase):
             o_c = torch.optim.SGD(m_c.parameters(), lr=0.5, momentum=0.9)
             s_c = torch.optim.lr_scheduler.StepLR(o_c, step_size=1000)
             train(m_c, loader(), None, o_c, s_c, self._cfg(td, 6), dev,
-                  resume_ckpt=ckpt)
+                  vocab_binding=BINDING, resume_ckpt=ckpt)
             self.assertLess(o_c.param_groups[0]["lr"], 1e-4)
 
 
@@ -636,14 +642,16 @@ class ResumeEquivalenceTest(unittest.TestCase):
         torch.manual_seed(7)
         m_s, o_s, s_s = build()
         with tempfile.TemporaryDirectory() as td:
-            train(m_s, loader(), None, o_s, s_s, cfg(td, 6, 999), dev, seed=7)
+            train(m_s, loader(), None, o_s, s_s, cfg(td, 6, 999), dev, seed=7,
+                  vocab_binding=BINDING)
             straight = [p.detach().clone() for p in m_s.parameters()]
             straight_opt, straight_sched = o_s.state_dict(), s_s.state_dict()
 
         torch.manual_seed(7)
         m_a, o_a, s_a = build()
         with tempfile.TemporaryDirectory() as td:
-            train(m_a, loader(), None, o_a, s_a, cfg(td, 3, 3), dev, seed=7)  # 1 epoch, saves at step 3
+            train(m_a, loader(), None, o_a, s_a, cfg(td, 3, 3), dev, seed=7,
+                  vocab_binding=BINDING)  # 1 epoch, saves at step 3
             ckpts = list(Path(td).glob("ckpt_*.pt"))
             self.assertTrue(ckpts, "train() did not write an epoch-boundary checkpoint")
             ckpt = ckpts[0]
@@ -651,7 +659,7 @@ class ResumeEquivalenceTest(unittest.TestCase):
             torch.manual_seed(999_999)  # perturb: a missing RNG restore would diverge
             m_b, o_b, s_b = build()
             train(m_b, loader(), None, o_b, s_b, cfg(td, 6, 999), dev,
-                  resume_ckpt=ckpt, seed=7)
+                  vocab_binding=BINDING, resume_ckpt=ckpt, seed=7)
             resumed = [p.detach().clone() for p in m_b.parameters()]
             resumed_opt, resumed_sched = o_b.state_dict(), s_b.state_dict()
 
@@ -689,10 +697,32 @@ class ResumeEquivalenceTest(unittest.TestCase):
                 config,
                 dev,
                 seed=7,
+                vocab_binding=BINDING,
             )
 
         self.assertEqual(len(manifest.validation), 1)
         self.assertTrue(math.isfinite(manifest.validation[0]["val_loss"]))
+
+    def test_train_requires_a_vocabulary_binding(self):
+        """No silent skip: a run (and so its checkpoints) must be bound to a vocabulary."""
+        from src.train.engine import train
+
+        model = _DropoutModel()
+        optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
+        scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=1)
+        loader = torch.utils.data.DataLoader(_FixedDS(), batch_size=2, shuffle=False)
+        with tempfile.TemporaryDirectory() as directory:
+            config = TrainConfig({}, {
+                "batch": {"per_gpu": 2, "grad_accum": 1},
+                "runtime": {"ckpt_dir": directory, "ckpt_every": 999},
+                "schedule": {"warmup_steps": 0, "total_steps": 1},
+                "optimizer": {"grad_clip": 1.0},
+            }, {"compile": False}, total_steps=1)
+            args = (model, loader, None, optimizer, scheduler, config, torch.device("cpu"))
+            with self.assertRaises(TypeError):
+                train(*args)  # vocab_binding is a required keyword
+            with self.assertRaisesRegex(ValueError, "requires vocab_binding"):
+                train(*args, vocab_binding=None)
 
 
 if __name__ == "__main__":

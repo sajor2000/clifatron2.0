@@ -291,6 +291,19 @@ class BundleContractTest(_BundleFixtureCase):
         with self.assertRaisesRegex(ArtifactMismatch, "numeric_edges"):
             load_bundle(broken, verify_signature=False)
 
+    def test_a_vocabulary_fit_on_a_verification_sample_is_refused(self):
+        """A `--sample-episodes` vocabulary is smoke-only (KTD9): a bundle built around
+        one must not load at a site, even when every hash and the manifest agree."""
+        broken = self._mutable_copy("bundle_sample_vocab")
+        vocab_path = broken / "vocab.json"
+        blob = json.loads(vocab_path.read_text())
+        blob["manifest"]["provenance"]["sample"] = True
+        blob["manifest"]["provenance"]["sample_size"] = 12
+        vocab_path.write_text(json.dumps(blob))
+        self._reseal(broken)          # file hashes + vocab binding now consistent
+        with self.assertRaisesRegex(ArtifactMismatch, "verification sample"):
+            load_bundle(broken, verify_signature=False)
+
     def test_a_sql_unsafe_column_name_is_refused(self):
         """An untrusted table spec column that could break out of DuckDB SQL fails closed."""
         import yaml

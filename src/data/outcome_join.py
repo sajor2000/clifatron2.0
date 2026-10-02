@@ -80,6 +80,24 @@ def join_outcomes(
     labels_sub = labels.select([c for c in label_cols if c in labels.columns])
 
     outcome_rows: dict[str, list[dict]] = {}
+    death_cause_idx = _death_cause_idx(data_config)
+    # Per outcome, resolved once on first use (same order, same errors as per row):
+    # (target_idx, direction, threshold_bin), or None for an outcome off the target map.
+    resolved: dict[str, tuple[int, str, int] | None] = {}
+
+    def resolve(outcome_name: str) -> tuple[int, str, int] | None:
+        if outcome_name not in resolved:
+            spec = outcome_specs[outcome_name]
+            concept = spec["concept"]
+            target_idx = concept_index.get(concept)
+            if target_idx is None:
+                resolved[outcome_name] = None
+            else:
+                direction = spec["direction"]
+                threshold = float(spec["threshold"])
+                resolved[outcome_name] = (target_idx, direction, _compute_threshold_bin(
+                    concept, threshold, segments, direction))
+        return resolved[outcome_name]
 
     for row in labels_sub.iter_rows(named=True):
         hosp_id = row["hospitalization_id"]
@@ -87,22 +105,18 @@ def join_outcomes(
         for outcome_name, (status_col, time_col) in outcome_name_cols.items():
             status = row[status_col]
             time_hours = row[time_col]
-            spec = outcome_specs[outcome_name]
-            concept = spec["concept"]
-            target_idx = concept_index.get(concept)
-            if target_idx is None:
+            plan = resolve(outcome_name)
+            if plan is None:
                 continue
-            direction = spec["direction"]
-            threshold = float(spec["threshold"])
+            target_idx, direction, threshold_bin = plan
 
             outcome_dict: dict[str, Any] = {
                 "status": status,
                 "target_idx": target_idx,
                 "time_from_anchor_hours": time_hours,
-                "threshold_bin": _compute_threshold_bin(concept, threshold, segments,
-                                                        direction),
+                "threshold_bin": threshold_bin,
                 "direction": direction,
-                "cause_idx": _death_cause_idx(data_config) if status == "competing_event" else None,
+                "cause_idx": death_cause_idx if status == "competing_event" else None,
             }
 
             outcomes_list.append(outcome_dict)

@@ -154,6 +154,25 @@ class TestKVCacheEquivalence:
             steps.append(enc.lm_logits(H[:, -1:, :]))  # keep [1,1,D] → logits [1,1,V]
         assert torch.allclose(torch.cat(steps, dim=1), full[:, 3:], atol=1e-4)
 
+    def test_textcode_encoder_generates_through_its_embedding_hook(self):
+        """TextCodeEncoder deletes tok_emb; the cached path must embed through
+        `embed_tokens` (prefill + incremental match the full forward)."""
+        from src.model.encoder_textcode import TextCodeEncoder
+
+        torch.manual_seed(0)
+        cfg = {"trunk": {"d_model": 32, "n_heads": 4, "n_layers": 2, "ffn_mult": 2,
+                         "dropout": 0.0, "tied_embeddings": False}}
+        enc = TextCodeEncoder(VOCAB, cfg, torch.randn(VOCAB, 16).numpy())
+        ids, pos = random_tokens(1, 9), minute_positions(1, 9)
+        full = enc.lm_logits(enc(ids, pos))
+        cache = KVCache(len(enc.blocks))
+        _cached_forward(enc, ids[:, :3], pos[:, :3], cache)
+        steps = [enc.lm_logits(_cached_forward(enc, ids[:, t:t + 1], pos[:, t:t + 1],
+                                               cache)[:, -1:, :]) for t in range(3, 9)]
+        assert torch.allclose(torch.cat(steps, dim=1), full[:, 3:], atol=1e-4)
+        out = generate(enc, ids, pos, max_new_tokens=5, temperature=0.0)
+        assert out["tokens"].shape == (1, 5) and int(out["lengths"][0]) == 5
+
     def test_multitoken_after_prefill_rejected(self):
         enc = tiny_encoder()
         ids, pos = random_tokens(1, 4), minute_positions(1, 4)

@@ -187,13 +187,14 @@ class ThresholdHazardHead(nn.Module):
         )
 
     def _logits(self, h_last, target_idx, tau_bin, direction) -> torch.Tensor:
-        if tau_bin.numel() and (int(tau_bin.min()) < 0
-                                or int(tau_bin.max()) >= self.thr_emb.num_embeddings):
-            raise ValueError(
-                f"threshold value bin out of range [0, {self.thr_emb.num_embeddings}): "
-                f"got {int(tau_bin.min())}..{int(tau_bin.max())}; n_value_bins must be "
-                "derived from the vocabulary the query's tau_bin was computed against"
-            )
+        if tau_bin.numel():
+            lo, hi = torch.stack(torch.aminmax(tau_bin)).tolist()   # one host sync
+            if int(lo) < 0 or int(hi) >= self.thr_emb.num_embeddings:
+                raise ValueError(
+                    f"threshold value bin out of range [0, {self.thr_emb.num_embeddings}): "
+                    f"got {int(lo)}..{int(hi)}; n_value_bins must be derived from the "
+                    "vocabulary the query's tau_bin was computed against"
+                )
         q = torch.cat(
             [h_last, self.target_emb(target_idx), self.thr_emb(tau_bin), self.dir_emb(direction)], dim=-1
         )

@@ -1,11 +1,12 @@
 {
   "src/data/cohort.py": "3d71015d76b3f392932d482897d4f667c592a3e40539536270b6f9f40ced5aad",
-  "src/data/segments.py": "4d98fabb94df3dcbd950aec0041648eb4bfd541afbd8c0989e8f3dca706cf742",
+  "src/data/segments.py": "39b03705b84581eae8ff127a2e9c5e095f2360c5d4985060d0c1ca4de7c13931",
   "src/data/splits.py": "6f3cf80eb75ebe0f3330f648bed4ebd83e50723847da86c6f87eff7c095c1a99",
-  "src/data/tokenize.py": "6dffb5aef1a46b59d2b7ac1c19acd06a1965eaba9c2d9b083fb4bfcab798786d",
+  "src/data/tokenization_report.py": "94f929bab56fad61a51cec29167352e1595a322768c0bc94d01708f0a8cf0ac4",
+  "src/data/tokenize.py": "39247c7702a5463537a19da7cb026564f7a77a3f78858cc7f2b58add70c72bd6",
   "src/data/units.py": "ba921f1268e86e454d9350e543e1545ff1a5083c30feac262de21dcdc734addd",
   "src/eval/attestation.py": "8e95d971b5c6e1fbf4cdaaf8f397ff567c817ce3b671d9ffe98dfea9b5af76d4",
-  "src/eval/bundle.py": "b6dc1470760edf52eb258a28c6ebebb132bec8ee240b120ac5e0c3253372251e",
+  "src/eval/bundle.py": "c79966df97b0d16f6094c0aa76261788eeecc920e78256a19f3789fb87465ea2",
   "src/eval/bundle_inference.py": "13e631a5766a3050601a71628e36a1a898857a78f1ecfe31dfa23f5e77be65b0",
   "src/eval/clif_auto_labeler.py": "7dd2e544a5d9b25c15338221513ce495de2399e16a7d435ac5e179e7bc76cf65",
   "src/eval/clif_validate.py": "f3e82c5a1f5f337692efb321406cd82ee1793d2f2e317217a909b038c552a4f1",
@@ -15,6 +16,6 @@
   "src/eval/synthetic_bundle.py": "7fef07d126bb06035e0a01c00c7625a5316bee49eb0f3a3313e35c7eb027a156",
   "src/eval/trust.py": "ca206619aa6e019f90e957e99b265f984aa3a1a585f0a8ac8d760d9ce9807325",
   "src/model/head_adapter.py": "5e6af9605fff448d847b519677cb4c3f536153336629bedb4e4779e74290dc18",
-  "src/model/heads.py": "e85fc4711049c19093010743b06a4378d4dd9ca10526b1e1b616a932d92a26c9",
+  "src/model/heads.py": "e84ca829b9614c739d7a34c5c1684f850127d695d2bb433cd75ec660ba35f706",
   "src/model/varlen_attention.py": "60cf5cf782f6500472c51644f9132b2f97a2754f51b1795cc4cce3e7d5a086d6"
 }

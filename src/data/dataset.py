@@ -82,16 +82,25 @@ class ModelDataset(Dataset):
         self._gem_built: dict[str, dict[str, Any]] = {}
         if representation == "gem":
             self.records, self._gem_streams = _gem_streams(self.records)
+            # Only a stay split into several windows reads its targets more than once
+            # per epoch, so only those are cached (a single-window stay rebuilds them).
+            windows: dict[str, int] = {}
+            for record in self.records:
+                key = _episode_key(record)
+                windows[key] = windows.get(key, 0) + 1
+            self._gem_multi_window = {key for key, n in windows.items() if n > 1}
 
     def __len__(self) -> int:
         return len(self.records)
 
     def __getitem__(self, index: int) -> dict[str, Any]:
+        if self.representation == "gem":
+            # `_gem_sample` never mutates the record and copies the per-token lists it
+            # returns except the soft fields, which every consumer (collate) only reads.
+            return self._gem_sample(self.records[index])
         record = deepcopy(self.records[index])
         if self.representation == "decile":
             return self._decile_sample(record)
-        if self.representation == "gem":
-            return self._gem_sample(record)
         return self._packed_sample(record)
 
     def set_epoch(self, epoch: int) -> None:
@@ -158,12 +167,13 @@ class ModelDataset(Dataset):
             sample["input_value_mask"] = [mask for _, mask in channel]
         return sample
 
-    def _gem_sample(self, record: dict[str, Any]) -> dict[str, Any]:
+    def _gem_sample(self, record: Mapping[str, Any]) -> dict[str, Any]:
         key = _episode_key(record)
         built = self._gem_built.get(key)
         if built is None:
             built = self.target_builder.build(self._gem_streams[key], epoch=self.epoch)
-            self._gem_built[key] = built
+            if key in self._gem_multi_window:
+                self._gem_built[key] = built
         start, end = int(record["source_start"]), int(record["source_end"])
         length = end - start
         anchor = built["anchor_idx"]

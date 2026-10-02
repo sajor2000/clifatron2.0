@@ -43,6 +43,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from src.data.segments import (
     artifact_binding,
     compare_binding,
+    load_vocab_blob,
     n_value_bins as vocab_n_value_bins,
     segments_hash,
     vocab_segments,
@@ -62,7 +63,6 @@ from src.train.pretrain import Loaders, Model, build_loaders, build_scheduler
 
 TOKENIZERS = ("fused", CONTINUOUS_FUSED, "textcode")
 SCHEMES = ("clinical_segment", "decile_ablation")   # configs/data.yaml value_binning.scheme
-PATH_KEYS = ("events", "vocab", "value_stats")
 SHARED_ARM_KEYS = ("freeze_trunk", "init_checkpoint")
 
 
@@ -85,7 +85,6 @@ class TokenizationAblationModel(Model):
             encoder = None
         super().__init__(vocab_size, n_targets, mcfg, n_value_bins=n_value_bins,
                          encoder=encoder)
-        self.tokenizer = tokenizer
 
 
 @dataclass
@@ -141,7 +140,7 @@ def check_arm_vocab(arm: dict, blob: dict) -> int:
         segments = primary_segments(blob)  # verifies the recorded primary_segments hash
         sources = blob.get("primary_binning_sources") or {}
         if arm.get("primary_vocab"):
-            primary = json.loads(Path(arm["primary_vocab"]).read_text())
+            primary = load_vocab_blob(arm["primary_vocab"])
             if segments_hash(vocab_segments(primary)) != segments_hash(segments):
                 raise SystemExit(f"arm {name}: its primary segments are not those of "
                                  f"{arm['primary_vocab']}")
@@ -184,7 +183,7 @@ def setup_arm(arm: dict, *, mcfg: dict, tcfg: dict, n_targets: int, device,
               dry_run: bool = False, is_main: bool = True, seed: int = 42) -> ArmRun:
     """Model + loaders for one resolved arm (see `resolve_arm`)."""
     torch.manual_seed(seed)
-    blob = json.loads(Path(arm["vocab"]).read_text())
+    blob = load_vocab_blob(arm["vocab"])
     binding = artifact_binding(blob)  # refuses a pre-v2 vocabulary
     value_bins = check_arm_vocab(arm, blob)
     vocab_size = int(mcfg["trunk"].get("target_vocab", 10000))
@@ -208,6 +207,7 @@ def setup_arm(arm: dict, *, mcfg: dict, tcfg: dict, n_targets: int, device,
     loaders = build_loaders(
         arm["events"],
         binding=binding,
+        vocab_blob=blob,
         tcfg=tcfg,
         mcfg=mcfg,
         vocab_size=vocab_size,

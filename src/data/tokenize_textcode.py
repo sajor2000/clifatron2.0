@@ -32,6 +32,13 @@ from collections.abc import Callable, Mapping, Sequence
 
 import numpy as np
 
+from src.data.segments import (
+    ADMISSION_PREFIX,
+    DEVICE_METRIC_PREFIX,
+    DISCHARGE_PREFIX,
+    interval_label,
+)
+
 CACHE_DTYPE = np.float32
 DEFAULT_TEXTCODE_ENCODER = "thomas-sounack/BioClinical-ModernBERT-base"
 TextEncoder = Callable[[Sequence[str]], np.ndarray]
@@ -42,7 +49,6 @@ _SPECIAL_DESCRIPTIONS = {
     "<eos>": "end of the hospital stay record",
     "<unk>": "unknown clinical event",
 }
-_DEVICE_METRIC_PREFIX = "device_metric:"
 
 
 def _words(text: str) -> str:
@@ -58,8 +64,8 @@ def _unit(concept: str, blob: Mapping) -> str:
     unit = ((blob.get("reference_units") or {}).get("concepts") or {}).get(concept)
     if not isinstance(unit, str) or not unit:
         return ""
-    if unit.startswith(_DEVICE_METRIC_PREFIX):
-        return f"device metric {_words(unit[len(_DEVICE_METRIC_PREFIX):])}"
+    if unit.startswith(DEVICE_METRIC_PREFIX):
+        return f"device metric {_words(unit[len(DEVICE_METRIC_PREFIX):])}"
     return unit
 
 
@@ -70,12 +76,10 @@ def code_description(token: str, vocab_blob: Mapping) -> str:
     ``cam_total=negative`` -> ``"cam total (assessments): negative"``;
     a bare presence token -> ``"icu (adt)"``; GEM terminal tokens and specials get fixed
     phrases. The interval is the bin's segment with its closure brackets."""
-    from src.data.segments import interval_label
-
     if token in _SPECIAL_DESCRIPTIONS:
         return _SPECIAL_DESCRIPTIONS[token]
-    for prefix, phrase in (("ADMISSION//", "hospital admission type"),
-                           ("DISCHARGE//", "hospital discharge disposition")):
+    for prefix, phrase in ((ADMISSION_PREFIX, "hospital admission type"),
+                           (DISCHARGE_PREFIX, "hospital discharge disposition")):
         if token.startswith(prefix):
             return f"{phrase}: {_words(token[len(prefix):])}"
     segments = vocab_blob.get("segments") or {}
@@ -146,8 +150,7 @@ def textcode_table(vocab_blob: Mapping, vocab_size: int, *,
     if max(descriptions) >= vocab_size:
         raise ValueError(f"vocabulary id {max(descriptions)} does not fit the model's "
                          f"vocab_size {vocab_size}")
-    ids = sorted(i for i, token in ((i, t) for t, i in vocab_blob["vocab"].items())
-                 if token != "<pad>")
+    ids = sorted(i for token, i in vocab_blob["vocab"].items() if token != "<pad>")
     cached = build_textcode_embeddings([descriptions[i] for i in ids], encode=encode,
                                        model_name=model_name)
     table = np.zeros((vocab_size, cached.shape[1]), dtype=CACHE_DTYPE)

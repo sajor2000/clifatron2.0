@@ -32,15 +32,28 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import math
 from collections.abc import Mapping
 from pathlib import Path
 
+from src.data.segments import (
+    TOKENIZER_VERSION,
+    ArtifactBindingError,
+    artifact_binding,
+    binding_expr,
+    compare_binding,
+    json_sha256,
+    n_value_bins_of,
+    segments_hash,
+    vocab_segments,
+)
+# The TargetBuilder.max_abs_value_z default: a finite sentinel (e.g. a 999999 pH) is
+# masked as an input exactly as it is dropped as a value-head target.
+from src.data.targets import MAX_ABS_Z
+
 REPRESENTATION = "continuous_fused"
-# Same plausibility bound as TargetBuilder.max_abs_value_z: a finite sentinel (e.g. a
-# 999999 pH) is masked as an input exactly as it is dropped as a value-head target.
-MAX_ABS_Z = 20.0
 
 
 def normalize_value(value: float | None, token_id: int,
@@ -90,14 +103,6 @@ def continuous_fused_vocab(primary_blob: Mapping) -> tuple[dict, dict[int, int]]
     The blob is tokenizer-v2 shaped with ``segments: {}`` (nothing is binned), and
     records the primary segments + their hash so the threshold head's value bins stay
     the primary ones (`primary_segments`)."""
-    from src.data.segments import (
-        TOKENIZER_VERSION,
-        artifact_binding,
-        json_sha256,
-        segments_hash,
-        vocab_segments,
-    )
-
     segments = vocab_segments(primary_blob)  # refuses a pre-v2 vocabulary
     primary_binding = artifact_binding(primary_blob)
     vocab: dict[str, int] = {}
@@ -109,7 +114,7 @@ def continuous_fused_vocab(primary_blob: Mapping) -> tuple[dict, dict[int, int]]
         remap[int(old_id)] = vocab[key]
 
     units = primary_blob.get("reference_units") or {}
-    manifest = json.loads(json.dumps(primary_blob.get("manifest") or {}))
+    manifest = copy.deepcopy(primary_blob.get("manifest") or {})
     hashes = dict(manifest.get("hashes") or {})
     hashes.update({
         "vocabulary": json_sha256(vocab),
@@ -132,7 +137,7 @@ def continuous_fused_vocab(primary_blob: Mapping) -> tuple[dict, dict[int, int]]
         "concept_sources": primary_blob.get("concept_sources"),
         "precedence_policy": primary_blob.get("precedence_policy"),
         "representation": REPRESENTATION,
-        "primary_segments": json.loads(json.dumps(segments)),
+        "primary_segments": copy.deepcopy(segments),
         "primary_binning_sources": dict(primary_blob.get("binning_sources") or {}),
         "primary_reference_units": units,
         "manifest": manifest,
@@ -144,8 +149,6 @@ def continuous_fused_vocab(primary_blob: Mapping) -> tuple[dict, dict[int, int]]
 def primary_segments(blob: Mapping) -> Mapping:
     """The primary clinical segments a continuous-fused artifact is bound to, verified
     against the manifest's ``primary_segments`` hash (fail closed when absent/altered)."""
-    from src.data.segments import ArtifactBindingError, segments_hash
-
     segments = blob.get("primary_segments") if isinstance(blob, Mapping) else None
     recorded = ((blob.get("manifest") or {}).get("hashes") or {}).get("primary_segments") \
         if isinstance(blob, Mapping) else None
@@ -165,11 +168,8 @@ def primary_segments(blob: Mapping) -> Mapping:
 
 def primary_n_value_bins(blob: Mapping) -> int:
     """`ThresholdHazardHead` value-bin count of a continuous-fused arm: the primary
-    clinical segments' (`segments.n_value_bins`)."""
-    from src.data.segments import TOKENIZER_VERSION, n_value_bins
-
-    return n_value_bins({"segments": primary_segments(blob),
-                         "manifest": {"tokenizer_version": TOKENIZER_VERSION}})
+    clinical segments' (`segments.n_value_bins_of`)."""
+    return n_value_bins_of(primary_segments(blob))
 
 
 def derive_continuous_fused_shard(primary_events, primary_blob: Mapping,
@@ -180,22 +180,27 @@ def derive_continuous_fused_shard(primary_events, primary_blob: Mapping,
     row must be bound to `primary_blob` (KTD7)."""
     import polars as pl
 
-    from src.data.segments import artifact_binding, compare_binding
-
     expected = artifact_binding(primary_blob)
-    for hashes in primary_events["artifact_hashes"].to_list():
+    # Distinct bindings in first-appearance order: the first mismatch is the first
+    # mismatching row's, as a row-by-row check would report.
+    for hashes in primary_events["artifact_hashes"].unique(maintain_order=True).to_list():
         compare_binding(hashes, expected, what="primary shard row")
     binding = artifact_binding(continuous_blob)
     lookup = {int(k): int(v) for k, v in remap.items()}
     frame = primary_events.drop([c for c in ("soft_token", "soft_weight")
                                  if c in primary_events.columns])
-    tokens = [[lookup[int(i)] for i in ids] for ids in frame["token"].to_list()]
-    frame = frame.with_columns(
-        pl.Series("token", tokens, dtype=frame.schema["token"]),
-        pl.struct([pl.lit(v, pl.String).alias(k) for k, v in binding.items()])
-        .alias("artifact_hashes"),
-    )
-    return frame
+    dtype = frame.schema["token"]
+    old = frame["token"]
+    tokens = old.list.eval(pl.element().replace_strict(
+        list(lookup), list(lookup.values()), default=None, return_dtype=dtype.inner))
+    n_empty = int((old.list.len() == 0).sum())
+    if (old.null_count() or tokens.explode(empty_as_null=True).null_count() != n_empty
+            or old.explode(empty_as_null=True).null_count() != n_empty):
+        # A null list / id, or an id the remap lacks: the per-id lookup raises exactly
+        # the error it always has (TypeError / KeyError).
+        tokens = pl.Series("token", [[lookup[int(i)] for i in ids] for ids in old.to_list()],
+                           dtype=dtype)
+    return frame.with_columns(tokens.alias("token"), binding_expr(binding))
 
 
 def write_continuous_fused_arm(primary_vocab: str | Path, primary_events: str | Path,

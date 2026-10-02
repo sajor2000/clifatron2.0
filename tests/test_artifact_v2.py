@@ -139,6 +139,17 @@ class ArtifactV2Test(unittest.TestCase):
         with self.assertRaisesRegex(QualificationError, "precedence policy"):
             validate_vocabulary_artifact(bad, self.cfg, self.policy)
 
+    def test_a_policy_v1_vocabulary_is_refused_with_a_retokenize_message(self):
+        """Policy v2 changed dose segments (step 8), so a v1-built vocabulary's dose bins
+        disagree with this build: refused, never reused."""
+        from src.data.tokenize import validate_vocabulary_artifact
+
+        old = copy.deepcopy(self.blob)
+        old["precedence_policy"] = 1
+        old["manifest"]["provenance"]["precedence_policy"] = 1
+        with self.assertRaisesRegex(QualificationError, "precedence policy 1.*re-tokeni[sz]e"):
+            validate_vocabulary_artifact(old, self.cfg, self.policy)
+
     def test_n_value_bins_is_max_segments_plus_one(self):
         from src.data.segments import n_value_bins
 

@@ -32,7 +32,7 @@ import yaml
 from torch.nn.parallel import DistributedDataParallel as DDP
 
 from src.model.encoder import count_params
-from src.data.segments import artifact_binding, n_value_bins
+from src.data.segments import artifact_binding, load_vocab_blob, n_value_bins
 from src.model.head_adapter import CLIFATRONHeads, load_backbone
 from src.train.engine import TrainConfig, train
 from src.train.pretrain import Model, build_loaders, build_scheduler
@@ -72,15 +72,6 @@ class AdapterModel(torch.nn.Module):
 
 
 # -------------------------------------------------------------------- driver
-def load_n_value_bins(path: str | Path) -> int:
-    """Threshold-head value-bin count from a tokenizer-v2 vocab.json (never a default)."""
-    path = Path(path)
-    if not path.exists():
-        raise SystemExit(f"{path} is required: n_value_bins is derived from the frozen "
-                         "vocabulary's segments")
-    return n_value_bins(json.loads(path.read_text()))
-
-
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--arm", required=True)
@@ -117,8 +108,11 @@ def main():
     )
     vocab_size = mcfg["trunk"].get("target_vocab", 10000)
     total_steps = arm_cfg["total_steps"]
-    vocab_path = Path(args.vocab or Path(args.data) / "vocab.json")
-    value_bins = load_n_value_bins(vocab_path)
+    # The threshold head's value-bin count comes from the vocabulary (never a default).
+    vocab_blob = load_vocab_blob(
+        Path(args.vocab or Path(args.data) / "vocab.json"),
+        required_for="n_value_bins is derived from the frozen vocabulary's segments")
+    value_bins = n_value_bins(vocab_blob)
 
     # --------------- build model
     if arm_cfg["trunk"] in ("clif_encoder",):
@@ -146,10 +140,11 @@ def main():
 
     # --------------- data: the shared pretrain loader path (shard rows and value stats
     # bound to the vocabulary; TargetBuilder masks; length-grouped / DDP samplers)
-    binding = artifact_binding(json.loads(vocab_path.read_text()))
+    binding = artifact_binding(vocab_blob)
     loaders = build_loaders(
         Path(args.events or Path(args.data) / "events.parquet"),
         binding=binding,
+        vocab_blob=vocab_blob,
         tcfg=tcfg,
         mcfg=mcfg,
         vocab_size=vocab_size,

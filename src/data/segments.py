@@ -1,4 +1,4 @@
-"""Closure-aware value segments, precedence policy v1, and THE binning function.
+"""Closure-aware value segments, precedence policy v2, and THE binning function.
 
 A binned concept is an ordered list of segments, each a plain JSON-serializable dict
 ``{"lo": float | None, "hi": float | None, "lo_closed": bool, "hi_closed": bool}``.
@@ -6,14 +6,16 @@ A point bin has ``lo == hi`` with both ends closed. ``None`` is an unbounded end
 only used by quantile (decile) segments; physician CSV segments are always finite. The
 fused token for a value is ``concept=<segment index>``.
 
-`bin_index` is the only code path that maps a value to a bin. Everything else
-(`tokenize._bin_of`, soft discretization, and later the threshold query, plausibility,
-viewer, generation and the site package) must delegate to it.
+`bin_index` is the only code path that maps a value to a bin (`Binner` is the same
+rules compiled once per concept, for the tokenizer's encode loop; `bin_index` is one
+`Binner` applied once). Everything else (`tokenize._bin_of`, soft discretization, and
+later the threshold query, plausibility, viewer, generation and the site package) must
+delegate to it.
 
 Physician CSV interval flags: ``[`` is ``>=``, ``(`` is ``>``, ``]`` is ``<=``, ``)`` is
 ``<``. A row with ``exact_dose_token == 1`` matches only ``value == min_value``.
 
-PRECEDENCE POLICY v1 (applied in this order; recorded in the vocabulary artifact):
+PRECEDENCE POLICY v2 (applied in this order; recorded in the vocabulary artifact):
 
 1. Boundaries within 1e-6 relative of each other are merged onto one value (a forced
    edge wins the merge; otherwise the smallest value does).
@@ -32,8 +34,18 @@ PRECEDENCE POLICY v1 (applied in this order; recorded in the vocabulary artifact
 5. A value in a gap goes to the nearest segment; an equidistant value goes to the lower.
 6. A value beyond the floor or ceiling clamps to the end segment.
 7. CSV measurement prefix ``angiotension`` is aliased to CLIF ``angiotensin``.
+8. Dose concepts (v2): every dose concept has a ``[0, 0]`` stop bin, and NO strictly
+   positive dose may reach it through the gap rule. When the segment after the stop bin
+   starts above 0 (the CSV gives lorazepam_mg_hr only ``[0, 0]`` and ``[1, 1]`` below
+   1 mg/hr; an ordinal dose has points 0, 1, 2, ...), an open running-dose segment
+   ``(0, next.lo)`` is inserted, its upper end the complement of the next segment's
+   lower closure. A new segment rather than extending the next one down to 0: the
+   next segment may be a physician point bin (``[1, 1]``), which must stay a point.
+   (`with_zero_point`; quantile doses already start ``(0, e0)``.)
 
-Steps 5 and 6 are applied by `bin_index`; the rest when segments are built.
+Steps 5 and 6 are applied by `bin_index`; the rest when segments are built. v1 (no
+step 8) put a running 0.25-0.5 mg/hr lorazepam infusion in the stop bin; a v1-built
+vocabulary is refused (`tokenize.validate_vocabulary_artifact`).
 
 ARTIFACT BINDING (tokenizer v2, KTD7). `vocab.json` v2 stores the segments under
 ``"segments"`` and ``manifest.tokenizer_version == 2``. `artifact_binding` is the
@@ -51,7 +63,7 @@ import math
 from pathlib import Path
 from typing import Iterable, Mapping, Sequence
 
-POLICY_VERSION = 1
+POLICY_VERSION = 2
 TOKENIZER_VERSION = 2
 RETOKENIZE = ("re-tokenize the reference site with the current tokenizer (rebuild "
               "vocab.json), then rebuild every shard, value-stats file and checkpoint "
@@ -62,6 +74,15 @@ DIRECTIONS = ("above", "below")
 
 _LO_FLAGS = {"[": True, "(": False}
 _HI_FLAGS = {"]": True, ")": False}
+
+# Vocabulary constants every tokenizer-v2 consumer shares (re-exported by
+# `src.data.tokenize`): the special ids every vocabulary reserves, the GEM framing-token
+# prefixes, and a device table's metric "unit" prefix in `reference_units`.
+SPECIAL = {"<pad>": 0, "<bos>": 1, "<eos>": 2, "<unk>": 3}
+UNK_ID = SPECIAL["<unk>"]
+ADMISSION_PREFIX = "ADMISSION//"
+DISCHARGE_PREFIX = "DISCHARGE//"
+DEVICE_METRIC_PREFIX = "device_metric:"
 
 
 def make_segment(lo: float | None, hi: float | None, lo_closed: bool, hi_closed: bool) -> dict:
@@ -131,7 +152,8 @@ def bin_index(value: float | None, segments: Sequence[Mapping]) -> int | None:
 
     Point segments first, then intervals (policy steps 1-4 already made these a strict
     partition), then the gap rule (nearest; equidistant -> lower), then clamping to the
-    end segment. None, NaN and +/-inf get no bin."""
+    end segment. None, NaN and +/-inf get no bin. (`Binner` holds the rules; this is
+    one `Binner` applied once.)"""
     if value is None or not segments:
         return None
     try:
@@ -140,22 +162,89 @@ def bin_index(value: float | None, segments: Sequence[Mapping]) -> int | None:
         return None
     if not math.isfinite(v):
         return None
-    for i, seg in enumerate(segments):
-        if is_point(seg) and seg["lo"] == v:
+    return Binner(segments).index(v)
+
+
+class Binner:
+    """`bin_index`'s rules over ONE concept's segments, compiled once for repeated use
+    (the tokenizer's encode loop): point segments become a value -> index map and the
+    interval bounds a list. Every segment's ``lo``/``hi`` is read up front; closure
+    flags and the clamp/gap bounds are read only when a rule needs them, as the plain
+    scan does."""
+
+    __slots__ = ("segments", "_points", "_intervals")
+
+    def __init__(self, segments: Sequence[Mapping]):
+        self.segments = segments
+        points: dict[float, int] = {}
+        intervals: list[tuple[int, float | None, float | None, Mapping]] = []
+        for i, seg in enumerate(segments):
+            if is_point(seg):
+                points.setdefault(seg["lo"], i)   # the first point segment wins
+            else:
+                intervals.append((i, seg["lo"], seg["hi"], seg))
+        self._points = points
+        self._intervals = intervals
+
+    def index(self, v: float) -> int:
+        """Bin of a FINITE float `v` (`bin_index` screens None / NaN / +-inf)."""
+        i = self._points.get(v)
+        if i is not None:
             return i
-    for i, seg in enumerate(segments):
-        if not is_point(seg) and contains(seg, v):
+        for i, lo, hi, seg in self._intervals:
+            if lo is not None and (v < lo or (v == lo and not seg["lo_closed"])):
+                continue
+            if hi is not None and (v > hi or (v == hi and not seg["hi_closed"])):
+                continue
             return i
-    first, last = segments[0], segments[-1]
-    if first["lo"] is not None and v <= first["lo"]:
-        return 0
-    if last["hi"] is not None and v >= last["hi"]:
-        return len(segments) - 1
-    for i in range(len(segments) - 1):
-        below, above = segments[i]["hi"], segments[i + 1]["lo"]
-        if below <= v <= above:
-            return i if (v - below) <= (above - v) else i + 1
-    raise ValueError(f"segments are not a sorted partition; cannot bin {v!r}")
+        segments = self.segments
+        first, last = segments[0], segments[-1]
+        if first["lo"] is not None and v <= first["lo"]:
+            return 0
+        if last["hi"] is not None and v >= last["hi"]:
+            return len(segments) - 1
+        for i in range(len(segments) - 1):
+            below, above = segments[i]["hi"], segments[i + 1]["lo"]
+            if below <= v <= above:
+                return i if (v - below) <= (above - v) else i + 1
+        raise ValueError(f"segments are not a sorted partition; cannot bin {v!r}")
+
+
+PLACEMENTS = ("inside", "gap", "clamp_low", "clamp_high")
+
+
+def classify_values(values, segments: Sequence[Mapping]) -> dict[str, int]:
+    """Aggregate counts of WHICH `bin_index` rule placed each finite value (R16): inside a
+    segment (point or interval), in a gap between segments (policy step 5), or beyond
+    the floor / ceiling (step 6, clamped). Vectorized over `values` (any array-like);
+    non-finite values are not counted (they get no bin)."""
+    import numpy as np
+
+    v = np.asarray(values, dtype=float)
+    v = v[np.isfinite(v)]
+    inside = np.zeros(v.shape, dtype=bool)
+    for seg in segments:
+        lo, hi = seg["lo"], seg["hi"]
+        if is_point(seg):
+            inside |= v == lo
+            continue
+        mask = np.ones(v.shape, dtype=bool)
+        if lo is not None:
+            mask &= (v >= lo) if seg["lo_closed"] else (v > lo)
+        if hi is not None:
+            mask &= (v <= hi) if seg["hi_closed"] else (v < hi)
+        inside |= mask
+    rest = ~inside
+    first_lo, last_hi = segments[0]["lo"], segments[-1]["hi"]
+    low = rest & (v <= first_lo) if first_lo is not None else np.zeros(v.shape, dtype=bool)
+    high = (rest & ~low & (v >= last_hi) if last_hi is not None
+            else np.zeros(v.shape, dtype=bool))
+    return {
+        "inside": int(inside.sum()),
+        "gap": int((rest & ~low & ~high).sum()),
+        "clamp_low": int(low.sum()),
+        "clamp_high": int(high.sum()),
+    }
 
 
 def threshold_bin(threshold: float, segments: Sequence[Mapping], direction: str) -> int:
@@ -211,8 +300,15 @@ def soft_bins(value: float | None, segments: Sequence[Mapping],
     A missing/categorical value pads a single ``(None, 1.0)`` assignment so every event
     yields the same-length list for the [B,T,K] tensor the encoder expects."""
     k = max(int(kernel_bins), 0)
+    return soft_bins_at(value, segments, k, bin_index(value, segments))
+
+
+def soft_bins_at(value: float | None, segments: Sequence[Mapping], kernel_bins: int,
+                 hard: int | None) -> list[tuple[int | None, float]]:
+    """`soft_bins` around an already-computed hard bin ``hard == bin_index(value,
+    segments)`` (the encode loop bins each value once and reuses it here)."""
+    k = max(int(kernel_bins), 0)
     width = 2 * k + 1
-    hard = bin_index(value, segments)
 
     def uniform(b: int | None) -> list[tuple[int | None, float]]:
         return [(b, 1.0)] + [(b, 0.0)] * (width - 1)
@@ -248,7 +344,7 @@ def soft_bins(value: float | None, segments: Sequence[Mapping],
     return list(zip(bins, weights))
 
 
-# ---- building segments under precedence policy v1 -------------------------------------
+# ---- building segments under precedence policy v2 -------------------------------------
 
 def _close(a: float, b: float) -> bool:
     return abs(a - b) <= MERGE_REL_TOL * max(abs(a), abs(b))
@@ -334,7 +430,8 @@ def _insert_point(segments: list[dict], v: float) -> list[dict]:
 
 def build_segments(rows: Sequence[Mapping], forced_edges: Iterable[float] = (),
                    direction: str | None = None) -> list[dict]:
-    """Apply precedence policy v1 to one concept's raw rows -> strict partition.
+    """Apply precedence policy steps 1-4 to one concept's raw rows -> strict partition
+    (step 8, dose concepts, is `with_zero_point`).
 
     Each row is ``{"lo", "hi", "lo_closed", "hi_closed"}`` plus optional ``"exact"``
     (CSV ``exact_dose_token == 1``: matches only ``value == lo``)."""
@@ -441,11 +538,20 @@ def has_zero_point(segments: Sequence[Mapping]) -> bool:
 
 
 def with_zero_point(segments: Sequence[Mapping]) -> list[dict]:
-    """A dose concept's ``[0, 0]`` stop bin (KTD3). Segments that already carry one (the
-    CSV medication rows do) are returned unchanged, so it is never duplicated."""
-    if has_zero_point(segments):
-        return [dict(s) for s in segments]
-    out = _insert_point([dict(s) for s in segments], 0.0)
+    """A dose concept's ``[0, 0]`` stop bin (KTD3) with no gap above it (policy step 8).
+
+    The stop bin is added unless the segments already carry one (the CSV medication rows
+    do), so it is never duplicated. If the next segment then starts above 0, an open
+    ``(0, next.lo)`` running-dose segment fills the gap, so a strictly positive dose can
+    never be binned as stopped by the gap rule."""
+    out = [dict(s) for s in segments]
+    if not has_zero_point(out):
+        out = _insert_point(out, 0.0)
+    zero = next(i for i, s in enumerate(out) if is_point(s) and s["lo"] == 0.0)
+    if zero + 1 < len(out):
+        nxt = out[zero + 1]
+        if nxt["lo"] is not None and nxt["lo"] > 0.0:
+            out.insert(zero + 1, make_segment(0.0, nxt["lo"], False, not nxt["lo_closed"]))
     validate_partition(out)
     return out
 
@@ -513,10 +619,25 @@ def n_value_bins(vocab_blob: Mapping) -> int:
     """`ThresholdHazardHead` value-bin count from the frozen vocabulary: the largest
     segment count over every binned concept, plus one. Derived here, never hard-coded,
     so a concept with more bins than a default can never index past the embedding."""
-    segments = vocab_segments(vocab_blob)
+    return n_value_bins_of(vocab_segments(vocab_blob))
+
+
+def n_value_bins_of(segments: Mapping) -> int:
+    """`n_value_bins` of a ``{concept: segments}`` map (e.g. a continuous-fused arm's
+    primary clinical segments)."""
     if not segments:
         raise ArtifactBindingError("vocabulary artifact has no binned concepts")
     return max(len(segs) for segs in segments.values()) + 1
+
+
+def load_vocab_blob(path: str | Path, *, required_for: str | None = None) -> dict:
+    """Read a vocab.json artifact (unvalidated; `vocab_segments` / `artifact_binding`
+    refuse a pre-v2 one). With `required_for`, a missing file exits the CLI with
+    ``"<path> is required: <required_for>"`` instead of raising FileNotFoundError."""
+    path = Path(path)
+    if required_for is not None and not path.exists():
+        raise SystemExit(f"{path} is required: {required_for}")
+    return json.loads(path.read_text())
 
 
 def artifact_binding(vocab_blob: Mapping) -> dict[str, str]:
@@ -528,6 +649,30 @@ def artifact_binding(vocab_blob: Mapping) -> dict[str, str]:
         "vocabulary": json_sha256(vocab_blob["vocab"]),
         "numeric_edges": segments_hash(segments),
     }
+
+
+def binding_expr(binding: Mapping[str, str]):
+    """The polars ``artifact_hashes`` struct literal every shard row of an artifact
+    carries (`artifact_binding`, one String field per key)."""
+    import polars as pl
+
+    return pl.struct([pl.lit(v, pl.String).alias(k) for k, v in binding.items()]) \
+        .alias("artifact_hashes")
+
+
+SAMPLE_VOCAB_REFUSAL = (
+    "was built from a verification sample (vocab.json provenance.sample: true, "
+    "`--sample-episodes` / `limit_stays`): it is smoke/dry-run only. Fit the production "
+    "vocabulary on the reference site's FULL train partition (re-tokenize without "
+    "--sample-episodes), then rebuild every shard, value-stats file and checkpoint from it"
+)
+
+
+def is_sample_vocab(vocab_blob: Mapping) -> bool:
+    """KTD9: True when the vocabulary was fit on a verification sample of episodes."""
+    manifest = vocab_blob.get("manifest") if isinstance(vocab_blob, Mapping) else None
+    provenance = (manifest or {}).get("provenance") if isinstance(manifest, Mapping) else None
+    return bool((provenance or {}).get("sample")) if isinstance(provenance, Mapping) else False
 
 
 def check_binding(recorded: Mapping | None, vocab_blob: Mapping, *, what: str) -> None:
@@ -595,7 +740,8 @@ def load_csv_segments(
     forced_edges: Mapping[str, Iterable[float]] | None = None,
     directions: Mapping[str, str] | None = None,
 ) -> dict[str, list[dict]]:
-    """Per-concept strict partitions from the physician CSV under policy v1."""
+    """Per-concept strict partitions from the physician CSV (policy steps 1-4, 7; the
+    tokenizer applies step 8 to dose concepts)."""
     forced_edges = forced_edges or {}
     directions = directions or {}
     wanted = None if concepts is None else set(concepts)

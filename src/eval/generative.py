@@ -54,13 +54,19 @@ from pathlib import Path
 
 import polars as pl
 
-from src.data.segments import vocab_segments
+from src.data.segments import (
+    artifact_binding,
+    compare_binding,
+    load_vocab_blob,
+    vocab_segments,
+)
 from src.eval.clinical_plausibility import split_sequence
 from src.eval.metrics import calibration_slope_intercept
 from src.eval.metrics import score as discrimination
 from src.model.generate import (
     STOP_CENSORED,
     STOP_EOS,
+    STOP_REASONS,
     STOP_TERMINAL,
     TIME_UNAVAILABLE_REASON,
     stay_stream,
@@ -256,6 +262,20 @@ def _load_sims(
     return out
 
 
+def check_events_binding(events_path: str | Path, vocab_artifact: dict) -> None:
+    """Refuse a real-events shard unless every distinct `artifact_hashes` value it
+    carries is the binding of `vocab_artifact` (tokenizer version, vocabulary and
+    segments hashes): decoding a shard with another vocabulary's id_to_token would
+    silently score the rollouts against the wrong tokens. A shard with no binding
+    predates tokenizer v2 and is refused with the re-tokenize message."""
+    expected = artifact_binding(vocab_artifact)
+    if "artifact_hashes" not in pl.read_parquet_schema(events_path):
+        compare_binding(None, expected, what="real events shard")
+    hashes = pl.read_parquet(events_path, columns=["artifact_hashes"])["artifact_hashes"]
+    for recorded in hashes.unique(maintain_order=True).to_list():
+        compare_binding(recorded, expected, what="real events shard")
+
+
 def _load_real(events_path: str | Path, id_to_token: dict[int, str]) -> list[dict]:
     df = pl.read_parquet(events_path)
     rows = df.to_dicts()
@@ -376,7 +396,7 @@ def rollout_mortality(records: list[dict], *, dispositions: tuple[str, ...] = ()
     separately and never counted as survival. `mortality` and its Wilson CI are None
     when no rollout reached a known disposition."""
     reasons = Counter(r["stop_reason"] for r in records)
-    unexpected = set(reasons) - {STOP_TERMINAL, STOP_EOS, STOP_CENSORED}
+    unexpected = set(reasons) - set(STOP_REASONS)
     if unexpected:
         raise ValueError(f"unknown stop_reason(s): {sorted(unexpected)}")
     terminals = Counter(r["terminal_type"] for r in records
@@ -518,7 +538,7 @@ def main(argv: list[str] | None = None) -> None:
     ap.add_argument("--out", default=None, help="site-local JSON report path (output/ tree)")
     args = ap.parse_args(argv)
 
-    vocab_artifact = json.loads(Path(args.vocab).read_text())
+    vocab_artifact = load_vocab_blob(args.vocab)
     vocab_segments(vocab_artifact)  # refuses a pre-v2 vocabulary (re-tokenize)
     vocab = vocab_artifact["vocab"]
     id_to_token = {int(i): t for t, i in vocab.items()}
@@ -526,6 +546,7 @@ def main(argv: list[str] | None = None) -> None:
     groups = concept_groups(data_config, vocab_artifact)
 
     sims = _load_sims(args.sims, vocab=set(vocab))
+    check_events_binding(args.events, vocab_artifact)   # before decoding with this vocab
     real = _load_real(args.events, id_to_token)
 
     prompt_source = None

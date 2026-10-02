@@ -9,6 +9,7 @@ import duckdb
 import polars as pl
 import yaml
 
+from src.data.segments import POLICY_VERSION
 from src.data.splits import content_manifest
 from src.data.tokenize import (
     _read_table,
@@ -179,7 +180,7 @@ class DataConfigTest(unittest.TestCase):
             "provenance": {
                 "source_site": "synthetic-reference",
                 "fit_partition": "train",
-                "precedence_policy": 1,
+                "precedence_policy": POLICY_VERSION,
                 "immutable": True,
             },
         }
@@ -187,7 +188,7 @@ class DataConfigTest(unittest.TestCase):
         def artifact(**over):
             blob = {"vocab": vocab, "segments": segments, "manifest": manifest,
                     "binning_sources": binning_sources, "reference_units": reference_units,
-                    "concept_sources": concept_sources, "precedence_policy": 1}
+                    "concept_sources": concept_sources, "precedence_policy": POLICY_VERSION}
             blob.update(over)
             return blob
 

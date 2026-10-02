@@ -10,9 +10,9 @@ Run:
 from __future__ import annotations
 
 import argparse
-import json
 import logging
 import math
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -33,7 +33,14 @@ from src.model.heads import (
 )
 from src.data.dataset import LengthGroupedSampler, ModelDataset, TokenBudgetBatchSampler
 from src.data.collate import collate_model_samples
-from src.data.segments import artifact_binding, n_value_bins
+from src.data.segments import (
+    SAMPLE_VOCAB_REFUSAL,
+    artifact_binding,
+    compare_binding,
+    is_sample_vocab,
+    load_vocab_blob,
+    n_value_bins,
+)
 from src.data.targets import TargetBuilder
 from src.train.engine import setup_ddp, is_distributed, TrainConfig, train
 
@@ -284,6 +291,7 @@ def build_loaders(
     events_path: str | Path,
     *,
     binding: dict[str, str],
+    vocab_blob: Mapping,
     tcfg: dict,
     mcfg: dict,
     vocab_size: int,
@@ -301,7 +309,14 @@ def build_loaders(
     outcomes, its sibling `events_with_outcomes.parquet` is used (refused when stale).
     `soft` selects hard vs soft encoder inputs (see `_apply_soft_policy`);
     `value_channel` adds the normalized current-value field (continuous-fused arm).
+
+    `vocab_blob` is that vocab.json itself: it must match `binding`, and a vocabulary
+    fit on a verification sample (`provenance.sample: true`, KTD9) is refused unless
+    `dry_run` — a sample vocabulary is smoke-only.
     """
+    compare_binding(binding, artifact_binding(vocab_blob), what="training binding")
+    if is_sample_vocab(vocab_blob) and not dry_run:
+        raise SystemExit(f"refusing to train: the vocabulary {SAMPLE_VOCAB_REFUSAL}")
     # Bind value-stats to the data's vocabulary AND segments so a stale /
     # cross-vocabulary / cross-bin stats file is rejected rather than silently applying
     # unrelated centers/scales.
@@ -511,11 +526,8 @@ def main():
 
     # KTD7: the data's tokenizer-v2 vocabulary binds everything below — the threshold
     # head's value-bin count, the shard rows, the value stats and every checkpoint.
-    vocab_path = Path(args.data) / "vocab.json"
-    if not vocab_path.exists():
-        raise SystemExit(f"{vocab_path} is required: training is bound to its vocabulary "
-                         "and segments")
-    vblob = json.loads(vocab_path.read_text())
+    vblob = load_vocab_blob(Path(args.data) / "vocab.json",
+                            required_for="training is bound to its vocabulary and segments")
     binding = artifact_binding(vblob)  # refuses a pre-v2 vocabulary (re-tokenize)
 
     model = Model(vocab_size, n_targets, mcfg, n_value_bins=n_value_bins(vblob)).to(dev)
@@ -525,6 +537,7 @@ def main():
     loaders = build_loaders(
         Path(args.data) / "events.parquet",
         binding=binding,
+        vocab_blob=vblob,
         tcfg=tcfg,
         mcfg=mcfg,
         vocab_size=vocab_size,
