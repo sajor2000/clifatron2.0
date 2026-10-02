@@ -681,3 +681,17 @@ clean. New this firing: remote branch
 `t3code/audit-tokenization-documentation` appeared (one commit, `046f805`,
 docs audit, 38 files, not merged to main). Not merged or reviewed — noted
 for the user. Launch blocked only on user infrastructure (17:20).
+
+### 2026-10-02 15:00 — Repo hygiene PR #15 merged mid-loop; protocol change adopted
+
+origin/main advanced 9 commits (`c5884f5` → `25b45ab`); fast-forwarded clean.
+PR #15 (`t3code/audit-tokenization-documentation`) merged: 131 no-op
+idle-verify entries collapsed to one summary line (log now 684 lines);
+**new protocol adopted — no-op passes are no longer logged or committed**;
+vendored impeccable skill untracked; `configs/data.yaml` notes.encoder
+aligned to BioClinical-ModernBERT-base and locked with a test; review
+fixes applied. Both suites re-verified on the new main: tests/ 430 passed
+4 skipped (+1 = the new notes-encoder config-lock test), clif-validate/ 32.
+Guardrails re-checked on the new tree: zero tracked data files, `/output/`
+ignored, working tree clean. Viewer alive with all five sources. Launch
+blocked only on user infrastructure (17:20).
