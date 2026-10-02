@@ -16,8 +16,12 @@ Each event is ONE FUSED token: `concept=bin` (numeric), `concept=<value>` (a cat
 result on a row with no numeric value, from a table's `categorical_value_col`), or bare
 `concept` (presence).
 Position is minutes since ICU admission (`pos_min`). Events are ordered by their
-availability timestamp (storetime semantics). Full spec, including known issues:
-website/docs/data-tokenization.md.
+availability timestamp (storetime semantics), then the stable tiebreak (source, concept,
+value), sorted AFTER the observation-window join so identical input always yields an
+identical stream (KTD6). Every table declares its availability semantics
+(`availability: result | recorded | missing_storetime`) and an optional conservative
+`availability_lag_minutes` applied before windowing (R12). Full spec, including known
+issues: website/docs/data-tokenization.md.
 
 Usage:
     python -m src.data.tokenize --site mimic --in $MIMIC_DIR --out output/intermediate_phi/mimic --build-vocab --episodes output/intermediate_phi/episodes.parquet
@@ -64,6 +68,14 @@ ROOT = Path(__file__).parents[2]
 COVERAGES = ("all", "targets_only")
 BINNING_SOURCES = ("csv", "ordinal", "quantile", "single")
 DEFAULT_DOSE_SOURCES = ("meds", "meds_intermittent")
+# R12: what a table's `availability_col` means. `result` = the time a result became
+# available (e.g. lab_result_dttm); `recorded` = the time the event was charted
+# (e.g. admin_dttm, in_dttm); `missing_storetime` = CLIF carries no store time for the
+# table, so `recorded_dttm` stands in and may precede true availability.
+AVAILABILITY_SEMANTICS = ("result", "recorded", "missing_storetime")
+# KTD6: the full event order within a stay. Applied after the observation-window join.
+# `cat_value` is a trailing tiebreak so value-only categorical rows are ordered too.
+EVENT_ORDER = ("hosp_id", "dttm", "source", "concept", "value", "cat_value")
 
 
 def _json_sha256(value: object) -> str:
@@ -126,9 +138,39 @@ def validate_vocabulary_artifact(
     return blob["vocab"], blob["edges"], manifest
 
 
+def validate_table_availability(tables: dict) -> dict[str, dict]:
+    """Require an availability declaration on every configured table (R12).
+
+    Returns ``{table: {"availability": semantics, "lag_minutes": lag}}``. A table with no
+    (or an unknown) `availability`, or a lag that is not a non-negative integer number of
+    minutes, fails closed: an undeclared table would silently be read as if its
+    timestamp were the time the value was knowable."""
+    if not isinstance(tables, dict) or not tables:
+        raise QualificationError("data config declares no tables")
+    declared: dict[str, dict] = {}
+    for name, spec in tables.items():
+        semantics = spec.get("availability") if isinstance(spec, dict) else None
+        if semantics not in AVAILABILITY_SEMANTICS:
+            raise QualificationError(
+                f"table {name!r} must declare availability as one of "
+                f"{', '.join(AVAILABILITY_SEMANTICS)} (got {semantics!r})"
+            )
+        lag = spec.get("availability_lag_minutes", 0)
+        if isinstance(lag, bool) or not isinstance(lag, int) or lag < 0:
+            raise QualificationError(
+                f"table {name!r} availability_lag_minutes must be a non-negative "
+                f"integer (got {lag!r})"
+            )
+        declared[name] = {"availability": semantics, "lag_minutes": lag}
+    return declared
+
+
 def _read_table(con, base: Path, spec: dict,
                 keep_ids: list | None = None) -> pl.DataFrame:
-    """Melt one CLIF table to long events ordered by its availability timestamp.
+    """Melt one CLIF table to long events keyed by its availability timestamp.
+
+    Row order is NOT meaningful here; `tokenize_site` imposes the full KTD6 order after
+    the observation-window join.
 
     If `keep_ids` is given, only rows for those hospitalization_ids are read
     (pushed into the SQL WHERE so the 45M+ row tables are filtered on scan, not
@@ -594,6 +636,7 @@ def tokenize_site(cfg: dict, site: str, base: Path, out: Path,
              "binning_sources": binning_sources},
             cfg, policy,
         )
+    availability = validate_table_availability(cfg.get("tables"))
     con = duckdb.connect()
     # DuckDB renders TIMESTAMPTZ columns in the SESSION timezone, so on a non-UTC
     # host every tz-aware parquet came back as e.g. America/Chicago and
@@ -620,11 +663,19 @@ def tokenize_site(cfg: dict, site: str, base: Path, out: Path,
     for name, spec in cfg["tables"].items():
         df = _read_table(con, base, spec, keep_ids=keep_ids)
         if len(df):
+            lag = availability[name]["lag_minutes"]
+            if lag:
+                # Conservative availability (R12): the value becomes knowable `lag`
+                # minutes after its timestamp, so shift BEFORE windowing — an event
+                # whose shifted time passes the anchor is excluded, and a kept event
+                # is positioned at its shifted time.
+                df = df.with_columns(pl.col("dttm") + pl.duration(minutes=lag))
             df = df.with_columns(source=pl.lit(name))
             frames.append(df)
     if not frames:
         raise QualificationError("no configured CLIF event tables were found")
-    events = pl.concat(frames, how="vertical_relaxed").sort(["hosp_id", "dttm"])
+    # No sort here: join order is not guaranteed, so the order is imposed after it.
+    events = pl.concat(frames, how="vertical_relaxed")
     validate_units(events, cfg)
 
     if episodes is None:
@@ -633,6 +684,12 @@ def tokenize_site(cfg: dict, site: str, base: Path, out: Path,
         name for name, spec in cfg["tables"].items() if spec.get("input_only")
     }
     events = restrict_to_observation_window(events, episodes, treatment_sources)
+    # KTD6: full-key sort AFTER the join (polars does not guarantee row order for equal
+    # keys through a join or an unmaintained sort). Nulls sort last so a missing value
+    # or categorical result has one fixed place; `group_by(maintain_order=True)` below
+    # hands `encode` each stay's rows in exactly this order.
+    order = [key for key in EVENT_ORDER if key in events.columns]
+    events = events.sort(order, nulls_last=True, maintain_order=True)
 
     # Guard: verify single-hospital consistency for reference-site vocab.
     # hospital_id is a CLIF 2.1 column that distinguishes hospitals within
@@ -691,6 +748,14 @@ def tokenize_site(cfg: dict, site: str, base: Path, out: Path,
                 "cohort_contract_version": episodes["cohort_contract_version"].item(0),
                 # Segment precedence policy (src/data/segments.py) the edges were built under.
                 "precedence_policy": POLICY_VERSION,
+                # R12: per-table availability semantics and lag, for the tokenization
+                # report. Provenance only — deliberately not a compatibility hash.
+                "availability": {
+                    name: spec["availability"] for name, spec in availability.items()
+                },
+                "availability_lag_minutes": {
+                    name: spec["lag_minutes"] for name, spec in availability.items()
+                },
             },
         }
         by_source = {
@@ -821,6 +886,7 @@ def main():
     args = ap.parse_args()
 
     cfg = yaml.safe_load(Path(args.config).read_text())
+    validate_table_availability(cfg.get("tables"))
     policy = yaml.safe_load((ROOT / cfg["artifact_policy"]).read_text())
     vocab, edges, vocab_manifest, binning_sources = None, None, None, None
     if args.vocab:

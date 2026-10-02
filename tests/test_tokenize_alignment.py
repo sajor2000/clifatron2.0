@@ -302,6 +302,7 @@ class FusedCategoricalAndCoverageTest(unittest.TestCase):
             cfg["tables"]["assessments"] = {
                 "file": "clif_patient_assessments",
                 "availability_col": "recorded_dttm",
+                "availability": "missing_storetime",
                 "concept_col": "assessment_category",
                 "value_col": "numerical_value",
                 "categorical_value_col": "categorical_value",
@@ -377,6 +378,229 @@ class FusedCategoricalAndCoverageTest(unittest.TestCase):
             for key in ("pos_min", "target_eligible", "value", "soft_token", "soft_weight"):
                 self.assertEqual(len(row[key]), n, key)
             self.assertEqual(row["n_events"], n)
+
+
+# U3 (R11, R12; KTD6): deterministic order and declared availability.
+TIE_HOUR = 2                      # no fixture MAP row lands on an even hour
+TIE_ROWS = [                      # inserted in this (deliberately unsorted) order
+    ("map", 72.0),
+    ("heart_rate", 90.0),
+    ("map", 68.0),
+]
+LAB_OFFSETS_MIN = (-15, -5, 0, 1)  # lab rows relative to each stay's anchor
+
+
+def _tokenize_variant(work, name, *, shuffle_seed=None, lab_lag=None, labs=False,
+                      drop_vitals_availability=False):
+    """Build the synthetic site, add tie rows (and optionally labs), tokenize it.
+
+    Runs inside `work` (the artifact policy classifies shards relative to the CWD).
+    Returns (events.parquet bytes, events frame, vocab blob, episodes)."""
+    import copy
+    from datetime import timedelta
+
+    import polars as pl
+    import yaml
+
+    from src.data.tokenize import tokenize_site
+    from src.eval.synthetic_bundle import (
+        FIXTURE_COHORT,
+        FIXTURE_DATA_CONFIG,
+        FIXTURE_POLICY,
+        SYNTHETIC_SITE,
+        build_synthetic_site,
+    )
+
+    site = work / f"site_{name}"
+    episode_path = build_synthetic_site(site)
+    episodes = pl.read_parquet(episode_path)
+    (work / "cohort.yaml").write_text(yaml.safe_dump(FIXTURE_COHORT))
+    (work / "artifact_policy.yaml").write_text(yaml.safe_dump(FIXTURE_POLICY))
+
+    vitals_path = site / "clif_vitals.parquet"
+    vitals = pl.read_parquet(vitals_path)
+    extra = []
+    for ep in episodes.iter_rows(named=True):
+        when = ep["icu_admit_dttm"] + timedelta(hours=TIE_HOUR)
+        for concept, value in TIE_ROWS:
+            extra.append({
+                "hospitalization_id": ep["hospitalization_id"], "recorded_dttm": when,
+                "vital_category": concept, "vital_value": value,
+                "vital_unit": "mmHg" if concept == "map" else "beats per minute",
+            })
+    vitals = pl.concat([vitals, pl.DataFrame(extra, schema=vitals.schema)])
+    if shuffle_seed is not None:
+        vitals = vitals.sample(fraction=1.0, shuffle=True, seed=shuffle_seed)
+    vitals.write_parquet(vitals_path)
+
+    cfg = copy.deepcopy(FIXTURE_DATA_CONFIG)
+    cfg["cohort_contract"] = str((work / "cohort.yaml").resolve())
+    cfg["artifact_policy"] = str((work / "artifact_policy.yaml").resolve())
+    if drop_vitals_availability:
+        cfg["tables"]["vitals"].pop("availability", None)
+    if labs:
+        lab_rows = []
+        for ep in episodes.iter_rows(named=True):
+            for k, offset in enumerate(LAB_OFFSETS_MIN):
+                lab_rows.append({
+                    "hospitalization_id": ep["hospitalization_id"],
+                    "lab_result_dttm": ep["anchor_dttm"] + timedelta(minutes=offset),
+                    "lab_category": "lactate",
+                    "lab_value_numeric": 1.0 + k,
+                })
+        pl.DataFrame(lab_rows, schema={
+            "hospitalization_id": pl.String,
+            "lab_result_dttm": pl.Datetime("us", "UTC"),
+            "lab_category": pl.String,
+            "lab_value_numeric": pl.Float64,
+        }).write_parquet(site / "clif_labs.parquet")
+        cfg["tables"]["labs"] = {
+            "file": "clif_labs",
+            "availability_col": "lab_result_dttm",
+            "availability": "result",
+            "concept_col": "lab_category",
+            "value_col": "lab_value_numeric",
+        }
+        if lab_lag is not None:
+            cfg["tables"]["labs"]["availability_lag_minutes"] = lab_lag
+
+    out = Path(f"output/intermediate_phi/order_{name}")
+    tokenize_site(cfg, SYNTHETIC_SITE, site, out, None, None,
+                  episodes=episodes, artifact_policy=FIXTURE_POLICY)
+    raw = (out / "events.parquet").read_bytes()
+    return (raw, pl.read_parquet(out / "events.parquet"),
+            json.loads((out / "vocab.json").read_text()), episodes)
+
+
+class DeterministicOrderAndAvailabilityTest(unittest.TestCase):
+    """U3: the post-join full-key sort and the per-table availability declaration."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls._td = tempfile.TemporaryDirectory()
+        cls.work = Path(cls._td.name)
+        cls._old_cwd = os.getcwd()
+        os.chdir(cls.work)
+        try:
+            cls.runs = {
+                "plain": _tokenize_variant(cls.work, "plain"),
+                "shuffled": _tokenize_variant(cls.work, "shuffled", shuffle_seed=11),
+                "lag10": _tokenize_variant(cls.work, "lag10", labs=True, lab_lag=10),
+                "lag0": _tokenize_variant(cls.work, "lag0", labs=True, lab_lag=0),
+                "lag_default": _tokenize_variant(cls.work, "lag_default", labs=True),
+            }
+        finally:
+            os.chdir(cls._old_cwd)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls._td.cleanup()
+
+    def _row(self, run, stay="synth-000"):
+        events = self.runs[run][1]
+        return events.filter(events["hosp_id"] == stay).row(0, named=True)
+
+    def _concepts(self, run, row):
+        inv = {i: t for t, i in self.runs[run][2]["vocab"].items()}
+        return [inv[t].split("=")[0] for t in row["token"]]
+
+    def test_shuffled_input_rows_give_byte_identical_events(self):
+        plain_bytes, plain, _, _ = self.runs["plain"]
+        shuffled_bytes, shuffled, _, _ = self.runs["shuffled"]
+        self.assertTrue(plain.equals(shuffled), "row order leaked into the token stream")
+        self.assertEqual(plain_bytes, shuffled_bytes)
+
+    def test_ties_at_one_timestamp_order_by_concept_then_value(self):
+        for run in ("plain", "shuffled"):
+            for stay in ("synth-000", "synth-005"):
+                row = self._row(run, stay)
+                concepts = self._concepts(run, row)
+                at_tie = [i for i, p in enumerate(row["pos_min"]) if p == TIE_HOUR * 60]
+                self.assertEqual(len(at_tie), len(TIE_ROWS))
+                self.assertEqual(
+                    [(concepts[i], row["value"][i]) for i in at_tie],
+                    [("heart_rate", 90.0), ("map", 68.0), ("map", 72.0)],
+                )
+
+    def test_positions_are_nondecreasing_within_every_stay(self):
+        for run in self.runs:
+            for row in self.runs[run][1].iter_rows(named=True):
+                self.assertEqual(row["pos_min"], sorted(row["pos_min"]), run)
+
+    def _lactate(self, run, stay):
+        row = self._row(run, stay)
+        concepts = self._concepts(run, row)
+        return [(row["pos_min"][i], row["value"][i])
+                for i, c in enumerate(concepts) if c == "lactate"]
+
+    def _anchor_min(self, run, stay):
+        episodes = self.runs[run][3]
+        ep = episodes.filter(episodes["hospitalization_id"] == stay).row(0, named=True)
+        return int((ep["anchor_dttm"] - ep["icu_admit_dttm"]).total_seconds() // 60)
+
+    def test_a_ten_minute_lag_excludes_events_made_available_after_the_anchor(self):
+        for stay in ("synth-000", "synth-007"):
+            anchor = self._anchor_min("lag10", stay)
+            # -15 min -> available at -5 (kept, positioned at availability); -5 -> +5,
+            # 0 -> +10, +1 -> +11 all fall after the end-inclusive anchor.
+            self.assertEqual(self._lactate("lag10", stay), [(anchor - 5, 1.0)])
+
+    def test_lag_zero_leaves_windowing_unchanged(self):
+        for stay in ("synth-000", "synth-007"):
+            anchor = self._anchor_min("lag0", stay)
+            self.assertEqual(
+                self._lactate("lag0", stay),
+                [(anchor - 15, 1.0), (anchor - 5, 2.0), (anchor, 3.0)],
+            )
+        self.assertEqual(self.runs["lag0"][0], self.runs["lag_default"][0])
+
+    def test_vocab_manifest_records_availability_per_table_outside_hashes(self):
+        manifest = self.runs["lag10"][2]["manifest"]
+        provenance = manifest["provenance"]
+        self.assertEqual(
+            provenance["availability"], {"vitals": "missing_storetime", "labs": "result"}
+        )
+        self.assertEqual(provenance["availability_lag_minutes"], {"vitals": 0, "labs": 10})
+        self.assertNotIn("availability", manifest["hashes"])
+
+    def test_a_table_without_availability_is_a_config_error(self):
+        from src.data.cohort import QualificationError
+
+        old_cwd = os.getcwd()
+        os.chdir(self.work)
+        try:
+            with self.assertRaisesRegex(QualificationError, "vitals.*availability"):
+                _tokenize_variant(self.work, "no_availability",
+                                  drop_vitals_availability=True)
+        finally:
+            os.chdir(old_cwd)
+
+    def test_configured_tables_declare_availability_semantics(self):
+        import yaml
+
+        from src.data.tokenize import validate_table_availability
+
+        root = Path(__file__).parents[1]
+        tables = yaml.safe_load((root / "configs/data.yaml").read_text())["tables"]
+        self.assertEqual(tables["vitals"]["availability"], "missing_storetime")
+        semantics = validate_table_availability(tables)
+        self.assertEqual(set(semantics), set(tables))
+
+    def test_group_by_maintain_order_keeps_sorted_within_group_order(self):
+        """`encode` relies on map_groups seeing each stay's rows in the sorted order."""
+        import polars as pl
+
+        frame = pl.DataFrame({
+            "hosp_id": ["b", "a", "b", "a", "b", "a"],
+            "k": [3, 2, 1, 3, 2, 1],
+        }).sort(["hosp_id", "k"], maintain_order=True)
+        seen = (
+            frame.group_by("hosp_id", maintain_order=True)
+            .map_groups(lambda g: pl.DataFrame({"hosp_id": g["hosp_id"][0],
+                                                "ks": [g["k"].to_list()]}))
+        )
+        self.assertEqual(seen["hosp_id"].to_list(), ["a", "b"])
+        self.assertEqual(seen["ks"].to_list(), [[1, 2, 3], [1, 2, 3]])
 
 
 if __name__ == "__main__":

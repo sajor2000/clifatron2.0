@@ -13,6 +13,7 @@ from src.data.splits import content_manifest
 from src.data.tokenize import (
     _read_table,
     restrict_to_observation_window,
+    validate_table_availability,
     validate_units,
     validate_vocabulary_artifact,
 )
@@ -58,6 +59,34 @@ class DataConfigTest(unittest.TestCase):
         self.assertTrue(data["tables"]["meds"]["input_only"])
         self.assertTrue(data["tables"]["resp_support"]["input_only"])
         self.assertTrue(data["tables"]["adt"]["input_only"])
+
+    def test_every_configured_table_declares_availability_semantics(self):
+        """R12: availability is required per table; a missing or unknown one fails."""
+        from src.data.cohort import QualificationError
+
+        root = Path(__file__).parents[1]
+        tables = yaml.safe_load((root / "configs/data.yaml").read_text())["tables"]
+        declared = validate_table_availability(tables)
+        self.assertEqual(set(declared), set(tables))
+        self.assertEqual(declared["vitals"]["availability"], "missing_storetime")
+        self.assertEqual(declared["resp_support"]["availability"], "missing_storetime")
+        self.assertEqual(declared["labs"]["availability"], "result")
+        self.assertEqual(declared["meds"]["availability"], "recorded")
+        self.assertEqual(declared["adt"]["availability"], "recorded")
+        self.assertTrue(all(d["lag_minutes"] == 0 for d in declared.values()))
+
+        missing = {**tables, "labs": {k: v for k, v in tables["labs"].items()
+                                      if k != "availability"}}
+        with self.assertRaisesRegex(QualificationError, "'labs'.*availability"):
+            validate_table_availability(missing)
+        unknown = {**tables, "labs": {**tables["labs"], "availability": "charttime"}}
+        with self.assertRaisesRegex(QualificationError, "'labs'.*availability"):
+            validate_table_availability(unknown)
+        for bad_lag in (-5, 2.5, True, "10"):
+            negative = {**tables, "labs": {**tables["labs"],
+                                           "availability_lag_minutes": bad_lag}}
+            with self.assertRaisesRegex(QualificationError, "availability_lag_minutes"):
+                validate_table_availability(negative)
 
     def test_observation_positions_are_icu_admission_relative_and_include_anchor(self):
         utc = "UTC"

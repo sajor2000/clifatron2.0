@@ -114,6 +114,7 @@ FIXTURE_DATA_CONFIG = {
         "vitals": {
             "file": "clif_vitals",
             "availability_col": "recorded_dttm",
+            "availability": "missing_storetime",   # R12: declared on every table
             "concept_col": "vital_category",
             "value_col": "vital_value",
             "unit_col": "vital_unit",

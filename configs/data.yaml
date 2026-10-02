@@ -9,27 +9,41 @@ cohort_contract: "configs/cohort.yaml"
 artifact_policy: "configs/artifact_policy.yaml"
 episode_artifact: "output/intermediate_phi/episodes.parquet"
 
+# Every table MUST declare `availability` (R12; tokenize fails closed otherwise):
+#   result            - availability_col is when the result became available
+#   recorded          - availability_col is when the event was charted/administered
+#   missing_storetime - CLIF carries no store time; recorded_dttm stands in
+# `availability_lag_minutes` (optional, default 0, non-negative integer) shifts the
+# table's timestamps later before the observation window is applied (conservative).
 tables:
   vitals:
     file: "clif_vitals"
     availability_col: "recorded_dttm"     # CLIF has no separate vital storetime
+    availability: "missing_storetime"
+    availability_lag_minutes: 0
     concept_col: "vital_category"        # mCIDE controlled vocab
     value_col: "vital_value"
   labs:
     file: "clif_labs"
     availability_col: "lab_result_dttm"   # result availability; MIMIC storetime maps here
+    availability: "result"
+    availability_lag_minutes: 0
     concept_col: "lab_category"
     value_col: "lab_value_numeric"
     unit_col: "reference_unit"
   resp_support:
     file: "clif_respiratory_support"
     availability_col: "recorded_dttm"
+    availability: "missing_storetime"
+    availability_lag_minutes: 0
     concept_col: "device_category"       # imv, nippv, high_flow, ...
     value_col: null                      # categorical event
     input_only: true
   meds:                                   # INPUT ONLY (not a target)
     file: "clif_medication_admin_continuous"
     availability_col: "admin_dttm"
+    availability: "recorded"
+    availability_lag_minutes: 0
     concept_col: "med_category"          # norepinephrine, propofol, heparin, furosemide...
     value_col: null                       # v2 emits med_category only (no dose) — see data-tokenization T4
     dose_tokenization: "tokenetl_only"    # dose bins exist only in vendored v1 tokenETL (not run by v2)
@@ -37,6 +51,8 @@ tables:
   adt:
     file: "clif_adt"
     availability_col: "in_dttm"
+    availability: "recorded"
+    availability_lag_minutes: 0
     concept_col: "location_category"
     value_col: null
     input_only: true
