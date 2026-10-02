@@ -27,6 +27,7 @@ import logging
 
 from src.data.segments import RETOKENIZE, TOKENIZER_VERSION
 from src.data.targets import TargetBuilder, TargetContractError
+from src.data.tokenize_continuous import normalize_value
 
 try:
     from external.clifatron.AR.qwen2.data.packed_dataset import PACKED_SCHEMA_VERSION  # type: ignore[import-untyped]
@@ -48,9 +49,16 @@ class ModelDataset(Dataset):
         expected_hashes: Mapping[str, str],
         episode_targets: Mapping[str, Mapping[str, Any]] | None = None,
         epoch: int = 0,
+        value_channel: bool = False,
     ) -> None:
+        """`value_channel` (continuous-fused arm, U6): each canonical sample also carries
+        `input_value` / `input_value_mask`, the CURRENT event's value normalized with the
+        target builder's frozen per-token stats (`tokenize_continuous.normalize_value`);
+        missing, categorical (NaN) and implausible values are masked to 0."""
         if representation not in {"decile", "clifatron_packed", "gem"}:
             raise ValueError("representation must be 'decile', 'clifatron_packed' or 'gem'")
+        if value_channel and representation != "decile":
+            raise ValueError("the input value channel is defined for canonical shards only")
         if (representation == "gem") != (getattr(target_builder, "mode", "icu_24h") == "gem"):
             raise TargetContractError(
                 "the gem representation requires TargetBuilder(mode='gem'), and only it"
@@ -63,6 +71,7 @@ class ModelDataset(Dataset):
         self.expected_hashes = dict(expected_hashes)
         self.episode_targets = dict(episode_targets or {})
         self.epoch = int(epoch)
+        self.value_channel = bool(value_channel)
         for record in self.records:
             self._validate_hashes(record)
             is_gem = record.get("trajectory") == "hospitalization"
@@ -111,7 +120,7 @@ class ModelDataset(Dataset):
     def _decile_sample(self, record: dict[str, Any]) -> dict[str, Any]:
         built = self.target_builder.build(record, epoch=self.epoch)
         length = len(record["token"])
-        return {
+        sample = {
             "packed_schema_version": PACKED_SCHEMA_VERSION,
             "input_ids": record["token"],
             "attention_mask": [1] * length,
@@ -139,6 +148,15 @@ class ModelDataset(Dataset):
                 }
             ],
         }
+        if self.value_channel:
+            stats = self.target_builder.value_stats
+            values = record.get("value") or [None] * length
+            channel = [normalize_value(value, token, stats,
+                                       max_abs_z=self.target_builder.max_abs_value_z)
+                       for token, value in zip(record["token"], values)]
+            sample["input_value"] = [value for value, _ in channel]
+            sample["input_value_mask"] = [mask for _, mask in channel]
+        return sample
 
     def _gem_sample(self, record: dict[str, Any]) -> dict[str, Any]:
         key = _episode_key(record)

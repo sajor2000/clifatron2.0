@@ -128,13 +128,18 @@ class CLIFEncoder(nn.Module):
             raise ValueError(
                 f"soft tokens (3D) require token_weight; got token.ndim={token.ndim}"
             )
-        x = self.tok_emb(token)
+        x = self.embed_tokens(token)
         if token_weight is not None:
             x = (x * token_weight.unsqueeze(-1)).sum(-2)
         cos, sin = build_rope_cache(pos_min, self.head_dim, self.rope_base)
         for blk in self.blocks:
             x = blk(x, cos, sin)
         return self.ln_f(x)                                      # per-token states H_t
+
+    def embed_tokens(self, token: torch.Tensor) -> torch.Tensor:
+        """Input embedding of token ids ([B,T] or [B,T,K]); the TextCode arm overrides
+        it with a frozen text-embedding table + trainable projection."""
+        return self.tok_emb(token)
 
     def lm_logits(self, H: torch.Tensor) -> torch.Tensor:
         return self.lm_head(H)

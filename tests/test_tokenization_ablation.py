@@ -1,19 +1,40 @@
-"""Tokenization ablation smoke tests on MPS.
+"""Tokenization ablation tests (U6; R15, KTD8).
 
-Forward-pass each of the 5 tokenization arms through a frozen encoder.
-Tests that the continuous-fused and textcode code paths produce valid
-tensors without import/crash errors.
+`TokenizationSmokeTest` forward-passes the encoder variants on random tensors.
+
+`AblationArmsEndToEndTest` is the real acceptance test: a synthetic CLIF site is
+tokenized with the REAL tokenizer twice (physician clinical segments and population
+deciles, both with soft discretization), outcomes are auto-labelled and joined, the
+continuous-fused arm is derived from the primary clinical shard, and every arm in
+`configs/tokenization_ablation.yaml` (only its data paths overridden) runs 2 optimizer
+steps through `build_loaders` -> `Model.forward` -> `engine.train`. The TextCode arm
+uses an injected deterministic text encoder, so no network or model download is
+needed. All data is synthetic. Runs on CPU in well under 60 s.
 """
 
+import copy
+import hashlib
+import json
+import os
+import tempfile
 import unittest
+import warnings
+from datetime import timedelta
+from pathlib import Path
 
 import numpy as np
 import torch
+
+try:  # pytest puts tests/ on sys.path (rootdir-less test modules)
+    from test_tokenize_alignment import _repartition
+except ImportError:  # pragma: no cover - run from the repo root as a package
+    from tests.test_tokenize_alignment import _repartition
 
 DEVICE = "mps" if torch.backends.mps.is_available() else "cpu"
 B, T = 4, 32
 VOCAB = 200
 D_MODEL = 64
+ROOT = Path(__file__).resolve().parents[1]
 
 
 class TokenizationSmokeTest(unittest.TestCase):
@@ -76,6 +97,16 @@ class TokenizationSmokeTest(unittest.TestCase):
         self.assertGreater(grads, 0)
         print(f"  continuous_fused: H={list(H.shape)} grads={grads}")
 
+    def test_03b_continuous_fused_nan_value_is_masked(self):
+        """A NaN (categorical) value never reaches the trunk as NaN."""
+        from src.model.encoder_continuous import ContinuousFusedEncoder
+
+        enc = ContinuousFusedEncoder(VOCAB, self._mini_cfg()).to(self.dev)
+        value = self.value.clone()
+        value[:, ::3] = float("nan")
+        H = enc(self.token, self.pos, continuous_value=value)
+        self.assertTrue(bool(torch.isfinite(H).all()))
+
     def test_04_textcode_embedding_shape(self):
         """TextCode returns correct [B,T,token_dim] shape."""
         from src.data.tokenize_textcode import textcode_embedding
@@ -89,14 +120,13 @@ class TokenizationSmokeTest(unittest.TestCase):
         self.assertEqual(output.shape, (2, 16, D_MODEL))
         print(f"  textcode: {list(output.shape)}")
 
-    def test_05_all_five_arms_dry_run(self):
-        """Each arm in tokenization_ablation.yaml loads without error."""
+    def test_05_every_configured_arm_builds(self):
+        """Each arm in tokenization_ablation.yaml builds its model (TextCode with an
+        injected embedding table: it has no model without one)."""
         import yaml
         from src.train.run_tokenization_ablation import TokenizationAblationModel
 
-        abl = yaml.safe_load(
-            __import__("pathlib").Path("configs/tokenization_ablation.yaml").read_text()
-        )
+        abl = yaml.safe_load((ROOT / "configs/tokenization_ablation.yaml").read_text())
         mcfg = {
             "trunk": {
                 "d_model": 32, "n_layers": 1, "n_heads": 2,
@@ -114,11 +144,479 @@ class TokenizationSmokeTest(unittest.TestCase):
             },
         }
 
-        for arm_name in abl["arms"]:
-            model = TokenizationAblationModel(50, 5, mcfg, abl["arms"][arm_name], n_value_bins=12)
+        table = np.random.default_rng(0).normal(size=(50, 12)).astype(np.float32)
+        for arm_name, arm in abl["arms"].items():
+            text_table = table if arm["tokenizer"] == "textcode" else None
+            model = TokenizationAblationModel(50, 5, mcfg, arm, n_value_bins=12,
+                                              text_table=text_table)
             total = sum(p.numel() for p in model.parameters())
-            print(f"  {arm_name}: {total:,} params, tokenizer={abl['arms'][arm_name]['tokenizer']}")
+            print(f"  {arm_name}: {total:,} params, tokenizer={arm['tokenizer']}")
             self.assertGreater(total, 0)
+
+    def test_06_textcode_arm_without_a_table_fails_closed(self):
+        from src.train.run_tokenization_ablation import TokenizationAblationModel
+
+        mcfg = {
+            "trunk": {"d_model": 16, "n_layers": 1, "n_heads": 2, "ffn_mult": 2,
+                      "dropout": 0.0, "tied_embeddings": False},
+            "heads": {"competing_risk": {"n_time_bins": 4},
+                      "threshold_hazard": {"n_time_bins": 4, "threshold_embed_dim": 4},
+                      "value_regression": {"enabled": True}},
+        }
+        with self.assertRaisesRegex(ValueError, "embedding table"):
+            TokenizationAblationModel(50, 2, mcfg, {"tokenizer": "textcode"},
+                                      n_value_bins=4)
+
+
+# ------------------------------------------------------------------------- fixture
+
+VALIDATION = [f"synth-{i:03d}" for i in range(20, 24)]
+CSV = ROOT / ("external/clifatron/tokenETL/config/"
+              "critical_illness_tokenization_final_with_intervals.csv")
+LACTATE = (1.0, 2.1, 3.0, 4.5, 6.5, 1.4)
+
+TINY_MCFG = {
+    "trunk": {"d_model": 16, "n_layers": 1, "n_heads": 2, "ffn_mult": 2,
+              "dropout": 0.0, "rope_base": 10000.0, "tied_embeddings": False,
+              "target_vocab": 256},
+    "heads": {
+        "next_event": {"enabled": True, "weight": 0.2},
+        "competing_risk": {"enabled": True, "weight": 1.0, "n_time_bins": 4,
+                           "horizon_hours": 48},
+        "threshold_hazard": {"enabled": True, "weight": 1.0, "horizon_hours": 48,
+                             "n_time_bins": 4, "threshold_embed_dim": 4},
+        "value_regression": {"enabled": True, "weight": 0.5},
+    },
+}
+
+
+def _tiny_tcfg(ckpt_dir: Path) -> dict:
+    return {
+        "optimizer": {"lr": 1e-3, "weight_decay": 0.0, "betas": [0.9, 0.95],
+                      "grad_clip": 1.0},
+        "schedule": {"warmup_steps": 1, "total_steps": 2, "cosine_decay": True},
+        "batch": {"per_gpu": 4, "grad_accum": 1},
+        "runtime": {"num_workers": 0, "log_every": 1000, "ckpt_every": 1000,
+                    "ckpt_dir": str(ckpt_dir)},
+        "eval_schedule": {"val_every": 1000},
+    }
+
+
+def fake_text_encoder(texts):
+    """Deterministic stand-in for the frozen clinical text encoder (no network)."""
+    rows = []
+    for text in texts:
+        seed = int.from_bytes(hashlib.sha256(text.encode()).digest()[:8], "big")
+        rows.append(np.random.default_rng(seed).normal(size=12))
+    return np.asarray(rows, dtype=np.float32)
+
+
+def _site_config(work: Path, scheme: str) -> dict:
+    from src.eval.synthetic_bundle import FIXTURE_DATA_CONFIG
+
+    cfg = copy.deepcopy(FIXTURE_DATA_CONFIG)
+    cfg["cohort_contract"] = str((work / "cohort.yaml").resolve())
+    cfg["artifact_policy"] = str((work / "artifact_policy.yaml").resolve())
+    cfg["tables"]["labs"] = {
+        "file": "clif_labs", "availability_col": "lab_result_dttm",
+        "availability": "result", "concept_col": "lab_category",
+        "value_col": "lab_value_numeric", "unit_col": "reference_unit",
+    }
+    cfg["tables"]["assessments"] = {
+        "file": "clif_patient_assessments", "availability_col": "recorded_dttm",
+        "availability": "missing_storetime", "concept_col": "assessment_category",
+        "value_col": "numerical_value", "categorical_value_col": "categorical_value",
+    }
+    cfg["target_concepts"] = [
+        {"name": "map", "source": "vitals", "direction": "below", "unit": "mmHg"},
+        {"name": "lactate", "source": "labs", "direction": "above", "unit": "mmol/L"},
+    ]
+    cfg["value_binning"]["forced_edges"] = {"map": [65.0], "lactate": [2.0, 4.0]}
+    cfg["value_binning"]["coverage"] = "all"
+    if scheme == "clinical_segment":
+        cfg["value_binning"].update({"scheme": "clinical_segment",
+                                     "segment_source": str(CSV)})
+    else:
+        cfg["value_binning"].update({"scheme": "decile", "n_bins": 16})
+    return cfg
+
+
+def _build_fixture(work: Path) -> dict:
+    """Synthetic site -> clinical + decile shards (real tokenizer, soft on), joined
+    outcomes, frozen value stats, and the derived continuous-fused arm."""
+    import polars as pl
+    import yaml
+
+    from src.data.outcome_join import join_outcomes
+    from src.data.tokenize import tokenize_site
+    from src.data.tokenize_continuous import write_continuous_fused_arm
+    from src.data.value_stats import compute_value_stats_from_events, write_value_stats
+    from src.eval.clif_auto_labeler import auto_label
+    from src.eval.synthetic_bundle import (
+        FIXTURE_COHORT,
+        FIXTURE_POLICY,
+        SYNTHETIC_SITE,
+        build_synthetic_site,
+    )
+    site = work / "site"
+    episodes = _repartition(pl.read_parquet(build_synthetic_site(site)), VALIDATION)
+    episode_path = site / "episodes_split.parquet"
+    episodes.write_parquet(episode_path)
+    (work / "cohort.yaml").write_text(yaml.safe_dump(FIXTURE_COHORT))
+    (work / "artifact_policy.yaml").write_text(yaml.safe_dump(FIXTURE_POLICY))
+
+    labs = {"hospitalization_id": [], "lab_result_dttm": [], "lab_category": [],
+            "lab_value_numeric": [], "reference_unit": []}
+    assess = {"hospitalization_id": [], "recorded_dttm": [], "assessment_category": [],
+              "numerical_value": [], "categorical_value": []}
+    for i, ep in enumerate(episodes.iter_rows(named=True)):
+        stay, admit = ep["hospitalization_id"], ep["icu_admit_dttm"]
+        for k, hour in enumerate((4, 12, 20)):
+            labs["hospitalization_id"].append(stay)
+            labs["lab_result_dttm"].append(admit + timedelta(hours=hour))
+            labs["lab_category"].append("lactate")
+            labs["lab_value_numeric"].append(LACTATE[(i + k) % len(LACTATE)])
+            labs["reference_unit"].append("mmol/L")
+        for k, hour in enumerate((3, 9, 15, 21)):
+            when = admit + timedelta(hours=hour)
+            assess["hospitalization_id"] += [stay, stay]
+            assess["recorded_dttm"] += [when, when]
+            assess["assessment_category"] += ["braden_mobility", "cam_total"]
+            assess["numerical_value"] += [float(1 + (i + k) % 4), None]
+            # cam_total is a categorical finding with NO numeric value (NaN value).
+            assess["categorical_value"] += [None, "Positive" if (i + k) % 2 else "Negative"]
+    utc = pl.Datetime("us", "UTC")
+    pl.DataFrame(labs, schema={
+        "hospitalization_id": pl.String, "lab_result_dttm": utc, "lab_category": pl.String,
+        "lab_value_numeric": pl.Float64, "reference_unit": pl.String,
+    }).write_parquet(site / "clif_labs.parquet")
+    pl.DataFrame(assess, schema={
+        "hospitalization_id": pl.String, "recorded_dttm": utc,
+        "assessment_category": pl.String, "numerical_value": pl.Float64,
+        "categorical_value": pl.String,
+    }).write_parquet(site / "clif_patient_assessments.parquet")
+
+    clinical_cfg = _site_config(work, "clinical_segment")
+    data_cfg_path = work / "data_config.yaml"
+    data_cfg_path.write_text(yaml.safe_dump(clinical_cfg))
+    labels = auto_label(str(site), episode_path, ["map_below_65_48h"],
+                        cohort_config=work / "cohort.yaml", data_config=data_cfg_path)
+
+    dirs = {}
+    for name, scheme in (("clinical", "clinical_segment"), ("decile", "decile")):
+        cfg = _site_config(work, scheme)
+        out = Path(f"output/intermediate_phi/{name}")
+        tokenize_site(cfg, SYNTHETIC_SITE, site, out, None,
+                      episodes=episodes, artifact_policy=FIXTURE_POLICY)
+        blob = json.loads((out / "vocab.json").read_text())
+        joined = join_outcomes(labels, pl.read_parquet(out / "events.parquet"), blob,
+                               cfg, FIXTURE_COHORT)
+        joined.write_parquet(out / "events_with_outcomes.parquet")
+        dirs[name] = out
+
+    cont = Path("output/intermediate_phi/continuous")
+    write_continuous_fused_arm(dirs["clinical"] / "vocab.json",
+                               dirs["clinical"] / "events_with_outcomes.parquet", cont,
+                               policy=FIXTURE_POLICY)
+    dirs["continuous"] = cont
+
+    for out in dirs.values():
+        blob = json.loads((out / "vocab.json").read_text())
+        stats = compute_value_stats_from_events(out / "events_with_outcomes.parquet")
+        write_value_stats(stats, out / "value_stats.json", vocab=blob["vocab"],
+                          segments=blob["segments"], fit_partition_name="train")
+    return {name: out.resolve() for name, out in dirs.items()}
+
+
+def _fixture_dir(dirs: dict, arm: dict) -> Path:
+    if arm["tokenizer"] == "continuous_fused":
+        return dirs["continuous"]
+    return dirs["decile"] if arm["scheme"] == "decile_ablation" else dirs["clinical"]
+
+
+class AblationArmsEndToEndTest(unittest.TestCase):
+    ARMS = ("clinical_soft", "clinical_hard", "global_deciles", "deciles_plus_soft",
+            "continuous_fused", "textcode")
+
+    @classmethod
+    def setUpClass(cls):
+        import yaml
+
+        from src.train.engine import _prepare_batch
+        from src.train.run_tokenization_ablation import (
+            masked_target_counts,
+            resolve_arm,
+            setup_arm,
+            train_arm,
+        )
+
+        cls._td = tempfile.TemporaryDirectory()
+        work = Path(cls._td.name)
+        old_cwd = os.getcwd()
+        os.chdir(work)
+        try:
+            cls.dirs = _build_fixture(work)
+            cls.abl = yaml.safe_load((ROOT / "configs/tokenization_ablation.yaml").read_text())
+            cls.cpu = torch.device("cpu")
+            cls.arm_cfgs, cls.runs, cls.batches, cls.counts = {}, {}, {}, {}
+            cls.first_losses, cls.ledgers = {}, {}
+            for name in cls.abl["arms"]:
+                d = _fixture_dir(cls.dirs, cls.abl["arms"][name])
+                arm = resolve_arm(cls.abl, name, events=d / "events_with_outcomes.parquet",
+                                  vocab=d / "vocab.json", value_stats=d / "value_stats.json",
+                                  primary_vocab=cls.dirs["clinical"] / "vocab.json")
+                tcfg = _tiny_tcfg(work / "ckpt" / name)
+                run = setup_arm(arm, mcfg=TINY_MCFG, tcfg=tcfg, n_targets=2,
+                                device=cls.cpu, text_encoder=fake_text_encoder, seed=0)
+                batch = _prepare_batch(next(iter(run.loaders.train)), cls.cpu)
+                with torch.no_grad():
+                    run.model.eval()
+                    cls.first_losses[name] = run.model(batch)
+                    run.model.train()
+                _, manifest = train_arm(run, tcfg=tcfg, mcfg=TINY_MCFG, device=cls.cpu,
+                                        total_steps=2, lr=float(arm["lr"]))
+                cls.arm_cfgs[name], cls.runs[name] = arm, run
+                cls.batches[name] = batch
+                cls.counts[name] = masked_target_counts(batch)
+                cls.ledgers[name] = manifest.ledger
+        finally:
+            os.chdir(old_cwd)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls._td.cleanup()
+
+    def _sample(self, arm: str, key: str):
+        ds = self.runs[arm].loaders.train_dataset
+        for index, record in enumerate(ds.records):
+            if record["episode_key"] == key:
+                return ds[index]
+        raise AssertionError(f"{key} not in {arm}")
+
+    # ------------------------------------------------------------------ config
+
+    def test_config_has_the_six_arms_mapped_to_data_yaml_schemes(self):
+        import yaml
+
+        self.assertEqual(tuple(self.abl["arms"]), self.ARMS)
+        schemes = {"clinical_segment", "decile_ablation"}
+        for name, arm in self.abl["arms"].items():
+            self.assertIn(arm["scheme"], schemes, name)
+            self.assertIn(arm["tokenizer"], ("fused", "continuous_fused", "textcode"))
+            for key in ("events", "vocab", "value_stats"):
+                self.assertTrue(arm.get(key), f"{name} needs its own {key} path")
+        self.assertEqual(self.abl["arms"]["clinical_soft"]["scheme"], "clinical_segment")
+        self.assertTrue(self.abl["arms"]["clinical_soft"]["soft_discretization"])
+        self.assertTrue(self.abl["arms"]["clinical_soft"].get("primary"))
+        self.assertEqual(self.abl["arms"]["textcode"]["textcode_encoder"],
+                         "thomas-sounack/BioClinical-ModernBERT-base")
+        cohort = yaml.safe_load((ROOT / "configs/cohort.yaml").read_text())
+        for outcome in (self.abl["shared"]["outcomes"]
+                        + self.abl["shared"].get("zero_shot_outcomes", [])):
+            self.assertIn(outcome, cohort["outcomes"])
+        for section in ("tail_sensitivity",):
+            for outcome in self.abl["report"][section]["outcomes"]:
+                self.assertIn(outcome, cohort["outcomes"])
+
+    # --------------------------------------------------------- end-to-end arms
+
+    def test_each_arm_runs_two_steps_with_finite_loss_and_masked_targets(self):
+        self.assertEqual(set(self.ledgers), set(self.ARMS))
+        for name in self.ARMS:
+            with self.subTest(arm=name):
+                self.assertEqual(self.ledgers[name]["optimizer_updates"], 2)
+                self.assertGreater(self.ledgers[name]["ntp_eligible_tokens"], 0)
+                counts = self.counts[name]
+                self.assertGreater(counts["ntp"], 0)
+                self.assertGreater(counts["value"], 0)
+                self.assertGreater(counts["th"], 0)
+                self.assertGreater(counts["cr"], 0)
+                for key, loss in self.first_losses[name].items():
+                    self.assertTrue(bool(torch.isfinite(loss)), f"{name} {key}")
+                self.assertGreater(float(self.first_losses[name]["th"]), 0.0)
+                self.assertGreater(float(self.first_losses[name]["val"]), 0.0)
+
+    def test_arm_inputs_differ_on_the_same_fixture(self):
+        key = self.runs["clinical_soft"].loaders.train_dataset.records[0]["episode_key"]
+        soft = self._sample("clinical_soft", key)
+        hard = self._sample("clinical_hard", key)
+        # Hard vs soft tensors: same hard ids, but only the soft arm carries [T, K].
+        self.assertEqual(soft["input_ids"], hard["input_ids"])
+        self.assertIsNotNone(soft["soft_token"])
+        self.assertEqual(len(soft["soft_token"][0]), 3)
+        self.assertIsNone(hard["soft_token"])
+        self.assertIn("soft_token", self.batches["clinical_soft"])
+        self.assertNotIn("soft_token", self.batches["clinical_hard"])
+        self.assertEqual(self.batches["clinical_soft"]["soft_token"].ndim, 3)
+        self.assertIn("soft_token", self.batches["deciles_plus_soft"])
+        self.assertNotIn("soft_token", self.batches["global_deciles"])
+
+        # Deciles vs clinical: a different vocabulary, so different ids per stay.
+        dec = self._sample("global_deciles", key)
+        self.assertNotEqual(self.runs["global_deciles"].binding["vocabulary"],
+                            self.runs["clinical_hard"].binding["vocabulary"])
+        self.assertNotEqual(dec["input_ids"], hard["input_ids"])
+
+        # Continuous-fused: edgeless concept ids plus a normalized current-value channel.
+        cont = self._sample("continuous_fused", key)
+        self.assertEqual(len(cont["input_ids"]), len(hard["input_ids"]))
+        self.assertNotEqual(cont["input_ids"], hard["input_ids"])
+        cvocab = self.runs["continuous_fused"].vocab_blob["vocab"]
+        self.assertIn("map", cvocab)
+        self.assertFalse(any(t.startswith("map=") for t in cvocab))
+        self.assertTrue(any(cont["input_value_mask"]))
+        self.assertIn("input_value", self.batches["continuous_fused"])
+        for arm in ("clinical_hard", "global_deciles", "textcode"):
+            self.assertNotIn("input_value", self.batches[arm])
+
+        # TextCode: the encoder's input table is the frozen text embedding of each
+        # fused id's generated description, projected by a trainable layer.
+        from src.data.tokenize_textcode import vocab_descriptions
+
+        enc = self.runs["textcode"].model.enc
+        blob = self.runs["textcode"].vocab_blob
+        descriptions = vocab_descriptions(blob)
+        ids = sorted(i for i in descriptions if i != blob["vocab"]["<pad>"])
+        expected = fake_text_encoder([descriptions[i] for i in ids])
+        self.assertTrue(np.allclose(enc.text_table[ids].numpy(), expected, atol=1e-6))
+        self.assertEqual(float(enc.text_table[blob["vocab"]["<pad>"]].abs().sum()), 0.0)
+        self.assertNotIn("text_table", dict(enc.named_parameters()))
+        self.assertTrue(enc.text_proj.weight.requires_grad)
+        self.assertFalse(hasattr(enc, "tok_emb"))
+
+    def test_continuous_fused_nan_categorical_event_and_primary_threshold_bins(self):
+        from src.data.segments import n_value_bins, threshold_bin
+
+        run = self.runs["continuous_fused"]
+        cvocab = run.vocab_blob["vocab"]
+        cam = [cvocab["cam_total=negative"], cvocab["cam_total=positive"]]
+        saw_nan = False
+        for index, record in enumerate(run.loaders.train_dataset.records):
+            sample = run.loaders.train_dataset[index]
+            for tok, raw, v, m in zip(record["token"], record["value"],
+                                      sample["input_value"], sample["input_value_mask"]):
+                if tok in cam:
+                    self.assertTrue(raw is None or not np.isfinite(raw))
+                    self.assertEqual((v, m), (0.0, False))
+                    saw_nan = True
+            for outcome in record["outcomes"]:
+                self.assertGreaterEqual(outcome["threshold_bin"], 0)
+        self.assertTrue(saw_nan, "fixture has no categorical (NaN) event")
+        losses = self.first_losses["continuous_fused"]
+        self.assertTrue(all(bool(torch.isfinite(v)) for v in losses.values()))
+        batch = self.batches["continuous_fused"]
+        self.assertTrue(bool((batch["th_tau"][batch["th_mask"]] >= 0).all()))
+
+        # threshold_bin and n_value_bins come from the PRIMARY clinical segments.
+        primary = json.loads((self.dirs["clinical"] / "vocab.json").read_text())
+        self.assertEqual(run.n_value_bins, n_value_bins(primary))
+        expected = threshold_bin(65.0, primary["segments"]["map"], "below")
+        taus = set(batch["th_tau"][batch["th_mask"]].tolist())
+        self.assertEqual(taus, {expected})
+
+    def test_continuous_fused_artifact_requires_the_primary_segments_hash(self):
+        from src.data.segments import ArtifactBindingError
+        from src.data.tokenize_continuous import primary_segments
+
+        blob = copy.deepcopy(self.runs["continuous_fused"].vocab_blob)
+        self.assertIn("primary_segments", blob["manifest"]["hashes"])
+        primary_segments(blob)  # verified
+        blob["primary_segments"]["map"] = blob["primary_segments"]["map"][:-1]
+        with self.assertRaisesRegex(ArtifactBindingError, "primary"):
+            primary_segments(blob)
+        del blob["manifest"]["hashes"]["primary_segments"]
+        with self.assertRaisesRegex(ArtifactBindingError, "primary"):
+            primary_segments(blob)
+
+    def test_normalize_value_uses_frozen_stats_and_masks_missing(self):
+        from src.data.tokenize_continuous import normalize_value
+
+        stats = {7: (2.0, 0.5)}
+        self.assertEqual(normalize_value(3.0, 7, stats), (2.0, True))
+        self.assertEqual(normalize_value(None, 7, stats), (0.0, False))
+        self.assertEqual(normalize_value(float("nan"), 7, stats), (0.0, False))
+        self.assertEqual(normalize_value(float("nan"), 9, stats), (0.0, False))
+        # An implausible sentinel (|z| > 20) is masked like the value-head target.
+        self.assertEqual(normalize_value(999999.0, 7, stats), (0.0, False))
+        with self.assertRaisesRegex(ValueError, "normalization statistics"):
+            normalize_value(1.0, 9, stats)
+
+    def test_textcode_description_for_lactate_bin_has_concept_interval_unit(self):
+        from src.data.segments import interval_label
+        from src.data.tokenize_textcode import code_description
+
+        blob = self.runs["textcode"].vocab_blob
+        desc = code_description("lactate=6", blob)
+        self.assertIn("lactate", desc)
+        self.assertIn(interval_label(blob["segments"]["lactate"][6]), desc)
+        self.assertIn("(2, 2.2]", desc)
+        self.assertIn("mmol/L", desc)
+        self.assertIn("labs", desc)
+        self.assertIn("negative", code_description("cam_total=negative", blob))
+        self.assertIn("icu", code_description("icu", blob))
+
+    def test_freeze_trunk_without_init_checkpoint_warns_and_keeps_trunk_trainable(self):
+        from src.train.run_tokenization_ablation import setup_arm
+
+        arm = dict(self.arm_cfgs["clinical_hard"], freeze_trunk=True)
+        # catch_warnings, not assertWarns: assertWarns walks sys.modules and trips
+        # transformers' lazy submodules when another test has imported transformers.
+        with tempfile.TemporaryDirectory() as td, warnings.catch_warnings(record=True) as seen:
+            warnings.simplefilter("always")
+            run = setup_arm(arm, mcfg=TINY_MCFG, tcfg=_tiny_tcfg(Path(td)),
+                            n_targets=2, device=self.cpu, seed=0)
+        self.assertTrue(any(issubclass(w.category, UserWarning)
+                            and "init checkpoint" in str(w.message) for w in seen))
+        self.assertTrue(all(p.requires_grad for p in run.model.parameters()))
+
+    def test_freeze_trunk_with_init_checkpoint_freezes_only_the_trunk(self):
+        from src.train.checkpoint import save_checkpoint
+        from src.train.run_tokenization_ablation import setup_arm
+
+        base = self.runs["clinical_hard"]
+        opt = torch.optim.SGD(base.model.parameters(), lr=0.1)
+        sched = torch.optim.lr_scheduler.LambdaLR(opt, lambda _: 1.0)
+        arm = dict(self.arm_cfgs["clinical_hard"], freeze_trunk=True)
+        with tempfile.TemporaryDirectory() as td:
+            ckpt = Path(td) / "init.pt"
+            save_checkpoint(ckpt, model=base.model, optimizer=opt, scheduler=sched,
+                            epoch=0, vocab_binding=base.binding)
+            run = setup_arm(arm, mcfg=TINY_MCFG, tcfg=_tiny_tcfg(Path(td)), n_targets=2,
+                            device=self.cpu, seed=1, init_checkpoint=ckpt)
+            for (name, p), (_, q) in zip(run.model.state_dict().items(),
+                                         base.model.state_dict().items()):
+                self.assertTrue(torch.equal(p, q), name)
+            # A checkpoint bound to a different vocabulary is refused.
+            other = self.runs["global_deciles"]
+            bad = Path(td) / "bad.pt"
+            save_checkpoint(bad, model=other.model, optimizer=opt, scheduler=sched,
+                            epoch=0, vocab_binding=other.binding)
+            with self.assertRaises(ValueError):
+                setup_arm(arm, mcfg=TINY_MCFG, tcfg=_tiny_tcfg(Path(td)), n_targets=2,
+                          device=self.cpu, seed=1, init_checkpoint=bad)
+        self.assertFalse(any(p.requires_grad for p in run.model.enc.blocks.parameters()))
+        self.assertTrue(all(p.requires_grad for p in run.model.th.parameters()))
+        self.assertTrue(run.model.enc.lm_head.projection.weight.requires_grad)
+
+    def test_value_regression_weight_changes_value_loss_contribution(self):
+        from src.train.run_tokenization_ablation import TokenizationAblationModel
+
+        run = self.runs["clinical_hard"]
+        batch = self.batches["clinical_hard"]
+        totals, vals = {}, {}
+        for weight in (0.5, 2.0):
+            mcfg = copy.deepcopy(TINY_MCFG)
+            mcfg["heads"]["value_regression"]["weight"] = weight
+            torch.manual_seed(0)
+            model = TokenizationAblationModel(256, 2, mcfg, self.arm_cfgs["clinical_hard"],
+                                              n_value_bins=run.n_value_bins).eval()
+            self.assertEqual(model.w["value_regression"], weight)
+            with torch.no_grad():
+                losses = model(batch)
+            totals[weight], vals[weight] = float(losses["total"]), float(losses["val"])
+        self.assertGreater(vals[0.5], 0.0)
+        self.assertAlmostEqual(vals[0.5], vals[2.0], places=5)
+        self.assertAlmostEqual(totals[2.0] - totals[0.5], 1.5 * vals[0.5], places=4)
 
 
 if __name__ == "__main__":
