@@ -3,6 +3,7 @@ import unittest
 import polars as pl
 import torch
 
+from src.data.segments import bin_index, segments_from_edges, validate_partition
 from src.data.tokenize import (
     ROOT,
     _bin_of,
@@ -19,6 +20,11 @@ _SEGMENT_CSV = (
 )
 
 
+def _is_boundary(segments: list[dict], value: float) -> bool:
+    """`value` is the shared endpoint of two consecutive segments."""
+    return any(a["hi"] == value == b["lo"] for a, b in zip(segments, segments[1:]))
+
+
 class ClinicalSegmentBinsTest(unittest.TestCase):
     """The primary v2 scheme: physician-designed clinical-segment bins from the CSV."""
 
@@ -29,24 +35,35 @@ class ClinicalSegmentBinsTest(unittest.TestCase):
         self.assertEqual(set(edges), {"lactate", "map", "creatinine"})
         # lactate has the clinician-designed granularity (many bins, sepsis-zone edges)
         self.assertGreater(len(edges["lactate"]), 10)
-        self.assertTrue(all(edges["lactate"][i] < edges["lactate"][i + 1]
-                            for i in range(len(edges["lactate"]) - 1)))  # strictly sorted
+        for segments in edges.values():
+            validate_partition(segments)  # strictly sorted, non-overlapping segments
+            self.assertTrue(all(a["hi"] <= b["lo"] for a, b in zip(segments, segments[1:])))
 
     def test_forced_edges_pinned_onto_segment_grid(self):
         edges = build_clinical_segment_bins(
-            ROOT / _SEGMENT_CSV, ["lactate"], forced_edges={"lactate": [2.0, 4.0]}
+            ROOT / _SEGMENT_CSV, ["lactate"], forced_edges={"lactate": [2.0, 4.0]},
+            directions={"lactate": "above"},
         )["lactate"]
-        self.assertTrue(any(abs(e - 2.0) < 1e-9 for e in edges))
-        self.assertTrue(any(abs(e - 4.0) < 1e-9 for e in edges))
+        self.assertTrue(_is_boundary(edges, 2.0))
+        self.assertTrue(_is_boundary(edges, 4.0))
+        # direction "above": the threshold value stays in the bin below the edge
+        self.assertEqual(_bin_of(4.0, "lactate", {"lactate": edges}),
+                         _bin_of(3.9, "lactate", {"lactate": edges}))
+        self.assertNotEqual(_bin_of(4.0, "lactate", {"lactate": edges}),
+                            _bin_of(4.01, "lactate", {"lactate": edges}))
 
     def test_map_65_decision_threshold_is_a_bin_edge(self):
         edges = build_clinical_segment_bins(
-            ROOT / _SEGMENT_CSV, ["map"], forced_edges={"map": [65.0]}
+            ROOT / _SEGMENT_CSV, ["map"], forced_edges={"map": [65.0]},
+            directions={"map": "below"},
         )["map"]
-        self.assertTrue(any(abs(e - 65.0) < 1e-9 for e in edges))
+        self.assertTrue(_is_boundary(edges, 65.0))
         # a MAP of 64 and 66 fall on opposite sides of the 65 edge
         self.assertNotEqual(_bin_of(64.0, "map", {"map": edges}),
                             _bin_of(66.0, "map", {"map": edges}))
+        # direction "below": MAP 65 itself is on the non-event (upper) side
+        self.assertEqual(_bin_of(65.0, "map", {"map": edges}),
+                         _bin_of(66.0, "map", {"map": edges}))
 
     def test_build_edges_dispatches_on_scheme(self):
         events = pl.DataFrame({"concept": ["lactate"] * 40,
@@ -76,7 +93,23 @@ class ClinicalSegmentBinsTest(unittest.TestCase):
                                "value": [float(v) / 8 for v in range(40)]})
         edges = build_edges({"scheme": "decile_ablation", "n_bins": 10}, events, ["lactate"])
         self.assertIn("lactate", edges)
-        self.assertEqual(len(edges["lactate"]), 9)  # 10 bins -> 9 interior edges
+        self.assertEqual(len(edges["lactate"]), 10)  # 10 bins -> 10 [a, b) segments
+        validate_partition(edges["lactate"])
+        interior = build_value_bins(events, 10)["lactate"]
+        self.assertEqual(edges["lactate"], segments_from_edges(interior))
+        # [a, b): a value exactly on a quantile edge goes to the bin above it
+        self.assertEqual(bin_index(interior[3], edges["lactate"]), 4)
+
+    def test_decile_forced_edges_take_outcome_direction_closure(self):
+        events = pl.DataFrame({"concept": ["lactate"] * 100,
+                               "value": [float(v) / 10 for v in range(100)]})
+        edges = build_edges(
+            {"scheme": "decile", "n_bins": 10, "forced_edges": {"lactate": [2.0]}},
+            events, ["lactate"], directions={"lactate": "above"},
+        )["lactate"]
+        self.assertTrue(_is_boundary(edges, 2.0))
+        self.assertEqual(bin_index(2.0, edges), bin_index(1.99, edges))
+        self.assertNotEqual(bin_index(2.0, edges), bin_index(2.01, edges))
 
 
 class TokenizeBinsTest(unittest.TestCase):

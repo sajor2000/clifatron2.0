@@ -1,7 +1,8 @@
 {
   "src/data/cohort.py": "3d71015d76b3f392932d482897d4f667c592a3e40539536270b6f9f40ced5aad",
+  "src/data/segments.py": "afe77eca0ba79f102295725a0e9f3c7154988403175be1f3c1ccb23cf158f76f",
   "src/data/splits.py": "6f3cf80eb75ebe0f3330f648bed4ebd83e50723847da86c6f87eff7c095c1a99",
-  "src/data/tokenize.py": "f62084250e05bf8d8c898832dd635daf9bd9c690d59db6974c8e2eaee8ecd7e0",
+  "src/data/tokenize.py": "c5954df165eb05f105e3ff8ab47fee8aa31f3b03ec02c2f3c0be0382b340075f",
   "src/eval/attestation.py": "8e95d971b5c6e1fbf4cdaaf8f397ff567c817ce3b671d9ffe98dfea9b5af76d4",
   "src/eval/bundle.py": "b900e0fef518b8c5ab6fafac7b65c2b5b690b8d72d6e87a27ff18c0bd054a808",
   "src/eval/bundle_inference.py": "661a29dc937924e6c790ab0fee0465cf2475d775e4603374fb86346352d1b6e0",

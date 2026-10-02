@@ -53,6 +53,7 @@ VENDOR_FILES = (
     "src/eval/synthetic_bundle.py",
     "src/data/splits.py",
     "src/data/cohort.py",
+    "src/data/segments.py",
     "src/data/tokenize.py",
     "src/model/heads.py",
     "src/model/varlen_attention.py",

@@ -33,6 +33,15 @@ from src.data.cohort import (
     validate_artifact_destination,
     validate_episode_artifact,
 )
+from src.data.segments import (
+    POLICY_VERSION,
+    as_segments,
+    bin_index,
+    load_csv_segments,
+    n_bins as segment_count,
+    segments_from_edges,
+    soft_bins,
+)
 from src.data.splits import fit_partition
 
 SPECIAL = {"<pad>": 0, "<bos>": 1, "<eos>": 2, "<unk>": 3}
@@ -270,62 +279,51 @@ def build_clinical_segment_bins(
     csv_path: str | Path,
     target_concepts: list[str],
     forced_edges: dict[str, list[float]] | None = None,
-) -> dict[str, list[float]]:
-    """Per-concept interior bin edges from the CLIF consortium's physician-designed
+    directions: dict[str, str] | None = None,
+) -> dict[str, list[dict]]:
+    """Per-concept closure-aware segments from the CLIF consortium's physician-designed
     segmentation CSV (`critical_illness_tokenization_final_with_intervals.csv`).
 
     These 1268 clinician-designed segments encode measurement-density granularity
     (tighter intervals in decision zones, extreme-value quintiles at the tails) that
     data-driven deciles cannot recover — the primary v2 scheme
-    (`value_binning.scheme: clinical_segment`)."""
-    import csv
-
-    forced_edges = forced_edges or {}
-    raw: dict[str, set[float]] = {}
-    with open(csv_path, newline="") as fh:
-        for row in csv.DictReader(fh):
-            measurement = row.get("measurement", "")
-            if measurement not in target_concepts:
-                continue
-            lo, hi = row.get("min_value"), row.get("max_value")
-            for v in (lo, hi):
-                if v is not None:
-                    try:
-                        raw.setdefault(measurement, set()).add(float(v))
-                    except (TypeError, ValueError):
-                        pass
-    edges = {}
-    for concept, boundaries in raw.items():
-        interior = sorted(b for b in boundaries if np.isfinite(b))
-        if len(interior) >= 2:
-            interior = interior[1:-1]
-        for pin in sorted({float(e) for e in forced_edges.get(concept, []) if np.isfinite(float(e))}):
-            if not any(np.isclose(e, pin) for e in interior):
-                interior.append(pin)
-                interior.sort()
-        edges[concept] = interior
-    return edges
+    (`value_binning.scheme: clinical_segment`). The CSV interval flags are honoured
+    and gaps/overlaps/forced edges resolve under precedence policy v1
+    (`src/data/segments.py`); `directions` (target concept -> "above"/"below") sets
+    the closure at forced edges so the threshold value lands on the non-event side."""
+    return load_csv_segments(csv_path, target_concepts, forced_edges, directions)
 
 
 def build_edges(bin_cfg: dict, fit_events: pl.DataFrame,
-                target_concepts: list[str]) -> dict[str, list[float]]:
-    """Dispatch on `value_binning.scheme` to build per-concept bin edges.
+                target_concepts: list[str],
+                directions: dict[str, str] | None = None) -> dict[str, list[dict]]:
+    """Dispatch on `value_binning.scheme` to build per-concept segments.
 
     - clinical_segment (default/primary): physician-designed segments from the CSV.
-    - decile / decile_ablation: population quantile edges (the Lee-2026 comparison arm).
+    - decile / decile_ablation: population quantile edges (the Lee-2026 comparison arm),
+      expressed as `[a, b)` segments with unbounded ends.
+
+    Both return `{concept: [segment, ...]}` (see `src/data/segments.py`); forced edges
+    take outcome-direction closure from `directions` in both schemes.
     """
     scheme = bin_cfg.get("scheme", "clinical_segment")
-    forced = bin_cfg.get("forced_edges")
+    forced = bin_cfg.get("forced_edges") or {}
+    directions = directions or {}
     if scheme in ("clinical_segment",):
         source = bin_cfg.get("segment_source")
         if not source:
             raise ValueError("value_binning.scheme=clinical_segment requires segment_source")
-        return build_clinical_segment_bins(ROOT / source, target_concepts, forced)
+        return build_clinical_segment_bins(ROOT / source, target_concepts, forced, directions)
     if scheme in ("decile", "decile_ablation"):
-        n_bins = bin_cfg.get("n_bins")
-        if not n_bins:
+        n_quantile_bins = bin_cfg.get("n_bins")
+        if not n_quantile_bins:
             raise ValueError(f"value_binning.scheme={scheme} requires n_bins")
-        return build_value_bins(fit_events, n_bins, forced)
+        return {
+            concept: segments_from_edges(
+                edges, forced.get(concept, ()), directions.get(concept)
+            )
+            for concept, edges in build_value_bins(fit_events, n_quantile_bins, forced).items()
+        }
     raise ValueError(f"unknown value_binning.scheme: {scheme!r}")
 
 
@@ -334,13 +332,13 @@ def fused_token(concept: str, b: int | None) -> str:
     return f"{concept}={b}" if b is not None else concept
 
 
-def build_vocab(events: pl.DataFrame, edges: dict[str, list[float]]) -> dict:
+def build_vocab(events: pl.DataFrame, edges: dict[str, list]) -> dict:
     """One id per FUSED token: `concept` (categorical) or `concept=bin` (numeric)."""
     vocab = dict(SPECIAL)
     nxt = len(vocab)
     for concept in sorted(events["concept"].unique().to_list()):
         if concept in edges:
-            for b in range(len(edges[concept]) + 1):        # n_bins fused tokens
+            for b in range(segment_count(edges[concept])):          # one fused token per segment
                 vocab[fused_token(concept, b)] = nxt
                 nxt += 1
         else:
@@ -349,62 +347,21 @@ def build_vocab(events: pl.DataFrame, edges: dict[str, list[float]]) -> dict:
     return vocab
 
 
-def _bin_of(value: float | None, concept: str, edges: dict[str, list[float]]) -> int | None:
+def _bin_of(value: float | None, concept: str, edges: dict[str, list]) -> int | None:
+    """Delegates to `segments.bin_index` (the single binning function). `edges[concept]`
+    is a segment list, or a legacy interior-edge list read with the `[a, b)` rule."""
     if value is None or concept not in edges:
         return None
-    return min(max(int(np.searchsorted(edges[concept], value, side="right")),
-                   0), len(edges[concept]))
+    return bin_index(value, as_segments(edges[concept]))
 
 
-def _soft_bins(value: float | None, concept: str, edges: dict[str, list[float]],
+def _soft_bins(value: float | None, concept: str, edges: dict[str, list],
                kernel_bins: int) -> list[tuple[int | None, float]]:
     """Return fixed-width (2*kernel_bins+1) assignments so every event produces
-    a uniform-length list for the [B,T,K] dense tensor the encoder expects."""
-    fixed_width = 2 * max(kernel_bins, 0) + 1
-
-    def _uniform(bin_idx, w=1.0):
-        """Pad a single assignment to `fixed_width` so every event yields a
-        uniform-length list for the [B,T,K] dense tensor the encoder expects.
-        Non-numeric events (hard_bin is None) and edgeless concepts land here."""
-        bins = [bin_idx] * fixed_width
-        weights = [w] + [0.0] * (fixed_width - 1)
-        return list(zip(bins, weights))
-
-    hard_bin = _bin_of(value, concept, edges)
-    if hard_bin is None or kernel_bins <= 0:
-        return _uniform(hard_bin)
-
-    boundaries = edges[concept]
-    if len(boundaries) < 2:
-        return _uniform(hard_bin)
-
-    lower = boundaries[hard_bin - 1] if hard_bin else None
-    upper = boundaries[hard_bin] if hard_bin < len(boundaries) else None
-    if lower is None and upper is not None:
-        width = boundaries[1] - upper
-        lower = upper - max(width, 1e-12)
-    if upper is None and lower is not None:
-        width = lower - boundaries[-2]
-        upper = lower + max(width, 1e-12)
-    center = hard_bin
-    if lower is not None and upper is not None and upper > lower:
-        center += float(np.clip((value - lower) / (upper - lower), 0, 1)) - 0.5
-
-    half = kernel_bins
-    candidates = np.arange(max(0, hard_bin - half), min(len(boundaries), hard_bin + half) + 1)
-    sigma = max(half / 2, 0.5)
-    weights = np.exp(-0.5 * ((candidates - center) / sigma) ** 2)
-    weights /= weights.sum()
-
-    width = 2 * half + 1
-    padded_bins = [hard_bin] * width
-    padded_weights = [0.0] * width
-    for idx, weight in zip(candidates, weights):
-        slot = int(idx) - (hard_bin - half)
-        if 0 <= slot < width:
-            padded_bins[slot] = int(idx)
-            padded_weights[slot] = float(weight)
-    return list(zip(padded_bins, padded_weights))
+    a uniform-length list for the [B,T,K] dense tensor the encoder expects.
+    Delegates to `segments.soft_bins`; unbinned concepts pad `(None, 1.0)`."""
+    segments = as_segments(edges[concept]) if concept in edges else []
+    return soft_bins(value, segments, kernel_bins)
 
 
 def _check_single_hospital(con, base: Path) -> None:
@@ -501,7 +458,10 @@ def tokenize_site(cfg: dict, site: str, base: Path, out: Path,
                 "value_binning.scheme=clinical_segment requires a non-empty cfg.target_concepts; "
                 "without it no clinical-segment edges are built and numeric events lose their value bins"
             )
-        edges = build_edges(bin_cfg, fit_events, target_concepts)
+        directions = {
+            t["name"]: t["direction"] for t in cfg.get("target_concepts", []) if "direction" in t
+        }
+        edges = build_edges(bin_cfg, fit_events, target_concepts, directions)
         vocab = build_vocab(fit_events, edges)
         cohort_cfg = yaml.safe_load((ROOT / cfg["cohort_contract"]).read_text())
         split_hashes = episodes["split_sha256"].drop_nulls().unique().to_list()
@@ -524,6 +484,8 @@ def tokenize_site(cfg: dict, site: str, base: Path, out: Path,
                 "source_site": site,
                 "fit_partition": cfg["value_binning"].get("fit_partition", "train"),
                 "cohort_contract_version": episodes["cohort_contract_version"].item(0),
+                # Segment precedence policy (src/data/segments.py) the edges were built under.
+                "precedence_policy": POLICY_VERSION,
             },
         }
         print(f"  built vocab: {len(vocab):,} tokens, {len(edges):,} numeric concepts")
