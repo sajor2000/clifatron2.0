@@ -38,10 +38,14 @@ outcomes are states doctors *act on* (never treatments — those are inputs only
 
 ## Tokenizer & trunk (see `MEMORY.md` §E + `AGENTS.md`)
 Full tokenizer spec: [`website/docs/data-tokenization.md`](website/docs/data-tokenization.md).
-- **Tokens:** fused `code=bin` · **physician-designed clinical-segment bins** from the CLIF consortium CSV
-  (primary, revised 2026-09-02; population deciles = `decile_ablation` arm) · **soft discretization** for
-  tail/threshold sensitivity · ICU decision thresholds forced as bin edges (lactate 2/4, MAP 65,
-  SpO₂ 88/90, creatinine 1.5/2/3).
+- **Tokens (tokenizer v2, 2026-10-02):** fused `code=bin` for **every** numeric concept · **physician-designed
+  clinical-segment bins** from the CLIF consortium CSV with its interval flags honored (primary; else ordinal
+  or frozen quantile bins; zero bin for every dose; population deciles = `decile_ablation` arm) · fused
+  `concept=value` categoricals · doses, vent settings, assessments, CRRT, ECMO/MCS, code status, position and
+  static admission tokens · **soft discretization** · ICU decision thresholds forced as bin edges with
+  outcome-direction closure (lactate 2/4, MAP 65, SpO₂ 88/90, creatinine 1.5/2/3) · deterministic order +
+  declared availability · a full-hospitalization GEM artifact · an aggregate-only report + gate.
+  Every v1 artifact and checkpoint is refused; a `--sample-episodes` vocabulary is smoke-only.
 - **Time:** minutes-since-ICU-admission **time-aware RoPE** (drop inserted `day_N/hour_N` tokens).
 - **Trunk:** from-scratch Qwen2-arch decoder (~30M; objective, not backbone, is the lever), d512 × 8L × 8H,
   SwiGLU/RMSNorm, no QK-Norm, **untied embeddings**, context 8192. Qwen3-arch = measured ablation row.

@@ -152,8 +152,8 @@ flowchart LR
 ```
 
 Resolution: **untied + ~10k vocab** (≈8–12M emb + ~25M trunk ≈ 33–37M, still the "~30M
-neighborhood"). Documented in `notes/NEXT_STEPS.md §2.3`. The current frozen v2 vocab is only a
-few hundred ids ([vocabulary](./data-tokenization.md#4--fused-vocabulary-and-the-frozen-manifest)),
+neighborhood"). Documented in `notes/NEXT_STEPS.md §2.3`. The tokenizer-v2 vocab is about 2k ids
+on the Site 1 verification sample ([vocabulary](./data-tokenization.md#4--fused-vocabulary-and-the-frozen-manifest)),
 so ~10k is headroom, not today's size.
 
 ---
