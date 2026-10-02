@@ -27,7 +27,7 @@ We attach the same four heads to either backbone's per-token hidden states. A Qw
 (adds QK-Norm) is a **measured ablation row** ([Ablations](./ablations.md)), so "Qwen2 vs Qwen3" is
 a quantified finding, not an assertion.
 
-:::info Objective, not backbone, is the lever
+:::info[Objective, not backbone, is the lever]
 ORA (arXiv:2602.00541) shows the gains are backbone-agnostic — so the backbone is a footnote and the
 *objective* is where the novelty lives. The from-scratch Qwen2-arch model is the primary contribution; the
 CLIFATRON-Qwen2 attach is the cheap wedge that de-risks it first. See `MEMORY.md` §B.
@@ -176,7 +176,7 @@ sequenceDiagram
     H-->>B: prediction (hazard / CIF / value / logit)
 ```
 
-:::warning Transformers v5 caveat
+:::warning[Transformers v5 caveat]
 The installed `transformers` is v5, where `output_hidden_states` moved to a
 `_can_record_outputs` mechanism and the *final* hidden state may differ from the last
 hidden-states entry due to extra normalization. Verify `anchor_state` against a real CLIFATRON

@@ -66,7 +66,7 @@ renders the score, the warnings, and the offending samples per rollout.
 Guarding narrowed the vitals and categoricals gaps vs the unguarded rollouts at a marginal
 JS/overlap cost — the right trade for a provably closed vocabulary.
 
-:::warning The key finding
+:::warning[The key finding]
 **Rollout anchoring does not improve with NTP steps.** Key-event recall and
 distance-to-observed were flat-to-worse from 3k → 6k steps (the model gets more diverse,
 not more locally faithful). That is evidence **for** the plan's sequencing: pure NTP for

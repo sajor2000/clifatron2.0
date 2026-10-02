@@ -11,7 +11,7 @@ anchor hidden state, and beat their **Method 1** (XGBoost-on-embeddings) on AUPR
 and **Method 2** (Monte-Carlo rollout) on cost — on CLIFATRON's own 4-task benchmark, across
 Site 1 / Site 2 / Site 3. Implemented in `src/eval/method3.py`.
 
-:::tip Why this is the wedge
+:::tip[Why this is the wedge]
 It runs on **any released checkpoint today** in frozen-probe mode — no retraining, minimal
 infra — yet it validates the whole objective thesis. It is the cheapest publishable result.
 :::
@@ -137,7 +137,7 @@ python -m src.eval.method3 \
   --method both
 ```
 
-:::warning Verify before running
+:::warning[Verify before running]
 Confirm CLIFATRON's benchmark parquet column names (`sequence` / `label` / subgroup columns)
 against its `build_benchmark.py`, and which sites the released checkpoint was trained on (a
 leakage risk for the "external" claim).

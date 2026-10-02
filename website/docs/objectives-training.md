@@ -40,7 +40,7 @@ flowchart TB
 | Value regression | `0.5` | The ORA "mark" — lifts physiology tasks |
 | Next-event (NTP) | `0.2` | Low-weight aux; retains open-ended zero-shot; **joint mode only** |
 
-:::note NTP only when the backbone trains
+:::note[NTP only when the backbone trains]
 `next-event` loss is added only when `freeze_backbone=False` — a frozen probe reads the
 backbone's existing representation, so re-fitting a next-token head would be pointless.
 :::
@@ -138,7 +138,7 @@ FSDP is *not* used (only pays off past ~2.3B params and is worse without NVLink)
 `src/train/pretrain.py` drives the from-scratch path; `src/train/joint_pretrain.py` drives the
 CLIFATRON joint path; `src/train/run_arm.py` drives the ablation arms.
 
-:::tip Value-head normalization — resolved
+:::tip[Value-head normalization — resolved]
 Value targets are standardized with per-token robust statistics frozen from the reference site's
 train partition (`src/data/value_stats.py`, vocab-hash-bound). `pretrain.py` rejects a stats file
 whose vocabulary hash or fit partition does not match, and refuses real (non-dry-run) training on

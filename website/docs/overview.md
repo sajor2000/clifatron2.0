@@ -27,13 +27,13 @@ rule, and document-isolation packing. What we add: threshold-conditioned time-to
 This site documents the **full planned scientific workflow** end to end, one stage per page,
 with diagrams drawn directly from the implementation in `src/`.
 
-:::note Single source of truth
+:::note[Single source of truth]
 The finalized design spec lives in `MEMORY.md` and `notes/NEXT_STEPS.md`. `notes/RESEARCH.md`
 and `notes/METHODS.md` carry the evidence base but are marked **pre-pivot** — where they
 disagree with `MEMORY.md`, `MEMORY.md` wins. These docs mirror the current (post-pivot) spec.
 :::
 
-:::tip What's new / where things stand
+:::tip[What's new / where things stand]
 Every **data-free, unblocked** unit has landed — the codebase is a complete, CI-enforced, reproducible
 methods artifact. New since the first docs: per-token **value-head normalization**, the full
 **governance / trust / disclosure** machinery (Ed25519 release-trust, cumulative disclosure ledger,

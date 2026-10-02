@@ -33,7 +33,7 @@ flowchart TB
     class DISC,CAL,DCA,SUB,LPE metric;
 ```
 
-:::warning DCA assumes calibrated probabilities
+:::warning[DCA assumes calibrated probabilities]
 Decision-curve analysis is computed **after** temperature scaling — net benefit is only
 meaningful on calibrated probabilities. The panel enforces this ordering in `full_panel`.
 :::

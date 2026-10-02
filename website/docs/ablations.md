@@ -45,7 +45,7 @@ flowchart TB
 | From scratch | random-init CLIFEncoder, Qwen2-arch ~30M (our primary model) | full (~35M) | TOO-BERT (from-scratch can win specific tasks) |
 | No-pretrain | random encoder (frozen) | head only | negative control (floor) |
 
-:::tip Why frozen-probe is the expected winner
+:::tip[Why frozen-probe is the expected winner]
 On data-constrained single-site data (utility saturates ~28M on Site 1, arXiv:2505.22964),
 unfreezing a 0.5B backbone risks catastrophic forgetting, and the task-aligned survival objective
 *is* the supervision.
@@ -113,7 +113,7 @@ TextCode. Each arm loads its own shard and frozen vocabulary through the shared
 The full arm table lives in
 **[Tokenization ablation](./data-tokenization.md#9--tokenization-ablation)**.
 
-:::info Runnable; no result yet
+:::info[Runnable; no result yet]
 All six arms run end to end: two optimizer steps on a synthetic shard in CI
 (`tests/test_tokenization_ablation.py`), and two steps each on a 5,000-episode Site 1 verification
 sample ([verified on real data](./data-tokenization.md#verified-on-real-data)). No tokenization

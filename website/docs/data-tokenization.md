@@ -20,7 +20,7 @@ and this page is a bug.
 | **Output** | `events.parquet` (24 h artifact, one row per ICU stay) · `gem_events.parquet` (full hospitalization, one row per window) · `vocab.json` (tokenizer v2 contract) · `tokenization_report.json` / `gem_tokenization_report.json` (aggregate-only) |
 | **Tests** | `tests/test_segments.py`, `tests/test_tokenize_bins.py`, `tests/test_tokenize_alignment.py`, `tests/test_units.py`, `tests/test_gem_artifact.py`, `tests/test_tokenize_workers.py`, `tests/test_tokenization_report.py`, `tests/test_tokenization_ablation.py` |
 
-:::warning Every v1 tokenizer artifact must be rebuilt
+:::warning[Every v1 tokenizer artifact must be rebuilt]
 Tokenizer v2 changed the token stream (bins, coverage, order, new sources). Every
 `vocab.json`, shard, value-stats file and checkpoint built by the previous tokenizer is
 **refused** with a re-tokenize message, never silently reused. The production vocabulary must be
@@ -123,7 +123,7 @@ prone / not-prone transitions.
 Rows with a null concept or null timestamp are dropped at read time. A table whose parquet file
 is missing is skipped with a log line. If **no** configured table exists, the run fails.
 
-:::warning Rule 1: treatments are inputs, never targets
+:::warning[Rule 1: treatments are inputs, never targets]
 Every event from an `input_only` table (medications, respiratory support, CRRT, ECMO/MCS, code
 status, position, ADT) and every static token gets `target_eligible = false`. These events stay
 in the context the model reads, but the target builder never makes them a next-event or value
@@ -384,7 +384,7 @@ fails the run under `unit_normalization.on_mismatch: error`.
 any binned concept plus one, derived from the vocabulary in training and in the site package's
 checkpoint loader, never hard-coded (24 on the Site 1 sample).
 
-:::info Single-hospital guard
+:::info[Single-hospital guard]
 If a site's `clif_adt` contains more than one `hospital_id`, tokenization fails. Each hospital
 must be its own site, because pooling hospitals under one site silently merges different
 workflows and populations (Rule 2).
@@ -456,7 +456,7 @@ index by index; a skipped event is dropped from **every** list.
 (`source_start`, `source_end`, `continuation_index`, `n_windows`, `continues_from_previous`,
 `continues_to_next`) and the stay's `anchor_idx` / `anchor_min` (§10).
 
-:::danger Data classification
+:::danger[Data classification]
 `events.parquet` and `gem_events.parquet` are patient-level PHI under `output/intermediate_phi/`.
 They stay on their node. External validation returns only aggregate metrics, through
 `clif-validate` (Rule 5). The tokenization reports are aggregate-only (§11).

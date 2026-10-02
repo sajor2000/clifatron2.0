@@ -44,7 +44,7 @@ flowchart TB
     class J leave;
 ```
 
-:::danger What crosses the node boundary
+:::danger[What crosses the node boundary]
 **Only** an aggregate/subgroup metrics JSON leaves a site. Raw rows, per-patient predictions,
 labels, gradients, and identifiers **never** leave. The validator output is checked to contain
 no `patient_id`, `hosp_id`, `sequence`, `token`, or `pos_min` fields (see
@@ -111,7 +111,7 @@ ascertainment windows (see `configs/cohort.yaml → outcomes`). The label states
 (`positive` / `negative` / `censored` / `not_ascertainable`), not a naive binary — a stay whose value
 was never measured within the ascertainment window is *not* forced to negative.
 
-:::note Treatments are inputs, never targets (Rule 1)
+:::note[Treatments are inputs, never targets (Rule 1)]
 IMV and vasopressors are deliberately **not** auto-labeled outcomes — they are treatments, so they are
 model *inputs* only. `tests/test_data_config.py` asserts `new_imv_24h` / `new_vasopressor_24h` are not
 tasks. Mortality enters only as the competing-risk death event, not as an auto-labeled binary outcome.
@@ -239,7 +239,7 @@ weights are governed artifacts under separate agreements; shipping a real bundle
 site additionally requires the derived-model transfer approval (pending — a governance action,
 not a code change). Publication mechanics (PyPI, wheelhouse, SBOM, chain-key custody) are U11.
 
-:::info Open design question — vocabulary transfer
+:::info[Open design question — vocabulary transfer]
 The federation assumes the frozen mCIDE vocab covers each site's concepts. PORTER (arXiv:2606.24102)
 shows fixed-vocabulary models can drop a large fraction of events on cross-site transfer. The
 **TextCode** tokenization arm (language-grounded event descriptions) is the mitigation to
