@@ -12,6 +12,14 @@ partition is binned (CSV segments, else ordinal point bins, else frozen quantile
 concepts always get a [0,0] stop bin) and the per-concept choice is recorded in vocab.json
 `binning_sources` (see `build_segments`).
 
+vocab.json is the tokenizer-v2 artifact (KTD7): `vocab`, `segments` (closure-aware, per
+binned concept), `binning_sources`, `reference_units` (per binned concept, plus the dose
+target units), `concept_sources` (charting tables + the input-only tables),
+`precedence_policy`, and a `manifest` with `tokenizer_version: 2` and a SHA-256 for each
+field (`numeric_edges` is the segments hash). Every events.parquet row carries the
+binding (`artifact_hashes`); anything built by the previous tokenizer is refused with a
+re-tokenize message.
+
 Each event is ONE FUSED token: `concept=bin` (numeric), `concept=<value>` (a categorical
 result on a row with no numeric value, from a table's `categorical_value_col`), or bare
 `concept` (presence).
@@ -38,7 +46,6 @@ Usage:
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import re
 from pathlib import Path
@@ -55,15 +62,20 @@ from src.data.cohort import (
 )
 from src.data.segments import (
     POLICY_VERSION,
+    RETOKENIZE,
+    TOKENIZER_VERSION,
+    artifact_binding,
     as_segments,
     bin_index,
     dose_segments_from_edges,
     is_ordinal,
+    json_sha256,
     load_csv_segments,
     n_bins as segment_count,
     ordinal_segments,
     segments_from_edges,
     soft_bins,
+    validate_partition,
     with_zero_point,
 )
 from src.data.splits import fit_partition
@@ -123,9 +135,56 @@ STATIC_SOURCE = "static"
 _LITERAL_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 
-def _json_sha256(value: object) -> str:
-    payload = json.dumps(value, sort_keys=True, separators=(",", ":"))
-    return hashlib.sha256(payload.encode()).hexdigest()
+_json_sha256 = json_sha256  # one canonical hashing rule (src/data/segments.py)
+
+# KTD7: hashes every tokenizer-v2 vocabulary manifest carries, whatever the policy lists.
+# `numeric_edges` is the segments hash.
+V2_HASHES = ("vocabulary", "numeric_edges", "binning_sources", "reference_units",
+             "concept_sources")
+# R14: a binned concept's reference "unit" when the wide device table it comes from
+# carries no unit column: the device metric (column) it measures.
+DEVICE_METRIC_PREFIX = "device_metric:"
+
+
+def _validate_v2_fields(blob: dict) -> None:
+    """Shape of the tokenizer-v2 fields (KTD7); their hashes are checked by the caller."""
+    segments = blob["segments"]
+    for concept, segs in segments.items():
+        try:
+            validate_partition(segs)
+        except (TypeError, ValueError, KeyError) as exc:
+            raise QualificationError(
+                f"vocabulary segments for {concept!r} are not a valid partition: {exc}"
+            ) from exc
+    sources = blob.get("binning_sources")
+    if (not isinstance(sources, dict) or set(sources) != set(segments)
+            or any(v not in BINNING_SOURCES for v in sources.values())):
+        raise QualificationError(
+            "vocabulary binning sources must name exactly the binned concepts, each one of "
+            f"{', '.join(BINNING_SOURCES)}"
+        )
+    units = blob.get("reference_units")
+    if (not isinstance(units, dict) or not isinstance(units.get("concepts"), dict)
+            or set(units["concepts"]) != set(segments)
+            or not isinstance(units.get("dose_targets"), dict)):
+        raise QualificationError(
+            "vocabulary reference units must map every binned concept (concepts) and "
+            "carry the dose target units (dose_targets)"
+        )
+    concept_sources = blob.get("concept_sources")
+    if (not isinstance(concept_sources, dict)
+            or not isinstance(concept_sources.get("tables"), dict)
+            or not isinstance(concept_sources.get("treatment_sources"), list)):
+        raise QualificationError(
+            "vocabulary concept sources must carry tables and treatment_sources"
+        )
+    policy = blob.get("precedence_policy")
+    recorded = ((blob["manifest"].get("provenance") or {}).get("precedence_policy", policy))
+    if policy != POLICY_VERSION or recorded != POLICY_VERSION:
+        raise QualificationError(
+            f"vocabulary segments were built under precedence policy {policy!r}, not "
+            f"{POLICY_VERSION}; {RETOKENIZE}"
+        )
 
 
 def validate_vocabulary_artifact(
@@ -135,12 +194,23 @@ def validate_vocabulary_artifact(
     *,
     expected_family: str = "experimental_representation",
 ) -> tuple[dict, dict, dict]:
-    """Validate imported vocabulary content and its original compatibility record."""
-    if not isinstance(blob.get("vocab"), dict) or not isinstance(blob.get("edges"), dict):
-        raise QualificationError("vocabulary artifact must contain vocab and edges mappings")
-    manifest = blob.get("manifest")
+    """Validate an imported tokenizer-v2 vocabulary artifact and its compatibility record.
+
+    Returns ``(vocab, segments, manifest)``. An artifact built by the previous tokenizer
+    (no ``tokenizer_version: 2``, ``edges`` instead of ``segments``) is refused with a
+    re-tokenize message, never reused."""
+    manifest = blob.get("manifest") if isinstance(blob, dict) else None
     if not isinstance(manifest, dict):
         raise QualificationError("vocabulary artifact is missing its manifest")
+    version = manifest.get("tokenizer_version")
+    if version != TOKENIZER_VERSION:
+        raise QualificationError(
+            f"vocabulary artifact was built by tokenizer version {version or 1}; this "
+            f"build requires version {TOKENIZER_VERSION}: {RETOKENIZE}"
+        )
+    if not isinstance(blob.get("vocab"), dict) or not isinstance(blob.get("segments"), dict):
+        raise QualificationError("vocabulary artifact must contain vocab and segments mappings")
+    _validate_v2_fields(blob)
     if manifest.get("artifact_family") != expected_family:
         raise QualificationError("incompatible vocabulary artifact family")
     if manifest.get("clif_version") != cfg["schema_version"]:
@@ -153,20 +223,20 @@ def validate_vocabulary_artifact(
     hashes = manifest.get("hashes")
     if not isinstance(hashes, dict):
         raise QualificationError("vocabulary manifest is missing compatibility hashes")
-    missing = sorted(set(family["required_hashes"]) - set(hashes))
+    missing = sorted((set(family["required_hashes"]) | set(V2_HASHES)) - set(hashes))
     if missing:
         raise QualificationError(f"vocabulary manifest is missing hashes: {', '.join(missing)}")
     if any(not isinstance(value, str) or len(value) != 64 for value in hashes.values()):
         raise QualificationError("vocabulary manifest contains an invalid SHA-256 hash")
     if hashes["vocabulary"] != _json_sha256(blob["vocab"]):
         raise QualificationError("vocabulary hash mismatch")
-    if hashes["numeric_edges"] != _json_sha256(blob["edges"]):
+    if hashes["numeric_edges"] != _json_sha256(blob["segments"]):
         raise QualificationError("numeric-edge hash mismatch")
-    # Per-concept binning sources (U2) are bound when both the map and its hash travel;
-    # the full v2 artifact contract (required hash, tokenizer version) is U5.
-    if blob.get("binning_sources") is not None and "binning_sources" in hashes:
-        if hashes["binning_sources"] != _json_sha256(blob["binning_sources"]):
-            raise QualificationError("binning-sources hash mismatch")
+    for field, label in (("binning_sources", "binning-sources"),
+                         ("reference_units", "reference-units"),
+                         ("concept_sources", "concept-sources")):
+        if hashes[field] != _json_sha256(blob[field]):
+            raise QualificationError(f"{label} hash mismatch")
     if hashes["clif_version"] != _json_sha256(cfg["schema_version"]):
         raise QualificationError("CLIF-version compatibility hash mismatch")
     if hashes.get("target_map") != _json_sha256(cfg["target_concepts"]):
@@ -180,7 +250,7 @@ def validate_vocabulary_artifact(
     cohort_cfg = yaml.safe_load((ROOT / cfg["cohort_contract"]).read_text())
     if hashes.get("outcome_spec") != _json_sha256(cohort_cfg["outcomes"]):
         raise QualificationError("outcome-spec compatibility hash mismatch")
-    return blob["vocab"], blob["edges"], manifest
+    return blob["vocab"], blob["segments"], manifest
 
 
 def validate_table_availability(tables: dict) -> dict[str, dict]:
@@ -660,37 +730,100 @@ def _carry_forward(events: pl.DataFrame, episodes: pl.DataFrame,
     )
 
 
-def _dose_target_units(cfg: dict, vocab_manifest: dict | None) -> dict[str, str]:
+def _dose_target_units(cfg: dict, vocab_artifact: dict | None) -> dict[str, str]:
     """The continuous-dose target unit per med_category (R6). Building: the physician
     CSV's medication rows. Importing: the units the frozen vocabulary was built with
-    (manifest provenance), so every site converts to the same concepts."""
-    if vocab_manifest is not None:
-        recorded = (vocab_manifest.get("provenance") or {}).get("dose_target_units")
-        if isinstance(recorded, dict):
-            return dict(recorded)
+    (hashed `reference_units.dose_targets`), so every site converts to the same
+    concepts."""
+    if vocab_artifact is not None:
+        return dict(vocab_artifact["reference_units"]["dose_targets"])
     source = cfg.get("value_binning", {}).get("segment_source")
     if not source or not (ROOT / source).exists():
         return {}
     return preferred_units_from_csv(ROOT / source)
 
 
-def validate_units(events: pl.DataFrame, cfg: dict) -> None:
-    def normalized(unit: str) -> str:
-        u = unit.strip().lower().replace("¬µ", "u").replace("µ", "u").replace("μ", "u")
-        return u.replace("k/ul", "10^3/ul").replace("10^3/ul", "10^3/ul")
+def _normalized_unit(unit: str) -> str:
+    u = unit.strip().lower().replace("¬µ", "u").replace("µ", "u").replace("μ", "u")
+    return u.replace("k/ul", "10^3/ul").replace("10^3/ul", "10^3/ul")
 
-    expected = cfg.get("unit_normalization", {}).get("concepts", {})
+
+def validate_units(events: pl.DataFrame, cfg: dict,
+                   reference_units: dict | None = None) -> None:
+    """Fail closed (under `unit_normalization.on_mismatch: error`) on a charted unit that
+    is not the expected one. Expected units: the config's canonical units, plus — when
+    importing a frozen vocabulary — the reference site's unit for EVERY binned concept
+    (`reference_units.concepts`), so a non-target concept charted in another unit is
+    never silently binned against the reference site's segments. Device metrics and
+    unit-less concepts are not unit-checked."""
+    expected = {
+        concept: unit
+        for concept, unit in ((reference_units or {}).get("concepts") or {}).items()
+        if isinstance(unit, str) and unit and not unit.startswith(DEVICE_METRIC_PREFIX)
+    }
+    expected.update(cfg.get("unit_normalization", {}).get("concepts", {}) or {})
     observed = events.filter(pl.col("unit").is_not_null()).select("concept", "unit").unique()
     mismatches = [
         f"{concept}: expected {expected[concept]!r}, found {unit!r}"
         for concept, unit in observed.iter_rows()
-        if concept in expected and normalized(unit) != normalized(expected[concept])
-        and unit not in (None, "")
+        if concept in expected and unit not in (None, "")
+        and _normalized_unit(unit) != _normalized_unit(expected[concept])
     ]
-    if mismatches and cfg["unit_normalization"].get("on_mismatch") == "error":
+    if mismatches and cfg.get("unit_normalization", {}).get("on_mismatch") == "error":
         raise ValueError("Non-canonical CLIF units: " + "; ".join(sorted(mismatches)))
-    if not expected:
-        return
+
+
+def reference_units(fit_events: pl.DataFrame, segments: dict, cfg: dict,
+                    dose_targets: dict[str, str]) -> dict:
+    """R14: the reference unit of every binned concept, plus the dose target units.
+
+    Per concept: the config's canonical unit; else the reference site's most frequent
+    charted unit (ties -> lexicographically first); else, for a wide device table
+    qualified by `concept_qualifier_col` (ECMO/MCS), ``device_metric:<column>``; else
+    None. Hashed into the vocabulary manifest so every site checks units identically."""
+    canonical = cfg.get("unit_normalization", {}).get("concepts", {}) or {}
+    observed: dict[str, str] = {}
+    if "unit" in fit_events.columns:
+        counts = (
+            fit_events.filter(pl.col("unit").is_not_null() & (pl.col("unit") != ""))
+            .group_by("concept", "unit").len()
+            .sort(["concept", "len", "unit"], descending=[False, True, False])
+        )
+        for concept, unit, _ in counts.iter_rows():
+            observed.setdefault(concept, unit)
+    metrics: dict[str, str] = {}
+    sources = _concept_tables(fit_events)
+    for name, spec in (cfg.get("tables") or {}).items():
+        if not spec.get("concept_qualifier_col"):
+            continue
+        for col in spec.get("value_cols") or ():
+            suffix = f"_{col.lower()}"
+            for concept, tables in sources.items():
+                if name in tables and concept.endswith(suffix):
+                    metrics.setdefault(concept, f"{DEVICE_METRIC_PREFIX}{col}")
+    units = {
+        concept: canonical.get(concept) or observed.get(concept) or metrics.get(concept)
+        for concept in sorted(segments)
+    }
+    return {"concepts": units, "dose_targets": dict(sorted(dose_targets.items()))}
+
+
+def _concept_tables(fit_events: pl.DataFrame) -> dict[str, list[str]]:
+    if fit_events.is_empty() or "source" not in fit_events.columns:
+        return {}
+    grouped = (
+        fit_events.filter(pl.col("concept").is_not_null())
+        .group_by("concept").agg(pl.col("source").unique().sort())
+        .sort("concept")
+    )
+    return {concept: list(tables) for concept, tables in grouped.iter_rows()}
+
+
+def concept_sources(fit_events: pl.DataFrame, treatment_sources: set[str]) -> dict:
+    """Per concept, the table(s) charting it in the fit partition, plus the input-only
+    (treatment/device/context) tables — what evaluation groups tokens by (KTD7)."""
+    return {"tables": _concept_tables(fit_events),
+            "treatment_sources": sorted(treatment_sources)}
 
 
 def restrict_to_observation_window(
@@ -1071,24 +1204,26 @@ def _check_single_hospital(con, base: Path) -> None:
 
 
 def tokenize_site(cfg: dict, site: str, base: Path, out: Path,
-                   vocab: dict | None, edges: dict | None,
-                   limit_stays: int | None = None,
-                   episodes: pl.DataFrame | None = None,
-                   vocab_manifest: dict | None = None,
-                   artifact_policy: dict | None = None,
-                   binning_sources: dict | None = None,
-                   stats: dict | None = None):
-    """Tokenize one site. `stats`, if given, is filled with aggregate-only run counts
-    (`dose_conversion`: {dose table: {status: rows}}) for the tokenization report."""
+                  vocab_artifact: dict | None = None, *,
+                  limit_stays: int | None = None,
+                  episodes: pl.DataFrame | None = None,
+                  artifact_policy: dict | None = None,
+                  stats: dict | None = None):
+    """Tokenize one site.
+
+    `vocab_artifact` None builds the frozen tokenizer-v2 vocabulary (reference site);
+    otherwise it is a whole `vocab.json` blob, validated (`validate_vocabulary_artifact`)
+    and applied unchanged. Every stay row of `events.parquet` carries the artifact
+    binding (`artifact_hashes`: tokenizer version, vocabulary and segments hashes).
+    `stats`, if given, is filled with aggregate-only run counts (`dose_conversion`:
+    {dose table: {status: rows}}) for the tokenization report. Returns
+    ``(vocab, segments)``."""
     policy = artifact_policy or yaml.safe_load((ROOT / cfg["artifact_policy"]).read_text())
     events_path = out / "events.parquet"
     validate_artifact_destination(events_path, "patient_level_phi", policy)
-    if vocab is not None:
-        vocab, edges, vocab_manifest = validate_vocabulary_artifact(
-            {"vocab": vocab, "edges": edges, "manifest": vocab_manifest,
-             "binning_sources": binning_sources},
-            cfg, policy,
-        )
+    vocab = edges = vocab_manifest = None
+    if vocab_artifact is not None:
+        vocab, edges, vocab_manifest = validate_vocabulary_artifact(vocab_artifact, cfg, policy)
     availability = validate_table_availability(cfg.get("tables"))
     con = duckdb.connect()
     # DuckDB renders TIMESTAMPTZ columns in the SESSION timezone, so on a non-UTC
@@ -1113,7 +1248,7 @@ def tokenize_site(cfg: dict, site: str, base: Path, out: Path,
         ]
         print(f"  limiting to {len(keep_ids):,} stays (sample mode)")
     building = vocab is None
-    target_units = _dose_target_units(cfg, None if building else vocab_manifest)
+    target_units = _dose_target_units(cfg, None if building else vocab_artifact)
     frames, shadow_frames, dose_stats = [], [], {}
     for name, spec in cfg["tables"].items():
         df, shadows, counts = _read_source(
@@ -1142,7 +1277,8 @@ def tokenize_site(cfg: dict, site: str, base: Path, out: Path,
         raise QualificationError(f"table name {STATIC_SOURCE!r} is reserved for static tokens")
     # No sort here: join order is not guaranteed, so the order is imposed after it.
     events = pl.concat(frames, how="diagonal_relaxed")
-    validate_units(events, cfg)
+    validate_units(events, cfg,
+                   None if building else vocab_artifact["reference_units"])
 
     if episodes is None:
         raise QualificationError("a canonical episode/split artifact is required")
@@ -1218,6 +1354,8 @@ def tokenize_site(cfg: dict, site: str, base: Path, out: Path,
                                if numeric and c in static_tokens},
         )
         vocab = build_vocab(fit_events, edges)
+        units = reference_units(fit_events, edges, cfg, target_units)
+        sources = concept_sources(fit_events, treatment_sources)
         cohort_cfg = yaml.safe_load((ROOT / cfg["cohort_contract"]).read_text())
         split_hashes = episodes["split_sha256"].drop_nulls().unique().to_list()
         if len(split_hashes) != 1:
@@ -1227,12 +1365,15 @@ def tokenize_site(cfg: dict, site: str, base: Path, out: Path,
             "vocabulary": _json_sha256(vocab),
             "numeric_edges": _json_sha256(edges),
             "binning_sources": _json_sha256(binning_sources),
+            "reference_units": _json_sha256(units),
+            "concept_sources": _json_sha256(sources),
             "target_map": _json_sha256(cfg["target_concepts"]),
             "outcome_spec": _json_sha256(cohort_cfg["outcomes"]),
             "clif_version": _json_sha256(cfg["schema_version"]),
         }
         vocab_manifest = {
             "artifact_family": "experimental_representation",
+            "tokenizer_version": TOKENIZER_VERSION,
             "clif_version": cfg["schema_version"],
             "mcide_version": cfg["mcide_version"],
             "hashes": hashes,
@@ -1250,10 +1391,8 @@ def tokenize_site(cfg: dict, site: str, base: Path, out: Path,
                 "availability_lag_minutes": {
                     name: spec["lag_minutes"] for name, spec in availability.items()
                 },
-                # U4 (R6): the continuous-dose target unit per med_category the frozen
-                # concepts were built with (importing sites convert to the same), and
-                # aggregate conversion-status counts over every dose row read.
-                "dose_target_units": target_units,
+                # U4 (R6): aggregate conversion-status counts over every dose row read.
+                # The dose target units themselves are hashed in `reference_units`.
                 "dose_conversion": dose_stats,
                 "static_tokens": static_tokens,
             },
@@ -1263,8 +1402,15 @@ def tokenize_site(cfg: dict, site: str, base: Path, out: Path,
         }
         print(f"  built vocab: {len(vocab):,} tokens, {len(edges):,} numeric concepts "
               f"(binning sources: {by_source})")
-    elif vocab_manifest is None:
-        raise QualificationError("an imported vocabulary requires a validated manifest")
+        vocab_artifact = {
+            "vocab": vocab,
+            "segments": edges,
+            "binning_sources": binning_sources,
+            "reference_units": units,
+            "concept_sources": sources,
+            "precedence_policy": POLICY_VERSION,
+            "manifest": vocab_manifest,
+        }
 
     # The unknown-concept fallback below emits SPECIAL["<unk>"] for a concept+bin the
     # frozen vocab does not cover (cross-site coverage). That is only safe if the vocab
@@ -1358,16 +1504,20 @@ def tokenize_site(cfg: dict, site: str, base: Path, out: Path,
         })
 
     shards = events.group_by("hosp_id", maintain_order=True).map_groups(encode)
+    if len(shards):
+        # KTD7: every shard row is bound to the tokenizer version, vocabulary and
+        # segments it was encoded with; ModelDataset refuses a row without it.
+        binding = artifact_binding(vocab_artifact)
+        shards = shards.with_columns(
+            pl.struct([pl.lit(v, pl.String).alias(k) for k, v in binding.items()])
+            .alias("artifact_hashes")
+        )
     out.mkdir(parents=True, exist_ok=True)
     shards.write_parquet(events_path)
     # DATA-CLASSIFICATION: PHI — contains hosp_id + per-stay token sequences + timing.
     # Do not export off-node. For external validation, use clif_validate.py which
     # returns only aggregate metrics. See NEXT_STEPS.md §6 rule 4.
-    if edges is not None:
-        blob = {"vocab": vocab, "edges": edges, "manifest": vocab_manifest}
-        if binning_sources is not None:
-            blob["binning_sources"] = binning_sources
-        (out / "vocab.json").write_text(json.dumps(blob))
+    (out / "vocab.json").write_text(json.dumps(vocab_artifact))
     print(f"  wrote {out/'events.parquet'} ({len(shards):,} stays)")
     return vocab, edges
 
@@ -1388,18 +1538,17 @@ def main():
     cfg = yaml.safe_load(Path(args.config).read_text())
     validate_table_availability(cfg.get("tables"))
     policy = yaml.safe_load((ROOT / cfg["artifact_policy"]).read_text())
-    vocab, edges, vocab_manifest, binning_sources = None, None, None, None
+    blob = None
     if args.vocab:
         blob = json.loads(Path(args.vocab).read_text())
-        vocab, edges, vocab_manifest = validate_vocabulary_artifact(blob, cfg, policy)
-        binning_sources = blob.get("binning_sources")
+        validate_vocabulary_artifact(blob, cfg, policy)
     elif not args.build_vocab:
         raise SystemExit("pass --build-vocab (first site) or --vocab PATH (later sites)")
 
     if args.dry_run:
         con = duckdb.connect()
         con.execute("SET TimeZone = 'UTC'")  # same session-tz pin as tokenize_site
-        target_units = _dose_target_units(cfg, vocab_manifest)
+        target_units = _dose_target_units(cfg, blob)
         for name, spec in cfg["tables"].items():
             df = _read_table(con, Path(args.indir), spec, tables=cfg["tables"],
                              target_units=target_units)
@@ -1412,12 +1561,9 @@ def main():
         args.site,
         Path(args.indir),
         Path(args.out),
-        vocab,
-        edges,
+        blob,
         episodes=episodes,
-        vocab_manifest=vocab_manifest,
         artifact_policy=policy,
-        binning_sources=binning_sources,
     )
 
 

@@ -14,8 +14,8 @@ from typing import Any
 
 import torch
 import torch.distributed as dist
-import yaml
 
+from src.data.segments import compare_binding
 from src.train.checkpoint import save_checkpoint, load_checkpoint
 from src.train.manifest import Manifest
 
@@ -248,7 +248,10 @@ def _train_one_epoch(
 
 
 def train(model, train_dl, val_dl, opt, scheduler, tcfg: TrainConfig, dev, *,
-          resume_ckpt=None, seed=42, fresh_schedule=False):
+          resume_ckpt=None, seed=42, fresh_schedule=False, vocab_binding=None):
+    """Resumable (DDP) training loop. `vocab_binding` (`segments.artifact_binding` of the
+    training vocab.json) is recorded in every checkpoint, and a resume checkpoint bound
+    to a different (or no) vocabulary/segments is refused before any state loads."""
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
     is_main = local_rank == 0
 
@@ -265,6 +268,9 @@ def train(model, train_dl, val_dl, opt, scheduler, tcfg: TrainConfig, dev, *,
     if resume_ckpt is not None:
         manifest.lineage_parent = str(resume_ckpt)
         loaded = load_checkpoint(resume_ckpt, dev)
+        if vocab_binding is not None:
+            compare_binding(loaded.get("vocab_binding"), vocab_binding,
+                            what="resume checkpoint")
         target_model = model.module if is_distributed() and hasattr(model, "module") else model
         target_model.load_state_dict(loaded["model"])
         # fresh_schedule: keep the model + optimizer (Adam moments) but NOT the
@@ -321,6 +327,7 @@ def train(model, train_dl, val_dl, opt, scheduler, tcfg: TrainConfig, dev, *,
                 step=gs,
                 rng_states=all_rng,
                 manifest=manifest,
+                vocab_binding=vocab_binding,
             )
         while next_ckpt_step <= gs:
             next_ckpt_step += tcfg.ckpt_every
@@ -448,6 +455,7 @@ def train(model, train_dl, val_dl, opt, scheduler, tcfg: TrainConfig, dev, *,
                     step=global_step,
                     rng_states=all_rng,
                     manifest=manifest,
+                    vocab_binding=vocab_binding,
                 )
             while next_ckpt_step <= global_step:
                 next_ckpt_step += tcfg.ckpt_every

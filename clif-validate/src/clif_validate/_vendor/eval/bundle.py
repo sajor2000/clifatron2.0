@@ -2,10 +2,13 @@
 
 A bundle is a directory holding everything inference needs and nothing else:
 
-    bundle_manifest.json   identity + per-file SHA-256 + zero-shot outcome queries
+    bundle_manifest.json   identity + per-file SHA-256 + zero-shot outcome queries +
+                           the heads' vocabulary binding (tokenizer version, vocabulary
+                           and segments hashes)
     head_weights.pt        trained head parameters (loaded strict=True)
     config.json, model.*   the HF backbone checkpoint
-    vocab.json             {"vocab", "edges", "manifest"} — the frozen vocabulary
+    vocab.json             the frozen tokenizer-v2 vocabulary artifact (vocab, segments,
+                           binning sources, reference units, manifest)
     data_config.yaml       resolved data config (tables, binning, versions)
     cohort.yaml            the frozen outcome contract the vocabulary was hashed against
     artifact_policy.yaml   disclosure policy pinned to THIS bundle
@@ -29,7 +32,10 @@ Three rules govern this module:
 3. **Verify before parse.** File hashes are checked before any bundled file's content
    is interpreted; the vocabulary then re-verifies its own compatibility hashes via
    `validate_vocabulary_artifact`; and the manifest's identity fields are cross-checked
-   against the vocabulary manifest so one bundle cannot carry two identities.
+   against the vocabulary manifest so one bundle cannot carry two identities. Each
+   outcome query's target_index/tau_bin/direction is re-derived from the bundled
+   cohort contract and segments (`segments.threshold_bin`, the tokenizer's own binning
+   function) and must match what the manifest declares.
 """
 
 from __future__ import annotations
@@ -44,7 +50,11 @@ from pathlib import Path
 import yaml
 
 from clif_validate._vendor.eval import schema as _schema
-from clif_validate._vendor.eval.clif_validate import ArtifactMismatch, verify_bundle_compatibility
+from clif_validate._vendor.eval.clif_validate import (
+    ArtifactMismatch,
+    check_manifest_binding,
+    verify_bundle_compatibility,
+)
 
 BUNDLE_MANIFEST = "bundle_manifest.json"
 # The detached Ed25519 signature over the manifest (U11). Kept in sync with
@@ -142,7 +152,8 @@ def _validated_outcome_queries(manifest: dict) -> dict[str, dict]:
 
     These are the model-facing integers, not the human-readable strings in
     `cohort.yaml`: per ThresholdHazardHead, `tau_bin` is the queried threshold's
-    VALUE-bin index (0..n_value_bins) and `direction` is 0=below / 1=above.
+    VALUE-bin index (0..n_value_bins) and `direction` is 0=below / 1=above. Shape only;
+    `check_outcome_queries` checks the values against the bundle's own segments.
     """
     queries = manifest.get("outcome_queries")
     if not isinstance(queries, dict) or not queries:
@@ -172,6 +183,51 @@ def _validated_outcome_queries(manifest: dict) -> dict[str, dict]:
                 f"got {q['direction']!r}"
             )
     return queries
+
+
+DIRECTION_CODES = {"below": 0, "above": 1}
+
+
+def expected_outcome_queries(data_cfg: dict, cohort_cfg: dict, segments: dict) -> dict[str, dict]:
+    """The zero-shot query each cohort outcome implies under these segments:
+    `target_index` = the outcome concept's position in `target_concepts`, `direction` =
+    0 below / 1 above, `tau_bin` = `segments.threshold_bin` — the token bin of a value
+    just on the event side of the threshold, i.e. exactly how the tokenizer bins it."""
+    from clif_validate._vendor.data.segments import threshold_bin
+
+    targets = [t["name"] for t in data_cfg.get("target_concepts", [])]
+    out: dict[str, dict] = {}
+    for name, spec in (cohort_cfg.get("outcomes") or {}).items():
+        concept, direction = spec.get("concept"), spec.get("direction")
+        if concept not in targets or direction not in DIRECTION_CODES or concept not in segments:
+            continue
+        out[name] = {
+            "target_index": targets.index(concept),
+            "tau_bin": threshold_bin(float(spec["threshold"]), segments[concept], direction),
+            "direction": DIRECTION_CODES[direction],
+        }
+    return out
+
+
+def check_outcome_queries(queries: dict, data_cfg: dict, cohort_cfg: dict,
+                          segments: dict) -> None:
+    """Every declared query must be the one the bundle's cohort contract and segments
+    imply; an inconsistent target_index/tau_bin/direction would score a different
+    question than the release attests to."""
+    expected = expected_outcome_queries(data_cfg, cohort_cfg, segments)
+    for name, query in queries.items():
+        want = expected.get(name)
+        if want is None:
+            raise ArtifactMismatch(
+                f"outcome query {name!r} has no binned target concept and threshold in the "
+                "bundled cohort contract and segments; its tau_bin cannot be verified"
+            )
+        for field in ("target_index", "direction", "tau_bin"):
+            if query[field] != want[field]:
+                raise ArtifactMismatch(
+                    f"outcome query {name!r} declares {field}={query[field]}, but the "
+                    f"bundle's cohort contract and segments give {field}={want[field]}"
+                )
 
 
 # A SQL column identifier: a letter/underscore start, then word chars. No spaces,
@@ -342,8 +398,9 @@ class Bundle:
     provenance: dict            # the identity block verify_bundle_compatibility returns
     outcome_queries: dict       # {outcome_name: {target_index, tau_bin, direction}}
     vocab: dict
-    edges: dict
+    segments: dict
     vocab_manifest: dict
+    vocab_artifact: dict        # the whole validated vocab.json (tokenize_site input)
     data_cfg: dict              # config-path fields rewritten to bundled absolutes
     policy: dict
     policy_path: Path
@@ -430,7 +487,9 @@ def load_bundle(path: str | Path, *, pin_policy: bool = True,
     blob = json.loads((root / "vocab.json").read_text())
     from clif_validate._vendor.data.tokenize import validate_vocabulary_artifact
 
-    vocab, edges, vocab_manifest = validate_vocabulary_artifact(blob, data_cfg, policy)
+    vocab, segments, vocab_manifest = validate_vocabulary_artifact(blob, data_cfg, policy)
+    check_outcome_queries(outcome_queries, data_cfg,
+                          yaml.safe_load(cohort_path.read_text()), segments)
 
     # One bundle, one identity: the manifest's headline hashes must be the ones the
     # vocabulary actually carries, or the provenance block would attest to a
@@ -446,6 +505,8 @@ def load_bundle(path: str | Path, *, pin_policy: bool = True,
             "bundle manifest outcome_spec_hash does not match the bundled cohort "
             "contract's hash — the manifest attests to different outcomes than it ships."
         )
+    # The heads were trained against one vocabulary and one set of segments (KTD7).
+    check_manifest_binding(manifest, blob)
     # The manifest carries the major.minor CLIF version verify_bundle_compatibility
     # gates on ("2.1"); the data config carries the full schema_version ("2.1.0").
     if data_cfg["schema_version"].split(".")[:2] != provenance["clif_version"].split(".")[:2]:
@@ -484,8 +545,9 @@ def load_bundle(path: str | Path, *, pin_policy: bool = True,
         provenance=provenance,
         outcome_queries=outcome_queries,
         vocab=vocab,
-        edges=edges,
+        segments=segments,
         vocab_manifest=vocab_manifest,
+        vocab_artifact=blob,
         data_cfg=data_cfg,
         policy=policy,
         policy_path=policy_path,
@@ -512,6 +574,8 @@ def write_bundle_manifest(bundle_dir: str | Path, *, model_bundle_id: str,
     is written to `bundle_manifest.sig`. `load_bundle(..., verify_signature=True)` then
     anchors trust in that signature rather than the self-hash alone.
     """
+    from clif_validate._vendor.data.segments import artifact_binding
+
     root = Path(bundle_dir)
     manifest = {
         "model_bundle_id": model_bundle_id,
@@ -520,6 +584,8 @@ def write_bundle_manifest(bundle_dir: str | Path, *, model_bundle_id: str,
         "outcome_spec_hash": outcome_spec_hash,
         "clif_version": clif_version,
         "outcome_queries": outcome_queries,
+        # KTD7: the heads' vocabulary binding, computed from the bundled vocab.json.
+        "vocab_binding": artifact_binding(json.loads((root / "vocab.json").read_text())),
         "files": hash_bundle_files(root),
     }
     if (signing_key is None) != (key_id is None):
@@ -547,6 +613,8 @@ __all__ = [
     "BUNDLE_MANIFEST",
     "REQUIRED_BUNDLE_FILES",
     "Bundle",
+    "check_outcome_queries",
+    "expected_outcome_queries",
     "hash_bundle_files",
     "load_bundle",
     "pin_bundle_policy",

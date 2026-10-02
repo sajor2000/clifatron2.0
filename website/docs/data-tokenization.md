@@ -16,7 +16,7 @@ and this page disagree, the code is right and this page is a bug.
 | **Code** | `src/data/tokenize.py` (one file, polars + DuckDB) |
 | **Config** | `configs/data.yaml` (tables, targets, binning) · `configs/cohort.yaml` (episode, anchor, windows) |
 | **Bin source** | `external/clifatron/tokenETL/config/critical_illness_tokenization_final_with_intervals.csv`: the CLIF consortium's physician-designed segments (1267 segment rows, 92 measurements) |
-| **Output** | `events.parquet` (one row per ICU stay) + `vocab.json` (vocabulary, edges, signed-hash manifest) |
+| **Output** | `events.parquet` (one row per ICU stay, each bound to the vocabulary + segments hashes) + `vocab.json` (tokenizer v2: vocabulary, segments, binning sources, reference units, concept sources, precedence policy, hashed manifest) |
 | **Tests** | `tests/test_tokenize_bins.py`, `tests/test_tokenize_alignment.py`, `tests/test_value_stats.py` |
 
 ---

@@ -449,10 +449,24 @@ class CheckpointStrictLoadTest(unittest.TestCase):
 
         from src.eval import clif_validate as CV
 
+        from src.data.segments import artifact_binding
+
         bundle = self.out / "bundle"
         bundle.mkdir()
         torch.save({"not_a_real_head.weight": torch.zeros(2, 2)},
                    bundle / "head_weights.pt")
+        # A correctly bound tokenizer-v2 vocabulary, so the strict head load is what fails.
+        vocab_blob = {
+            "vocab": {"<pad>": 0, "map=0": 1, "map=1": 2},
+            "segments": {"map": [
+                {"lo": None, "hi": 65.0, "lo_closed": False, "hi_closed": False},
+                {"lo": 65.0, "hi": None, "lo_closed": True, "hi_closed": False},
+            ]},
+            "manifest": {"tokenizer_version": 2},
+        }
+        (bundle / "vocab.json").write_text(json.dumps(vocab_blob))
+        (bundle / "bundle_manifest.json").write_text(
+            json.dumps({"vocab_binding": artifact_binding(vocab_blob)}))
 
         class _Stub(torch.nn.Module):
             def __init__(self):
@@ -463,7 +477,7 @@ class CheckpointStrictLoadTest(unittest.TestCase):
         import src.model.head_adapter as HA
         saved_load, saved_heads = HA.load_backbone, HA.CLIFATRONHeads
         HA.load_backbone = lambda p: _Stub()
-        HA.CLIFATRONHeads = lambda backbone, n, freeze_backbone=True: _Stub()
+        HA.CLIFATRONHeads = lambda backbone, n, freeze_backbone=True, n_value_bins=None: _Stub()
         try:
             with self.assertRaises(CV.ArtifactMismatch) as ctx:
                 CV.load_checkpoint(str(bundle))

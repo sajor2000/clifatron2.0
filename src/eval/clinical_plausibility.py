@@ -70,14 +70,16 @@ def assess_sequence(
     tokens: Sequence[str],
     *,
     vocab: set[str] | None = None,
-    edges: Mapping[str, Sequence[float]] | None = None,
+    segments: Mapping[str, Sequence[Mapping]] | None = None,
     prompt_tokens: Sequence[str] | None = None,
 ) -> dict[str, Any]:
     """Assess structural and lightweight clinical-sequence heuristics.
 
     The result is intentionally explainable: every score contribution is tied
     to a warning. ``prompt_tokens=None`` means prompt provenance was not
-    supplied, while an empty prompt is a valid, explicit prompt.
+    supplied, while an empty prompt is a valid, explicit prompt. ``segments`` is the
+    tokenizer-v2 vocabulary's frozen segments: a ``concept=k`` token is valid only for
+    ``0 <= k < len(segments[concept])`` (one token per segment, KTD1).
     """
     token_list = [str(token) for token in tokens]
     warnings: list[dict[str, Any]] = []
@@ -95,16 +97,15 @@ def assess_sequence(
     invalid_bins: list[str] = []
     for token in token_list:
         concept, bin_index = split_fused_token(token)
-        if bin_index is None or edges is None or concept not in edges:
+        if bin_index is None or segments is None or concept not in segments:
             continue
-        n_bins = len(edges[concept]) + 1
-        if bin_index < 0 or bin_index >= n_bins:
+        if bin_index < 0 or bin_index >= len(segments[concept]):
             invalid_bins.append(token)
     if invalid_bins:
         warnings.append(_warning(
             "invalid-bin",
             "error",
-            f"{len(invalid_bins)} numeric bin token(s) are outside the frozen edges.",
+            f"{len(invalid_bins)} numeric bin token(s) are outside the frozen segments.",
             count=len(invalid_bins),
             sample=invalid_bins[:10],
         ))

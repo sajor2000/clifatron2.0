@@ -34,6 +34,7 @@ from collections.abc import Mapping, Sequence
 import torch
 import torch.nn.functional as F
 
+from src.data.segments import n_value_bins, vocab_segments
 from src.model.encoder import CLIFEncoder, apply_rope, build_rope_cache
 from src.eval.clinical_plausibility import assess_sequence, split_sequence
 
@@ -357,10 +358,10 @@ def load_vocab(path: str | Path) -> dict[str, int]:
 
 
 def load_vocab_artifact(path: str | Path) -> dict:
-    """Load the full frozen vocab artifact, including numeric bin edges."""
+    """Load the full frozen tokenizer-v2 vocab artifact (vocab + segments + manifest).
+    A pre-v2 artifact (edge lists, no tokenizer version) is refused: re-tokenize."""
     blob = json.loads(Path(path).read_text())
-    if "vocab" not in blob:
-        blob = {"vocab": blob}
+    vocab_segments(blob)
     return blob
 
 
@@ -449,12 +450,18 @@ class SimulationWriter:
 
 
 def load_generation_model(checkpoint_path: str | Path, model_config: str | Path,
-                           data_config: str | Path) -> CLIFEncoder:
+                          data_config: str | Path, vocab_artifact: dict) -> CLIFEncoder:
     """Load a pretrain-style checkpoint (schema_version 2; state under 'model') for
-    generation. Falls back to a bare `enc.`-prefixed (or bare-encoder) state dict."""
+    generation. Falls back to a bare `enc.`-prefixed (or bare-encoder) state dict.
+
+    The checkpoint must be bound to `vocab_artifact` (KTD7): a checkpoint trained on a
+    different vocabulary or different segments — or on the previous tokenizer, which
+    recorded no binding — is refused, since its token ids and bins would be decoded
+    against the wrong artifact. The threshold head's value-bin count is derived from
+    the artifact's segments."""
     import yaml
 
-    from src.train.checkpoint import load_checkpoint
+    from src.train.checkpoint import load_checkpoint, verify_checkpoint_binding
     from src.train.pretrain import Model
 
     mcfg = yaml.safe_load(Path(model_config).read_text())
@@ -462,9 +469,11 @@ def load_generation_model(checkpoint_path: str | Path, model_config: str | Path,
     n_targets = len(dcfg["target_concepts"])
     vocab_size = mcfg["trunk"].get("target_vocab", 10000)
     blob = load_checkpoint(checkpoint_path)
+    verify_checkpoint_binding(blob, vocab_artifact)
     state = blob.get("model", blob)
     try:
-        model = Model(vocab_size, n_targets, mcfg)
+        model = Model(vocab_size, n_targets, mcfg,
+                      n_value_bins=n_value_bins(vocab_artifact))
         model.load_state_dict(state)
         return model.enc
     except (RuntimeError, KeyError):
@@ -480,7 +489,9 @@ def main(argv: list[str] | None = None) -> None:
     ap.add_argument("--checkpoint", required=True)
     ap.add_argument("--model-config", default="configs/model.yaml")
     ap.add_argument("--data-config", default="configs/data.yaml")
-    ap.add_argument("--vocab", default=None, help="vocab.json (decode prompts + outputs)")
+    ap.add_argument("--vocab", required=True,
+                    help="the checkpoint's tokenizer-v2 vocab.json (binding check, decode "
+                         "prompts + outputs)")
     ap.add_argument("--prompts", default=None,
                     help="text file, one space-joined token sequence per line "
                          "(default: a single <bos>-only prompt)")
@@ -504,9 +515,9 @@ def main(argv: list[str] | None = None) -> None:
     args = ap.parse_args(argv)
 
     device = torch.device(args.device)
-    vocab = load_vocab(args.vocab) if args.vocab else None
-    vocab_artifact = load_vocab_artifact(args.vocab) if args.vocab else {}
-    tok2id = vocab or {}
+    vocab_artifact = load_vocab_artifact(args.vocab)
+    vocab = vocab_artifact["vocab"]
+    tok2id = vocab
     bos = tok2id.get("<bos>", 1)
 
     if args.prompts:
@@ -529,7 +540,8 @@ def main(argv: list[str] | None = None) -> None:
     stop_ids = (tuple(args.stop_token_ids) if args.stop_token_ids is not None
                else ((vocab or {}).get("<eos>", 2),))
 
-    enc = load_generation_model(args.checkpoint, args.model_config, args.data_config).to(device)
+    enc = load_generation_model(args.checkpoint, args.model_config, args.data_config,
+                                vocab_artifact).to(device)
     decoder = make_decoder(vocab) if vocab else (lambda ids: [str(i) for i in ids])
     generator = torch.Generator(device=device)
     generator.manual_seed(args.seed)
@@ -569,7 +581,7 @@ def main(argv: list[str] | None = None) -> None:
             review = assess_sequence(
                 tokens,
                 vocab=set(tok2id) if tok2id else None,
-                edges=vocab_artifact.get("edges"),
+                segments=vocab_artifact["segments"],
                 prompt_tokens=prompt_text.split(),
             )
             writer.add(

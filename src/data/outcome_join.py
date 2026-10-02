@@ -31,9 +31,10 @@ import json
 from pathlib import Path
 from typing import Any
 
-import numpy as np
 import polars as pl
 import yaml
+
+from src.data.segments import threshold_bin, vocab_segments
 
 ROOT = Path(__file__).parents[2]
 
@@ -43,11 +44,15 @@ def _death_cause_idx(data_config: dict) -> int:
     return len(data_config["target_concepts"])
 
 
-def _compute_threshold_bin(concept: str, threshold: float, edges: dict) -> int:
-    bins = edges.get(concept)
-    if bins is None:
+def _compute_threshold_bin(concept: str, threshold: float, segments: dict,
+                           direction: str) -> int:
+    """The queried threshold's value bin, via the tokenizer's own `bin_index` over the
+    frozen segments (`segments.threshold_bin`): the bin of a value just on the event side
+    of the threshold. -1 when the concept has no bins."""
+    segs = segments.get(concept)
+    if segs is None:
         return -1
-    return int(np.searchsorted([float(e) for e in bins], threshold, side="right"))
+    return threshold_bin(threshold, segs, direction)
 
 
 def join_outcomes(
@@ -57,7 +62,7 @@ def join_outcomes(
     data_config: dict,
     cohort_config: dict,
 ) -> pl.DataFrame:
-    edges = vocab.get("edges", {})
+    segments = vocab_segments(vocab)  # refuses a pre-v2 (edge-list) vocabulary
     target_concepts = data_config["target_concepts"]
     concept_index = {c["name"]: idx for idx, c in enumerate(target_concepts)}
     outcome_specs = cohort_config["outcomes"]
@@ -94,7 +99,8 @@ def join_outcomes(
                 "status": status,
                 "target_idx": target_idx,
                 "time_from_anchor_hours": time_hours,
-                "threshold_bin": _compute_threshold_bin(concept, threshold, edges),
+                "threshold_bin": _compute_threshold_bin(concept, threshold, segments,
+                                                        direction),
                 "direction": direction,
                 "cause_idx": _death_cause_idx(data_config) if status == "competing_event" else None,
             }

@@ -13,7 +13,6 @@ import argparse
 import json
 import logging
 import math
-import os
 from pathlib import Path
 
 import torch
@@ -33,6 +32,7 @@ from src.model.heads import (
 )
 from src.data.dataset import LengthGroupedSampler, ModelDataset, TokenBudgetBatchSampler
 from src.data.collate import collate_model_samples
+from src.data.segments import artifact_binding, n_value_bins
 from src.data.targets import TargetBuilder
 from src.train.engine import setup_ddp, is_distributed, TrainConfig, train
 
@@ -92,6 +92,7 @@ def _load_value_stats(
     path: str | None,
     *,
     expected_vocab_hash: str | None = None,
+    expected_segments_hash: str | None = None,
     expected_fit_partition: str | None = None,
 ) -> dict[int, tuple[float, float]]:
     if path is None:
@@ -100,6 +101,7 @@ def _load_value_stats(
     return load_value_stats(
         path,
         expected_vocab_hash=expected_vocab_hash,
+        expected_segments_hash=expected_segments_hash,
         expected_fit_partition=expected_fit_partition,
     )
 
@@ -147,7 +149,8 @@ def objective_weights(mcfg: dict) -> dict[str, float]:
 
 
 class Model(torch.nn.Module):
-    def __init__(self, vocab_size, n_targets, mcfg):
+    def __init__(self, vocab_size, n_targets, mcfg, *, n_value_bins: int):
+        """`n_value_bins` comes from the frozen vocabulary (`segments.n_value_bins`)."""
         super().__init__()
         n_causes = n_targets + 1  # +1 for global death competing-cause slot
         self.enc = CLIFEncoder(vocab_size, mcfg)
@@ -157,7 +160,7 @@ class Model(torch.nn.Module):
         self.cr = CompetingRiskHead(d, n_causes, h["competing_risk"]["n_time_bins"])
         self.th = ThresholdHazardHead(
             d, n_targets, h["threshold_hazard"]["n_time_bins"],
-            n_value_bins=10, thr_dim=h["threshold_hazard"]["threshold_embed_dim"],
+            n_value_bins=n_value_bins, thr_dim=h["threshold_hazard"]["threshold_embed_dim"],
         )
         self.vr = ValueRegressionHead(d, vocab_size) if h["value_regression"]["enabled"] else None
 
@@ -259,24 +262,28 @@ def main():
     mcfg = yaml.safe_load(Path(args.model_config).read_text())
     dcfg = yaml.safe_load(Path("configs/data.yaml").read_text())
     n_targets = len(dcfg["target_concepts"])
-    n_causes = n_targets + 1  # +1 for the global death competing-cause slot
     vocab_size = mcfg["trunk"].get("target_vocab", 10000)
 
-    model = Model(vocab_size, n_targets, mcfg).to(dev)
+    # KTD7: the data's tokenizer-v2 vocabulary binds everything below — the threshold
+    # head's value-bin count, the shard rows, the value stats and every checkpoint.
+    vocab_path = Path(args.data) / "vocab.json"
+    if not vocab_path.exists():
+        raise SystemExit(f"{vocab_path} is required: training is bound to its vocabulary "
+                         "and segments")
+    vblob = json.loads(vocab_path.read_text())
+    binding = artifact_binding(vblob)  # refuses a pre-v2 vocabulary (re-tokenize)
+
+    model = Model(vocab_size, n_targets, mcfg, n_value_bins=n_value_bins(vblob)).to(dev)
     if is_main:
         print(f"params: {count_params(model)/1e6:.1f}M")
 
-    # Bind value-stats to the data's vocabulary so a stale / cross-vocabulary stats
-    # file is rejected rather than silently applying unrelated centers/scales.
-    expected_vocab_hash = None
-    vocab_path = Path(args.data) / "vocab.json"
-    if vocab_path.exists():
-        from src.data.value_stats import vocab_hash
-        vblob = json.loads(vocab_path.read_text())
-        expected_vocab_hash = vocab_hash(vblob.get("vocab", vblob))
+    # Bind value-stats to the data's vocabulary AND segments so a stale /
+    # cross-vocabulary / cross-bin stats file is rejected rather than silently applying
+    # unrelated centers/scales.
     value_stats = _load_value_stats(
         args.value_stats,
-        expected_vocab_hash=expected_vocab_hash,
+        expected_vocab_hash=binding["vocabulary"],
+        expected_segments_hash=binding["numeric_edges"],
         expected_fit_partition="train",
     )
     data_dir = Path(args.data)
@@ -331,7 +338,8 @@ def main():
         value_stats=value_stats,
         run_seed=42,
     )
-    expected_hashes = {}
+    # Every shard row must be bound to this vocabulary and these segments.
+    expected_hashes = dict(binding)
     dataset = ModelDataset(
         records,
         representation="decile",
@@ -456,6 +464,7 @@ def main():
     model, manifest = train(
         model, dl, validation_dl, opt, scheduler, train_cfg, dev,
         resume_ckpt=args.resume, seed=42, fresh_schedule=args.fresh_schedule,
+        vocab_binding=binding,
     )
 
     if is_main:

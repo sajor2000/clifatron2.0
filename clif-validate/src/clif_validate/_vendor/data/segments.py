@@ -34,15 +34,28 @@ PRECEDENCE POLICY v1 (applied in this order; recorded in the vocabulary artifact
 7. CSV measurement prefix ``angiotension`` is aliased to CLIF ``angiotensin``.
 
 Steps 5 and 6 are applied by `bin_index`; the rest when segments are built.
+
+ARTIFACT BINDING (tokenizer v2, KTD7). `vocab.json` v2 stores the segments under
+``"segments"`` and ``manifest.tokenizer_version == 2``. `artifact_binding` is the
+identity every downstream artifact records (shard ``artifact_hashes``, checkpoints,
+bundle manifests): tokenizer version, vocabulary hash, and segments hash
+(``numeric_edges``). `check_binding` refuses a mismatch, and refuses an artifact that
+records no binding at all (built by the previous tokenizer) with a re-tokenize message.
 """
 from __future__ import annotations
 
 import csv
+import hashlib
+import json
 import math
 from pathlib import Path
 from typing import Iterable, Mapping, Sequence
 
 POLICY_VERSION = 1
+TOKENIZER_VERSION = 2
+RETOKENIZE = ("re-tokenize the reference site with the current tokenizer (rebuild "
+              "vocab.json), then rebuild every shard, value-stats file and checkpoint "
+              "from it")
 MERGE_REL_TOL = 1e-6
 CSV_MEASUREMENT_ALIASES: tuple[tuple[str, str], ...] = (("angiotension", "angiotensin"),)
 DIRECTIONS = ("above", "below")
@@ -143,6 +156,39 @@ def bin_index(value: float | None, segments: Sequence[Mapping]) -> int | None:
         if below <= v <= above:
             return i if (v - below) <= (above - v) else i + 1
     raise ValueError(f"segments are not a sorted partition; cannot bin {v!r}")
+
+
+def threshold_bin(threshold: float, segments: Sequence[Mapping], direction: str) -> int:
+    """The value bin a threshold query names: the bin of a value just on the EVENT side
+    of `threshold` (``below``: just under it; ``above``: just over it), via `bin_index`.
+
+    With the forced edge's outcome-direction closure (policy step 3) the threshold value
+    itself sits on the non-event side, so this is the bin adjacent to the edge — e.g.
+    MAP < 65 names the bin of 64.9, lactate > 4 the bin of 4.01."""
+    _check_direction(direction)
+    if direction is None:
+        raise ValueError("a threshold query needs a direction ('above' or 'below')")
+    t = float(threshold)
+    if not math.isfinite(t):
+        raise ValueError(f"threshold must be finite, got {threshold!r}")
+    nudged = math.nextafter(t, -math.inf if direction == "below" else math.inf)
+    b = bin_index(nudged, segments)
+    if b is None:
+        raise ValueError("a threshold query needs at least one segment")
+    return b
+
+
+def interval_label(seg: Mapping) -> str:
+    """Human-readable interval with closure brackets, e.g. ``[65, 67]`` or ``(-inf, 65)``;
+    a point segment reads ``[v]``."""
+    def num(x: float) -> str:
+        return f"{x:g}"
+
+    if is_point(seg):
+        return f"[{num(seg['lo'])}]"
+    lo = "(-inf" if seg["lo"] is None else ("[" if seg["lo_closed"] else "(") + num(seg["lo"])
+    hi = "+inf)" if seg["hi"] is None else num(seg["hi"]) + ("]" if seg["hi_closed"] else ")")
+    return f"{lo}, {hi}"
 
 
 def _neighbor_width(segments: Sequence[Mapping], start: int, step: int) -> float:
@@ -429,6 +475,81 @@ def as_segments(obj: Sequence) -> list:
 
 def n_bins(obj: Sequence) -> int:
     return len(as_segments(obj))
+
+
+# ---- tokenizer-v2 artifact binding (KTD7) -----------------------------------------------
+
+class ArtifactBindingError(ValueError):
+    """An artifact is bound to a different (or no) tokenizer vocabulary/segments."""
+
+
+def json_sha256(value: object) -> str:
+    """SHA-256 of the canonical JSON form (sorted keys, compact) — the one hashing rule
+    for every vocabulary-artifact field."""
+    payload = json.dumps(value, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(payload.encode()).hexdigest()
+
+
+def segments_hash(segments: Mapping) -> str:
+    """The segments hash (`numeric_edges` in the vocabulary manifest)."""
+    return json_sha256(segments)
+
+
+def vocab_segments(vocab_blob: Mapping) -> Mapping:
+    """The v2 ``segments`` map of a vocab.json blob; a v1 blob (``edges``, no tokenizer
+    version) is refused with the re-tokenize message."""
+    segments = vocab_blob.get("segments") if isinstance(vocab_blob, Mapping) else None
+    version = (vocab_blob.get("manifest") or {}).get("tokenizer_version") \
+        if isinstance(vocab_blob, Mapping) else None
+    if not isinstance(segments, Mapping) or version != TOKENIZER_VERSION:
+        raise ArtifactBindingError(
+            f"vocabulary artifact is not tokenizer version {TOKENIZER_VERSION} "
+            f"(found {version!r}); {RETOKENIZE}"
+        )
+    return segments
+
+
+def n_value_bins(vocab_blob: Mapping) -> int:
+    """`ThresholdHazardHead` value-bin count from the frozen vocabulary: the largest
+    segment count over every binned concept, plus one. Derived here, never hard-coded,
+    so a concept with more bins than a default can never index past the embedding."""
+    segments = vocab_segments(vocab_blob)
+    if not segments:
+        raise ArtifactBindingError("vocabulary artifact has no binned concepts")
+    return max(len(segs) for segs in segments.values()) + 1
+
+
+def artifact_binding(vocab_blob: Mapping) -> dict[str, str]:
+    """The identity a downstream artifact records, computed from content (never read
+    from the manifest): tokenizer version, vocabulary hash, segments hash."""
+    segments = vocab_segments(vocab_blob)
+    return {
+        "tokenizer_version": str(TOKENIZER_VERSION),
+        "vocabulary": json_sha256(vocab_blob["vocab"]),
+        "numeric_edges": segments_hash(segments),
+    }
+
+
+def check_binding(recorded: Mapping | None, vocab_blob: Mapping, *, what: str) -> None:
+    """Refuse `what` unless its recorded binding equals `vocab_blob`'s. A missing binding
+    means the artifact predates tokenizer v2."""
+    compare_binding(recorded, artifact_binding(vocab_blob), what=what)
+
+
+def compare_binding(recorded: Mapping | None, expected: Mapping, *, what: str) -> None:
+    """`check_binding` against an already-computed expected binding."""
+    if not isinstance(recorded, Mapping) or not recorded.get("numeric_edges"):
+        raise ArtifactBindingError(
+            f"{what} records no tokenizer-v{TOKENIZER_VERSION} vocabulary binding "
+            f"(built by the previous tokenizer); {RETOKENIZE}"
+        )
+    for key in ("tokenizer_version", "vocabulary", "numeric_edges"):
+        if str(recorded.get(key)) != str(expected[key]):
+            raise ArtifactBindingError(
+                f"{what} {key} mismatch: it was built against a different vocabulary "
+                f"artifact than the one supplied ({key} {str(recorded.get(key))[:12]}… != "
+                f"{str(expected[key])[:12]}…); {RETOKENIZE}"
+            )
 
 
 # ---- physician CSV loader ---------------------------------------------------------------

@@ -10,7 +10,6 @@ import json
 import os
 import tempfile
 import unittest
-import warnings
 from pathlib import Path
 
 import numpy as np
@@ -91,7 +90,6 @@ class SmokeTest(unittest.TestCase):
 
     @classmethod
     def _build_vocab(cls):
-        import polars as pl
         import yaml as _yaml
         from src.data.cohort import build_cohort_artifact
         from src.data.tokenize import tokenize_site
@@ -108,12 +106,14 @@ class SmokeTest(unittest.TestCase):
         )
 
         tokenize_site(cls.cfg, "mimic", CLIF_DATA, cls.out_dir,
-                      vocab=None, edges=None, limit_stays=N_STAYS * 3,
+                      None, limit_stays=N_STAYS * 3,
                       episodes=episodes, artifact_policy=policy)
 
         blob = json.loads((cls.out_dir / "vocab.json").read_text())
         cls.vocab = blob["vocab"]
-        cls.edges = blob["edges"]
+        cls.edges = blob["segments"]
+        from src.data.segments import n_value_bins
+        cls.n_value_bins = n_value_bins(blob)
         cls.vocab_size = len(cls.vocab)
         print(f"Built vocab: {cls.vocab_size:,} tokens, {len(cls.edges)} numeric concepts")
 
@@ -121,17 +121,17 @@ class SmokeTest(unittest.TestCase):
     def test_01_from_scratch_forward_pass(self):
         """Random-init CLIFEncoder + heads, one step."""
         _run_arm("from_scratch", self.mcfg, self.batch, self.vocab_size,
-                 n_targets=10, freeze_trunk=False)
+                 n_targets=10, freeze_trunk=False, n_value_bins=self.n_value_bins)
 
     def test_02_frozen_backbone_no_pretrain_baseline(self):
         """Frozen random encoder + TaskHead baseline."""
         _run_arm("no_pretrain_baseline", self.mcfg, self.batch, self.vocab_size,
-                 n_targets=10, freeze_trunk=True)
+                 n_targets=10, freeze_trunk=True, n_value_bins=self.n_value_bins)
 
     def test_03_joint_full_model_ntp_forward(self):
         """Unfrozen CLIFEncoder + heads, full loss."""
         _run_arm("joint_finetune", self.mcfg, self.batch, self.vocab_size,
-                 n_targets=10, freeze_trunk=False)
+                 n_targets=10, freeze_trunk=False, n_value_bins=self.n_value_bins)
 
 
 class DataFreeSmokeTest(unittest.TestCase):
@@ -266,7 +266,6 @@ def _make_batch(shards: list, vocab_size: int):
     value_target = torch.zeros((len(shards), max_len))
     value_mask_t = torch.zeros((len(shards), max_len), dtype=torch.bool)
 
-    n_targets = 10
     th_target = torch.zeros(len(shards), dtype=torch.long)
     th_tau = torch.zeros(len(shards), dtype=torch.long)
     th_dir = torch.zeros(len(shards), dtype=torch.long)
@@ -355,19 +354,14 @@ def _make_batch(shards: list, vocab_size: int):
 
 
 def _run_arm(name: str, mcfg: dict, batch: dict, vocab_size: int,
-             n_targets: int, freeze_trunk: bool):
-    from src.model.encoder import CLIFEncoder, count_params
-    from src.model.heads import (
-        CompetingRiskHead, ThresholdHazardHead, ValueRegressionHead,
-        next_event_loss,
-    )
+             n_targets: int, freeze_trunk: bool, n_value_bins: int):
+    from src.model.encoder import count_params
     from src.train.run_arm import FromScratchModel
-    from src.train.curriculum import curriculum_weights
 
     dev = torch.device(DEVICE)
     print(f"\n--- {name} ({dev}) ---")
 
-    model = FromScratchModel(vocab_size, n_targets, mcfg).to(dev)
+    model = FromScratchModel(vocab_size, n_targets, mcfg, n_value_bins=n_value_bins).to(dev)
 
     if freeze_trunk:
         for p in model.enc.parameters():
@@ -400,7 +394,7 @@ def _run_arm(name: str, mcfg: dict, batch: dict, vocab_size: int,
     print(f"  gradients: {grads} params with non-zero grad")
 
     assert grads > 0, f"{name}: no gradients flowed — dead model"
-    print(f"  PASS")
+    print("  PASS")
 
 
 if __name__ == "__main__":

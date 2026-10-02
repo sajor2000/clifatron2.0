@@ -11,7 +11,8 @@ from src.data.targets import TargetBuilder
 def record(key, tokens):
     return {
         "episode_key": key,
-        "artifact_hashes": {"vocabulary": "v1"},
+        "artifact_hashes": {"vocabulary": "v1", "numeric_edges": "s1",
+                            "tokenizer_version": "2"},
         "token": tokens,
         "pos_min": list(range(len(tokens))),
         "value": [None] * len(tokens),
@@ -33,7 +34,8 @@ class CollateTest(unittest.TestCase):
             [record("opaque-a", [3, 4]), record("opaque-b", [5, 6, 7])],
             representation="decile",
             target_builder=TargetBuilder(16, 48, 48, {}),
-            expected_hashes={"vocabulary": "v1"},
+            expected_hashes={"vocabulary": "v1", "numeric_edges": "s1",
+                             "tokenizer_version": "2"},
         )
         self.samples = [dataset[0], dataset[1]]
 

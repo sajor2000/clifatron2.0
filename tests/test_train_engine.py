@@ -1,13 +1,11 @@
 import math
-import os
 import tempfile
 import unittest
 from pathlib import Path
 
 import torch
-import yaml
 
-from src.train.engine import setup_ddp, is_distributed, _prepare_batch, _train_one_epoch, _restore_rng_states, TrainConfig
+from src.train.engine import _prepare_batch, _train_one_epoch, _restore_rng_states, TrainConfig
 from src.train.pretrain import _has_supervised_outcomes, _load_decile_records
 from src.train.manifest import Manifest
 from src.train.checkpoint import save_checkpoint, load_checkpoint
@@ -260,7 +258,8 @@ class TestTrainingEngine(unittest.TestCase):
         }
         record = {
             "episode_key": "stay-a",
-            "artifact_hashes": {},
+            "artifact_hashes": {"tokenizer_version": "2", "vocabulary": "v",
+                                "numeric_edges": "s"},
             "token": [3, 4, 5],
             "pos_min": [0, 1, 2],
             "value": [None, None, None],
@@ -271,7 +270,7 @@ class TestTrainingEngine(unittest.TestCase):
         }
         ds = ModelDataset([record], representation="decile", target_builder=TargetBuilder(16, 4, 4, {}), expected_hashes={})
         batch = _prepare_batch(collate_model_samples([ds[0]]), torch.device("cpu"))
-        model = Model(vocab_size=16, n_targets=2, mcfg=cfg)
+        model = Model(vocab_size=16, n_targets=2, mcfg=cfg, n_value_bins=4)
         losses = model(batch)
         self.assertTrue(torch.isfinite(losses["total"]))
         self.assertEqual(float(losses["cr"]), 0.0)
@@ -315,7 +314,7 @@ class TestTrainingEngine(unittest.TestCase):
             "th_dir": torch.zeros(0, dtype=torch.long),
             "th_crossed": torch.zeros(0, dtype=torch.long),
         }
-        losses = Model(vocab_size=16, n_targets=2, mcfg=cfg)(batch)
+        losses = Model(vocab_size=16, n_targets=2, mcfg=cfg, n_value_bins=4)(batch)
         self.assertTrue(torch.isfinite(losses["total"]))
         self.assertEqual(float(losses["cr"]), 0.0)
         self.assertEqual(float(losses["th"]), 0.0)
@@ -354,7 +353,7 @@ class TestTrainingEngine(unittest.TestCase):
             "th_crossed": torch.tensor([-1]),
         }
         with self.assertRaisesRegex(RuntimeError, "multi-document packed rows"):
-            Model(vocab_size=16, n_targets=2, mcfg=cfg)(batch)
+            Model(vocab_size=16, n_targets=2, mcfg=cfg, n_value_bins=4)(batch)
 
     def test_train_sets_dataset_epoch_for_threshold_sampling(self):
         class EpochDS(torch.utils.data.Dataset):

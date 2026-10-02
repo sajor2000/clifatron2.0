@@ -101,15 +101,35 @@ class AblationTest(unittest.TestCase):
 
     def test_dry_run_arm_loads(self):
         import subprocess
-        result = subprocess.run(
-            ["uv", "run", "python", "-m", "src.train.run_arm",
-             "--arm", "from_scratch", "--data", "/tmp",
-             "--ablation-config", "configs/ablation.yaml",
-             "--dry-run"],
-            capture_output=True, text=True,
-        )
+
+        # n_value_bins is derived from the data's tokenizer-v2 vocab.json (U5, KTD7).
+        with tempfile.TemporaryDirectory() as data:
+            (Path(data) / "vocab.json").write_text(json.dumps({
+                "vocab": {"<pad>": 0, "map=0": 1, "map=1": 2},
+                "segments": {"map": [
+                    {"lo": None, "hi": 65.0, "lo_closed": False, "hi_closed": False},
+                    {"lo": 65.0, "hi": None, "lo_closed": True, "hi_closed": False},
+                ]},
+                "manifest": {"tokenizer_version": 2},
+            }))
+            result = subprocess.run(
+                ["uv", "run", "python", "-m", "src.train.run_arm",
+                 "--arm", "from_scratch", "--data", data,
+                 "--ablation-config", "configs/ablation.yaml",
+                 "--dry-run"],
+                capture_output=True, text=True,
+            )
+            missing = subprocess.run(
+                ["uv", "run", "python", "-m", "src.train.run_arm",
+                 "--arm", "from_scratch", "--data", str(Path(data) / "absent"),
+                 "--ablation-config", "configs/ablation.yaml", "--dry-run"],
+                capture_output=True, text=True,
+            )
         self.assertNotEqual(result.returncode, 1)
         self.assertIn("CLIFEncoder from scratch", result.stdout)
+        # Without a vocabulary there is no n_value_bins to derive: refuse, never default.
+        self.assertNotEqual(missing.returncode, 0)
+        self.assertIn("vocab.json", missing.stderr)
 
 
 if __name__ == "__main__":

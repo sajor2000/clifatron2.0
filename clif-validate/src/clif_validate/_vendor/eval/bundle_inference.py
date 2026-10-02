@@ -2,7 +2,7 @@
 
 `evaluate_site` deliberately has no default `predict_fn`; the CLI used to supply one
 that raised, naming the four inputs it lacked: the resolved data config, the
-bundle-pinned vocabulary and numeric edges, a policy-checked shard directory, and the
+bundle-pinned vocabulary and segments, a policy-checked shard directory, and the
 episode frame. A loaded `Bundle` supplies the first three and the caller supplies the
 rest, so this module builds the callable that was previously impossible to build:
 
@@ -88,11 +88,11 @@ def bundle_predict_fn(bundle: Bundle, model, *, data_path: str | Path,
         episodes = pl.read_parquet(episode_artifact)
         shard = Path(shard_dir)
         shard.mkdir(parents=True, exist_ok=True)
+        # The whole validated vocab artifact (segments, reference units, dose targets):
+        # tokenize_site re-validates it and bins with exactly the bundle's segments.
         tokenize_site(
-            bundle.data_cfg, site_id, Path(data_path), shard,
-            dict(bundle.vocab), dict(bundle.edges),
+            bundle.data_cfg, site_id, Path(data_path), shard, bundle.vocab_artifact,
             episodes=episodes,
-            vocab_manifest=bundle.vocab_manifest,
             artifact_policy=bundle.policy,
         )
         events = pl.read_parquet(shard / "events.parquet")

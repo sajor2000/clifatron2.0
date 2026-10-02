@@ -115,7 +115,7 @@ class TokenizationSmokeTest(unittest.TestCase):
         }
 
         for arm_name in abl["arms"]:
-            model = TokenizationAblationModel(50, 5, mcfg, abl["arms"][arm_name])
+            model = TokenizationAblationModel(50, 5, mcfg, abl["arms"][arm_name], n_value_bins=12)
             total = sum(p.numel() for p in model.parameters())
             print(f"  {arm_name}: {total:,} params, tokenizer={abl['arms'][arm_name]['tokenizer']}")
             self.assertGreater(total, 0)

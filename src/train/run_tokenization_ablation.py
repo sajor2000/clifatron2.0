@@ -18,6 +18,7 @@ Or run all arms sequentially:
 from __future__ import annotations
 
 import argparse
+import json
 import os
 from pathlib import Path
 
@@ -26,6 +27,7 @@ import torch.distributed as dist
 import yaml
 from torch.nn.parallel import DistributedDataParallel as DDP
 
+from src.data.segments import n_value_bins as vocab_n_value_bins
 from src.model.encoder import CLIFEncoder, count_params
 from src.model.encoder_continuous import ContinuousFusedEncoder
 from src.model.heads import (
@@ -47,7 +49,7 @@ def setup_ddp():
 
 class TokenizationAblationModel(torch.nn.Module):
     def __init__(self, vocab_size: int, n_targets: int, mcfg: dict,
-                 arm_cfg: dict):
+                 arm_cfg: dict, *, n_value_bins: int):
         super().__init__()
         tokenizer_type = arm_cfg.get("tokenizer", "decile")
         d = mcfg["trunk"]["d_model"]
@@ -63,7 +65,7 @@ class TokenizationAblationModel(torch.nn.Module):
         self.cr = CompetingRiskHead(d, n_targets + 1, h["competing_risk"]["n_time_bins"])
         self.th = ThresholdHazardHead(
             d, n_targets, h["threshold_hazard"]["n_time_bins"],
-            n_value_bins=10, thr_dim=h["threshold_hazard"]["threshold_embed_dim"],
+            n_value_bins=n_value_bins, thr_dim=h["threshold_hazard"]["threshold_embed_dim"],
         )
         self.vr = ValueRegressionHead(d, vocab_size) if h["value_regression"]["enabled"] else None
 
@@ -93,6 +95,9 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--arm", required=True)
     ap.add_argument("--data", required=True)
+    ap.add_argument("--vocab", required=True,
+                    help="the arm's tokenizer-v2 vocab.json; n_value_bins is derived "
+                         "from its segments")
     ap.add_argument("--ablation-config", default="configs/tokenization_ablation.yaml")
     ap.add_argument("--model-config", default="configs/model.yaml")
     ap.add_argument("--out", default="results/tokenization_ablation")
@@ -113,9 +118,11 @@ def main():
         yaml.safe_load(Path("configs/data.yaml").read_text())["target_concepts"]
     )
     vocab_size = mcfg["trunk"].get("target_vocab", 10000)
+    value_bins = vocab_n_value_bins(json.loads(Path(args.vocab).read_text()))
 
     if args.dry_run:
-        model = TokenizationAblationModel(vocab_size, n_targets, mcfg, arm_cfg)
+        model = TokenizationAblationModel(vocab_size, n_targets, mcfg, arm_cfg,
+                                          n_value_bins=value_bins)
         total = count_params(model)
         trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
         print(f"[{args.arm}] {total/1e6:.1f}M total / {trainable/1e6:.1f}M trainable")
@@ -124,7 +131,8 @@ def main():
         return
 
     total_steps = arm_cfg["total_steps"]
-    model = TokenizationAblationModel(vocab_size, n_targets, mcfg, arm_cfg).to(dev)
+    model = TokenizationAblationModel(vocab_size, n_targets, mcfg, arm_cfg,
+                                      n_value_bins=value_bins).to(dev)
 
     if is_main:
         total = count_params(model)

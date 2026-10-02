@@ -170,3 +170,50 @@ def test_evaluate_uses_prompt_column_pairing(tmp_path):
     # prompt-2 -> h2 continuation [icu]; rollout [icu] hits it
     assert per["h2"]["unigram_recall"] == 1.0
     assert ker["mean_unigram_recall"] == pytest.approx(0.75)
+
+
+# ------------------------------------------------- U5: groups from the vocab artifact
+
+VOCAB_ARTIFACT = {
+    "segments": {"map": [], "lactate": [], "norepinephrine_mcg_kg_min": [], "sodium": []},
+    "binning_sources": {"map": "csv", "lactate": "csv",
+                        "norepinephrine_mcg_kg_min": "csv", "sodium": "quantile"},
+    "concept_sources": {
+        "tables": {
+            "map": ["vitals"], "lactate": ["labs"], "sodium": ["labs"],
+            "norepinephrine_mcg_kg_min": ["meds"], "device_category": ["resp_support"],
+            "cam_total": ["assessments"], "sex": ["static"],
+        },
+        "treatment_sources": ["meds", "resp_support", "static"],
+    },
+}
+ARTIFACT_GROUPS = concept_groups({"target_concepts": [
+    {"name": "map", "source": "vitals"}, {"name": "lactate", "source": "labs"},
+]}, VOCAB_ARTIFACT)
+
+
+def test_treatment_and_device_fused_tokens_land_in_the_treatment_group():
+    """`device_category=imv` and a med dose token contain `=`, but they are treatments
+    and devices, not measurements — grouping follows the token's source table."""
+    from src.eval.generative import _group_of
+
+    assert _group_of("device_category=imv", ARTIFACT_GROUPS) == "treatments"
+    assert _group_of("norepinephrine_mcg_kg_min=3", ARTIFACT_GROUPS) == "treatments"
+    assert _group_of("sex=female", ARTIFACT_GROUPS) == "treatments"
+    assert _group_of("map=4", ARTIFACT_GROUPS) == "vitals"
+    assert _group_of("lactate=2", ARTIFACT_GROUPS) == "labs"
+    assert _group_of("sodium=2", ARTIFACT_GROUPS) == "measurements"
+    assert _group_of("cam_total=positive", ARTIFACT_GROUPS) == "categoricals"
+    assert _group_of("<eos>", ARTIFACT_GROUPS) == "specials"
+
+
+def test_calibration_reports_the_treatment_group_and_recall_counts_it_as_key():
+    real = ["map=4", "device_category=imv", "norepinephrine_mcg_kg_min=3", "sodium=2"]
+    gen = ["map=4", "norepinephrine_mcg_kg_min=1", "sodium=2", "sodium=2"]
+    cal = event_rate_calibration(real, gen, ARTIFACT_GROUPS)
+    assert cal["group_rates"]["treatments"] == {"real": 0.5, "gen": 0.25}
+    assert cal["group_rates"]["measurements"] == {"real": 0.25, "gen": 0.5}
+    ker = key_event_recall(real, gen, ARTIFACT_GROUPS)
+    # key events: device_category + norepinephrine (treatments); gen hits the infusion
+    assert ker["n_real_categorical"] == 2
+    assert ker["categorical_recall"] == pytest.approx(0.5)

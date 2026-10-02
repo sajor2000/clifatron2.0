@@ -18,6 +18,7 @@ from torch.utils.data import DataLoader, Dataset, Sampler
 
 import logging
 
+from src.data.segments import RETOKENIZE, TOKENIZER_VERSION
 from src.data.targets import TargetBuilder, TargetContractError
 
 try:
@@ -70,6 +71,17 @@ class ModelDataset(Dataset):
         hashes = record.get("artifact_hashes")
         if not isinstance(hashes, Mapping):
             raise TargetContractError("sample is missing artifact_hashes")
+        if self.representation == "decile" and (
+            not hashes.get("numeric_edges")
+            or str(hashes.get("tokenizer_version")) != str(TOKENIZER_VERSION)
+        ):
+            # KTD7: a canonical shard row records the tokenizer version and segments
+            # hash it was encoded with. Without them it was built by the previous
+            # tokenizer, whose bins no longer mean what the vocabulary says.
+            raise TargetContractError(
+                f"shard row is not bound to tokenizer-v{TOKENIZER_VERSION} segments "
+                f"(no numeric_edges/tokenizer_version in artifact_hashes); {RETOKENIZE}"
+            )
         for name, expected in self.expected_hashes.items():
             if hashes.get(name) != expected:
                 raise TargetContractError(f"artifact hash mismatch: {name}")

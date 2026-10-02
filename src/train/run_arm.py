@@ -19,6 +19,7 @@ Arms that use clif_encoder (from_scratch, no_pretrain) don't need --checkpoint.
 from __future__ import annotations
 
 import argparse
+import json
 import os
 from pathlib import Path
 from dataclasses import dataclass, field
@@ -35,6 +36,7 @@ from src.model.heads import (
     ValueRegressionHead,
     next_event_loss,
 )
+from src.data.segments import n_value_bins
 from src.model.head_adapter import CLIFATRONHeads, load_backbone
 from src.train.curriculum import curriculum_weights
 from src.train.pretrain import objective_weights
@@ -75,7 +77,7 @@ class FromScratchModel(torch.nn.Module):
     `heads.*.weight`, fail-to-zero guards for absent head targets — so a real total
     loss reaches the training engine instead of `None` (which crashed engine.train)."""
 
-    def __init__(self, vocab_size: int, n_targets: int, mcfg: dict):
+    def __init__(self, vocab_size: int, n_targets: int, mcfg: dict, *, n_value_bins: int):
         super().__init__()
         self.w = objective_weights(mcfg)
         self.enc = CLIFEncoder(vocab_size, mcfg)
@@ -84,7 +86,7 @@ class FromScratchModel(torch.nn.Module):
         self.cr = CompetingRiskHead(d, n_targets + 1, h["competing_risk"]["n_time_bins"])
         self.th = ThresholdHazardHead(
             d, n_targets, h["threshold_hazard"]["n_time_bins"],
-            n_value_bins=10, thr_dim=h["threshold_hazard"]["threshold_embed_dim"],
+            n_value_bins=n_value_bins, thr_dim=h["threshold_hazard"]["threshold_embed_dim"],
         )
         self.vr = ValueRegressionHead(d, vocab_size) if h["value_regression"]["enabled"] else None
 
@@ -121,13 +123,13 @@ class FromScratchModel(torch.nn.Module):
 
 
 class AdapterModel(torch.nn.Module):
-    def __init__(self, backbone, n_targets: int, freeze_trunk: bool):
+    def __init__(self, backbone, n_targets: int, freeze_trunk: bool, *, n_value_bins: int):
         super().__init__()
         self.adapter = CLIFATRONHeads(
             backbone, n_targets,
             freeze_backbone=freeze_trunk,
             cr_bins=16, th_bins=48,
-            n_value_bins=10, enable_value=True,
+            n_value_bins=n_value_bins, enable_value=True,
             tie_weights=False,
         )
 
@@ -137,11 +139,22 @@ class AdapterModel(torch.nn.Module):
 
 
 # -------------------------------------------------------------------- driver
+def load_n_value_bins(path: str | Path) -> int:
+    """Threshold-head value-bin count from a tokenizer-v2 vocab.json (never a default)."""
+    path = Path(path)
+    if not path.exists():
+        raise SystemExit(f"{path} is required: n_value_bins is derived from the frozen "
+                         "vocabulary's segments")
+    return n_value_bins(json.loads(path.read_text()))
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--arm", required=True)
     ap.add_argument("--checkpoint", default=None)
     ap.add_argument("--data", required=True)
+    ap.add_argument("--vocab", default=None,
+                    help="tokenizer-v2 vocab.json (default: <data>/vocab.json)")
     ap.add_argument("--ablation-config", default="configs/ablation.yaml")
     ap.add_argument("--model-config", default="configs/model.yaml")
     ap.add_argument("--train-config", default="configs/train.yaml")
@@ -166,10 +179,12 @@ def main():
     )
     vocab_size = mcfg["trunk"].get("target_vocab", 10000)
     total_steps = arm_cfg["total_steps"]
+    value_bins = load_n_value_bins(args.vocab or Path(args.data) / "vocab.json")
 
     # --------------- build model
     if arm_cfg["trunk"] in ("clif_encoder",):
-        model = FromScratchModel(vocab_size, n_targets, mcfg).to(dev)
+        model = FromScratchModel(vocab_size, n_targets, mcfg,
+                                 n_value_bins=value_bins).to(dev)
         if is_main:
             print(f"[{args.arm}] CLIFEncoder from scratch, {count_params(model)/1e6:.1f}M params")
     else:
@@ -177,7 +192,7 @@ def main():
             raise SystemExit(f"--checkpoint required for arm {args.arm}")
         backbone = load_backbone(args.checkpoint)
         freeze = arm_cfg.get("freeze_trunk", True)
-        model = AdapterModel(backbone, n_targets, freeze).to(dev)
+        model = AdapterModel(backbone, n_targets, freeze, n_value_bins=value_bins).to(dev)
         if is_main:
             total_p = sum(p.numel() for p in model.parameters())
             trainable_p = sum(p.numel() for p in model.parameters() if p.requires_grad)

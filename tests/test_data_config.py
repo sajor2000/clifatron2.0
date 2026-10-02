@@ -147,8 +147,14 @@ class DataConfigTest(unittest.TestCase):
         cfg = yaml.safe_load((root / "configs/data.yaml").read_text())
         policy = yaml.safe_load((root / "configs/artifact_policy.yaml").read_text())
         cohort_cfg = yaml.safe_load((root / cfg["cohort_contract"]).read_text())
-        vocab = {"<pad>": 0, "map=0": 1}
-        edges = {"map": [65.0]}
+        vocab = {"<pad>": 0, "map=0": 1, "map=1": 2}
+        segments = {"map": [
+            {"lo": None, "hi": 65.0, "lo_closed": False, "hi_closed": False},
+            {"lo": 65.0, "hi": None, "lo_closed": True, "hi_closed": False},
+        ]}
+        binning_sources = {"map": "csv"}
+        reference_units = {"concepts": {"map": "mmHg"}, "dose_targets": {}}
+        concept_sources = {"tables": {"map": ["vitals"]}, "treatment_sources": []}
 
         def digest(value):
             payload = json.dumps(value, sort_keys=True, separators=(",", ":"))
@@ -156,12 +162,16 @@ class DataConfigTest(unittest.TestCase):
 
         manifest = {
             "artifact_family": "experimental_representation",
+            "tokenizer_version": 2,
             "clif_version": cfg["schema_version"],
             "mcide_version": cfg["mcide_version"],
             "hashes": {
                 "training_split": "1" * 64,
                 "vocabulary": digest(vocab),
-                "numeric_edges": digest(edges),
+                "numeric_edges": digest(segments),
+                "binning_sources": digest(binning_sources),
+                "reference_units": digest(reference_units),
+                "concept_sources": digest(concept_sources),
                 "target_map": digest(cfg["target_concepts"]),
                 "outcome_spec": digest(cohort_cfg["outcomes"]),
                 "clif_version": digest(cfg["schema_version"]),
@@ -169,28 +179,67 @@ class DataConfigTest(unittest.TestCase):
             "provenance": {
                 "source_site": "synthetic-reference",
                 "fit_partition": "train",
+                "precedence_policy": 1,
                 "immutable": True,
             },
         }
-        loaded_vocab, loaded_edges, loaded_manifest = validate_vocabulary_artifact(
-            {"vocab": vocab, "edges": edges, "manifest": manifest}, cfg, policy
+
+        def artifact(**over):
+            blob = {"vocab": vocab, "segments": segments, "manifest": manifest,
+                    "binning_sources": binning_sources, "reference_units": reference_units,
+                    "concept_sources": concept_sources, "precedence_policy": 1}
+            blob.update(over)
+            return blob
+
+        loaded_vocab, loaded_segments, loaded_manifest = validate_vocabulary_artifact(
+            artifact(), cfg, policy
         )
         self.assertEqual(loaded_vocab, vocab)
-        self.assertEqual(loaded_edges, edges)
+        self.assertEqual(loaded_segments, segments)
         self.assertEqual(loaded_manifest, manifest)
 
-        tampered = {"vocab": {**vocab, "new": 2}, "edges": edges, "manifest": manifest}
         with self.assertRaisesRegex(ValueError, "hash mismatch"):
-            validate_vocabulary_artifact(tampered, cfg, policy)
+            validate_vocabulary_artifact(artifact(vocab={**vocab, "new": 3}), cfg, policy)
 
-        wrong_family = {"vocab": vocab, "edges": edges, "manifest": {**manifest, "artifact_family": "clifatron_checkpoint"}}
+        moved = json.loads(json.dumps(segments))
+        moved["map"][0]["hi"] = moved["map"][1]["lo"] = 66.0
+        with self.assertRaisesRegex(ValueError, "numeric-edge hash mismatch"):
+            validate_vocabulary_artifact(artifact(segments=moved), cfg, policy)
+
+        with self.assertRaisesRegex(ValueError, "binning sources"):
+            validate_vocabulary_artifact(artifact(binning_sources={}), cfg, policy)
+
+        wrong_family = artifact(manifest={**manifest, "artifact_family": "clifatron_checkpoint"})
         with self.assertRaisesRegex(ValueError, "family"):
             validate_vocabulary_artifact(wrong_family, cfg, policy)
 
         bad_target = json.loads(json.dumps(manifest))
         bad_target["hashes"]["target_map"] = "2" * 64
         with self.assertRaisesRegex(ValueError, "target-map"):
-            validate_vocabulary_artifact({"vocab": vocab, "edges": edges, "manifest": bad_target}, cfg, policy)
+            validate_vocabulary_artifact(artifact(manifest=bad_target), cfg, policy)
+
+        missing = json.loads(json.dumps(manifest))
+        missing["hashes"].pop("reference_units")
+        with self.assertRaisesRegex(ValueError, "missing hashes: reference_units"):
+            validate_vocabulary_artifact(artifact(manifest=missing), cfg, policy)
+
+    def test_unit_mismatch_on_a_non_target_binned_concept_is_an_error(self):
+        """U5: validate_units covers every binned concept via the vocab's reference
+        units, not only the configured target concepts."""
+        cfg = {"unit_normalization": {"on_mismatch": "error", "concepts": {"map": "mmHg"}}}
+        reference_units = {"concepts": {"map": "mmHg", "sodium": "mmol/L",
+                                        "ecmo_flow": None},
+                           "dose_targets": {}}
+        ok = pl.DataFrame({"concept": ["sodium", "map", "ecmo_flow"],
+                           "unit": ["mmol/L", "mmHg", "L/min"], "value": [140.0, 70.0, 4.0]})
+        validate_units(ok, cfg, reference_units)
+        bad = pl.DataFrame({"concept": ["sodium"], "unit": ["mg/dL"], "value": [140.0]})
+        with self.assertRaisesRegex(ValueError, "Non-canonical CLIF units: sodium"):
+            validate_units(bad, cfg, reference_units)
+        # Without the vocab's reference units the non-target concept was never checked.
+        validate_units(bad, cfg)
+        warn = {"unit_normalization": {"on_mismatch": "warn", "concepts": {}}}
+        validate_units(bad, warn, reference_units)
 
     def test_reads_availability_column_and_validates_canonical_unit(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -60,7 +60,6 @@ class ArtifactPolicyTest(unittest.TestCase):
                 Path("missing-input"),
                 Path("output/final_no_phi/tokens"),
                 None,
-                None,
                 artifact_policy=self.policy,
             )
 

@@ -44,11 +44,13 @@ def hidden_dim(backbone) -> int:
 
 class CLIFATRONHeads(nn.Module):
     """Backbone + our heads. Anchor = hour-24 token (their benchmark truncates to 24h);
-    pass `anchor_idx` explicitly, else the last real token (from attention_mask) is used."""
+    pass `anchor_idx` explicitly, else the last real token (from attention_mask) is used.
+    `n_value_bins` is required: derive it from the frozen vocabulary
+    (`segments.n_value_bins`), so the threshold head matches the bins it is queried with."""
 
-    def __init__(self, backbone, n_targets: int, *, freeze_backbone: bool = True,
-                  cr_bins: int = 16, th_bins: int = 48, n_value_bins: int = 10,
-                  enable_value: bool = True, tie_weights: bool = False):
+    def __init__(self, backbone, n_targets: int, *, n_value_bins: int,
+                 freeze_backbone: bool = True, cr_bins: int = 16, th_bins: int = 48,
+                 enable_value: bool = True, tie_weights: bool = False):
         super().__init__()
         self.backbone = backbone
         d = hidden_dim(backbone)

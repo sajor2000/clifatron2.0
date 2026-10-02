@@ -6,8 +6,9 @@ generation-side scores):
   - event_rate_calibration: Jensen-Shannon divergence (base-2, [0,1]) between
     real and generated token-rate distributions, top-k overlap, generated-only
     mass (closed-world sampling should hold it ~0), and per-group rate comparison
-    (measurements vs categoricals; vitals vs labs via configs/data.yaml
-    target_concepts). The 2026-09-26 overnight log's qualitative finding —
+    (vitals/labs via configs/data.yaml target_concepts; treatments = every token
+    charted by an input-only table, binned or not, per the vocab artifact's
+    `concept_sources`; other binned measurements; categoricals). The 2026-09-26 overnight log's qualitative finding —
     3000-step rollouts are labs-heavy while the real stream is vitals+meds-heavy
     (0/8 top-token overlap) — is what this metric quantifies.
   - key_event_recall: of the real continuation's token concepts (and its
@@ -42,6 +43,7 @@ from pathlib import Path
 
 import polars as pl
 
+from src.data.segments import vocab_segments
 from src.eval.clinical_plausibility import split_sequence
 
 
@@ -53,12 +55,38 @@ def token_concept(token: str) -> str:
     return token.split("=", 1)[0]
 
 
-def concept_groups(data_config: dict) -> dict[str, str]:
-    """concept -> group from configs/data.yaml target_concepts (vitals/labs).
-    Everything else is categorical (treatments, devices, demographics, specials)."""
-    groups = {}
+GROUPS = ("vitals", "labs", "measurements", "treatments", "categoricals", "specials")
+# Key events for recall: the clinically decisive non-measurement events.
+KEY_GROUPS = frozenset({"treatments", "categoricals"})
+
+
+def concept_groups(data_config: dict, vocab_artifact: dict | None = None) -> dict[str, str]:
+    """concept -> group (KTD7: by SOURCE, not by whether the token contains `=`).
+
+    - ``treatments``: charted by an input-only table (treatments, devices, context,
+      static tokens) per the vocab artifact's `concept_sources` — so a fused
+      `device_category=imv` or a binned dose `norepinephrine_mcg_kg_min=3` lands here;
+    - target concepts: their configs/data.yaml source (vitals / labs);
+    - ``measurements``: any other binned concept (`binning_sources`);
+    - ``categoricals``: every other concept the artifact knows.
+
+    Without an artifact only the target concepts are mapped; `_group_of` then falls
+    back on the token shape for the rest."""
+    groups: dict[str, str] = {}
+    if vocab_artifact:
+        sources = vocab_artifact.get("concept_sources") or {}
+        treatment = set(sources.get("treatment_sources") or ())
+        binned = set(vocab_artifact.get("binning_sources") or ())
+        for concept, tables in (sources.get("tables") or {}).items():
+            if treatment & set(tables):
+                groups[concept] = "treatments"
+            else:
+                groups[concept] = "measurements" if concept in binned else "categoricals"
+        for concept in binned:
+            groups.setdefault(concept, "measurements")
     for spec in data_config.get("target_concepts", []):
-        groups[spec["name"]] = str(spec.get("source", "measurements"))
+        if groups.get(spec["name"]) != "treatments":
+            groups[spec["name"]] = str(spec.get("source", "measurements"))
     return groups
 
 
@@ -93,7 +121,7 @@ def event_rate_calibration(real_tokens: list[str], gen_tokens: list[str],
     n_real, n_gen = len(real_tokens), len(gen_tokens)
     gen_only = [t for t in gen_counts if t not in real_counts]
     group_rates: dict[str, dict[str, float]] = {}
-    for group in ("vitals", "labs", "categoricals", "specials"):
+    for group in GROUPS:
         real_rate = sum(c for t, c in real_counts.items() if _group_of(t, groups) == group) / (n_real or 1)
         gen_rate = sum(c for t, c in gen_counts.items() if _group_of(t, groups) == group) / (n_gen or 1)
         group_rates[group] = {"real": round(real_rate, 4), "gen": round(gen_rate, 4)}
@@ -109,22 +137,28 @@ def event_rate_calibration(real_tokens: list[str], gen_tokens: list[str],
 
 
 def _group_of(token: str, groups: dict[str, str]) -> str:
+    """A token's group: its concept's group from `concept_groups`. A concept the map
+    does not know falls back on the token shape: a numeric bin suffix reads as a
+    measurement, anything else as a categorical."""
     if token in _SPECIALS:
         return "specials"
-    if "=" in token:
-        return groups.get(token_concept(token), "measurements")
-    return "categoricals"
+    concept = token_concept(token)
+    if concept in groups:
+        return groups[concept]
+    _, _, suffix = token.partition("=")
+    return "measurements" if suffix.isdigit() else "categoricals"
 
 
 def key_event_recall(real_continuation: list[str], gen_tokens: list[str],
                      groups: dict[str, str]) -> dict:
     """Recall of the real continuation's concepts in the generated rollout —
-    overall and for categoricals specifically (treatments, devices, demographics:
-    the tokens with no `=bin`, i.e. the clinically decisive non-numeric events)."""
+    overall and for key events specifically (`KEY_GROUPS`: treatments, devices,
+    demographics and other categoricals — the clinically decisive events, whether or
+    not their token carries a dose bin)."""
     real_concepts = {token_concept(t) for t in real_continuation}
     gen_concepts = {token_concept(t) for t in gen_tokens}
-    real_key = {token_concept(t) for t in real_continuation if _group_of(t, groups) == "categoricals"}
-    gen_key = {token_concept(t) for t in gen_tokens if _group_of(t, groups) == "categoricals"}
+    real_key = {token_concept(t) for t in real_continuation if _group_of(t, groups) in KEY_GROUPS}
+    gen_key = {token_concept(t) for t in gen_tokens if _group_of(t, groups) in KEY_GROUPS}
     return {
         "n_real_concepts": len(real_concepts),
         "unigram_recall": round(len(real_concepts & gen_concepts) / len(real_concepts), 4) if real_concepts else 0.0,
@@ -299,10 +333,12 @@ def main(argv: list[str] | None = None) -> None:
     ap.add_argument("--out", default=None, help="site-local JSON report path (output/ tree)")
     args = ap.parse_args(argv)
 
-    vocab = json.loads(Path(args.vocab).read_text()).get("vocab", {})
+    vocab_artifact = json.loads(Path(args.vocab).read_text())
+    vocab_segments(vocab_artifact)  # refuses a pre-v2 vocabulary (re-tokenize)
+    vocab = vocab_artifact["vocab"]
     id_to_token = {int(i): t for t, i in vocab.items()}
     data_config = yaml.safe_load(Path(args.data_config).read_text())
-    groups = concept_groups(data_config)
+    groups = concept_groups(data_config, vocab_artifact)
 
     sims = _load_sims(args.sims, vocab=set(vocab))
     real = _load_real(args.events, id_to_token)

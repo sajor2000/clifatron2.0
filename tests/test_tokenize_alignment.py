@@ -61,7 +61,7 @@ class TokenizeAlignmentTest(unittest.TestCase):
 
                 episodes = pl.read_parquet(episode_path)
                 out = Path("output/intermediate_phi/align_build")
-                tokenize_site(cfg, SYNTHETIC_SITE, site, out, None, None,
+                tokenize_site(cfg, SYNTHETIC_SITE, site, out, None,
                               episodes=episodes, artifact_policy=FIXTURE_POLICY)
                 events = pl.read_parquet(out / "events.parquet")
             finally:
@@ -125,11 +125,11 @@ class UnkReservedTokenGuardTest(unittest.TestCase):
                 # First build a valid frozen vocab (writes vocab.json with its manifest).
                 out = Path("output/intermediate_phi/unk_build")
                 tokenize_site(
-                    cfg, SYNTHETIC_SITE, site, out, None, None,
+                    cfg, SYNTHETIC_SITE, site, out, None,
                     episodes=episodes, artifact_policy=FIXTURE_POLICY,
                 )
                 blob = json.loads((out / "vocab.json").read_text())
-                vocab, edges, manifest = blob["vocab"], blob["edges"], blob["manifest"]
+                vocab, manifest = blob["vocab"], blob["manifest"]
 
                 # Corrupt the reserved <unk> id and re-import with a manifest hash that
                 # still matches the corrupted vocab (so the <unk> guard — not the hash
@@ -141,9 +141,9 @@ class UnkReservedTokenGuardTest(unittest.TestCase):
                 out2 = Path("output/intermediate_phi/unk_reject")
                 with self.assertRaisesRegex(QualificationError, "<unk>"):
                     tokenize_site(
-                        cfg, SYNTHETIC_SITE, site, out2, bad_vocab, edges,
-                        episodes=episodes, vocab_manifest=manifest,
-                        artifact_policy=FIXTURE_POLICY,
+                        cfg, SYNTHETIC_SITE, site, out2,
+                        {**blob, "vocab": bad_vocab, "manifest": manifest},
+                        episodes=episodes, artifact_policy=FIXTURE_POLICY,
                     )
             finally:
                 os.chdir(old_cwd)
@@ -316,7 +316,7 @@ class FusedCategoricalAndCoverageTest(unittest.TestCase):
                 "coverage": "all",
             })
             out = Path("output/intermediate_phi/fused_build")
-            tokenize_site(cfg, SYNTHETIC_SITE, site, out, None, None,
+            tokenize_site(cfg, SYNTHETIC_SITE, site, out, None,
                           episodes=episodes, artifact_policy=FIXTURE_POLICY)
             cls.events = pl.read_parquet(out / "events.parquet")
             cls.blob = json.loads((out / "vocab.json").read_text())
@@ -346,14 +346,14 @@ class FusedCategoricalAndCoverageTest(unittest.TestCase):
 
     def test_value_only_categorical_becomes_a_fused_token(self):
         self.assertIn("cam_total=negative", self.vocab)
-        self.assertNotIn("cam_total", self.blob["edges"])
+        self.assertNotIn("cam_total", self.blob["segments"])
         tokens = self._tokens("synth-000")
         self.assertEqual(tokens.count("cam_total=negative"), len(self.HOURS))
         self.assertNotIn("cam_total", tokens)
 
     def test_unseen_categorical_and_validation_only_concept_map_to_unk(self):
         self.assertNotIn("cam_total=unable_to_assess", self.vocab)
-        self.assertNotIn("valonly_score", self.blob["edges"])
+        self.assertNotIn("valonly_score", self.blob["segments"])
         self.assertNotIn("valonly_score", self.blob["binning_sources"])
         self.assertFalse(any(t.startswith("valonly_score") for t in self.vocab))
         tokens = self._tokens(self.VALIDATION[0])
@@ -366,7 +366,7 @@ class FusedCategoricalAndCoverageTest(unittest.TestCase):
         from src.data.tokenize import _json_sha256
 
         sources = self.blob["binning_sources"]
-        self.assertEqual(set(sources), set(self.blob["edges"]))
+        self.assertEqual(set(sources), set(self.blob["segments"]))
         self.assertEqual(sources["map"], "csv")
         self.assertEqual(
             self.blob["manifest"]["hashes"]["binning_sources"], _json_sha256(sources)
@@ -465,7 +465,7 @@ def _tokenize_variant(work, name, *, shuffle_seed=None, lab_lag=None, labs=False
             cfg["tables"]["labs"]["availability_lag_minutes"] = lab_lag
 
     out = Path(f"output/intermediate_phi/order_{name}")
-    tokenize_site(cfg, SYNTHETIC_SITE, site, out, None, None,
+    tokenize_site(cfg, SYNTHETIC_SITE, site, out, None,
                   episodes=episodes, artifact_policy=FIXTURE_POLICY)
     raw = (out / "events.parquet").read_bytes()
     return (raw, pl.read_parquet(out / "events.parquet"),
@@ -774,7 +774,7 @@ def _build_u4_site(work, name, *, static_tokens=None):
     })
     out = Path(f"output/intermediate_phi/u4_{name}")
     stats: dict = {}
-    tokenize_site(cfg, SYNTHETIC_SITE, site, out, None, None, episodes=episodes,
+    tokenize_site(cfg, SYNTHETIC_SITE, site, out, None, episodes=episodes,
                   artifact_policy=FIXTURE_POLICY, stats=stats)
     return (pl.read_parquet(out / "events.parquet"),
             json.loads((out / "vocab.json").read_text()), stats, episodes)
@@ -814,7 +814,7 @@ class NewEventSourcesTest(unittest.TestCase):
         return [r for r in self._rows(stay) if r[0].split("=")[0] == prefix]
 
     def _zero_bin(self, concept):
-        segments = self.blob["edges"][concept]
+        segments = self.blob["segments"][concept]
         return next(i for i, s in enumerate(segments) if s["lo"] == s["hi"] == 0.0)
 
     # --- continuous doses ---------------------------------------------------------
@@ -835,10 +835,10 @@ class NewEventSourcesTest(unittest.TestCase):
 
     def test_fallback_concept_is_fitted_from_a_fit_only_shadow(self):
         # Every TRAIN dose was converted, yet the native-unit fallback has frozen bins.
-        self.assertIn("fentanyl_mcg_hr", self.blob["edges"])
+        self.assertIn("fentanyl_mcg_hr", self.blob["segments"])
         self.assertIn("fentanyl_mcg_hr", self.blob["binning_sources"])
         self.assertTrue(any(t.startswith("fentanyl_mcg_hr=") for t in self.vocab))
-        self.assertEqual(self.blob["edges"]["fentanyl_mcg_hr"][0],
+        self.assertEqual(self.blob["segments"]["fentanyl_mcg_hr"][0],
                          {"lo": 0.0, "hi": 0.0, "lo_closed": True, "hi_closed": True})
         # The shadow never reaches the token stream.
         for stay in ("synth-000", "synth-005"):
@@ -867,7 +867,7 @@ class NewEventSourcesTest(unittest.TestCase):
         self.assertEqual(len(cefepime), 2)
         self.assertEqual(cefepime[0][0], cefepime[1][0])
         self.assertEqual([v for _, _, v, _ in cefepime], [2000.0, 2000.0])
-        self.assertIn("cefepime_mg", self.blob["edges"])
+        self.assertIn("cefepime_mg", self.blob["segments"])
         self.assertEqual(self._zero_bin("cefepime_mg"), 0)
 
     def test_dose_unit_falls_back_to_category_unit(self):
@@ -876,6 +876,36 @@ class NewEventSourcesTest(unittest.TestCase):
             self.stats["dose_conversion"]["meds_intermittent"]["unconvertible"],
             len(self.episodes),
         )
+
+    # --- U5: reference units and concept sources ------------------------------------
+    def test_reference_units_cover_binned_concepts_dose_targets_and_device_metrics(self):
+        units = self.blob["reference_units"]
+        self.assertEqual(set(units["concepts"]), set(self.blob["segments"]))
+        self.assertEqual(units["concepts"]["fentanyl_mcg_kg_hr"], "mcg/kg/hr")
+        # A native-unit fallback concept carries the unit its rows are charted with
+        # (the concept's unit suffix, U4).
+        self.assertEqual(units["concepts"]["fentanyl_mcg_hr"], "mcg_hr")
+        self.assertEqual(units["concepts"]["cefepime_mg"], "mg")
+        # CLIF vitals carry no unit column and this fixture config declares no canonical
+        # unit, so map has no reference unit to check (the configured one wins when set).
+        self.assertIsNone(units["concepts"]["map"])
+        self.assertEqual(units["concepts"]["ecmo_device_rate"], "device_metric:device_rate")
+        self.assertIsNone(units["concepts"]["age_decile"])
+        # Dose target units moved from (unhashed) provenance into the hashed field.
+        self.assertEqual(units["dose_targets"]["fentanyl"], "mcg/kg/hr")
+        self.assertNotIn("dose_target_units", self.blob["manifest"]["provenance"])
+
+    def test_concept_sources_name_each_concepts_tables_and_the_treatment_tables(self):
+        sources = self.blob["concept_sources"]
+        self.assertEqual(sources["tables"]["fentanyl_mcg_kg_hr"], ["meds"])
+        self.assertEqual(sources["tables"]["mode_category"], ["resp_support"])
+        self.assertEqual(sources["tables"]["gcs_total"], ["assessments"])
+        self.assertEqual(sources["tables"]["sex"], ["static"])
+        self.assertLessEqual({"meds", "meds_intermittent", "resp_support", "crrt", "ecmo",
+                              "code_status", "position", "adt", "static"},
+                             set(sources["treatment_sources"]))
+        self.assertNotIn("assessments", sources["treatment_sources"])
+        self.assertNotIn("vitals", sources["treatment_sources"])
 
     # --- ventilator ---------------------------------------------------------------
     def test_a_resp_row_melts_to_its_settings_plus_a_fused_mode(self):
@@ -898,12 +928,12 @@ class NewEventSourcesTest(unittest.TestCase):
         gcs = self._concept("synth-000", "gcs_total")
         first = next(r for r in gcs if r[1] == 420)
         self.assertEqual(first[0],
-                         f"gcs_total={bin_index(8.0, self.blob['edges']['gcs_total'])}")
+                         f"gcs_total={bin_index(8.0, self.blob['segments']['gcs_total'])}")
         self.assertTrue(all(r[3] for r in gcs))
 
     def test_assessment_concepts_are_lowercased(self):
-        self.assertIn("rass", self.blob["edges"])
-        self.assertNotIn("RASS", self.blob["edges"])
+        self.assertIn("rass", self.blob["segments"])
+        self.assertNotIn("RASS", self.blob["segments"])
 
     def test_value_only_cam_result_is_fused(self):
         cam = self._concept("synth-000", "cam_total")
@@ -921,8 +951,8 @@ class NewEventSourcesTest(unittest.TestCase):
         lvad = self._concept("synth-000", "lvad_device_rate")
         self.assertEqual((len(ecmo), len(lvad)), (1, 1))
         self.assertEqual((ecmo[0][2], lvad[0][2]), (3000.0, 9000.0))
-        self.assertIn("ecmo_device_rate", self.blob["edges"])
-        self.assertIn("lvad_device_rate", self.blob["edges"])
+        self.assertIn("ecmo_device_rate", self.blob["segments"])
+        self.assertIn("lvad_device_rate", self.blob["segments"])
 
     # --- code status / position -------------------------------------------------------
     def test_code_status_in_effect_at_admission_and_mid_stay_change(self):
