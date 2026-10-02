@@ -182,9 +182,10 @@ _SQL_IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _TABLE_FILE_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 
 # The table-spec fields tokenize._read_table interpolates into a DuckDB query string.
-# `value_col`/`unit_col` are optional; the rest are required when a table is declared.
+# `value_col`/`unit_col`/`categorical_value_col` are optional; the rest are required
+# when a table is declared.
 _REQUIRED_SPEC_IDENTIFIERS = ("concept_col", "availability_col")
-_OPTIONAL_SPEC_IDENTIFIERS = ("value_col", "unit_col")
+_OPTIONAL_SPEC_IDENTIFIERS = ("value_col", "unit_col", "categorical_value_col")
 
 
 def _validate_data_config_identifiers(data_cfg: dict) -> None:

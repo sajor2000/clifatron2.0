@@ -83,6 +83,21 @@ value_binning:
   scheme: "clinical_segment"               # {clinical_segment | decile_ablation}; continuous_fused is not a build_edges scheme yet
   segment_source: "external/clifatron/tokenETL/config/critical_illness_tokenization_final_with_intervals.csv"
   n_bins: 10                               # ignored by clinical_segment; used by the decile_ablation arm
+  # COVERAGE (U2, R4/KTD3): `all` bins EVERY numeric concept in the reference-site train
+  # partition. Source priority per concept: (1) physician CSV segments; (2) one point bin
+  # per value for integer scales with <= ordinal_max_distinct distinct values (GCS, RASS,
+  # Braden); (3) frozen quantile bins (quantile_n_bins target, deduplicated, [a,b),
+  # forced edges pinned). Fewer than min_count fitting values -> one bin ("single").
+  # The decile arm = coverage all with every source forced to quantile (n_bins target).
+  # The per-concept choice is recorded in vocab.json `binning_sources`.
+  # `targets_only` restores the pre-v2 behaviour (CSV bins for target_concepts only).
+  coverage: "all"                          # {all | targets_only}
+  ordinal_max_distinct: 25
+  min_count: 20
+  quantile_n_bins: 10
+  # Dose concepts (any concept charted by these tables, or a table flagged `dose: true`)
+  # get a [0,0] stop bin; their quantiles are fit on strictly positive doses only.
+  dose_sources: [meds, meds_intermittent]
   build_from_site: "mimic"                 # freeze bin edges on reference site, apply identically everywhere
   fit_partition: "train"                   # never fit vocabulary/edges on validation, calibration, or test
   # SOFT DISCRETIZATION: applied ON TOP of clinical segments to smooth hard bin boundaries
@@ -94,7 +109,7 @@ value_binning:
   # threshold-hazard head's queries. clinical_segment: ADDED to the CSV grid (bin count grows);
   # decile_ablation: REPLACES the nearest quantile edge (n_bins is an upper bound: duplicate
   # quantiles from repeated values are deduplicated, so a concept can end up with fewer bins).
-  # NOTE: clinical_segment bins ONLY target_concepts; other numeric concepts become bare tokens.
+  # Forced edges apply to whichever source bins the concept (ignored for ordinal point bins).
   forced_edges:                           # concept: [physical-value cutpoints guaranteed to be bin boundaries]
     lactate:    [2.0, 4.0]                # Sepsis-3 / Surviving Sepsis
     map:        [65.0]                    # vasopressor trigger

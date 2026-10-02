@@ -250,6 +250,18 @@ class BundleContractTest(_BundleFixtureCase):
         with self.assertRaisesRegex(ArtifactMismatch, "SQL identifier"):
             load_bundle(broken)
 
+    def test_a_sql_unsafe_categorical_value_column_is_refused(self):
+        """`categorical_value_col` is interpolated into SQL too (U2), so it is validated."""
+        import yaml
+
+        broken = self._mutable_copy("bundle_sqlcatcol")
+        dc = yaml.safe_load((broken / "data_config.yaml").read_text())
+        dc["tables"]["vitals"]["categorical_value_col"] = "x) FROM read_text('/etc/passwd') --"
+        (broken / "data_config.yaml").write_text(yaml.safe_dump(dc))
+        self._reseal(broken)
+        with self.assertRaisesRegex(ArtifactMismatch, "SQL identifier"):
+            load_bundle(broken)
+
     def test_a_traversal_file_name_is_refused(self):
         import yaml
 

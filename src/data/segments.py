@@ -372,6 +372,54 @@ def segments_from_edges(edges: Sequence[float], forced_edges: Iterable[float] = 
     return segs
 
 
+def ordinal_segments(values: Iterable[float]) -> list[dict]:
+    """One closed point segment per distinct value (integer ordinal scales: GCS, RASS,
+    Braden). Values between or beyond the points follow the gap and clamp rules."""
+    points = sorted({float(v) for v in values})
+    if not points or any(not math.isfinite(v) for v in points):
+        raise ValueError("ordinal segments need at least one finite value")
+    segs = [make_segment(v, v, True, True) for v in points]
+    validate_partition(segs)
+    return segs
+
+
+def is_ordinal(values: Sequence[float], max_distinct: int) -> bool:
+    """Integer-valued with at most `max_distinct` distinct values (KTD3 source 2)."""
+    distinct = {float(v) for v in values}
+    return (0 < len(distinct) <= max_distinct
+            and all(math.isfinite(v) and v == round(v) for v in distinct))
+
+
+def has_zero_point(segments: Sequence[Mapping]) -> bool:
+    return any(is_point(s) and s["lo"] == 0.0 for s in segments)
+
+
+def with_zero_point(segments: Sequence[Mapping]) -> list[dict]:
+    """A dose concept's ``[0, 0]`` stop bin (KTD3). Segments that already carry one (the
+    CSV medication rows do) are returned unchanged, so it is never duplicated."""
+    if has_zero_point(segments):
+        return [dict(s) for s in segments]
+    out = _insert_point([dict(s) for s in segments], 0.0)
+    validate_partition(out)
+    return out
+
+
+def dose_segments_from_edges(edges: Sequence[float], forced_edges: Iterable[float] = (),
+                             direction: str | None = None) -> list[dict]:
+    """Quantile edges fit on strictly positive doses -> ``[0,0], (0, e0), [e0, e1), ...,
+    [e_n, +inf)``. The zero bin keeps a stopped infusion distinct from any running dose;
+    a (nonsensical) negative dose clamps into it."""
+    forced = [float(e) for e in forced_edges if math.isfinite(float(e))]
+    if any(e <= 0.0 for e in list(edges) + forced):
+        raise ValueError("dose quantile and forced edges must be strictly positive")
+    segs = segments_from_edges(edges, forced, direction)
+    first = dict(segs[0])
+    first["lo"], first["lo_closed"] = 0.0, False
+    out = [make_segment(0.0, 0.0, True, True), first] + [dict(s) for s in segs[1:]]
+    validate_partition(out)
+    return out
+
+
 def as_segments(obj: Sequence) -> list:
     """Compatibility: accept segments, or a legacy interior-edge list (``[a, b)`` rule)."""
     if obj and all(isinstance(x, Mapping) for x in obj):

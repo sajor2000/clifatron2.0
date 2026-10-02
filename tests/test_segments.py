@@ -23,6 +23,7 @@ from __future__ import annotations
 import json
 import math
 
+import polars as pl
 import pytest
 import yaml
 
@@ -230,3 +231,203 @@ def test_every_csv_measurement_loads_into_a_strict_partition(segs):
 def test_segments_and_policy_are_json_serializable(segs):
     assert S.POLICY_VERSION == 1
     assert json.loads(json.dumps(segs)) == segs
+
+
+# ---- U2: bins for every numeric concept, zero-aware doses ---------------------------------
+
+def _fit_events(concepts: dict) -> pl.DataFrame:
+    """``{concept: (source, values)}`` -> a train-partition long event frame."""
+    rows = {"concept": [], "value": [], "source": []}
+    for concept, (source, values) in concepts.items():
+        for v in values:
+            rows["concept"].append(concept)
+            rows["value"].append(None if v is None else float(v))
+            rows["source"].append(source)
+    return pl.DataFrame(rows, schema={"concept": pl.String, "value": pl.Float64,
+                                      "source": pl.String})
+
+
+def _build_all(fit, *, bin_overrides: dict | None = None, directions: dict | None = None,
+               targets: list[str] | None = None):
+    import copy
+
+    from src.data.tokenize import build_segments
+
+    bin_cfg = copy.deepcopy(CFG["value_binning"])
+    bin_cfg.update(bin_overrides or {})
+    targets = [t["name"] for t in CFG["target_concepts"]] if targets is None else targets
+    return build_segments(bin_cfg, fit, targets, DIRECTIONS if directions is None else directions)
+
+
+def test_config_declares_full_coverage_and_dose_sources():
+    vb = CFG["value_binning"]
+    assert vb["coverage"] == "all"
+    assert vb["ordinal_max_distinct"] == 25
+    assert vb["min_count"] == 20
+    assert vb["quantile_n_bins"] == 10
+    assert {"meds", "meds_intermittent"} <= set(vb["dose_sources"])
+
+
+def test_csv_concept_uses_physician_segments():
+    import numpy as np
+
+    fit = _fit_events({"potassium": ("labs", np.linspace(2.5, 6.5, 200))})
+    segs, sources = _build_all(fit)
+    assert sources["potassium"] == "csv"
+    assert segs["potassium"] == S.load_csv_segments(CSV, ["potassium"])["potassium"]
+
+
+def test_integer_scale_with_few_distinct_values_gets_one_point_bin_per_value():
+    fit = _fit_events({"gcs_total": ("assessments", list(range(3, 16)) * 10)})
+    segs, sources = _build_all(fit)
+    assert sources["gcs_total"] == "ordinal"
+    gcs = segs["gcs_total"]
+    assert len(gcs) == 13
+    assert all(S.is_point(s) for s in gcs)
+    assert [s["lo"] for s in gcs] == [float(v) for v in range(3, 16)]
+    assert [S.bin_index(v, gcs) for v in range(3, 16)] == list(range(13))
+    S.validate_partition(gcs)
+
+
+def test_non_csv_continuous_concept_gets_quantile_bins_with_forced_edges_pinned():
+    import numpy as np
+
+    values = np.random.default_rng(0).lognormal(0.0, 0.6, 500)
+    fit = _fit_events({"synth_lab": ("labs", values)})
+    segs, sources = _build_all(
+        fit, bin_overrides={"forced_edges": {**FORCED, "synth_lab": [1.0]}},
+        directions={**DIRECTIONS, "synth_lab": "above"},
+    )
+    assert sources["synth_lab"] == "quantile"
+    lab = segs["synth_lab"]
+    assert 9 <= len(lab) <= 11
+    S.validate_partition(lab)
+    assert any(a["hi"] == 1.0 == b["lo"] for a, b in zip(lab, lab[1:]))
+    # direction "above": the threshold value stays on the non-event (lower) side.
+    assert S.bin_index(1.0, lab) == S.bin_index(0.999, lab)
+    assert S.bin_index(1.0, lab) != S.bin_index(1.001, lab)
+
+
+def test_concept_with_fewer_than_min_count_values_gets_one_reported_bin():
+    fit = _fit_events({"rare_lab": ("labs", [0.3, 1.7, 2.2, 9.1, 40.5])})
+    segs, sources = _build_all(fit)
+    assert sources["rare_lab"] == "single"
+    assert len(segs["rare_lab"]) == 1
+    assert {S.bin_index(v, segs["rare_lab"]) for v in (0.3, 1.7, 40.5, -5.0)} == {0}
+
+
+def test_non_csv_dose_with_many_zeros_keeps_zero_distinct_and_fits_on_positive_values():
+    import numpy as np
+
+    rng = np.random.default_rng(1)
+    doses = [0.0] * 200 + list(rng.uniform(100.0, 2500.0, 300))   # 40% zeros
+    fit = _fit_events({"heparin_u_hr": ("meds", doses)})
+    segs, sources = _build_all(fit)
+    hep = segs["heparin_u_hr"]
+    assert sources["heparin_u_hr"] == "quantile"
+    S.validate_partition(hep)
+    assert hep[0] == S.make_segment(0.0, 0.0, True, True)
+    assert S.bin_index(0.0, hep) == 0
+    assert S.bin_index(1.0, hep) not in (None, 0)
+    # Quantiles were fit on the positive doses: the zeros did not collapse edges.
+    assert len(hep) >= 10
+    assert sum(1 for s in hep if s["lo"] == 0.0 and s["hi"] == 0.0) == 1
+
+
+def test_unconverted_dose_stop_lands_in_the_zero_bin_distinct_from_a_running_dose():
+    import numpy as np
+
+    rng = np.random.default_rng(2)
+    doses = [0.0] * 40 + list(rng.uniform(10.0, 200.0, 160))
+    fit = _fit_events({"fentanyl_mcg_hr": ("meds", doses)})
+    segs, _ = _build_all(fit)
+    fent = segs["fentanyl_mcg_hr"]
+    assert S.bin_index(0.0, fent) == 0 and S.is_point(fent[0])
+    assert S.bin_index(25.0, fent) != S.bin_index(0.0, fent)
+
+
+def test_dose_concepts_are_config_driven_and_csv_dose_zero_rows_are_not_duplicated():
+    import numpy as np
+
+    rng = np.random.default_rng(3)
+    vals = [0.0] * 30 + list(rng.uniform(0.01, 0.5, 70))
+    fit = _fit_events({
+        "norepinephrine_mcg_kg_min": ("meds", vals),     # CSV dose: has its own [0,0] row
+        "zeroish_lab": ("labs", vals),                   # same values, NOT a dose source
+    })
+    segs, sources = _build_all(fit)
+    assert sources["norepinephrine_mcg_kg_min"] == "csv"
+    ne = segs["norepinephrine_mcg_kg_min"]
+    assert sum(1 for s in ne if S.is_point(s) and s["lo"] == 0.0) == 1
+    assert not any(S.is_point(s) for s in segs["zeroish_lab"])
+    # A table flagged `dose: true` is a dose source too, independent of dose_sources.
+    import copy
+
+    from src.data.tokenize import build_segments
+
+    bin_cfg = copy.deepcopy(CFG["value_binning"])
+    bin_cfg["dose_sources"] = []
+    segs3, _ = build_segments(bin_cfg, fit, [], {}, tables={"labs": {"dose": True}})
+    assert segs3["zeroish_lab"][0] == S.make_segment(0.0, 0.0, True, True)
+
+
+def test_decile_arm_forces_every_concept_to_quantile():
+    import numpy as np
+
+    fit = _fit_events({
+        "potassium": ("labs", np.linspace(2.5, 6.5, 200)),
+        "gcs_total": ("assessments", list(range(3, 16)) * 10),
+    })
+    segs, sources = _build_all(fit, bin_overrides={"scheme": "decile_ablation"})
+    assert sources == {"potassium": "quantile", "gcs_total": "quantile"}
+    assert segs["potassium"] != S.load_csv_segments(CSV, ["potassium"])["potassium"]
+
+
+def test_targets_only_coverage_keeps_the_legacy_behavior():
+    import numpy as np
+
+    fit = _fit_events({
+        "potassium": ("labs", np.linspace(2.5, 6.5, 200)),
+        "map": ("vitals", np.linspace(40, 120, 200)),
+    })
+    segs, sources = _build_all(fit, bin_overrides={"coverage": "targets_only"})
+    assert "potassium" not in segs
+    assert sources["map"] == "csv"
+
+
+def test_unknown_coverage_fails_closed():
+    fit = _fit_events({"map": ("vitals", [70.0] * 30)})
+    with pytest.raises(ValueError, match="coverage"):
+        _build_all(fit, bin_overrides={"coverage": "most"})
+
+
+def test_every_numeric_concept_gets_a_binning_source():
+    import numpy as np
+
+    rng = np.random.default_rng(4)
+    fit = _fit_events({
+        "potassium": ("labs", np.linspace(2.5, 6.5, 200)),
+        "gcs_total": ("assessments", list(range(3, 16)) * 10),
+        "synth_lab": ("labs", rng.lognormal(0.0, 0.6, 300)),
+        "rare_lab": ("labs", [1.0, 2.0]),
+        "heparin_u_hr": ("meds", [0.0] * 20 + list(rng.uniform(1, 9, 50))),
+        "cam_total": ("assessments", [None] * 10),          # no numeric value -> not binned
+    })
+    segs, sources = _build_all(fit)
+    numeric = {"potassium", "gcs_total", "synth_lab", "rare_lab", "heparin_u_hr"}
+    assert numeric <= set(sources)
+    assert "cam_total" not in sources and "cam_total" not in segs
+    assert set(sources.values()) <= {"csv", "ordinal", "quantile", "single"}
+    for concept in sources:
+        S.validate_partition(segs[concept])
+
+
+# ---- U2: fused categorical values -----------------------------------------------------------
+
+def test_categorical_values_are_normalized_into_fused_tokens():
+    from src.data.tokenize import categorical_token
+
+    assert categorical_token("cam_total", "Negative") == "cam_total=negative"
+    assert categorical_token("braden_mobility", "  Very Limited ") == "braden_mobility=very_limited"
+    # A bare-integer category would collide with a bin index token; it is disambiguated.
+    assert categorical_token("rass", "2") != "rass=2"
