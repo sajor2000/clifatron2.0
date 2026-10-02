@@ -70,6 +70,23 @@ class NotesSmokeTest(unittest.TestCase):
         self.assertTrue(mask[0])
         self.assertFalse(mask[1])
 
+    def test_06_configured_encoder_matches_notes_encoder_default(self):
+        """configs/data.yaml notes.encoder names the NotesEncoder default (no download)."""
+        import inspect
+        from pathlib import Path
+
+        import yaml
+
+        from src.model.notes_encoder import NotesEncoder
+
+        root = Path(__file__).parents[1]
+        configured = yaml.safe_load((root / "configs/data.yaml").read_text())["notes"]["encoder"]
+        default = inspect.signature(NotesEncoder.__init__).parameters["model_name"].default
+        self.assertEqual(
+            configured, default,
+            f"configs/data.yaml notes.encoder={configured!r} but NotesEncoder default={default!r}",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

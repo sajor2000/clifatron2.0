@@ -110,4 +110,4 @@ notes:
   time_col: "note_dttm"
   text_col: "note_text"
   leakage_guard: "note_dttm <= anchor + obs_hours"   # pre-anchor notes only (rule 3)
-  encoder: "abhinand/MedEmbed-small-v0.1"            # small clinical sentence encoder
+  encoder: "thomas-sounack/BioClinical-ModernBERT-base"  # frozen; MEMORY.md multimodal decision = NotesEncoder default (test-locked)
