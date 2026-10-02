@@ -43,5 +43,10 @@ config/credentials.json
 
 # local tooling / binaries (per-machine, do not commit)
 .agents/
+# vendored third-party agent skills + session-local agent state (install globally instead)
+/agent/
+/.claude/skills/
+/.claude/scheduled_tasks.lock
+/skills-lock.json
 bin/
 docusaurus-dev.log
