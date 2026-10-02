@@ -695,3 +695,17 @@ fixes applied. Both suites re-verified on the new main: tests/ 430 passed
 Guardrails re-checked on the new tree: zero tracked data files, `/output/`
 ignored, working tree clean. Viewer alive with all five sources. Launch
 blocked only on user infrastructure (17:20).
+
+### 2026-10-02 18:00 — New in-tree artifact: v2 tokenizer sample arms (other session)
+
+Three new git-ignored sample tokenizations appeared in `output/intermediate_phi/`
+(created 17:06–17:12, after the 17:00 pass): `mimic_v2_sample` (119M),
+`mimic_v2_sample_decile` (38M), `mimic_v2_sample_continuous` (6.8M). Reports
+show tokenizer_version 2, 5,000-stay samples, mean 391.83 events/stay, p99
+811, total ~1.96M events, distinct vocabulary/numeric-edges hashes per arm
+(clinical-segment vs decile vs continuous); continuous arm has no
+tokenization_report.json (vocab + value_stats + events only). Produced by
+another session on this Mac — not by this loop; no data left `output/` (all
+git-ignored). Suites green on this pass: tests/ 430 passed 4 skipped,
+clif-validate/ 32. origin/main in sync at `ff3fbad`; viewer alive, all
+sources. Loop work remains gated on user infrastructure (18:00).
