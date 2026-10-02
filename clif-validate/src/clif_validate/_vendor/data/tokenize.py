@@ -42,6 +42,8 @@ issues: website/docs/data-tokenization.md.
 Usage:
     python -m src.data.tokenize --site mimic --in $MIMIC_DIR --out output/intermediate_phi/mimic --build-vocab --episodes output/intermediate_phi/episodes.parquet
     python -m src.data.tokenize --site rush  --in $RUSH_DIR  --out output/intermediate_phi/rush --vocab output/intermediate_phi/mimic/vocab.json --episodes output/intermediate_phi/rush_episodes.parquet
+    # GEM (U8): full-hospitalization windows beside events.parquet, same frozen vocab
+    python -m src.data.tokenize --site mimic --in $MIMIC_DIR --out output/intermediate_phi/mimic --vocab output/intermediate_phi/mimic/vocab.json --episodes output/intermediate_phi/episodes.parquet --trajectory hospitalization
 """
 from __future__ import annotations
 
@@ -130,6 +132,15 @@ STATIC_TOKENS = {
     "admission_type": ("hospitalization", "admission_type_category", False),
 }
 STATIC_SOURCE = "static"
+# U8 (R17, R18; KTD10): `icu_24h` = the 24 h prediction artifact (events.parquet, window
+# [ICU admit, anchor], positions from ICU admission). `hospitalization` = the GEM
+# artifact (gem_events.parquet, window [hospital admission, discharge], positions from
+# hospital admission, framed by <bos> ADMISSION//x ... DISCHARGE//y <eos>).
+TRAJECTORIES = ("icu_24h", "hospitalization")
+ADMISSION_PREFIX = "ADMISSION//"
+DISCHARGE_PREFIX = "DISCHARGE//"
+GEM_EVENTS_FILE = "gem_events.parquet"
+_GEM_LABEL_RE = re.compile(r"^[a-z][a-z0-9_]*$")
 # A table spec's literal concept / an MCS qualifier fallback, inlined into SQL as a string
 # literal, so it must be a plain identifier (the bundle validator enforces the same).
 _LITERAL_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
@@ -278,6 +289,72 @@ def validate_table_availability(tables: dict) -> dict[str, dict]:
             )
         declared[name] = {"availability": semantics, "lag_minutes": lag}
     return declared
+
+
+def validate_gem_config(gem: object) -> dict:
+    """The `gem` block (U8): two label allowlists (`dispositions`, `admission_types`),
+    each containing `unknown`, maps whose every value is in its allowlist, and a window
+    size `max_tokens` >= 2. Fails closed: a malformed block would silently mint terminal
+    tokens outside the frozen allowlist."""
+    if not isinstance(gem, dict):
+        raise QualificationError("data config has no `gem` block (terminal allowlists)")
+    for labels_key, map_key in (("dispositions", "disposition_map"),
+                                ("admission_types", "admission_map")):
+        labels = gem.get(labels_key)
+        if (not isinstance(labels, list) or len(set(labels)) != len(labels)
+                or not all(isinstance(x, str) and _GEM_LABEL_RE.match(x) for x in labels)
+                or "unknown" not in labels):
+            raise QualificationError(
+                f"gem.{labels_key} must be distinct lowercase labels including 'unknown'"
+            )
+        mapping = gem.get(map_key)
+        if (not isinstance(mapping, dict)
+                or any(v not in labels for v in mapping.values())
+                or any(not isinstance(k, str) or k != k.strip().lower() for k in mapping)):
+            raise QualificationError(
+                f"gem.{map_key} keys must be lowercase raw categories and its values "
+                f"members of gem.{labels_key}"
+            )
+    size = gem.get("max_tokens")
+    if isinstance(size, bool) or not isinstance(size, int) or size < 2:
+        raise QualificationError("gem.max_tokens must be an integer >= 2")
+    return gem
+
+
+def _gem_label(raw: object, mapping: dict) -> str:
+    key = "" if raw is None else str(raw).strip().lower()
+    return mapping.get(key, "unknown") if key else "unknown"
+
+
+def disposition_label(raw: object, gem: dict) -> str:
+    """CLIF `discharge_category` -> one of `gem.dispositions`. Null, blank, `Missing` and
+    any category the map does not name -> `unknown` (end of observation, never read as
+    survival)."""
+    return _gem_label(raw, gem["disposition_map"])
+
+
+def admission_label(raw: object, gem: dict) -> str:
+    """CLIF `admission_type_category` -> one of `gem.admission_types` (unmapped or
+    missing -> `unknown`)."""
+    return _gem_label(raw, gem["admission_map"])
+
+
+def gem_tokens(gem: dict) -> list[str]:
+    """The fixed GEM allowlist in vocabulary order: ADMISSION//* then DISCHARGE//*."""
+    return ([f"{ADMISSION_PREFIX}{a}" for a in gem["admission_types"]]
+            + [f"{DISCHARGE_PREFIX}{d}" for d in gem["dispositions"]])
+
+
+def gem_window_bounds(n: int, max_tokens: int) -> list[tuple[int, int]]:
+    """Consecutive `[start, end)` windows of at most `max_tokens` covering `n` tokens.
+    The final `<eos>` is never left alone in a window, so the last window always ends
+    `DISCHARGE//… <eos>` (the penultimate window gives up one token instead)."""
+    if max_tokens < 2:
+        raise ValueError(f"max_tokens must be >= 2, got {max_tokens}")
+    bounds = [*range(0, n, max_tokens), n]
+    if len(bounds) > 2 and bounds[-1] - bounds[-2] == 1:
+        bounds[-2] -= 1
+    return list(zip(bounds[:-1], bounds[1:]))
 
 
 def _empty_events() -> pl.DataFrame:
@@ -701,18 +778,19 @@ def _read_static(con, base: Path, cfg: dict, keep_ids: list | None) -> pl.DataFr
 
 
 def _carry_forward(events: pl.DataFrame, episodes: pl.DataFrame,
-                   sources: set[str]) -> pl.DataFrame:
+                   sources: set[str], start_col: str = "icu_admit_dttm") -> pl.DataFrame:
     """State tables (`carry_forward: true`; code status, position): of each stay's rows
-    charted BEFORE the observation window opens (ICU admission), only the last state per
-    concept is kept, moved to the window start. The state was already knowable then, so
-    this never moves information earlier; without it a code status set at hospital
-    admission would vanish from an ICU stay that starts later."""
+    charted BEFORE the observation window opens (`start_col`: ICU admission for the 24 h
+    artifact, hospital admission for GEM), only the last state per concept is kept,
+    moved to the window start. The state was already knowable then, so this never moves
+    information earlier; without it a code status set at hospital admission would
+    vanish from an ICU stay that starts later."""
     if not sources or events.is_empty():
         return events
     is_state = pl.col("source").is_in(sorted(sources))
     state = events.filter(is_state).join(
         episodes.select(pl.col("hospitalization_id").alias("hosp_id"),
-                        pl.col("icu_admit_dttm").alias("_start")),
+                        pl.col(start_col).alias("_start")),
         on="hosp_id", how="left",
     )
     early = (pl.col("dttm") < pl.col("_start")).fill_null(False)
@@ -826,25 +904,62 @@ def concept_sources(fit_events: pl.DataFrame, treatment_sources: set[str]) -> di
             "treatment_sources": sorted(treatment_sources)}
 
 
+def _check_window_inputs(events: pl.DataFrame, episodes: pl.DataFrame,
+                         episode_times: list[str]) -> None:
+    validate_episode_artifact(episodes)
+    if events.schema.get("hosp_id") != pl.String:
+        raise QualificationError("events.hosp_id must be a string identifier")
+    if events["hosp_id"].has_nulls():
+        raise QualificationError("events.hosp_id contains null identifiers")
+    missing = sorted(set(episode_times) - set(episodes.columns))
+    if missing:
+        raise QualificationError(
+            f"episode artifact is missing required columns: {', '.join(missing)}")
+    for frame, name, column in [(events, "events", "dttm"),
+                                *((episodes, "episodes", c) for c in episode_times)]:
+        dtype = frame.schema[column]
+        if not isinstance(dtype, pl.Datetime) or dtype.time_zone != "UTC":
+            raise QualificationError(f"{name}.{column} must be timezone-aware UTC")
+
+
+def restrict_to_hospitalization_window(
+    events: pl.DataFrame,
+    episodes: pl.DataFrame,
+    treatment_sources: set[str] | None = None,
+) -> pl.DataFrame:
+    """GEM (U8): join canonical episodes and retain each ELIGIBLE stay's events from
+    hospital admission to discharge (inclusive) — pre-ICU (ED/ward), ICU and post-ICU.
+    `pos_min` = minutes since hospital admission; `_le_anchor` marks events at or before
+    the ICU-admit+24 h anchor (for the record's `anchor_idx`)."""
+    _check_window_inputs(events, episodes, ["admission_dttm", "discharge_dttm", "anchor_dttm"])
+    return (
+        events.join(
+            episodes.select("hospitalization_id", "admission_dttm", "discharge_dttm",
+                            "anchor_dttm", "eligible", "partition"),
+            left_on="hosp_id", right_on="hospitalization_id", how="inner",
+        )
+        .filter(
+            pl.col("eligible")
+            & (pl.col("dttm") >= pl.col("admission_dttm"))
+            & (pl.col("dttm") <= pl.col("discharge_dttm"))
+        )
+        .with_columns(
+            (pl.col("dttm") - pl.col("admission_dttm")).dt.total_minutes()
+            .cast(pl.Int64).alias("pos_min"),
+            (~pl.col("source").is_in(sorted(treatment_sources or set())))
+            .alias("target_eligible"),
+            (pl.col("dttm") <= pl.col("anchor_dttm")).alias("_le_anchor"),
+        )
+    )
+
+
 def restrict_to_observation_window(
     events: pl.DataFrame,
     episodes: pl.DataFrame,
     treatment_sources: set[str] | None = None,
 ) -> pl.DataFrame:
     """Join canonical episodes and retain only anchor-available ICU events."""
-    validate_episode_artifact(episodes)
-    if events.schema.get("hosp_id") != pl.String:
-        raise QualificationError("events.hosp_id must be a string identifier")
-    if events["hosp_id"].has_nulls():
-        raise QualificationError("events.hosp_id contains null identifiers")
-    for frame, name, column in [
-        (events, "events", "dttm"),
-        (episodes, "episodes", "icu_admit_dttm"),
-        (episodes, "episodes", "anchor_dttm"),
-    ]:
-        dtype = frame.schema[column]
-        if not isinstance(dtype, pl.Datetime) or dtype.time_zone != "UTC":
-            raise QualificationError(f"{name}.{column} must be timezone-aware UTC")
+    _check_window_inputs(events, episodes, ["icu_admit_dttm", "anchor_dttm"])
 
     observed = (
         events.join(
@@ -1203,12 +1318,166 @@ def _check_single_hospital(con, base: Path) -> None:
         )
 
 
+def _extend_for_gem(gem_cfg: dict, gem_fit: pl.DataFrame, fit_events: pl.DataFrame,
+                    vocab: dict, edges: dict, binning_sources: dict, units: dict, *,
+                    bin_cfg: dict, cfg: dict, directions: dict, target_units: dict,
+                    treatment_sources: set[str], quantile_concepts: set[str],
+                    ) -> tuple[dict, dict, dict, dict, dict]:
+    """U8: extend the 24 h-fit vocabulary so the GEM artifact shares it.
+
+    Every concept the 24 h train window charts keeps its segments, binning source,
+    reference unit and token ids. Concepts charted ONLY in the full-hospitalization
+    train events (`gem_fit`) get segments by the same source priority (`build_segments`)
+    fit on those events; their tokens, and categorical values of existing concepts seen
+    only outside the 24 h window, are appended after every 24 h token. The fixed
+    ADMISSION// / DISCHARGE// allowlist is appended last, present even when no stay has
+    that admission type or disposition. Returns ``(vocab, segments, binning_sources,
+    reference_units, concept_sources)``."""
+    known = set(fit_events["concept"].drop_nulls().unique().to_list()) | set(edges)
+    extra_fit = gem_fit.filter(pl.col("concept").is_not_null()
+                               & ~pl.col("concept").is_in(sorted(known)))
+    extra_edges: dict = {}
+    if not extra_fit.is_empty():
+        built, built_sources = build_segments(
+            bin_cfg, extra_fit, [], directions, tables=cfg["tables"],
+            quantile_concepts=quantile_concepts)
+        extra_edges = {c: segs for c, segs in built.items() if c not in edges}
+        if extra_edges:
+            extra_units = reference_units(extra_fit, extra_edges, cfg, target_units)
+            edges = dict(sorted({**edges, **extra_edges}.items()))
+            binning_sources = dict(sorted(
+                {**binning_sources, **{c: built_sources[c] for c in extra_edges}}.items()))
+            units = {"concepts": dict(sorted({**units["concepts"],
+                                              **extra_units["concepts"]}.items())),
+                     "dose_targets": units["dose_targets"]}
+    vocab = dict(vocab)
+    nxt = max(vocab.values()) + 1
+    for token in [*build_vocab(gem_fit, edges), *gem_tokens(gem_cfg)]:
+        if token not in vocab:
+            vocab[token] = nxt
+            nxt += 1
+    tables = _concept_tables(fit_events)
+    for concept, names in _concept_tables(gem_fit).items():
+        tables[concept] = sorted(set(tables.get(concept, ())) | set(names))
+    sources = {"tables": dict(sorted(tables.items())),
+               "treatment_sources": sorted(treatment_sources)}
+    return vocab, edges, binning_sources, units, sources
+
+
+GEM_SCHEMA = {
+    "hosp_id": pl.String,
+    "trajectory": pl.String,
+    "token": pl.List(pl.Int64),
+    "soft_token": pl.List(pl.List(pl.Int64)),
+    "soft_weight": pl.List(pl.List(pl.Float64)),
+    "pos_min": pl.List(pl.Int64),
+    "value": pl.List(pl.Float64),
+    "target_eligible": pl.List(pl.Boolean),
+    "partition": pl.String,
+    "n_events": pl.Int64,
+    "source_start": pl.Int64,
+    "source_end": pl.Int64,
+    "continuation_index": pl.Int64,
+    "n_windows": pl.Int64,
+    "continues_from_previous": pl.Boolean,
+    "continues_to_next": pl.Boolean,
+    "anchor_idx": pl.Int64,
+    "anchor_min": pl.Int64,
+}
+
+
+def _gem_records(shards: pl.DataFrame, stays: pl.DataFrame, vocab: dict, gem_cfg: dict,
+                 max_tokens: int, soft_width: int, binding: dict,
+                 stats: dict | None) -> pl.DataFrame:
+    """Frame each eligible stay `<bos> ADMISSION//a <events> DISCHARGE//d <eos>` and split
+    it into windows (one row each) of at most `max_tokens`.
+
+    The disposition appears ONLY as the single DISCHARGE// token, at the true
+    discharge_dttm position (minutes since admission), target-eligible; `<bos>`,
+    ADMISSION// and `<eos>` are inputs only. `anchor_idx` / `anchor_min` (stay-level
+    index / minutes of the last token at or before ICU admit + 24 h) are retained for
+    representation evaluation. Windows are contiguous slices of the stay stream:
+    `source_start`/`source_end` index it, `continuation_index` counts windows, and the
+    `continues_*` flags mark the cuts (the packed-segment continuation contract)."""
+    if "discharge_category" not in stays.columns:
+        raise QualificationError("episode artifact is missing discharge_category (GEM)")
+    body = {row["hosp_id"]: row for row in shards.iter_rows(named=True)} if len(shards) else {}
+    admission_type = (pl.col("admission_type_category").cast(pl.String)
+                      if "admission_type_category" in stays.columns
+                      else pl.lit(None, pl.String))
+    frame = stays.select(
+        pl.col("hospitalization_id").alias("hosp_id"), "partition",
+        (pl.col("discharge_dttm") - pl.col("admission_dttm")).dt.total_minutes()
+        .cast(pl.Int64).alias("discharge_min"),
+        (pl.col("anchor_dttm") - pl.col("admission_dttm")).dt.total_minutes()
+        .cast(pl.Int64).alias("anchor_min"),
+        admission_type.alias("admission_type"),
+        pl.col("discharge_category").cast(pl.String).alias("disposition"),
+    ).sort("hosp_id")
+    bos, eos = SPECIAL["<bos>"], SPECIAL["<eos>"]
+    one_hot = [1.0] + [0.0] * (soft_width - 1)
+    nan = float("nan")
+    rows: list[dict] = []
+    counts: dict[str, dict[str, int]] = {"dispositions": {}, "admission_types": {}}
+    for stay in frame.iter_rows(named=True):
+        adm = admission_label(stay["admission_type"], gem_cfg)
+        dis = disposition_label(stay["disposition"], gem_cfg)
+        counts["admission_types"][adm] = counts["admission_types"].get(adm, 0) + 1
+        counts["dispositions"][dis] = counts["dispositions"].get(dis, 0) + 1
+        adm_id = vocab[f"{ADMISSION_PREFIX}{adm}"]
+        dis_id = vocab[f"{DISCHARGE_PREFIX}{dis}"]
+        events = body.get(stay["hosp_id"])
+        end_min = stay["discharge_min"]
+
+        def framed(key: str, head: list, tail: list) -> list:
+            return [*head, *(events[key] if events else ()), *tail]
+
+        stream = {
+            "token": framed("token", [bos, adm_id], [dis_id, eos]),
+            "soft_token": framed("soft_token", [[bos] * soft_width, [adm_id] * soft_width],
+                                 [[dis_id] * soft_width, [eos] * soft_width]),
+            "soft_weight": framed("soft_weight", [one_hot, one_hot], [one_hot, one_hot]),
+            "pos_min": framed("pos_min", [0, 0], [end_min, end_min]),
+            "value": framed("value", [nan, nan], [nan, nan]),
+            "target_eligible": framed("target_eligible", [False, False], [True, False]),
+        }
+        anchor_idx = 1 + (events["_n_le_anchor"] if events else 0)
+        bounds = gem_window_bounds(len(stream["token"]), max_tokens)
+        for index, (lo, hi) in enumerate(bounds):
+            rows.append({
+                "hosp_id": stay["hosp_id"],
+                "trajectory": "hospitalization",
+                **{key: values[lo:hi] for key, values in stream.items()},
+                "partition": stay["partition"],
+                "n_events": hi - lo,
+                "source_start": lo,
+                "source_end": hi,
+                "continuation_index": index,
+                "n_windows": len(bounds),
+                "continues_from_previous": index > 0,
+                "continues_to_next": index < len(bounds) - 1,
+                "anchor_idx": anchor_idx,
+                "anchor_min": stay["anchor_min"],
+            })
+    if stats is not None:
+        # Aggregate-only (no identifiers): stays, windows and label counts.
+        stats["gem"] = {"stays": frame.height, "windows": len(rows),
+                        **{k: dict(sorted(v.items())) for k, v in counts.items()}}
+    records = pl.DataFrame(rows, schema=GEM_SCHEMA)
+    return records.with_columns(
+        pl.struct([pl.lit(v, pl.String).alias(k) for k, v in binding.items()])
+        .alias("artifact_hashes")
+    )
+
+
 def tokenize_site(cfg: dict, site: str, base: Path, out: Path,
                   vocab_artifact: dict | None = None, *,
                   limit_stays: int | None = None,
                   episodes: pl.DataFrame | None = None,
                   artifact_policy: dict | None = None,
-                  stats: dict | None = None):
+                  stats: dict | None = None,
+                  trajectory: str = "icu_24h",
+                  max_tokens: int | None = None):
     """Tokenize one site.
 
     `vocab_artifact` None builds the frozen tokenizer-v2 vocabulary (reference site);
@@ -1217,13 +1486,49 @@ def tokenize_site(cfg: dict, site: str, base: Path, out: Path,
     binding (`artifact_hashes`: tokenizer version, vocabulary and segments hashes).
     `stats`, if given, is filled with aggregate-only run counts (`dose_conversion`:
     {dose table: {status: rows}}) for the tokenization report. Returns
-    ``(vocab, segments)``."""
+    ``(vocab, segments)``.
+
+    `trajectory` (U8, KTD10): ``icu_24h`` (default) writes events.parquet + vocab.json.
+    ``hospitalization`` writes ONLY gem_events.parquet beside them, with the SAME frozen
+    vocabulary, which must be imported (`vocab_artifact`; the reference site passes the
+    vocab.json its icu_24h build just wrote) and must carry the `gem` allowlist. One row
+    per window of at most `max_tokens` (default `gem.max_tokens`) tokens.
+
+    One reference build, one vocabulary: when the config has a `gem` block, the build
+    keeps the 24 h fit unchanged (same segments and ids for every concept in the 24 h
+    train window) and appends (a) tokens for concepts / categorical values seen ONLY in
+    the full-hospitalization train events (ED and ward ADT locations, ward-only labs) —
+    their bins fit on those train events — and then (b) the fixed ADMISSION// and
+    DISCHARGE// allowlist."""
+    if trajectory not in TRAJECTORIES:
+        raise ValueError(f"trajectory must be one of {TRAJECTORIES}, got {trajectory!r}")
+    gem_mode = trajectory == "hospitalization"
+    gem_cfg = cfg.get("gem")
+    if gem_mode:
+        validate_gem_config(gem_cfg)
+        if vocab_artifact is None:
+            raise QualificationError(
+                "the hospitalization (GEM) trajectory requires the frozen vocabulary built "
+                "by the reference site's icu_24h run (pass its vocab.json)"
+            )
+        max_tokens = int(gem_cfg["max_tokens"] if max_tokens is None else max_tokens)
+        if max_tokens < 2:
+            raise ValueError(f"max_tokens must be >= 2, got {max_tokens}")
+    elif gem_cfg is not None:
+        validate_gem_config(gem_cfg)
     policy = artifact_policy or yaml.safe_load((ROOT / cfg["artifact_policy"]).read_text())
-    events_path = out / "events.parquet"
+    events_path = out / (GEM_EVENTS_FILE if gem_mode else "events.parquet")
     validate_artifact_destination(events_path, "patient_level_phi", policy)
     vocab = edges = vocab_manifest = None
     if vocab_artifact is not None:
         vocab, edges, vocab_manifest = validate_vocabulary_artifact(vocab_artifact, cfg, policy)
+        if gem_mode:
+            absent = [t for t in gem_tokens(gem_cfg) if t not in vocab]
+            if absent:
+                raise QualificationError(
+                    f"vocabulary lacks {len(absent)} gem allowlist token(s) (e.g. "
+                    f"{absent[0]!r}); rebuild it with the configured `gem` block"
+                )
     availability = validate_table_availability(cfg.get("tables"))
     con = duckdb.connect()
     # DuckDB renders TIMESTAMPTZ columns in the SESSION timezone, so on a non-UTC
@@ -1282,27 +1587,38 @@ def tokenize_site(cfg: dict, site: str, base: Path, out: Path,
 
     if episodes is None:
         raise QualificationError("a canonical episode/split artifact is required")
-    if static_tokens:
-        # R21: static admission tokens sit at the stay start (ICU admission for the
-        # 24 h artifact), ahead of every other event there (`static_rank`).
-        static = _read_static(con, base, cfg, keep_ids).join(
-            episodes.select(pl.col("hospitalization_id").alias("hosp_id"),
-                            pl.col("icu_admit_dttm").alias("dttm")),
-            on="hosp_id", how="inner",
-        )
-        if len(static):
-            events = pl.concat(
-                [events, static.with_columns(unit=pl.lit(None, pl.String),
-                                             source=pl.lit(STATIC_SOURCE))],
-                how="diagonal_relaxed",
+    static = _read_static(con, base, cfg, keep_ids) if static_tokens else None
+    carried = {name for name, spec in cfg["tables"].items() if spec.get("carry_forward")}
+    raw_events = events
+
+    def at_stay_start(start_col: str) -> pl.DataFrame:
+        """R21: static admission tokens at the stay start (`start_col`: ICU admission
+        for the 24 h artifact, hospital admission for GEM), ahead of every other event
+        there (`static_rank`); then state carried forward to that start."""
+        frame = raw_events
+        if static is not None:
+            placed = static.join(
+                episodes.select(pl.col("hospitalization_id").alias("hosp_id"),
+                                pl.col(start_col).alias("dttm")),
+                on="hosp_id", how="inner",
             )
-    events = _carry_forward(events, episodes, {
-        name for name, spec in cfg["tables"].items() if spec.get("carry_forward")
-    })
+            if len(placed):
+                frame = pl.concat(
+                    [frame, placed.with_columns(unit=pl.lit(None, pl.String),
+                                                source=pl.lit(STATIC_SOURCE))],
+                    how="diagonal_relaxed",
+                )
+        return _carry_forward(frame, episodes, carried, start_col)
+
     treatment_sources = {
         name for name, spec in cfg["tables"].items() if spec.get("input_only")
     } | ({STATIC_SOURCE} if static_tokens else set())
-    events = restrict_to_observation_window(events, episodes, treatment_sources)
+    if gem_mode:
+        events = restrict_to_hospitalization_window(
+            at_stay_start("admission_dttm"), episodes, treatment_sources)
+    else:
+        events = restrict_to_observation_window(
+            at_stay_start("icu_admit_dttm"), episodes, treatment_sources)
     # KTD6: full-key sort AFTER the join (polars does not guarantee row order for equal
     # keys through a join or an unmaintained sort). Nulls sort last so a missing value
     # or categorical result has one fixed place; `group_by(maintain_order=True)` below
@@ -1356,6 +1672,26 @@ def tokenize_site(cfg: dict, site: str, base: Path, out: Path,
         vocab = build_vocab(fit_events, edges)
         units = reference_units(fit_events, edges, cfg, target_units)
         sources = concept_sources(fit_events, treatment_sources)
+        if gem_cfg is not None:
+            # U8: one vocabulary for both artifacts. Extend it with what only the
+            # full-hospitalization train events chart, then the fixed allowlist.
+            gem_fit = fit_partition(restrict_to_hospitalization_window(
+                at_stay_start("admission_dttm"), episodes, treatment_sources),
+                bin_cfg.get("fit_partition", "train"))
+            if shadow_frames:
+                gem_shadows = restrict_to_hospitalization_window(
+                    pl.concat(shadow_frames, how="diagonal_relaxed"), episodes,
+                    treatment_sources)
+                gem_fit = pl.concat([gem_fit, gem_shadows.filter(
+                    pl.col("partition") == bin_cfg.get("fit_partition", "train"))],
+                    how="diagonal_relaxed")
+            vocab, edges, binning_sources, units, sources = _extend_for_gem(
+                gem_cfg, gem_fit, fit_events, vocab, edges, binning_sources, units,
+                bin_cfg=bin_cfg, cfg=cfg, directions=directions, target_units=target_units,
+                treatment_sources=treatment_sources,
+                quantile_concepts={c for c, (_, _, numeric) in STATIC_TOKENS.items()
+                                   if numeric and c in static_tokens},
+            )
         cohort_cfg = yaml.safe_load((ROOT / cfg["cohort_contract"]).read_text())
         split_hashes = episodes["split_sha256"].drop_nulls().unique().to_list()
         if len(split_hashes) != 1:
@@ -1433,6 +1769,11 @@ def tokenize_site(cfg: dict, site: str, base: Path, out: Path,
         # position and eligibility flag after the first skip and make n_events disagree
         # with the sequence length (CodeRabbit: critical desync).
         pos_min, target_eligible = [], []
+        # GEM: count of emitted events at or before the anchor (a prefix, since the
+        # stream is time-ordered) -> the record's anchor_idx.
+        n_le_anchor = 0
+        le_anchor = (group["_le_anchor"] if gem_mode
+                     else [False] * len(group))
         bin_cfg = cfg["value_binning"]
         soft_width = (
             2 * max(int(bin_cfg["soft_kernel_bins"]), 0) + 1
@@ -1441,9 +1782,9 @@ def tokenize_site(cfg: dict, site: str, base: Path, out: Path,
         cat_values = (
             group["cat_value"] if "cat_value" in group.columns else [None] * len(group)
         )
-        for c, v, cat, pos, eligible in zip(
+        for c, v, cat, pos, eligible, le in zip(
             group["concept"], group["value"], cat_values,
-            group["pos_min"], group["target_eligible"],
+            group["pos_min"], group["target_eligible"], le_anchor,
         ):
             v_for_bin = float(v) if v is not None and np.isfinite(v) else None
             # KTD4: a categorical value is fused only when the row has no finite numeric
@@ -1457,6 +1798,7 @@ def tokenize_site(cfg: dict, site: str, base: Path, out: Path,
                 pos_min.append(pos)
                 target_eligible.append(eligible)
                 valnum.append(float("nan"))
+                n_le_anchor += bool(le)
                 continue
             if v_for_bin is None and c in edges:
                 # Missing numeric measurements are not physiologic low-bin events.
@@ -1491,6 +1833,8 @@ def tokenize_site(cfg: dict, site: str, base: Path, out: Path,
             pos_min.append(pos)
             target_eligible.append(eligible)
             valnum.append(float(v) if v is not None else float("nan"))  # ORA value-regression target
+            n_le_anchor += bool(le)
+        extra = {"_n_le_anchor": n_le_anchor} if gem_mode else {}
         return pl.DataFrame({
             "hosp_id": group["hosp_id"][0],
             "token": [token],
@@ -1501,9 +1845,26 @@ def tokenize_site(cfg: dict, site: str, base: Path, out: Path,
             "target_eligible": [target_eligible],
             "partition": group["partition"][0],
             "n_events": len(token),
+            **extra,
         })
 
     shards = events.group_by("hosp_id", maintain_order=True).map_groups(encode)
+    if gem_mode:
+        bin_cfg = cfg["value_binning"]
+        soft_width = (2 * max(int(bin_cfg["soft_kernel_bins"]), 0) + 1
+                      if bin_cfg.get("soft_discretization") else 1)
+        stays = episodes.filter(pl.col("eligible"))
+        if keep_ids is not None:
+            stays = stays.filter(pl.col("hospitalization_id").is_in(keep_ids))
+        gem = _gem_records(shards, stays, vocab, gem_cfg, max_tokens, soft_width,
+                           artifact_binding(vocab_artifact), stats)
+        out.mkdir(parents=True, exist_ok=True)
+        gem.write_parquet(events_path)
+        # DATA-CLASSIFICATION: PHI (hosp_id + per-stay sequences + timing), like
+        # events.parquet. vocab.json / events.parquet are not touched by this mode.
+        print(f"  wrote {events_path} ({gem['hosp_id'].n_unique() if len(gem) else 0:,} "
+              f"stays, {len(gem):,} windows)")
+        return vocab, edges
     if len(shards):
         # KTD7: every shard row is bound to the tokenizer version, vocabulary and
         # segments it was encoded with; ModelDataset refuses a row without it.
@@ -1533,6 +1894,11 @@ def main():
     ap.add_argument("--episodes", required=True,
                     help="canonical local episode/split parquet from configs/cohort.yaml")
     ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--trajectory", choices=TRAJECTORIES, default="icu_24h",
+                    help="icu_24h: events.parquet + vocab.json; hospitalization: "
+                         "gem_events.parquet with the --vocab frozen vocabulary (U8)")
+    ap.add_argument("--max-tokens", type=int, default=None,
+                    help="GEM window size (default: gem.max_tokens in the data config)")
     args = ap.parse_args()
 
     cfg = yaml.safe_load(Path(args.config).read_text())
@@ -1564,6 +1930,8 @@ def main():
         blob,
         episodes=episodes,
         artifact_policy=policy,
+        trajectory=args.trajectory,
+        max_tokens=args.max_tokens,
     )
 
 

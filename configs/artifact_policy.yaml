@@ -16,7 +16,10 @@ classes:
     directory: output/intermediate_phi
     formats: [parquet]
     export_allowed: false
-    includes: [episode_shards, split_assignments, labels, predictions, caches, access_logs]
+    # gem_shards = gem_events.parquet (U8 full-hospitalization GEM windows), validated
+    # against this class exactly like the 24 h events.parquet episode shards.
+    includes: [episode_shards, gem_shards, split_assignments, labels, predictions, caches,
+               access_logs]
     backup: prohibited_unless_site_approved
     retention: delete_after_approved_project_window
     deletion: secure_delete

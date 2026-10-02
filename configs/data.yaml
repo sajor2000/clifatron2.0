@@ -155,6 +155,46 @@ static_source:
   hospitalization_file: "clif_hospitalization"   # age_at_admission, admission_type_category
   patient_file: "clif_patient"                   # sex_category, race_category, ethnicity_category
 
+# Full-hospitalization GEM artifact (U8; R17, R18, KTD10). `tokenize_site(...,
+# trajectory="hospitalization")` writes gem_events.parquet beside events.parquet with the
+# SAME frozen vocab.json (built by the reference site's icu_24h run): window
+# [admission_dttm, discharge_dttm], positions = minutes since hospital admission, framed
+# `<bos> ADMISSION//<type> <static tokens> ...events... DISCHARGE//<disposition> <eos>`.
+# The two allowlists below are appended to the vocabulary at build time (after every
+# data-derived token, so data token ids do not move) whether or not the data contains
+# them. DISCHARGE//* is the ONLY place disposition appears, at the true discharge_dttm,
+# and it is target-eligible; <bos>, ADMISSION//*, static and treatment tokens are inputs.
+# Map keys are raw CLIF categories lowercased and stripped; anything unmapped (including
+# null/blank) -> `unknown` = end of observation, never read as survival.
+gem:
+  max_tokens: 8192                         # = configs/model.yaml trunk.max_tokens (test-locked)
+  dispositions: [home, facility, hospice, expired, ama, other, unknown]
+  disposition_map:
+    home: home
+    expired: expired
+    hospice: hospice
+    skilled nursing facility (snf): facility
+    acute inpatient rehab facility: facility
+    long term care hospital (ltach): facility
+    psychiatric hospital: facility
+    acute care hospital: facility
+    assisted living: facility
+    against medical advice (ama): ama
+    other: other
+    missing: unknown
+    unknown: unknown
+  admission_types: [ed, elective, direct, transfer, other, unknown]
+  admission_map:                           # CLIF admission_type_category (MIMIC: ed/elective/direct)
+    ed: ed
+    elective: elective
+    direct: direct
+    osh: transfer
+    facility: transfer
+    transfer: transfer
+    other: other
+    missing: unknown
+    unknown: unknown
+
 # Target measurement concepts (K hazard heads, ICareFM-style). Treatments excluded.
 target_concepts:
   - {name: map,               source: vitals, direction: below, unit: mmHg}
