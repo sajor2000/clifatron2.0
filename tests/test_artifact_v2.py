@@ -296,3 +296,27 @@ class ArtifactV2Test(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class UnitSpellingEquivalenceTest(unittest.TestCase):
+    """Re-importing the reference site's own vocab must not fail on unit spellings
+    (U8 real-data finding): 'mm Hg' == 'mmHg', and a dose concept's reference unit
+    recorded in suffix form ('mg_hr') == the charted 'mg/hour'."""
+
+    def _events(self, concept, unit):
+        import polars as pl
+        return pl.DataFrame({"concept": [concept], "unit": [unit]})
+
+    def test_spacing_and_suffix_forms_are_equivalent(self):
+        from src.data.tokenize import validate_units
+        cfg = {"unit_normalization": {"on_mismatch": "error", "concepts": {}}}
+        ref = {"concepts": {"pco2_arterial": "mm Hg", "nicardipine_mg_hr": "mg_hr"}}
+        validate_units(self._events("pco2_arterial", "mmHg"), cfg, ref)
+        validate_units(self._events("nicardipine_mg_hr", "mg/hour"), cfg, ref)
+
+    def test_a_real_unit_mismatch_still_fails_closed(self):
+        from src.data.tokenize import validate_units
+        cfg = {"unit_normalization": {"on_mismatch": "error", "concepts": {}}}
+        ref = {"concepts": {"glucose_serum": "mg/dL"}}
+        with self.assertRaises(ValueError):
+            validate_units(self._events("glucose_serum", "mmol/L"), cfg, ref)

@@ -86,6 +86,7 @@ from src.data.units import (
     canonical_unit,
     dose_plan,
     normalize_name,
+    normalize_unit,
     preferred_units_from_csv,
 )
 
@@ -822,8 +823,12 @@ def _dose_target_units(cfg: dict, vocab_artifact: dict | None) -> dict[str, str]
 
 
 def _normalized_unit(unit: str) -> str:
+    """Spelling-insensitive unit key: `mm Hg` == `mmHg`, and a dose concept's suffix-form
+    reference unit (`mg_hr`) == the charted `mg/hour`, so re-importing the reference
+    site's own vocab never fails on spelling alone."""
     u = unit.strip().lower().replace("¬µ", "u").replace("µ", "u").replace("μ", "u")
-    return u.replace("k/ul", "10^3/ul").replace("10^3/ul", "10^3/ul")
+    u = normalize_unit(u.replace("k/ul", "10^3/ul"))
+    return re.sub(r"[\s_/]+", "", u)
 
 
 def validate_units(events: pl.DataFrame, cfg: dict,
