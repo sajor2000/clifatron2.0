@@ -15,11 +15,11 @@ execution: code
 - **Objective:** Before the first real training run, the model sees the value of every numeric clinical measurement, dose, setting and score it is given. Physician-designed bins are used wherever they exist. The same stay produces the same token stream on every run, in every consumer, and at every site.
 - **Means:** a segment-based binning core that follows the CSV interval flags (KTD1, KTD2), bins for every numeric concept with zero-aware dose bins (KTD3), new value-bearing event sources (KTD5), a deterministic order (KTD6), and consumers and artifacts kept in lockstep (KTD7).
 - **Authority:** MEMORY.md, then AGENTS.md, then this plan. The hard rules (treatments are inputs only, frozen vocab, availability ordering, no data leaves its node) are never relaxed.
-- **Execution profile:** sequential.
-  1. Core: U1, U2, U3.
-  2. U4 then U5, in sequence. They share `tokenize.py`, `bundle.py`, `configs/data.yaml` and the vendored manifest.
-  3. U6 after U5.
-  4. U7.
+- **Execution profile:** sequential, in this order:
+  1. Core: U1 (landed), U2, U3.
+  2. U4 then U5. They share `tokenize.py`, `bundle.py`, `configs/data.yaml` and the vendored manifest.
+  3. U8 then U9.
+  4. U6, then U7.
 
   Test-first for every behavior change.
 - **Stop conditions:**
@@ -78,6 +78,20 @@ The evidence supports binning every value as a fused token. Guo et al. 2026 foun
 - R13. Threshold queries (`threshold_bin`), plausibility checks, the sequence viewer, generation and its evaluation groups, and the site package bin values with the same function and the same frozen segments as the tokenizer.
 - R14. The vocabulary artifact records the segments, closure, precedence-policy version, per-concept binning source, and reference unit or device metric, plus a tokenizer version. Tokenized shards, value statistics, bundles and checkpoints are bound to the tokenizer version and segments hash. Anything built by the previous tokenizer is rejected with a re-tokenize message, never silently reused.
 
+**Generative trajectories (GEM) — added 2026-10-02**
+- R17. A separate full-hospitalization GEM artifact is built with the same frozen vocabulary. It runs from hospital admission to discharge, including pre-ICU and post-ICU events, with positions in minutes since hospital admission. The 24-hour prediction artifact and its competing-risk death target are unchanged.
+- R18. The GEM sequence is framed as `<bos>`, then `ADMISSION//<admission_type>`, then the events, then exactly one `DISCHARGE//<disposition>` terminal token at the real `discharge_dttm`, then `<eos>`.
+  - Dispositions: `home`, `facility`, `hospice`, `expired`, `ama`, `other`, `unknown`.
+  - A missing disposition maps to `unknown`, which means end of observation and is never read as survival.
+  - No future outcome appears as an input flag. The terminal token occurs only at its true time.
+  - The ICU-admit+24h anchor index is retained for representation evaluation.
+- R19. Generation stops at any terminal token or `<eos>`. Each rollout records `stop_reason`, the terminal type, and the terminal time. A rollout that hits the token or time cap is right-censored, never counted as survival.
+- R20. Rollout mortality is the death-before-discharge frequency over N rollouts, with a confidence interval. The generative evaluation reports:
+  - Terminal-type confusion.
+  - Nontermination (censoring) rate.
+  - Time-to-terminal error.
+  - Mortality discrimination and calibration against observed disposition.
+
 **Ablation and verification**
 - R15. Every tokenization-ablation arm runs end to end with masked losses and config-driven weights, on synthetic shards and on the real verification sample. The arms produce arm-specific inputs, and the continuous-fused and TextCode arms have real implementations, not stubs.
 - R16. A tokenization run writes an aggregate-only report. It contains no row-level data. Contents:
@@ -95,12 +109,16 @@ The evidence supports binning every value as a fused token. Guo et al. 2026 foun
 
 - **All gaps T1–T7 are in scope, and every numeric value gets bins.** (session-settled: user-directed — chosen over "T3 + T1 only, defer the rest" and over CSV-only binning: user said "fix this all" and "we need to have bins for everything.") Governs R4, R5, R6, R7, R8, R9, R10, R15.
 - **Bin closure follows the physician CSV's interval flags.** (session-settled: user-approved — chosen over keeping the uniform `[a,b)` rule: it matches the physician bin design and CLIFATRON v1.) Governs R1, R2, R3.
+- **GEM terminal-event work is folded into this v2 change, so the vocabulary changes and the model retrains once.** (session-settled: user-directed — chosen over a separate follow-up PR and over terminal tokens for the ICU episode only: avoids a second vocabulary break and retrain.) Governs R17, R18, R19, R20.
+- **The GEM trajectory unit is the full hospitalization (admission to final disposition).** (session-settled: user-directed — chosen over the first ICU episode only: needed for day-1-to-death generation and discharge-destination outcomes, matching BBJ's CLIF GEM and ETHOS.) Governs R17, R18.
 
 ### Scope Boundaries
 
 - Demographics, Elixhauser comorbidities, and other static context tokens are excluded.
 - New outcome definitions are excluded. Outcomes stay `configs/cohort.yaml` as-is.
 - Changes to the hazard-head target set are excluded.
+- Post-discharge deaths (`clif_patient.death_dttm` after discharge) are excluded, because the trajectory unit ends at hospital disposition.
+- An EHR2Path-style length-of-stay countdown is excluded. If added later, it is an ablation only, because a true LOS supplied at inference leaks the future.
 - The full 546k-stay retokenization and any retraining are excluded. Those are the user's L40 run. This plan verifies on a bounded sample of eligible ICU episodes, and that sample's vocabulary is smoke-only (KTD9).
 
 ### Deferred to Follow-Up Work
@@ -176,6 +194,19 @@ The evidence supports binning every value as a fused token. Guo et al. 2026 foun
   - The production vocabulary comes from the full train partition in the L40 retokenization.
 
   Governs R15, R16.
+
+- KTD10. **GEM artifact as a second tokenizer mode, not a second tokenizer.**
+  - `tokenize_site` gains `trajectory: icu_24h | hospitalization`. The hospitalization mode uses `admission_dttm` to `discharge_dttm` (no 24h cut) and the same frozen v2 vocab and segments. It writes `gem_events.parquet` beside `events.parquet`.
+  - Terminal and admission tokens come from a fixed allowlist in `configs/data.yaml`, inserted into the vocab whether or not the data contains them:
+    - `discharge_category` maps to the 7 dispositions. Expired → `expired`; SNF, rehab, LTACH, acute care, psych and assisted living → `facility`; Missing → `unknown`.
+    - `admission_type_category` maps to the admission token.
+  - Terminal tokens are target-eligible. Treatment sources stay input-only (Rule 1).
+  - `TargetBuilder` gains a `gem` mode: next-event targets over the whole sequence, a post-anchor feature check disabled for that mode only, and no TTE labels. The 24h records keep the existing check.
+  - Long stays are split into windows of at most 8192 tokens through the existing packed-segment continuation fields (`continuation_index`, `continues_to_next`). The first window always starts with `<bos>` and `ADMISSION`.
+  - Generation resolves every `DISCHARGE//*` id plus `<eos>` as stop ids, returns `stop_reason`, and marks capped rollouts censored.
+  - Evidence: ETHOS (PMID 39300208) and BBJ CLIF GEM (`bbj-lab/coreopsis`, `fms-ehrs`) for terminal framing and rollout mortality. SurvivEHR (PMID 42106492) for keeping death as a timed competing event alongside the terminal token, and for degradation over long recursive horizons.
+
+  Governs R17, R18, R19, R20.
 
 ### High-Level Technical Design
 
@@ -351,6 +382,52 @@ flowchart TB
   - The full synthetic reproduce passes.
 - **Verification:** `tests/` and `clif-validate/tests/` pass. `sync_vendor.py --check` is clean. The reproduce passes.
 
+### U8. Full-hospitalization GEM artifact with terminal tokens
+
+- **Goal:** the model can learn whole hospital courses that end in a real disposition, without any outcome leakage into the inputs.
+- **Requirements:** R17, R18 (KTD10)
+- **Dependencies:** U4, U5
+- **Files:** `src/data/tokenize.py` (`trajectory` mode, admission and terminal framing, windowing), `configs/data.yaml` (`gem` block: disposition and admission maps, terminal allowlist), `src/data/targets.py` (`gem` mode), `src/data/dataset.py` (GEM records through the packed-segment path), `tests/test_gem_artifact.py` (new), `clif-validate/scripts/sync_vendor.py` (re-sync if vendored modules change)
+- **Approach:**
+  1. Window the events by admission to discharge.
+  2. Prepend `<bos>` and `ADMISSION//x`, and append `DISCHARGE//y` at `discharge_dttm`, then `<eos>`.
+  3. Positions are minutes since hospital admission.
+  4. Record `anchor_idx` at ICU admit + 24h.
+  5. Split into windows of at most 8192 tokens with continuation fields.
+  6. Put terminal tokens in the frozen vocab allowlist.
+- **Execution note:** test-first.
+- **Test scenarios:**
+  - An Expired stay → the last two tokens are `DISCHARGE//expired` and `<eos>`, at the `discharge_dttm` position.
+  - A Missing disposition → `DISCHARGE//unknown`.
+  - SNF → `DISCHARGE//facility`.
+  - No terminal or disposition token appears anywhere but the end, and the 24h `events.parquet` from the same input is byte-identical to the non-GEM run.
+  - Pre-ICU (ED) and post-ICU ward events are included, with positions relative to hospital admission.
+  - A 20k-event stay → windows of at most 8192 tokens, the first starting `<bos> ADMISSION//…`, the last ending `DISCHARGE//… <eos>`, and continuation flags consistent.
+  - The terminal tokens exist in the vocab even if a fixture lacks hospice stays.
+  - `TargetBuilder` in `gem` mode makes the terminal token a next-event target, and makes treatment events non-targets.
+  - `TargetBuilder` in the 24h mode still rejects post-anchor features.
+- **Verification:** GEM tests pass, and the 24h artifact is unchanged.
+
+### U9. Generate until disposition and rollout mortality evaluation
+
+- **Goal:** generated trajectories stop at a real disposition, and mortality can be estimated and evaluated from rollouts.
+- **Requirements:** R19, R20 (KTD10)
+- **Dependencies:** U8
+- **Files:** `src/model/generate.py` (terminal stop ids, `stop_reason`, censoring, N-rollout driver), `src/eval/generative.py` (terminal metrics, rollout mortality with CI, calibration), `tests/test_generate.py`, `tests/test_generative_eval.py`
+- **Approach:**
+  1. Resolve `DISCHARGE//*` and `<eos>` ids from the vocab.
+  2. Stop each rollout on them, and record stop type, step and elapsed minutes. A cap gives `censored`.
+  3. Mortality is the expired count divided by terminated rollouts, with the censored count reported separately and a Wilson CI.
+  4. The evaluation computes AUROC and AUPRC against observed `expired`, the calibration slope and intercept, the terminal-type confusion matrix, the nontermination rate, and the time-to-terminal MAE. It reuses `src/eval/metrics.py`.
+- **Execution note:** test-first, with a stub model whose logits are scripted.
+- **Test scenarios:**
+  - A scripted model that emits `DISCHARGE//expired` at step 5 → `stop_reason=terminal`, type `expired`, step 5.
+  - A scripted model that never terminates → `censored` at the cap, never counted as survival.
+  - 10 rollouts with 3 expired, 5 home and 2 censored → mortality 3/8 with a CI, and a censored count of 2.
+  - Evaluation on 4 stays with known outcomes gives the expected AUROC and confusion counts.
+  - A checkpoint whose vocab lacks terminal tokens is refused by the rollout driver (via U5's hash check).
+- **Verification:** generation and evaluation tests pass.
+
 ### U6. Runnable tokenization ablation
 
 - **Goal:** every ablation arm trains end to end with arm-specific inputs.
@@ -385,13 +462,13 @@ flowchart TB
 ### U7. Report, real-data verification, and docs
 
 - **Goal:** the new tokenizer is proven on a real, eligible-ICU sample, and the docs describe it.
-- **Requirements:** R12, R15, R16 (KTD9), and the documentation of every R.
-- **Dependencies:** U1–U6
+- **Requirements:** R12, R15, R16, R17 (KTD9), and the documentation of every R.
+- **Dependencies:** U1–U6, U8, U9
 - **Files:** `src/data/tokenize.py` (aggregate report; `--sample-episodes N` drawn deterministically from the episode artifact; `sample: true` provenance), `src/train/pretrain.py` (refuse a sample vocab), `website/docs/data-tokenization.md`, `MEMORY.md` (§E1b → resolved, with the retrain note), `docs/solutions/methods-decisions/clinical-segment-binning-primary-scheme.md`, `README.md`, `tests/test_tokenize_alignment.py`
 - **Approach:**
   1. Write `tokenization_report.json`, aggregate-only.
   2. Run the reference build on 5,000 eligible ICU episodes from the staged local data into `output/` (gitignored, PHI on node).
-  3. Run all 6 ablation arms for 2 steps on the resulting shard.
+  3. Run all 6 ablation arms for 2 steps on the resulting shard. Build the GEM artifact on the same sample, and run 2 GEM next-event steps plus 2 short rollouts.
   4. Inspect the report.
   5. Update the docs to the as-built behavior: T1–T7 resolved, T7 shown as declared per-table availability.
 - **Execution note:** smoke-first on real data after the synthetic suites pass.
@@ -426,7 +503,7 @@ flowchart TB
 
 ## Definition of Done
 
-- R1–R16 hold, and every Verification Contract check passes.
+- R1–R20 hold, and every Verification Contract check passes.
 - Every behavior-changing unit has a test that failed before its change.
 - No treatment source is target-eligible, and every tokenization artifact stays under `output/` (gitignored).
 - MEMORY.md and the tokenizer spec state that existing tokenized artifacts and checkpoints must be rebuilt, and that the production vocabulary must be fit on the full train partition.
