@@ -182,10 +182,74 @@ _SQL_IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _TABLE_FILE_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 
 # The table-spec fields tokenize._read_table interpolates into a DuckDB query string.
-# `value_col`/`unit_col`/`categorical_value_col` are optional; the rest are required
-# when a table is declared.
-_REQUIRED_SPEC_IDENTIFIERS = ("concept_col", "availability_col")
-_OPTIONAL_SPEC_IDENTIFIERS = ("value_col", "unit_col", "categorical_value_col")
+# `availability_col` is required; every other column field is optional, but a table must
+# name its concepts somehow (concept_col, a literal concept, or melted columns).
+_REQUIRED_SPEC_IDENTIFIERS = ("availability_col",)
+_OPTIONAL_SPEC_IDENTIFIERS = (
+    "concept_col", "value_col", "unit_col", "categorical_value_col",
+    # U4 (KTD5): MCS group qualifier, a single-concept table's literal concept (inlined
+    # as a SQL string literal), and the patient-keyed join columns (code status).
+    "concept_qualifier_col", "concept", "patient_id_col", "admission_col", "discharge_col",
+)
+# Lists of column identifiers melted into one event per column (wide tables).
+_LIST_SPEC_IDENTIFIERS = ("value_cols", "categorical_value_cols")
+# Additional parquet basenames a table spec reads (the patient -> stay join).
+_OPTIONAL_SPEC_FILES = ("hospitalization_file",)
+_CONCEPT_SOURCES = ("concept_col", "concept", "value_cols", "categorical_value_cols")
+
+
+def _refuse_identifier(where: str, field: str, value: object) -> None:
+    raise ArtifactMismatch(
+        f"bundle {where} field {field!r}={value!r} is not a valid "
+        "SQL identifier; refusing to interpolate it into a query"
+    )
+
+
+def _check_identifier(where: str, field: str, value: object) -> None:
+    if not isinstance(value, str) or not _SQL_IDENT_RE.match(value):
+        _refuse_identifier(where, field, value)
+
+
+def _check_file(where: str, field: str, value: object) -> None:
+    if not isinstance(value, str) or not _TABLE_FILE_RE.match(value):
+        raise ArtifactMismatch(
+            f"bundle {where} declares an unsafe {field} {value!r}; "
+            "must be a bare parquet basename (no path separators or '..')"
+        )
+
+
+def _check_enum(where: str, field: str, value: object, allowed: tuple) -> None:
+    if value not in allowed:
+        raise ArtifactMismatch(
+            f"bundle {where} field {field!r}={value!r} is invalid; "
+            f"expected one of {', '.join(map(str, allowed))}"
+        )
+
+
+def _validate_dose_block(where: str, dose: object, tables: dict, enums: dict) -> None:
+    if not isinstance(dose, dict):
+        raise ArtifactMismatch(f"bundle {where} dose block is not a mapping")
+    _check_enum(where, "dose.kind", dose.get("kind"), enums["dose_kinds"])
+    if dose.get("action_col") is not None:
+        _check_identifier(where, "dose.action_col", dose["action_col"])
+    stops = dose.get("stop_actions")
+    if stops is not None:
+        # Bound as query parameters, but held to the identifier shape anyway.
+        if not isinstance(stops, list):
+            _refuse_identifier(where, "dose.stop_actions", stops)
+        for stop in stops:
+            _check_identifier(where, "dose.stop_actions", stop)
+    weight = dose.get("weight_source")
+    if weight is not None:
+        if not isinstance(weight, dict) or weight.get("table") not in tables:
+            raise ArtifactMismatch(
+                f"bundle {where} dose.weight_source must name a declared table, got {weight!r}"
+            )
+        _check_identifier(where, "dose.weight_source.concept", weight.get("concept"))
+        wspec = tables[weight["table"]]
+        for field in ("concept_col", "value_col"):
+            _check_identifier(f"table {weight['table']!r}", field,
+                              wspec.get(field) if isinstance(wspec, dict) else None)
 
 
 def _validate_data_config_identifiers(data_cfg: dict) -> None:
@@ -198,13 +262,22 @@ def _validate_data_config_identifiers(data_cfg: dict) -> None:
     engine that can read local files (review finding). Full releaser-signature trust is
     U11; this is the cheap, in-scope defense that does not wait on it: every bundle
     identifier must look like an identifier before it reaches a query string.
+
+    U4 (KTD5) widened the interpolated surface: melted column lists, the MCS qualifier,
+    literal concepts, the patient-keyed join (columns + hospitalization file), the dose
+    block and the static-token entity files. Every one is validated here, and the
+    spec enums (`dose.kind`, `emit`, `key`, `static_tokens`) must be known values.
     """
+    from clif_validate._vendor.data.tokenize import DOSE_KINDS, EMIT_MODES, STATIC_TOKENS, TABLE_KEYS
+
+    enums = {"dose_kinds": DOSE_KINDS}
     tables = data_cfg.get("tables")
     if not isinstance(tables, dict) or not tables:
         raise ArtifactMismatch("bundle data config declares no tables")
     for name, spec in tables.items():
         if not isinstance(spec, dict):
             raise ArtifactMismatch(f"bundle table spec {name!r} is not a mapping")
+        where = f"table {name!r}"
         file_stem = spec.get("file")
         if not isinstance(file_stem, str) or not _TABLE_FILE_RE.match(file_stem):
             raise ArtifactMismatch(
@@ -212,20 +285,41 @@ def _validate_data_config_identifiers(data_cfg: dict) -> None:
                 "must be a bare parquet basename (no path separators or '..')"
             )
         for field in _REQUIRED_SPEC_IDENTIFIERS:
-            value = spec.get(field)
-            if not isinstance(value, str) or not _SQL_IDENT_RE.match(value):
-                raise ArtifactMismatch(
-                    f"bundle table {name!r} field {field!r}={value!r} is not a valid "
-                    "SQL identifier; refusing to interpolate it into a query"
-                )
+            _check_identifier(where, field, spec.get(field))
         for field in _OPTIONAL_SPEC_IDENTIFIERS:
-            value = spec.get(field)
-            if value is not None and (not isinstance(value, str)
-                                      or not _SQL_IDENT_RE.match(value)):
-                raise ArtifactMismatch(
-                    f"bundle table {name!r} field {field!r}={value!r} is not a valid "
-                    "SQL identifier; refusing to interpolate it into a query"
-                )
+            if spec.get(field) is not None:
+                _check_identifier(where, field, spec[field])
+        for field in _LIST_SPEC_IDENTIFIERS:
+            cols = spec.get(field)
+            if cols is None:
+                continue
+            if not isinstance(cols, list) or not cols:
+                _refuse_identifier(where, field, cols)
+            for col in cols:
+                _check_identifier(where, field, col)
+        for field in _OPTIONAL_SPEC_FILES:
+            if spec.get(field) is not None:
+                _check_file(where, field, spec[field])
+        if not any(spec.get(field) for field in _CONCEPT_SOURCES):
+            _refuse_identifier(where, "concept_col", spec.get("concept_col"))
+        if spec.get("emit") is not None:
+            _check_enum(where, "emit", spec["emit"], EMIT_MODES)
+        if spec.get("key") is not None:
+            _check_enum(where, "key", spec["key"], TABLE_KEYS)
+        if spec.get("dose") is not None:
+            _validate_dose_block(where, spec["dose"], tables, enums)
+    static = data_cfg.get("static_tokens")
+    if static is not None:
+        if not isinstance(static, list):
+            raise ArtifactMismatch(f"bundle static_tokens must be a list, got {static!r}")
+        for token in static:
+            _check_enum("static_tokens", "static_tokens", token, tuple(STATIC_TOKENS))
+    source = data_cfg.get("static_source")
+    if source is not None:
+        if not isinstance(source, dict):
+            raise ArtifactMismatch("bundle static_source is not a mapping")
+        for field, value in source.items():
+            _check_file("static_source", field, value)
 
 
 def pin_bundle_policy(policy_path: str | Path) -> None:

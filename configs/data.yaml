@@ -31,22 +31,111 @@ tables:
     concept_col: "lab_category"
     value_col: "lab_value_numeric"
     unit_col: "reference_unit"
-  resp_support:
+  resp_support:                           # INPUT ONLY
     file: "clif_respiratory_support"
     availability_col: "recorded_dttm"
     availability: "missing_storetime"
     availability_lag_minutes: 0
-    concept_col: "device_category"       # imv, nippv, high_flow, ...
-    value_col: null                      # categorical event
+    # Wide table (R8): every numeric setting/observation column is melted to its own
+    # event (concept = column name = the physician CSV measurement name), and every
+    # categorical column to a fused `column=value` token (KTD4). Nulls emit nothing.
+    value_cols: [fio2_set, lpm_set, tidal_volume_set, resp_rate_set, pressure_control_set,
+                 pressure_support_set, flow_rate_set, peak_inspiratory_pressure_set,
+                 inspiratory_time_set, peep_set, tidal_volume_obs, resp_rate_obs,
+                 plateau_pressure_obs, peak_inspiratory_pressure_obs, peep_obs,
+                 minute_vent_obs, mean_airway_pressure_obs]
+    categorical_value_cols: [device_category, mode_category, tracheostomy]
     input_only: true
   meds:                                   # INPUT ONLY (not a target)
     file: "clif_medication_admin_continuous"
     availability_col: "admin_dttm"
     availability: "recorded"
     availability_lag_minutes: 0
-    concept_col: "med_category"          # norepinephrine, propofol, heparin, furosemide...
-    value_col: null                       # v2 emits med_category only (no dose) — see data-tokenization T4
-    dose_tokenization: "tokenetl_only"    # dose bins exist only in vendored v1 tokenETL (not run by v2)
+    concept_col: "med_category"          # norepinephrine, propofol, heparin, ...
+    value_col: "med_dose"
+    unit_col: "med_dose_unit"
+    # R6: doses convert to the physician CSV's preferred unit for the med_category
+    # (concept = the CSV measurement name, e.g. norepinephrine_mcg_kg_min). Per-kg
+    # conversions use the most recent weight available at or before the dose (DuckDB
+    # ASOF join on availability time, both tables' lags applied). A dose that cannot be
+    # converted keeps its native unit under `{med_category}_{unit}`; the reference site
+    # also fits those fallback concepts from its pre-conversion doses (fit-only shadow).
+    # Rows whose action is in stop_actions are a dose of 0 (the [0,0] stop bin).
+    dose:
+      kind: "continuous"
+      action_col: "mar_action_category"
+      stop_actions: [stop]
+      weight_source: {table: vitals, concept: weight_kg}
+    input_only: true
+  meds_intermittent:                      # INPUT ONLY
+    file: "clif_medication_admin_intermittent"
+    availability_col: "admin_dttm"
+    availability: "recorded"
+    availability_lag_minutes: 0
+    concept_col: "med_category"
+    value_col: "med_dose"
+    unit_col: "med_dose_unit"
+    # R7: one canonical unit per kind (mass -> mg, units -> u); only `dose` / `mL` (and
+    # unrecognised units) fall back to `{med_category}_{unit}`.
+    dose:
+      kind: "intermittent"
+    input_only: true
+  assessments:                            # TARGET-ELIGIBLE (R9): measurements, not treatments
+    file: "clif_patient_assessments"
+    availability_col: "recorded_dttm"
+    availability: "missing_storetime"
+    availability_lag_minutes: 0
+    concept_col: "assessment_category"   # gcs_*, RASS -> rass, braden_*, cam_*, sbt_*
+    normalize_concept: true               # lowercase concept names (RASS -> rass)
+    value_col: "numerical_value"          # numeric scales -> binned (ordinal for GCS/RASS/Braden)
+    categorical_value_col: "categorical_value"   # fused only when there is no numeric value
+  crrt:                                   # INPUT ONLY
+    file: "clif_crrt_therapy"
+    availability_col: "recorded_dttm"
+    availability: "missing_storetime"
+    availability_lag_minutes: 0
+    value_cols: [blood_flow_rate, pre_filter_replacement_fluid_rate,
+                 post_filter_replacement_fluid_rate, dialysate_flow_rate, ultrafiltration_out]
+    categorical_value_cols: [crrt_mode_category]
+    input_only: true
+  ecmo:                                   # INPUT ONLY
+    file: "clif_ecmo_mcs"
+    availability_col: "recorded_dttm"
+    availability: "missing_storetime"
+    availability_lag_minutes: 0
+    # R10: concepts are `{mcs_group}_{column}` (normalized; a missing group -> unknown),
+    # so an ECMO pump speed and an LVAD pump speed are different concepts.
+    concept_qualifier_col: "mcs_group"
+    value_cols: [device_rate, flow, sweep, fdO2]
+    categorical_value_cols: [device_category]
+    input_only: true
+  code_status:                            # INPUT ONLY (R21)
+    file: "clif_code_status"
+    # Keyed by PATIENT: joined to stays through the hospitalization table. The status in
+    # effect at admission (latest start_dttm <= admission) is emitted at admission; each
+    # later change within the stay at its start_dttm.
+    key: "patient"
+    patient_id_col: "patient_id"
+    hospitalization_file: "clif_hospitalization"
+    admission_col: "admission_dttm"
+    discharge_col: "discharge_dttm"
+    availability_col: "start_dttm"
+    availability: "recorded"
+    availability_lag_minutes: 0
+    concept: "code_status"                # fused code_status=<category>
+    categorical_value_col: "code_status_category"
+    emit: "transitions"                   # first status + changes only
+    carry_forward: true                   # state in effect at window start is kept
+    input_only: true
+  position:                               # INPUT ONLY (R21)
+    file: "clif_position"
+    availability_col: "recorded_dttm"
+    availability: "missing_storetime"
+    availability_lag_minutes: 0
+    concept: "position"                   # fused position=prone|not_prone
+    categorical_value_col: "position_category"
+    emit: "transitions"
+    carry_forward: true
     input_only: true
   adt:
     file: "clif_adt"
@@ -56,6 +145,15 @@ tables:
     concept_col: "location_category"
     value_col: null
     input_only: true
+
+# Static admission tokens (R21, KTD11; BBJ CLIF GEM): emitted once at the stay start,
+# before any other event, in this fixed order. age_decile = quantile (decile) bins of
+# age_at_admission fit on the reference train partition; the rest are fused categoricals
+# (`sex=female`, ...). Input-only, never targets. `static_tokens: []` disables them.
+static_tokens: [age_decile, sex, race, ethnicity, admission_type]
+static_source:
+  hospitalization_file: "clif_hospitalization"   # age_at_admission, admission_type_category
+  patient_file: "clif_patient"                   # sex_category, race_category, ethnicity_category
 
 # Target measurement concepts (K hazard heads, ICareFM-style). Treatments excluded.
 target_concepts:

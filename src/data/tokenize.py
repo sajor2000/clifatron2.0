@@ -15,6 +15,14 @@ concepts always get a [0,0] stop bin) and the per-concept choice is recorded in 
 Each event is ONE FUSED token: `concept=bin` (numeric), `concept=<value>` (a categorical
 result on a row with no numeric value, from a table's `categorical_value_col`), or bare
 `concept` (presence).
+
+Event sources are config-declared (KTD5, U4): long tables (`concept_col`), wide tables
+melted per column (`value_cols` / `categorical_value_cols`, optionally qualified by
+`concept_qualifier_col`), medication doses converted to one unit per concept (`dose`,
+`src/data/units.py`; per-kg via an availability-safe ASOF weight join), patient-keyed
+state (`key: patient`, code status), state changes only (`emit: transitions`), state
+carried to the window start (`carry_forward`), and static admission tokens
+(`static_tokens`) at the stay start. Treatments and context are `input_only`.
 Position is minutes since ICU admission (`pos_min`). Events are ordered by their
 availability timestamp (storetime semantics), then the stable tiebreak (source, concept,
 value), sorted AFTER the observation-window join so identical input always yields an
@@ -59,6 +67,13 @@ from src.data.segments import (
     with_zero_point,
 )
 from src.data.splits import fit_partition
+from src.data.units import (
+    STATUSES as DOSE_STATUSES,
+    canonical_unit,
+    dose_plan,
+    normalize_name,
+    preferred_units_from_csv,
+)
 
 SPECIAL = {"<pad>": 0, "<bos>": 1, "<eos>": 2, "<unk>": 3}
 ROOT = Path(__file__).parents[2]
@@ -74,8 +89,38 @@ DEFAULT_DOSE_SOURCES = ("meds", "meds_intermittent")
 # table, so `recorded_dttm` stands in and may precede true availability.
 AVAILABILITY_SEMANTICS = ("result", "recorded", "missing_storetime")
 # KTD6: the full event order within a stay. Applied after the observation-window join.
-# `cat_value` is a trailing tiebreak so value-only categorical rows are ordered too.
-EVENT_ORDER = ("hosp_id", "dttm", "source", "concept", "value", "cat_value")
+# `static_rank` (null for every non-static event, nulls last) puts the static admission
+# tokens first at the stay start in their fixed order; `cat_value` is a trailing
+# tiebreak so value-only categorical rows are ordered too.
+EVENT_ORDER = ("hosp_id", "dttm", "static_rank", "source", "concept", "value", "cat_value")
+EVENT_SCHEMA = {
+    "hosp_id": pl.String,
+    "dttm": pl.Datetime("us", "UTC"),
+    "concept": pl.String,
+    "value": pl.Float64,
+    "unit": pl.String,
+    "cat_value": pl.String,
+}
+# U4 (KTD5): table-spec enums. `dose.kind` selects the unit-conversion rule; `emit:
+# transitions` keeps only a stay's first state and its changes; `key: patient` joins a
+# patient-keyed table (code status) to stays through the hospitalization table.
+DOSE_KINDS = ("continuous", "intermittent")
+EMIT_MODES = ("all", "transitions")
+TABLE_KEYS = ("hospitalization", "patient")
+# R21 / KTD11: static admission tokens, in their fixed emission order:
+# token -> (entity table, CLIF 2.1 column, numeric?). Numeric tokens are binned with
+# frozen quantile (decile) segments; the rest are fused `token=value` categoricals.
+STATIC_TOKENS = {
+    "age_decile": ("hospitalization", "age_at_admission", True),
+    "sex": ("patient", "sex_category", False),
+    "race": ("patient", "race_category", False),
+    "ethnicity": ("patient", "ethnicity_category", False),
+    "admission_type": ("hospitalization", "admission_type_category", False),
+}
+STATIC_SOURCE = "static"
+# A table spec's literal concept / an MCS qualifier fallback, inlined into SQL as a string
+# literal, so it must be a plain identifier (the bundle validator enforces the same).
+_LITERAL_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 
 def _json_sha256(value: object) -> str:
@@ -165,31 +210,45 @@ def validate_table_availability(tables: dict) -> dict[str, dict]:
     return declared
 
 
-def _read_table(con, base: Path, spec: dict,
-                keep_ids: list | None = None) -> pl.DataFrame:
-    """Melt one CLIF table to long events keyed by its availability timestamp.
+def _empty_events() -> pl.DataFrame:
+    return pl.DataFrame(schema=EVENT_SCHEMA)
 
-    Row order is NOT meaningful here; `tokenize_site` imposes the full KTD6 order after
-    the observation-window join.
 
-    If `keep_ids` is given, only rows for those hospitalization_ids are read
-    (pushed into the SQL WHERE so the 45M+ row tables are filtered on scan, not
-    after loading). Used to tokenize a small sample fast for smoke tests / dev."""
-    fp = base / f"{spec['file']}.parquet"
-    if not fp.exists():
-        print(f"  [skip] {fp.name} not found")
-        return pl.DataFrame(
-            schema={
-                "hosp_id": pl.String,
-                "dttm": pl.Datetime("us", "UTC"),
-                "concept": pl.String,
-                "value": pl.Float64,
-                "unit": pl.String,
-                "cat_value": pl.String,
-            }
-        )
+def _id_filter(keep_ids: list | None, column: str = "hospitalization_id") -> tuple[str, list]:
+    """SQL fragment + bound parameters restricting `column` to `keep_ids`.
+
+    An empty keep_ids would generate `IN ()`, which DuckDB rejects as a syntax error
+    (CodeRabbit); an empty allow-list means "keep nothing", so match no rows explicitly.
+    The ids are bound as parameters, never inlined: an id containing an apostrophe would
+    otherwise terminate the literal and corrupt the query (CodeRabbit). Column/table
+    identifiers cannot be bound, so those stay interpolated — the bundle path validates
+    them as identifiers before they reach here."""
+    if keep_ids is None:
+        return "", []
+    if not keep_ids:
+        return "AND 1 = 0", []
+    placeholders = ", ".join("?" for _ in keep_ids)
+    return (f"AND CAST({column} AS VARCHAR) IN ({placeholders})",
+            [str(i) for i in keep_ids])
+
+
+def _name_sql(expr: str) -> str:
+    """SQL twin of `units.normalize_name`: lowercase, non-alphanumeric runs -> `_`."""
+    return (f"regexp_replace(regexp_replace(lower(trim(CAST({expr} AS VARCHAR))), "
+            f"'[^a-z0-9]+', '_', 'g'), '^_+|_+$', '', 'g')")
+
+
+def _literal(value: object, what: str) -> str:
+    if not isinstance(value, str) or not _LITERAL_RE.match(value):
+        raise QualificationError(f"{what} must be a plain identifier, got {value!r}")
+    return f"'{value}'"
+
+
+def _long_sql(fp: Path, spec: dict, keep_ids: list | None) -> tuple[str, list]:
+    """One event per row: concept from `concept_col` (or the literal `concept`), with an
+    optional numeric `value_col`, `unit_col` and categorical `categorical_value_col`."""
     val = spec.get("value_col")
-    val_sql = f"CAST({val} AS DOUBLE)" if val else "NULL"
+    val_sql = f"CAST({val} AS DOUBLE)" if val else "CAST(NULL AS DOUBLE)"
     unit = spec.get("unit_col")
     unit_sql = f"CAST({unit} AS VARCHAR)" if unit else "CAST('' AS VARCHAR)"
     # KTD4: a table may declare the column holding a categorical result (CLIF
@@ -199,36 +258,420 @@ def _read_table(con, base: Path, spec: dict,
     cat = spec.get("categorical_value_col")
     cat_sql = f"CAST({cat} AS VARCHAR)" if cat else "CAST(NULL AS VARCHAR)"
     time_col = spec["availability_col"]
-    id_filter = ""
-    params: list = []
-    if keep_ids is not None:
-        # An empty keep_ids would generate `IN ()`, which DuckDB rejects as a syntax
-        # error (CodeRabbit). An empty allow-list means "keep nothing", so match no
-        # rows explicitly rather than emitting invalid SQL.
-        if not keep_ids:
-            id_filter = "AND 1 = 0"
-        else:
-            # Parameterize the id list rather than inlining quoted literals: a
-            # hospitalization_id containing an apostrophe would otherwise terminate the
-            # literal and corrupt the query (CodeRabbit). Column/table identifiers
-            # cannot be bound as parameters, so those stay interpolated — the bundle
-            # path validates them as identifiers before they reach here.
-            placeholders = ", ".join("?" for _ in keep_ids)
-            id_filter = f"AND CAST(hospitalization_id AS VARCHAR) IN ({placeholders})"
-            params = [str(i) for i in keep_ids]
-    q = f"""
-        SELECT hospitalization_id       AS hosp_id,
+    concept_col = spec.get("concept_col")
+    if concept_col:
+        concept_sql = _name_sql(concept_col) if spec.get("normalize_concept") else concept_col
+        present = f"{concept_col} IS NOT NULL"
+    else:
+        # A single-concept table (position): every row is that concept, so a row
+        # without a categorical (or numeric) value carries nothing.
+        concept_sql = f"CAST({_literal(spec.get('concept'), 'concept')} AS VARCHAR)"
+        present = " OR ".join(f"{c} IS NOT NULL" for c in (val, cat) if c) or "FALSE"
+        present = f"({present})"
+    id_sql, params = _id_filter(keep_ids)
+    return f"""
+        SELECT CAST(hospitalization_id AS VARCHAR) AS hosp_id,
                {time_col}                AS dttm,
-               {spec['concept_col']}     AS concept,
+               {concept_sql}             AS concept,
                {val_sql}                 AS value,
                {unit_sql}                AS unit,
                {cat_sql}                 AS cat_value
         FROM read_parquet('{fp}')
-        WHERE {spec['concept_col']} IS NOT NULL
+        WHERE {present}
           AND {time_col} IS NOT NULL
-          {id_filter}
+          {id_sql}
+    """, params
+
+
+def _melt_sql(fp: Path, spec: dict, keep_ids: list | None, cols: list, *,
+              numeric: bool) -> tuple[str, list]:
+    """Wide -> long (R8, R10): one event per non-null cell of `cols`, the concept being
+    the lowercased column name, qualified as `{qualifier}_{column}` when the table
+    declares `concept_qualifier_col` (ECMO/MCS device group). One parquet scan (UNPIVOT
+    drops NULL cells)."""
+    time_col = spec["availability_col"]
+    qual = spec.get("concept_qualifier_col")
+    qual_sel = f"{qual} AS _qual," if qual else ""
+    name = "lower(_col)"
+    if qual:
+        name = f"coalesce(nullif({_name_sql('_qual')}, ''), 'unknown') || '_' || lower(_col)"
+    cast = "DOUBLE" if numeric else "VARCHAR"
+    casts = ", ".join(f"CAST({c} AS {cast}) AS {c}" for c in cols)
+    id_sql, params = _id_filter(keep_ids)
+    value_sql, cat_sql = ("_val", "CAST(NULL AS VARCHAR)") if numeric else (
+        "CAST(NULL AS DOUBLE)", "_val")
+    return f"""
+        SELECT hosp_id, dttm, {name} AS concept, {value_sql} AS value,
+               CAST(NULL AS VARCHAR) AS unit, {cat_sql} AS cat_value
+        FROM (
+            UNPIVOT (
+                SELECT CAST(hospitalization_id AS VARCHAR) AS hosp_id, {time_col} AS dttm,
+                       {qual_sel} {casts}
+                FROM read_parquet('{fp}')
+                WHERE {time_col} IS NOT NULL {id_sql}
+            ) ON {", ".join(cols)} INTO NAME _col VALUE _val
+        )
+    """, params
+
+
+def _patient_keyed_sql(base: Path, fp: Path, spec: dict,
+                       keep_ids: list | None) -> tuple[str, list] | None:
+    """R21: a patient-keyed state table (code status) joined to stays.
+
+    For each hospitalization, the latest state with `start <= admission` is emitted AT
+    admission (all rows tied at that start, so the result is deterministic), and every
+    state starting after admission (and, when `discharge_col` is set, no later than
+    discharge) is emitted at its own start."""
+    hosp_fp = base / f"{spec.get('hospitalization_file', 'clif_hospitalization')}.parquet"
+    if not hosp_fp.exists():
+        print(f"  [skip] {fp.name}: {hosp_fp.name} (patient -> stay join) not found")
+        return None
+    pid = spec.get("patient_id_col", "patient_id")
+    adm = spec.get("admission_col", "admission_dttm")
+    dis = spec.get("discharge_col")
+    dis_sql = dis if dis else "CAST(NULL AS TIMESTAMPTZ)"
+    time_col = spec["availability_col"]
+    cat = spec["categorical_value_col"]
+    concept = _literal(spec.get("concept"), "concept")
+    id_sql, params = _id_filter(keep_ids)
+    return f"""
+        WITH s AS (
+            SELECT CAST({pid} AS VARCHAR) AS pid, {time_col} AS t,
+                   CAST({cat} AS VARCHAR) AS v
+            FROM read_parquet('{fp}')
+            WHERE {pid} IS NOT NULL AND {time_col} IS NOT NULL AND {cat} IS NOT NULL
+        ), h AS (
+            SELECT CAST(hospitalization_id AS VARCHAR) AS hosp_id,
+                   CAST({pid} AS VARCHAR) AS pid, {adm} AS adm, {dis_sql} AS dis
+            FROM read_parquet('{hosp_fp}')
+            WHERE {pid} IS NOT NULL AND {adm} IS NOT NULL {id_sql}
+        ), at_admission AS (
+            SELECT h.hosp_id, h.adm AS dttm, s.v
+            FROM h JOIN s ON h.pid = s.pid AND s.t <= h.adm
+            QUALIFY s.t = max(s.t) OVER (PARTITION BY h.hosp_id)
+        ), changes AS (
+            SELECT h.hosp_id, s.t AS dttm, s.v
+            FROM h JOIN s ON h.pid = s.pid AND s.t > h.adm
+                          AND (h.dis IS NULL OR s.t <= h.dis)
+        )
+        SELECT hosp_id, dttm, CAST({concept} AS VARCHAR) AS concept,
+               CAST(NULL AS DOUBLE) AS value, CAST(NULL AS VARCHAR) AS unit,
+               v AS cat_value
+        FROM (SELECT * FROM at_admission UNION ALL SELECT * FROM changes)
+    """, params
+
+
+def _transitions_sql(inner: str) -> str:
+    """R21: keep a stay's first state and each row whose state differs from the previous
+    row's. Rows are ordered by (dttm, normalized state); the state is the categorical
+    value normalized like `categorical_token` (lowercase, whitespace runs -> `_`)."""
+    return f"""
+        SELECT hosp_id, dttm, concept, value, unit, cat_value FROM (
+            SELECT *, lag(_state) OVER (
+                PARTITION BY hosp_id, concept ORDER BY dttm, _state) AS _prev
+            FROM (
+                SELECT *, regexp_replace(lower(trim(cat_value)), '\\s+', '_', 'g') AS _state
+                FROM ({inner}) WHERE cat_value IS NOT NULL
+            )
+        ) WHERE _prev IS NULL OR _prev <> _state
     """
-    return con.execute(q, params).pl()
+
+
+def _read_dose_table(con, base: Path, fp: Path, spec: dict, keep_ids: list | None,
+                     tables: dict | None, target_units: dict[str, str] | None,
+                     fit_shadows: bool) -> tuple[pl.DataFrame, pl.DataFrame | None, dict]:
+    """R6/R7 (KTD5): medication doses with unit conversion.
+
+    SQL reads the doses (a stop action is a dose of 0) and, for continuous doses, ASOF
+    joins the most recent weight whose availability time (charted time + the weight
+    table's lag) is at or before the dose's (admin time + this table's lag). Each
+    distinct (medication, unit) pair is then resolved ONCE by `units.dose_plan`, joined
+    back and applied vectorized — never per row in Python.
+
+    Returns (events, fit-only shadow events, {status: count}). Shadows (reference-site
+    build only) are the native-unit fallback rows of every weight-dependent conversion,
+    so fallback concepts get frozen bins even when this site converted every row."""
+    dose = spec["dose"]
+    kind = dose.get("kind")
+    if kind not in DOSE_KINDS:
+        raise QualificationError(f"dose.kind must be one of {DOSE_KINDS}, got {kind!r}")
+    time_col, concept_col = spec["availability_col"], spec["concept_col"]
+    val, unit = spec["value_col"], spec["unit_col"]
+    dose_sql = f"CAST({val} AS DOUBLE)"
+    params: list = []
+    stops = [str(a).lower() for a in dose.get("stop_actions") or ()]
+    action = dose.get("action_col")
+    if action and stops:
+        placeholders = ", ".join("?" for _ in stops)
+        dose_sql = (f"CASE WHEN lower(CAST({action} AS VARCHAR)) IN ({placeholders}) "
+                    f"THEN 0.0 ELSE {dose_sql} END")
+        params += stops
+    id_sql, id_params = _id_filter(keep_ids)
+    params += id_params
+    lag = int(spec.get("availability_lag_minutes", 0))
+    doses = f"""
+        SELECT CAST(hospitalization_id AS VARCHAR) AS hosp_id, {time_col} AS dttm,
+               CAST({concept_col} AS VARCHAR) AS med, {dose_sql} AS dose,
+               coalesce(CAST({unit} AS VARCHAR), '') AS unit_raw,
+               {time_col} + INTERVAL {lag} MINUTE AS avail
+        FROM read_parquet('{fp}')
+        WHERE {concept_col} IS NOT NULL AND {time_col} IS NOT NULL {id_sql}
+    """
+    weight = dose.get("weight_source") if kind == "continuous" else None
+    wspec = (tables or {}).get(weight["table"]) if weight else None
+    wfp = base / f"{wspec['file']}.parquet" if wspec else None
+    if weight and (wfp is None or not wfp.exists()):
+        print(f"  [warn] {fp.name}: weight source {weight['table']!r} not found; "
+              "per-kg conversions fall back to native units")
+    if wfp is not None and wfp.exists():
+        wtime, wval = wspec["availability_col"], wspec["value_col"]
+        wlag = int(wspec.get("availability_lag_minutes", 0))
+        w_id_sql, w_params = _id_filter(keep_ids)
+        # One weight per (stay, availability time): ties are averaged so the ASOF match
+        # is deterministic.
+        sql = f"""
+            WITH d AS ({doses}), w AS (
+                SELECT hosp_id, avail, avg(weight_kg) AS weight_kg FROM (
+                    SELECT CAST(hospitalization_id AS VARCHAR) AS hosp_id,
+                           {wtime} + INTERVAL {wlag} MINUTE AS avail,
+                           CAST({wval} AS DOUBLE) AS weight_kg
+                    FROM read_parquet('{wfp}')
+                    WHERE {wspec['concept_col']} = ? AND {wtime} IS NOT NULL
+                      AND isfinite(CAST({wval} AS DOUBLE)) AND CAST({wval} AS DOUBLE) > 0
+                      {w_id_sql}
+                ) GROUP BY hosp_id, avail
+            )
+            SELECT d.hosp_id, d.dttm, d.med, d.dose, d.unit_raw, w.weight_kg
+            FROM d ASOF LEFT JOIN w ON d.hosp_id = w.hosp_id AND d.avail >= w.avail
+        """
+        params += [weight["concept"], *w_params]
+    else:
+        sql = f"""SELECT hosp_id, dttm, med, dose, unit_raw,
+                         CAST(NULL AS DOUBLE) AS weight_kg FROM ({doses})"""
+    frame = con.execute(sql, params).pl()
+
+    target_units = target_units or {}
+    pairs = frame.select("med", "unit_raw").unique().iter_rows()
+    plans = []
+    for med, raw in pairs:
+        target = (target_units.get(normalize_name(med)) if kind == "continuous"
+                  else canonical_unit(raw))
+        plan = dose_plan(med, raw, target)
+        if kind == "intermittent" and target is None:
+            plan["status"] = "unconvertible"   # `dose`, `mL`, unrecognised (R7)
+        plans.append({"med": med, "unit_raw": raw, **plan,
+                      "native_unit": plan["native_concept"][len(normalize_name(med)) + 1:]})
+    mapping = pl.DataFrame(plans, schema={
+        "med": pl.String, "unit_raw": pl.String, "native_concept": pl.String,
+        "target_concept": pl.String, "factor": pl.Float64, "weight_power": pl.Int64,
+        "status": pl.String, "target_unit": pl.String, "native_unit": pl.String,
+    })
+    needs_weight = pl.col("weight_power") != 0
+    joined = frame.join(mapping, on=["med", "unit_raw"], how="left").with_columns(
+        pl.when((pl.col("status") == "converted") & needs_weight
+                & pl.col("weight_kg").is_null())
+        .then(pl.lit("no_weight")).otherwise(pl.col("status")).alias("status")
+    )
+    converted = pl.col("status") == "converted"
+    scale = (pl.when(needs_weight)
+             .then(pl.col("factor") * pl.col("weight_kg").pow(pl.col("weight_power")))
+             .otherwise(pl.col("factor")))
+    native = pl.col("status").is_in(["no_weight", "unconvertible"])
+    events = joined.select(
+        "hosp_id", "dttm",
+        pl.when(native).then(pl.col("native_concept"))
+        .otherwise(pl.col("target_concept")).alias("concept"),
+        pl.when(converted).then(pl.col("dose") * scale)
+        .otherwise(pl.col("dose")).alias("value"),
+        pl.when(converted).then(pl.col("target_unit"))
+        .otherwise(pl.col("native_unit")).alias("unit"),
+        pl.lit(None, dtype=pl.String).alias("cat_value"),
+    )
+    counts = dict.fromkeys(DOSE_STATUSES, 0)
+    for status, n in joined.group_by("status").len().iter_rows():
+        counts[status] = int(n)
+    shadows = None
+    if fit_shadows:
+        shadows = joined.filter(converted & needs_weight).select(
+            "hosp_id", "dttm", pl.col("native_concept").alias("concept"),
+            pl.col("dose").alias("value"), pl.col("native_unit").alias("unit"),
+            pl.lit(None, dtype=pl.String).alias("cat_value"),
+        )
+    return events, shadows, counts
+
+
+def _read_source(con, base: Path, spec: dict, keep_ids: list | None = None, *,
+                 tables: dict | None = None, target_units: dict[str, str] | None = None,
+                 fit_shadows: bool = False) -> tuple[pl.DataFrame, pl.DataFrame | None,
+                                                     dict | None]:
+    """Read one configured table -> (events, fit-only shadows or None, dose status
+    counts or None). See `_read_table`."""
+    fp = base / f"{spec['file']}.parquet"
+    if not fp.exists():
+        print(f"  [skip] {fp.name} not found")
+        return _empty_events(), None, None
+    if spec.get("dose"):
+        return _read_dose_table(con, base, fp, spec, keep_ids, tables, target_units,
+                                fit_shadows)
+    key = spec.get("key", "hospitalization")
+    if key not in TABLE_KEYS:
+        raise QualificationError(f"table key must be one of {TABLE_KEYS}, got {key!r}")
+    emit = spec.get("emit", "all")
+    if emit not in EMIT_MODES:
+        raise QualificationError(f"table emit must be one of {EMIT_MODES}, got {emit!r}")
+    parts: list[tuple[str, list]] = []
+    if key == "patient":
+        part = _patient_keyed_sql(base, fp, spec, keep_ids)
+        if part is None:
+            return _empty_events(), None, None
+        parts.append(part)
+    elif spec.get("concept_col") or spec.get("concept"):
+        parts.append(_long_sql(fp, spec, keep_ids))
+    if spec.get("value_cols"):
+        parts.append(_melt_sql(fp, spec, keep_ids, list(spec["value_cols"]), numeric=True))
+    if spec.get("categorical_value_cols"):
+        parts.append(_melt_sql(fp, spec, keep_ids, list(spec["categorical_value_cols"]),
+                               numeric=False))
+    if not parts:
+        raise QualificationError(
+            f"table {spec['file']!r} declares no concept source "
+            "(concept_col, concept, value_cols or categorical_value_cols)"
+        )
+    sql = "\nUNION ALL\n".join(f"SELECT * FROM ({q})" for q, _ in parts)
+    if emit == "transitions":
+        sql = _transitions_sql(sql)
+    params = [p for _, part_params in parts for p in part_params]
+    return con.execute(sql, params).pl(), None, None
+
+
+def _read_table(con, base: Path, spec: dict,
+                keep_ids: list | None = None, *, tables: dict | None = None,
+                target_units: dict[str, str] | None = None) -> pl.DataFrame:
+    """Melt one CLIF table to long events keyed by its availability timestamp.
+
+    A table spec declares its concepts one or more ways (KTD5): `concept_col` (one event
+    per row; `normalize_concept` lowercases it), a literal `concept`, `value_cols` /
+    `categorical_value_cols` (wide tables melted per column, optionally qualified by
+    `concept_qualifier_col`), a `dose` block (unit conversion, R6/R7), `key: patient`
+    (patient-keyed state, joined to stays) and `emit: transitions` (state changes only).
+
+    Row order is NOT meaningful here; `tokenize_site` imposes the full KTD6 order after
+    the observation-window join.
+
+    If `keep_ids` is given, only rows for those hospitalization_ids are read
+    (pushed into the SQL WHERE so the 45M+ row tables are filtered on scan, not
+    after loading). Used to tokenize a small sample fast for smoke tests / dev."""
+    return _read_source(con, base, spec, keep_ids, tables=tables,
+                        target_units=target_units)[0]
+
+
+def _read_static(con, base: Path, cfg: dict, keep_ids: list | None) -> pl.DataFrame:
+    """R21: one row per (stay, static token) -> hosp_id, concept, value, cat_value,
+    static_rank. Columns or entity files a site lacks are skipped (a missing value emits
+    no token); the stay-start time is attached by `tokenize_site`."""
+    tokens = list(cfg.get("static_tokens") or ())
+    unknown = sorted(set(tokens) - set(STATIC_TOKENS))
+    if unknown:
+        raise QualificationError(f"unknown static_tokens: {', '.join(unknown)}")
+    schema = {"hosp_id": pl.String, "concept": pl.String, "value": pl.Float64,
+              "cat_value": pl.String, "static_rank": pl.UInt8}
+    if not tokens:
+        return pl.DataFrame(schema=schema)
+    source = cfg.get("static_source") or {}
+    hosp_fp = base / f"{source.get('hospitalization_file', 'clif_hospitalization')}.parquet"
+    pat_fp = base / f"{source.get('patient_file', 'clif_patient')}.parquet"
+    if not hosp_fp.exists():
+        print(f"  [skip] static tokens: {hosp_fp.name} not found")
+        return pl.DataFrame(schema=schema)
+
+    def columns(fp: Path) -> set[str]:
+        return {r[0] for r in con.execute(
+            f"DESCRIBE SELECT * FROM read_parquet('{fp}')").fetchall()}
+
+    hosp_cols = columns(hosp_fp)
+    pat_cols = (columns(pat_fp) if pat_fp.exists() and "patient_id" in hosp_cols
+                else set())
+    select = []
+    for token in tokens:
+        entity, col, _ = STATIC_TOKENS[token]
+        if col in (hosp_cols if entity == "hospitalization" else pat_cols):
+            select.append(f"{'h' if entity == 'hospitalization' else 'p'}.{col} AS {token}")
+        else:
+            print(f"  [skip] static token {token}: {col} not found")
+    if not select:
+        return pl.DataFrame(schema=schema)
+    pat_join = ""
+    if pat_cols:
+        pat_select = ", ".join(f"min({c}) AS {c}" for c in sorted(pat_cols - {"patient_id"})
+                               if c in {v[1] for v in STATIC_TOKENS.values()})
+        pat_join = f"""LEFT JOIN (
+            SELECT CAST(patient_id AS VARCHAR) AS patient_id, {pat_select}
+            FROM read_parquet('{pat_fp}') GROUP BY 1
+        ) p ON CAST(h.patient_id AS VARCHAR) = p.patient_id"""
+    id_sql, params = _id_filter(keep_ids, "h.hospitalization_id")
+    wide = con.execute(f"""
+        SELECT CAST(h.hospitalization_id AS VARCHAR) AS hosp_id, {", ".join(select)}
+        FROM read_parquet('{hosp_fp}') h {pat_join}
+        WHERE h.hospitalization_id IS NOT NULL {id_sql}
+    """, params).pl()
+    frames = []
+    for token in tokens:
+        if token not in wide.columns:
+            continue
+        rank = list(STATIC_TOKENS).index(token)
+        numeric = STATIC_TOKENS[token][2]
+        col = pl.col(token)
+        frames.append(wide.filter(col.is_not_null()).select(
+            "hosp_id", pl.lit(token).alias("concept"),
+            (col.cast(pl.Float64) if numeric else pl.lit(None, pl.Float64)).alias("value"),
+            (pl.lit(None, pl.String) if numeric else col.cast(pl.String)).alias("cat_value"),
+            pl.lit(rank, pl.UInt8).alias("static_rank"),
+        ))
+    return pl.concat(frames) if frames else pl.DataFrame(schema=schema)
+
+
+def _carry_forward(events: pl.DataFrame, episodes: pl.DataFrame,
+                   sources: set[str]) -> pl.DataFrame:
+    """State tables (`carry_forward: true`; code status, position): of each stay's rows
+    charted BEFORE the observation window opens (ICU admission), only the last state per
+    concept is kept, moved to the window start. The state was already knowable then, so
+    this never moves information earlier; without it a code status set at hospital
+    admission would vanish from an ICU stay that starts later."""
+    if not sources or events.is_empty():
+        return events
+    is_state = pl.col("source").is_in(sorted(sources))
+    state = events.filter(is_state).join(
+        episodes.select(pl.col("hospitalization_id").alias("hosp_id"),
+                        pl.col("icu_admit_dttm").alias("_start")),
+        on="hosp_id", how="left",
+    )
+    early = (pl.col("dttm") < pl.col("_start")).fill_null(False)
+    carried = (
+        state.filter(early)
+        .sort(["hosp_id", "source", "concept", "dttm", "cat_value", "value"],
+              nulls_last=True, maintain_order=True)
+        .group_by(["hosp_id", "source", "concept"], maintain_order=True).last()
+        .with_columns(pl.col("_start").alias("dttm"))
+    )
+    return pl.concat(
+        [events.filter(~is_state), state.filter(~early).drop("_start"),
+         carried.drop("_start").select(state.drop("_start").columns)],
+        how="diagonal_relaxed",
+    )
+
+
+def _dose_target_units(cfg: dict, vocab_manifest: dict | None) -> dict[str, str]:
+    """The continuous-dose target unit per med_category (R6). Building: the physician
+    CSV's medication rows. Importing: the units the frozen vocabulary was built with
+    (manifest provenance), so every site converts to the same concepts."""
+    if vocab_manifest is not None:
+        recorded = (vocab_manifest.get("provenance") or {}).get("dose_target_units")
+        if isinstance(recorded, dict):
+            return dict(recorded)
+    source = cfg.get("value_binning", {}).get("segment_source")
+    if not source or not (ROOT / source).exists():
+        return {}
+    return preferred_units_from_csv(ROOT / source)
 
 
 def validate_units(events: pl.DataFrame, cfg: dict) -> None:
@@ -373,9 +816,11 @@ def build_clinical_segment_bins(
 def build_edges(bin_cfg: dict, fit_events: pl.DataFrame,
                 target_concepts: list[str],
                 directions: dict[str, str] | None = None,
-                *, tables: dict | None = None) -> dict[str, list[dict]]:
+                *, tables: dict | None = None,
+                quantile_concepts: set[str] | None = None) -> dict[str, list[dict]]:
     """Per-concept segments only; see `build_segments` for the binning sources."""
-    return build_segments(bin_cfg, fit_events, target_concepts, directions, tables=tables)[0]
+    return build_segments(bin_cfg, fit_events, target_concepts, directions, tables=tables,
+                          quantile_concepts=quantile_concepts)[0]
 
 
 def _build_edges_targets_only(bin_cfg: dict, fit_events: pl.DataFrame,
@@ -429,7 +874,9 @@ def dose_concepts(fit_events: pl.DataFrame, bin_cfg: dict,
 def build_segments(bin_cfg: dict, fit_events: pl.DataFrame,
                    target_concepts: list[str],
                    directions: dict[str, str] | None = None,
-                   *, tables: dict | None = None) -> tuple[dict[str, list[dict]], dict[str, str]]:
+                   *, tables: dict | None = None,
+                   quantile_concepts: set[str] | None = None,
+                   ) -> tuple[dict[str, list[dict]], dict[str, str]]:
     """Segments for every numeric concept + its binning source (R4; KTD3).
 
     `fit_events` must already be the reference site's fit (train) partition. Under
@@ -447,6 +894,8 @@ def build_segments(bin_cfg: dict, fit_events: pl.DataFrame,
     Every dose concept (`dose_concepts`) gets a ``[0, 0]`` point segment and its
     quantiles are fit on strictly positive values only. Target concepts the CSV defines
     keep their segments even when absent from the fit partition (threshold queries).
+    `quantile_concepts` skip the ordinal rule (the static `age_decile` token is deciles
+    of age even when a small fit set happens to be integer-valued with few distinct ages).
 
     Returns ``({concept: segments}, {concept: source})``.
     """
@@ -511,7 +960,8 @@ def build_segments(bin_cfg: dict, fit_events: pl.DataFrame,
         if len(fit_vals) < min_count:
             segments[concept] = to_segments([], concept_forced, direction)
             sources[concept] = "single"
-        elif csv_source and is_ordinal(vals, max_distinct):
+        elif (csv_source and concept not in (quantile_concepts or ())
+              and is_ordinal(vals, max_distinct)):
             # Point bins already separate every integer, so forced edges add nothing.
             points = [*vals.tolist(), 0.0] if is_dose else vals.tolist()
             segments[concept] = ordinal_segments(points)
@@ -626,7 +1076,10 @@ def tokenize_site(cfg: dict, site: str, base: Path, out: Path,
                    episodes: pl.DataFrame | None = None,
                    vocab_manifest: dict | None = None,
                    artifact_policy: dict | None = None,
-                   binning_sources: dict | None = None):
+                   binning_sources: dict | None = None,
+                   stats: dict | None = None):
+    """Tokenize one site. `stats`, if given, is filled with aggregate-only run counts
+    (`dose_conversion`: {dose table: {status: rows}}) for the tokenization report."""
     policy = artifact_policy or yaml.safe_load((ROOT / cfg["artifact_policy"]).read_text())
     events_path = out / "events.parquet"
     validate_artifact_destination(events_path, "patient_level_phi", policy)
@@ -659,30 +1112,60 @@ def tokenize_site(cfg: dict, site: str, base: Path, out: Path,
             ).fetchall()
         ]
         print(f"  limiting to {len(keep_ids):,} stays (sample mode)")
-    frames = []
+    building = vocab is None
+    target_units = _dose_target_units(cfg, None if building else vocab_manifest)
+    frames, shadow_frames, dose_stats = [], [], {}
     for name, spec in cfg["tables"].items():
-        df = _read_table(con, base, spec, keep_ids=keep_ids)
-        if len(df):
-            lag = availability[name]["lag_minutes"]
+        df, shadows, counts = _read_source(
+            con, base, spec, keep_ids, tables=cfg["tables"], target_units=target_units,
+            fit_shadows=building,
+        )
+        if counts is not None:
+            dose_stats[name] = counts
+        lag = availability[name]["lag_minutes"]
+        for frame, sink in ((df, frames), (shadows, shadow_frames)):
+            if frame is None or not len(frame):
+                continue
             if lag:
                 # Conservative availability (R12): the value becomes knowable `lag`
                 # minutes after its timestamp, so shift BEFORE windowing — an event
                 # whose shifted time passes the anchor is excluded, and a kept event
                 # is positioned at its shifted time.
-                df = df.with_columns(pl.col("dttm") + pl.duration(minutes=lag))
-            df = df.with_columns(source=pl.lit(name))
-            frames.append(df)
+                frame = frame.with_columns(pl.col("dttm") + pl.duration(minutes=lag))
+            sink.append(frame.with_columns(source=pl.lit(name)))
+    if stats is not None:
+        stats["dose_conversion"] = dose_stats
     if not frames:
         raise QualificationError("no configured CLIF event tables were found")
+    static_tokens = list(cfg.get("static_tokens") or ())
+    if STATIC_SOURCE in cfg["tables"]:
+        raise QualificationError(f"table name {STATIC_SOURCE!r} is reserved for static tokens")
     # No sort here: join order is not guaranteed, so the order is imposed after it.
-    events = pl.concat(frames, how="vertical_relaxed")
+    events = pl.concat(frames, how="diagonal_relaxed")
     validate_units(events, cfg)
 
     if episodes is None:
         raise QualificationError("a canonical episode/split artifact is required")
+    if static_tokens:
+        # R21: static admission tokens sit at the stay start (ICU admission for the
+        # 24 h artifact), ahead of every other event there (`static_rank`).
+        static = _read_static(con, base, cfg, keep_ids).join(
+            episodes.select(pl.col("hospitalization_id").alias("hosp_id"),
+                            pl.col("icu_admit_dttm").alias("dttm")),
+            on="hosp_id", how="inner",
+        )
+        if len(static):
+            events = pl.concat(
+                [events, static.with_columns(unit=pl.lit(None, pl.String),
+                                             source=pl.lit(STATIC_SOURCE))],
+                how="diagonal_relaxed",
+            )
+    events = _carry_forward(events, episodes, {
+        name for name, spec in cfg["tables"].items() if spec.get("carry_forward")
+    })
     treatment_sources = {
         name for name, spec in cfg["tables"].items() if spec.get("input_only")
-    }
+    } | ({STATIC_SOURCE} if static_tokens else set())
     events = restrict_to_observation_window(events, episodes, treatment_sources)
     # KTD6: full-key sort AFTER the join (polars does not guarantee row order for equal
     # keys through a join or an unmaintained sort). Nulls sort last so a missing value
@@ -708,6 +1191,15 @@ def tokenize_site(cfg: dict, site: str, base: Path, out: Path,
             )
         bin_cfg = cfg["value_binning"]
         fit_events = fit_partition(events, bin_cfg.get("fit_partition", "train"))
+        if shadow_frames:
+            # R6 / KTD5: the native-unit fallback rows of weight-converted doses are fit
+            # (windowed and train-only, like every event) but never tokenized.
+            shadows = restrict_to_observation_window(
+                pl.concat(shadow_frames, how="diagonal_relaxed"), episodes, treatment_sources
+            )
+            shadows = shadows.filter(
+                pl.col("partition") == bin_cfg.get("fit_partition", "train"))
+            fit_events = pl.concat([fit_events, shadows], how="diagonal_relaxed")
         target_concepts = [t["name"] for t in cfg.get("target_concepts", [])]
         # Fail closed on a missing/empty target_concepts under clinical_segment: an empty
         # list would silently build no edges, so every numeric event would collapse to a
@@ -721,7 +1213,9 @@ def tokenize_site(cfg: dict, site: str, base: Path, out: Path,
             t["name"]: t["direction"] for t in cfg.get("target_concepts", []) if "direction" in t
         }
         edges, binning_sources = build_segments(
-            bin_cfg, fit_events, target_concepts, directions, tables=cfg["tables"]
+            bin_cfg, fit_events, target_concepts, directions, tables=cfg["tables"],
+            quantile_concepts={c for c, (_, _, numeric) in STATIC_TOKENS.items()
+                               if numeric and c in static_tokens},
         )
         vocab = build_vocab(fit_events, edges)
         cohort_cfg = yaml.safe_load((ROOT / cfg["cohort_contract"]).read_text())
@@ -756,6 +1250,12 @@ def tokenize_site(cfg: dict, site: str, base: Path, out: Path,
                 "availability_lag_minutes": {
                     name: spec["lag_minutes"] for name, spec in availability.items()
                 },
+                # U4 (R6): the continuous-dose target unit per med_category the frozen
+                # concepts were built with (importing sites convert to the same), and
+                # aggregate conversion-status counts over every dose row read.
+                "dose_target_units": target_units,
+                "dose_conversion": dose_stats,
+                "static_tokens": static_tokens,
             },
         }
         by_source = {
@@ -899,8 +1399,10 @@ def main():
     if args.dry_run:
         con = duckdb.connect()
         con.execute("SET TimeZone = 'UTC'")  # same session-tz pin as tokenize_site
+        target_units = _dose_target_units(cfg, vocab_manifest)
         for name, spec in cfg["tables"].items():
-            df = _read_table(con, Path(args.indir), spec)
+            df = _read_table(con, Path(args.indir), spec, tables=cfg["tables"],
+                             target_units=target_units)
             print(f"{name}: {len(df):,} events, concepts={df['concept'].n_unique() if len(df) else 0}")
         return
 

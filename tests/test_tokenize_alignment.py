@@ -603,5 +603,400 @@ class DeterministicOrderAndAvailabilityTest(unittest.TestCase):
         self.assertEqual(seen["ks"].to_list(), [[1, 2, 3], [1, 2, 3]])
 
 
+
+# U4 (R6-R10, R21; KTD5, KTD11): new event sources, end to end through `tokenize_site`.
+RESP_NUMERIC = (
+    "fio2_set", "lpm_set", "tidal_volume_set", "resp_rate_set", "pressure_control_set",
+    "pressure_support_set", "flow_rate_set", "peak_inspiratory_pressure_set",
+    "inspiratory_time_set", "peep_set", "tidal_volume_obs", "resp_rate_obs",
+    "plateau_pressure_obs", "peak_inspiratory_pressure_obs", "peep_obs", "minute_vent_obs",
+    "mean_airway_pressure_obs",
+)
+RESP_CATEGORICAL = ("device_category", "mode_category", "tracheostomy")
+CRRT_NUMERIC = ("blood_flow_rate", "pre_filter_replacement_fluid_rate",
+                "post_filter_replacement_fluid_rate", "dialysate_flow_rate",
+                "ultrafiltration_out")
+U4_VALIDATION = ["synth-001"]      # the stay whose only weight is charted AFTER its dose
+STATIC_ORDER = ("age_decile", "sex", "race", "ethnicity", "admission_type")
+
+
+def _write(frame_rows, schema, path):
+    import polars as pl
+
+    pl.DataFrame(frame_rows, schema=schema, orient="row").write_parquet(path)
+
+
+def _build_u4_site(work, name, *, static_tokens=None):
+    """Synthetic site with every U4 source; tokenized with the repo's configs/data.yaml
+    table specs. Returns (events, vocab blob, stats, episodes)."""
+    import copy
+    from datetime import timedelta
+
+    import polars as pl
+    import yaml
+
+    from src.data.tokenize import ROOT, tokenize_site
+    from src.eval.synthetic_bundle import (
+        FIXTURE_COHORT,
+        FIXTURE_DATA_CONFIG,
+        FIXTURE_POLICY,
+        SYNTHETIC_SITE,
+        build_synthetic_site,
+    )
+
+    site = work / f"site_{name}"
+    episodes = _repartition(pl.read_parquet(build_synthetic_site(site)), U4_VALIDATION)
+    (work / "cohort.yaml").write_text(yaml.safe_dump(FIXTURE_COHORT))
+    (work / "artifact_policy.yaml").write_text(yaml.safe_dump(FIXTURE_POLICY))
+    eps = list(episodes.iter_rows(named=True))
+    utc = pl.Datetime("us", "UTC")
+    h = lambda ep, hours: ep["icu_admit_dttm"] + timedelta(hours=hours)  # noqa: E731
+
+    # Hospital admission for synth-002 precedes its ICU admission by 6 h (carry-forward).
+    hosp = pl.read_parquet(site / "clif_hospitalization.parquet")
+    hosp = hosp.with_columns(
+        pl.when(pl.col("hospitalization_id") == "synth-002")
+        .then(pl.col("admission_dttm") - pl.duration(hours=6))
+        .otherwise(pl.col("admission_dttm")).alias("admission_dttm"),
+        pl.lit("ed").alias("admission_type_category"),
+    )
+    hosp.write_parquet(site / "clif_hospitalization.parquet")
+    _write([(f"synth-p-{i:03d}", "Female" if i % 2 == 0 else "Male", "White", "Non-Hispanic")
+            for i in range(len(eps))],
+           {"patient_id": pl.String, "sex_category": pl.String, "race_category": pl.String,
+            "ethnicity_category": pl.String}, site / "clif_patient.parquet")
+
+    vitals = pl.read_parquet(site / "clif_vitals.parquet")
+    weights = [{"hospitalization_id": ep["hospitalization_id"],
+                "recorded_dttm": h(ep, 5 if ep["hospitalization_id"] == "synth-001" else 1),
+                "vital_category": "weight_kg", "vital_value": 80.0, "vital_unit": "kg"}
+               for ep in eps]
+    pl.concat([vitals, pl.DataFrame(weights, schema=vitals.schema)]).write_parquet(
+        site / "clif_vitals.parquet")
+
+    meds = []
+    for ep in eps:
+        stay = ep["hospitalization_id"]
+        meds += [
+            (stay, "fentanyl", h(ep, 3), "start", 100.0, "mcg/hour"),
+            (stay, "vasopressin", h(ep, 4), "start", 2.4, "units/hour"),
+            (stay, "fentanyl", h(ep, 8), "stop", 0.0, "mcg/hour"),
+            (stay, "propofol", h(ep, 2), "start", 20.0, "mL/hour"),
+        ]
+        if stay == "synth-001":
+            meds.append((stay, "fentanyl", h(ep, 6), "dose_change", 100.0, "mcg/hour"))
+    _write(meds, {"hospitalization_id": pl.String, "med_category": pl.String,
+                  "admin_dttm": utc, "mar_action_category": pl.String,
+                  "med_dose": pl.Float32, "med_dose_unit": pl.String},
+           site / "clif_medication_admin_continuous.parquet")
+
+    _write([row for ep in eps for row in (
+        (ep["hospitalization_id"], "cefepime", h(ep, 5), "given", 2.0, "grams"),
+        (ep["hospitalization_id"], "cefepime", h(ep, 9), "given", 2000.0, "mg"),
+        (ep["hospitalization_id"], "acetaminophen", h(ep, 11), "given", 1.0, "dose"),
+    )], {"hospitalization_id": pl.String, "med_category": pl.String, "admin_dttm": utc,
+         "mar_action_category": pl.String, "med_dose": pl.Float32,
+         "med_dose_unit": pl.String},
+        site / "clif_medication_admin_intermittent.parquet")
+
+    resp_schema = {"hospitalization_id": pl.String, "recorded_dttm": utc,
+                   "device_category": pl.String, "mode_category": pl.String,
+                   "tracheostomy": pl.Boolean, **{c: pl.Float64 for c in RESP_NUMERIC}}
+    resp = []
+    for ep in eps:
+        row = dict.fromkeys(resp_schema)
+        row.update(hospitalization_id=ep["hospitalization_id"], recorded_dttm=h(ep, 6),
+                   mode_category="Assist Control-Volume Control", fio2_set=0.4, peep_set=8.0)
+        resp.append(row)
+    pl.DataFrame(resp, schema=resp_schema).write_parquet(
+        site / "clif_respiratory_support.parquet")
+
+    assessments = []
+    for i, ep in enumerate(eps):
+        stay = ep["hospitalization_id"]
+        assessments += [
+            (stay, h(ep, 7), "gcs_total", 8.0, None),
+            (stay, h(ep, 10), "gcs_total", float(3 + i % 13), None),
+            (stay, h(ep, 7), "RASS", -2.0, None),
+            (stay, h(ep, 7), "cam_total", None, "Positive"),
+        ]
+    _write(assessments, {"hospitalization_id": pl.String, "recorded_dttm": utc,
+                         "assessment_category": pl.String, "numerical_value": pl.Float64,
+                         "categorical_value": pl.String},
+           site / "clif_patient_assessments.parquet")
+
+    _write([(ep["hospitalization_id"], h(ep, 6.5), "cvvhdf", 200.0, None, None, None, None)
+            for ep in eps],
+           {"hospitalization_id": pl.String, "recorded_dttm": utc,
+            "crrt_mode_category": pl.String, **{c: pl.Float32 for c in CRRT_NUMERIC}},
+           site / "clif_crrt_therapy.parquet")
+    _write([row for ep in eps for row in (
+        (ep["hospitalization_id"], h(ep, 6.5), "Other", "ECMO", 3000.0, None, None, None),
+        (ep["hospitalization_id"], h(ep, 6.5), "Other", "LVAD", 9000.0, None, None, None),
+    )], {"hospitalization_id": pl.String, "recorded_dttm": utc, "device_category": pl.String,
+         "mcs_group": pl.String, "device_rate": pl.Float32, "flow": pl.Float32,
+         "sweep": pl.Float32, "fdO2": pl.Float32}, site / "clif_ecmo_mcs.parquet")
+
+    admission = dict(zip(hosp["patient_id"], hosp["admission_dttm"]))
+    code = []
+    for ep in eps:
+        pid = ep["patient_id"]
+        if pid == "synth-p-000":
+            code += [(pid, admission[pid] - timedelta(days=2), "DNR"),
+                     (pid, h(ep, 12), "DNR/DNI")]
+        elif pid == "synth-p-002":
+            code += [(pid, admission[pid] - timedelta(days=1), "Full"),
+                     (pid, h(ep, -3), "DNR")]          # after hospital, before ICU admit
+        else:
+            code.append((pid, admission[pid] - timedelta(days=1), "Full"))
+    _write(code, {"patient_id": pl.String, "start_dttm": utc,
+                  "code_status_category": pl.String}, site / "clif_code_status.parquet")
+
+    ep0 = eps[0]
+    position = [("synth-000", h(ep0, 1) + timedelta(minutes=10 * k), "not_prone")
+                for k in range(100)]
+    position.append(("synth-000", h(ep0, 18), "prone"))
+    _write(position[::-1], {"hospitalization_id": pl.String, "recorded_dttm": utc,
+                            "position_category": pl.String}, site / "clif_position.parquet")
+
+    data_cfg = yaml.safe_load((ROOT / "configs/data.yaml").read_text())
+    cfg = copy.deepcopy(FIXTURE_DATA_CONFIG)
+    cfg["cohort_contract"] = str((work / "cohort.yaml").resolve())
+    cfg["artifact_policy"] = str((work / "artifact_policy.yaml").resolve())
+    cfg["tables"] = copy.deepcopy(data_cfg["tables"])
+    cfg["static_source"] = copy.deepcopy(data_cfg["static_source"])
+    cfg["static_tokens"] = (list(data_cfg["static_tokens"]) if static_tokens is None
+                            else static_tokens)
+    cfg["value_binning"].update({
+        "scheme": "clinical_segment",
+        "segment_source": str(ROOT / data_cfg["value_binning"]["segment_source"]),
+        "coverage": "all",
+    })
+    out = Path(f"output/intermediate_phi/u4_{name}")
+    stats: dict = {}
+    tokenize_site(cfg, SYNTHETIC_SITE, site, out, None, None, episodes=episodes,
+                  artifact_policy=FIXTURE_POLICY, stats=stats)
+    return (pl.read_parquet(out / "events.parquet"),
+            json.loads((out / "vocab.json").read_text()), stats, episodes)
+
+
+class NewEventSourcesTest(unittest.TestCase):
+    """U4: doses (continuous + intermittent), ventilator, assessments, CRRT, ECMO/MCS,
+    code status, position and static admission tokens."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls._td = tempfile.TemporaryDirectory()
+        work = Path(cls._td.name)
+        old_cwd = os.getcwd()
+        os.chdir(work)
+        try:
+            cls.events, cls.blob, cls.stats, cls.episodes = _build_u4_site(work, "full")
+            cls.nostatic = _build_u4_site(work, "nostatic", static_tokens=[])
+        finally:
+            os.chdir(old_cwd)
+        cls.vocab = cls.blob["vocab"]
+        cls.inv = {i: t for t, i in cls.vocab.items()}
+
+    @classmethod
+    def tearDownClass(cls):
+        cls._td.cleanup()
+
+    def _rows(self, stay, events=None, inv=None):
+        """[(token, pos_min, value, target_eligible)] for one stay, in stream order."""
+        events = self.events if events is None else events
+        inv = self.inv if inv is None else inv
+        row = events.filter(events["hosp_id"] == stay).row(0, named=True)
+        return [(inv[t], p, v, e) for t, p, v, e in zip(
+            row["token"], row["pos_min"], row["value"], row["target_eligible"])]
+
+    def _concept(self, stay, prefix):
+        return [r for r in self._rows(stay) if r[0].split("=")[0] == prefix]
+
+    def _zero_bin(self, concept):
+        segments = self.blob["edges"][concept]
+        return next(i for i, s in enumerate(segments) if s["lo"] == s["hi"] == 0.0)
+
+    # --- continuous doses ---------------------------------------------------------
+    def test_per_kg_conversion_uses_the_prior_weight(self):
+        fentanyl = self._concept("synth-000", "fentanyl_mcg_kg_hr")
+        self.assertEqual([(p, v) for _, p, v, _ in fentanyl], [(180, 1.25), (480, 0.0)])
+
+    def test_no_prior_weight_falls_back_to_native_unit_and_never_uses_a_later_weight(self):
+        rows = self._rows("synth-001")
+        dose_rows = [(t.split("=")[0], p, v) for t, p, v, _ in rows
+                     if t.startswith("fentanyl_")]
+        # +3 h: the only weight is charted at +5 h, so it must not be used.
+        self.assertEqual(dose_rows[0], ("fentanyl_mcg_hr", 180, 100.0))
+        # +6 h: the +5 h weight is now available.
+        self.assertEqual(dose_rows[1], ("fentanyl_mcg_kg_hr", 360, 1.25))
+        self.assertNotIn("<unk>", [t for t, *_ in rows if t.startswith("fentanyl")])
+        self.assertEqual(self.stats["dose_conversion"]["meds"]["no_weight"], 1)
+
+    def test_fallback_concept_is_fitted_from_a_fit_only_shadow(self):
+        # Every TRAIN dose was converted, yet the native-unit fallback has frozen bins.
+        self.assertIn("fentanyl_mcg_hr", self.blob["edges"])
+        self.assertIn("fentanyl_mcg_hr", self.blob["binning_sources"])
+        self.assertTrue(any(t.startswith("fentanyl_mcg_hr=") for t in self.vocab))
+        self.assertEqual(self.blob["edges"]["fentanyl_mcg_hr"][0],
+                         {"lo": 0.0, "hi": 0.0, "lo_closed": True, "hi_closed": True})
+        # The shadow never reaches the token stream.
+        for stay in ("synth-000", "synth-005"):
+            self.assertEqual(self._concept(stay, "fentanyl_mcg_hr"), [])
+        provenance = self.blob["manifest"]["provenance"]
+        self.assertEqual(provenance["dose_conversion"], self.stats["dose_conversion"])
+
+    def test_units_per_hour_become_units_per_minute(self):
+        vaso = self._concept("synth-000", "vasopressin_u_min")
+        self.assertEqual(len(vaso), 1)
+        self.assertAlmostEqual(vaso[0][2], 0.04, places=6)
+
+    def test_a_stop_row_lands_in_the_zero_bin(self):
+        stop = [r for r in self._concept("synth-000", "fentanyl_mcg_kg_hr") if r[1] == 480]
+        self.assertEqual(stop[0][0], f"fentanyl_mcg_kg_hr={self._zero_bin('fentanyl_mcg_kg_hr')}")
+        running = [r for r in self._concept("synth-000", "fentanyl_mcg_kg_hr") if r[1] == 180]
+        self.assertNotEqual(running[0][0], stop[0][0])
+
+    def test_volume_rate_is_an_unconvertible_native_fallback(self):
+        self.assertEqual(len(self._concept("synth-000", "propofol_ml_hr")), 1)
+        self.assertGreater(self.stats["dose_conversion"]["meds"]["unconvertible"], 0)
+
+    # --- intermittent doses -------------------------------------------------------
+    def test_grams_and_milligrams_share_one_concept_and_bin(self):
+        cefepime = self._concept("synth-000", "cefepime_mg")
+        self.assertEqual(len(cefepime), 2)
+        self.assertEqual(cefepime[0][0], cefepime[1][0])
+        self.assertEqual([v for _, _, v, _ in cefepime], [2000.0, 2000.0])
+        self.assertIn("cefepime_mg", self.blob["edges"])
+        self.assertEqual(self._zero_bin("cefepime_mg"), 0)
+
+    def test_dose_unit_falls_back_to_category_unit(self):
+        self.assertEqual(len(self._concept("synth-000", "acetaminophen_dose")), 1)
+        self.assertEqual(
+            self.stats["dose_conversion"]["meds_intermittent"]["unconvertible"],
+            len(self.episodes),
+        )
+
+    # --- ventilator ---------------------------------------------------------------
+    def test_a_resp_row_melts_to_its_settings_plus_a_fused_mode(self):
+        resp_concepts = set(RESP_NUMERIC) | set(RESP_CATEGORICAL)
+        resp = [r for r in self._rows("synth-000") if r[0].split("=")[0] in resp_concepts]
+        self.assertEqual(len(resp), 3)
+        self.assertEqual({r[1] for r in resp}, {360})
+        tokens = [r[0] for r in resp]
+        self.assertIn("mode_category=assist_control-volume_control", tokens)
+        fio2 = next(r for r in resp if r[0].startswith("fio2_set="))
+        peep = next(r for r in resp if r[0].startswith("peep_set="))
+        self.assertEqual((fio2[2], peep[2]), (0.4, 8.0))
+        self.assertEqual(self.blob["binning_sources"]["fio2_set"], "csv")
+
+    # --- assessments ----------------------------------------------------------------
+    def test_gcs_is_ordinal_and_target_eligible(self):
+        from src.data.segments import bin_index
+
+        self.assertEqual(self.blob["binning_sources"]["gcs_total"], "ordinal")
+        gcs = self._concept("synth-000", "gcs_total")
+        first = next(r for r in gcs if r[1] == 420)
+        self.assertEqual(first[0],
+                         f"gcs_total={bin_index(8.0, self.blob['edges']['gcs_total'])}")
+        self.assertTrue(all(r[3] for r in gcs))
+
+    def test_assessment_concepts_are_lowercased(self):
+        self.assertIn("rass", self.blob["edges"])
+        self.assertNotIn("RASS", self.blob["edges"])
+
+    def test_value_only_cam_result_is_fused(self):
+        cam = self._concept("synth-000", "cam_total")
+        self.assertEqual([r[0] for r in cam], ["cam_total=positive"])
+        self.assertTrue(cam[0][3])
+
+    # --- CRRT / ECMO-MCS ------------------------------------------------------------
+    def test_crrt_settings_and_mode(self):
+        self.assertEqual(len(self._concept("synth-000", "blood_flow_rate")), 1)
+        self.assertEqual([r[0] for r in self._concept("synth-000", "crrt_mode_category")],
+                         ["crrt_mode_category=cvvhdf"])
+
+    def test_mcs_metrics_are_qualified_by_device_group(self):
+        ecmo = self._concept("synth-000", "ecmo_device_rate")
+        lvad = self._concept("synth-000", "lvad_device_rate")
+        self.assertEqual((len(ecmo), len(lvad)), (1, 1))
+        self.assertEqual((ecmo[0][2], lvad[0][2]), (3000.0, 9000.0))
+        self.assertIn("ecmo_device_rate", self.blob["edges"])
+        self.assertIn("lvad_device_rate", self.blob["edges"])
+
+    # --- code status / position -------------------------------------------------------
+    def test_code_status_in_effect_at_admission_and_mid_stay_change(self):
+        self.assertEqual([(t, p) for t, p, *_ in self._concept("synth-000", "code_status")],
+                         [("code_status=dnr", 0), ("code_status=dnr/dni", 720)])
+        self.assertEqual([(t, p) for t, p, *_ in self._concept("synth-003", "code_status")],
+                         [("code_status=full", 0)])
+
+    def test_code_status_charted_before_icu_admission_carries_forward_to_the_window(self):
+        # synth-002: Full at hospital admission (ICU - 6 h), DNR at ICU - 3 h. Only the
+        # state in effect at ICU admission is carried, positioned at the window start.
+        self.assertEqual([(t, p) for t, p, *_ in self._concept("synth-002", "code_status")],
+                         [("code_status=dnr", 0)])
+
+    def test_position_emits_only_transitions(self):
+        # Transition semantics: rows are ordered by (recorded_dttm, normalized value); the
+        # first observation of a stay is emitted, then only rows whose value differs
+        # from the previous row's. 100 not_prone rows then one prone -> two events.
+        self.assertEqual([(t, p) for t, p, *_ in self._concept("synth-000", "position")],
+                         [("position=not_prone", 60), ("position=prone", 1080)])
+        self.assertEqual(self._concept("synth-003", "position"), [])
+
+    # --- static admission tokens --------------------------------------------------------
+    def test_static_tokens_lead_every_stay_once_in_fixed_order(self):
+        self.assertEqual(self.blob["binning_sources"]["age_decile"], "quantile")
+        for i, stay in enumerate(self.events["hosp_id"].to_list()):
+            rows = self._rows(stay)
+            head = [(t.split("=")[0], p) for t, p, *_ in rows[:len(STATIC_ORDER)]]
+            self.assertEqual(head, [(c, 0) for c in STATIC_ORDER], stay)
+            for concept in STATIC_ORDER:
+                self.assertEqual(sum(t.split("=")[0] == concept for t, *_ in rows), 1)
+        tokens = [t for t, *_ in self._rows("synth-000")[:len(STATIC_ORDER)]]
+        self.assertEqual(tokens[1:], ["sex=female", "race=white", "ethnicity=non-hispanic",
+                                      "admission_type=ed"])
+
+    def test_no_static_tokens_when_disabled(self):
+        events, blob, _, _ = self.nostatic
+        inv = {i: t for t, i in blob["vocab"].items()}
+        for stay in events["hosp_id"].to_list():
+            concepts = {t.split("=")[0] for t, *_ in self._rows(stay, events, inv)}
+            self.assertFalse(concepts & set(STATIC_ORDER), stay)
+        self.assertFalse(any(t.split("=")[0] in STATIC_ORDER for t in blob["vocab"]))
+
+    # --- treatment rule ----------------------------------------------------------------
+    def test_treatment_and_context_sources_are_never_targets(self):
+        input_only = (set(RESP_NUMERIC) | set(RESP_CATEGORICAL) | set(CRRT_NUMERIC)
+                      | set(STATIC_ORDER) | {
+                          "fentanyl_mcg_kg_hr", "fentanyl_mcg_hr", "vasopressin_u_min",
+                          "propofol_ml_hr", "cefepime_mg", "acetaminophen_dose",
+                          "crrt_mode_category", "ecmo_device_rate", "lvad_device_rate",
+                          "ecmo_device_category", "lvad_device_category",
+                          "code_status", "position", "icu"})
+        targets = {"map", "weight_kg", "gcs_total", "rass", "cam_total"}
+        seen = set()
+        for stay in self.events["hosp_id"].to_list():
+            for token, _, _, eligible in self._rows(stay):
+                concept = token.split("=")[0]
+                seen.add(concept)
+                if concept in input_only:
+                    self.assertFalse(eligible, token)
+                elif concept in targets:
+                    self.assertTrue(eligible, token)
+                else:
+                    self.fail(f"unclassified concept {concept!r}")
+        self.assertLessEqual({"fentanyl_mcg_kg_hr", "fentanyl_mcg_hr", "fio2_set",
+                              "peep_set", "mode_category", "blood_flow_rate", "code_status",
+                              "position", "age_decile", "cefepime_mg", "gcs_total"}, seen)
+
+    def test_per_stay_arrays_stay_aligned(self):
+        for row in self.events.iter_rows(named=True):
+            n = len(row["token"])
+            for key in ("pos_min", "target_eligible", "value", "soft_token", "soft_weight"):
+                self.assertEqual(len(row[key]), n, key)
+            self.assertEqual(row["pos_min"], sorted(row["pos_min"]))
+
 if __name__ == "__main__":
     unittest.main()

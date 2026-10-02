@@ -270,5 +270,128 @@ class DataConfigTest(unittest.TestCase):
             )
 
 
+
+NEW_TABLE_FILES = {
+    "meds_intermittent": "clif_medication_admin_intermittent",
+    "assessments": "clif_patient_assessments",
+    "crrt": "clif_crrt_therapy",
+    "ecmo": "clif_ecmo_mcs",
+    "code_status": "clif_code_status",
+    "position": "clif_position",
+}
+
+
+class NewSourceConfigTest(unittest.TestCase):
+    """U4 (KTD5, KTD11): the new sources are config-declared."""
+
+    @classmethod
+    def setUpClass(cls):
+        root = Path(__file__).parents[1]
+        cls.cfg = yaml.safe_load((root / "configs/data.yaml").read_text())
+        cls.tables = cls.cfg["tables"]
+
+    def test_new_tables_are_declared_with_availability_and_zero_lag(self):
+        for name, file in NEW_TABLE_FILES.items():
+            self.assertEqual(self.tables[name]["file"], file, name)
+            self.assertEqual(self.tables[name]["availability_lag_minutes"], 0, name)
+        semantics = {name: self.tables[name]["availability"] for name in NEW_TABLE_FILES}
+        self.assertEqual(semantics, {
+            "meds_intermittent": "recorded", "assessments": "missing_storetime",
+            "crrt": "missing_storetime", "ecmo": "missing_storetime",
+            "code_status": "recorded", "position": "missing_storetime",
+        })
+        self.assertEqual(self.tables["resp_support"]["availability"], "missing_storetime")
+
+    def test_treatments_and_context_are_input_only_assessments_are_targets(self):
+        for name in ("meds", "meds_intermittent", "resp_support", "crrt", "ecmo",
+                     "code_status", "position", "adt"):
+            self.assertTrue(self.tables[name].get("input_only"), name)
+        for name in ("assessments", "labs", "vitals"):
+            self.assertFalse(self.tables[name].get("input_only", False), name)
+
+    def test_resp_melts_the_seventeen_csv_settings(self):
+        import csv
+
+        csv_path = Path(__file__).parents[1] / self.cfg["value_binning"]["segment_source"]
+        with open(csv_path, newline="") as fh:
+            resp = {r["measurement"] for r in csv.DictReader(fh)
+                    if r["category"] == "respiratory_support"}
+        spec = self.tables["resp_support"]
+        self.assertEqual(len(spec["value_cols"]), 17)
+        self.assertEqual(set(spec["value_cols"]), resp)
+        self.assertEqual(spec["categorical_value_cols"],
+                         ["device_category", "mode_category", "tracheostomy"])
+
+    def test_dose_blocks_and_static_tokens(self):
+        meds = self.tables["meds"]["dose"]
+        self.assertEqual(meds["kind"], "continuous")
+        self.assertEqual(meds["weight_source"], {"table": "vitals", "concept": "weight_kg"})
+        self.assertEqual(self.tables["meds_intermittent"]["dose"]["kind"], "intermittent")
+        self.assertEqual(self.tables["ecmo"]["concept_qualifier_col"], "mcs_group")
+        self.assertEqual(self.tables["code_status"]["key"], "patient")
+        self.assertEqual(self.tables["position"]["emit"], "transitions")
+        self.assertEqual(self.cfg["static_tokens"],
+                         ["age_decile", "sex", "race", "ethnicity", "admission_type"])
+
+    def test_repo_config_passes_the_bundle_identifier_validator(self):
+        from src.eval.bundle import _validate_data_config_identifiers
+
+        _validate_data_config_identifiers(self.cfg)
+
+
+class BundleIdentifierValidatorTest(unittest.TestCase):
+    """Every new SQL-interpolated config field is validated (KTD5)."""
+
+    def _cfg(self):
+        import copy
+
+        root = Path(__file__).parents[1]
+        return copy.deepcopy(yaml.safe_load((root / "configs/data.yaml").read_text()))
+
+    def test_unsafe_new_fields_are_rejected(self):
+        from src.eval.bundle import _validate_data_config_identifiers
+        from src.eval.clif_validate import ArtifactMismatch
+
+        bad = "x;DROP"
+        mutations = {
+            "value_cols entry": lambda c: c["tables"]["resp_support"]["value_cols"].append(bad),
+            "value_cols not a list": lambda c: c["tables"]["crrt"].__setitem__("value_cols", bad),
+            "categorical_value_cols": lambda c: c["tables"]["resp_support"][
+                "categorical_value_cols"].append(bad),
+            "concept_qualifier_col": lambda c: c["tables"]["ecmo"].__setitem__(
+                "concept_qualifier_col", bad),
+            "literal concept": lambda c: c["tables"]["position"].__setitem__("concept", bad),
+            "patient_id_col": lambda c: c["tables"]["code_status"].__setitem__(
+                "patient_id_col", bad),
+            "admission_col": lambda c: c["tables"]["code_status"].__setitem__(
+                "admission_col", bad),
+            "discharge_col": lambda c: c["tables"]["code_status"].__setitem__(
+                "discharge_col", bad),
+            "hospitalization_file": lambda c: c["tables"]["code_status"].__setitem__(
+                "hospitalization_file", "../../etc/passwd"),
+            "dose action_col": lambda c: c["tables"]["meds"]["dose"].__setitem__(
+                "action_col", bad),
+            "dose kind": lambda c: c["tables"]["meds"]["dose"].__setitem__("kind", bad),
+            "weight table": lambda c: c["tables"]["meds"]["dose"]["weight_source"].__setitem__(
+                "table", "nope"),
+            "weight concept": lambda c: c["tables"]["meds"]["dose"][
+                "weight_source"].__setitem__("concept", bad),
+            "stop_actions": lambda c: c["tables"]["meds"]["dose"].__setitem__(
+                "stop_actions", [bad]),
+            "emit": lambda c: c["tables"]["position"].__setitem__("emit", bad),
+            "key": lambda c: c["tables"]["code_status"].__setitem__("key", bad),
+            "static token": lambda c: c["static_tokens"].append(bad),
+            "static patient file": lambda c: c["static_source"].__setitem__(
+                "patient_file", "../x"),
+            "static hospitalization file": lambda c: c["static_source"].__setitem__(
+                "hospitalization_file", "a/b"),
+        }
+        for label, mutate in mutations.items():
+            cfg = self._cfg()
+            mutate(cfg)
+            with self.assertRaises(ArtifactMismatch, msg=label):
+                _validate_data_config_identifiers(cfg)
+
+
 if __name__ == "__main__":
     unittest.main()
