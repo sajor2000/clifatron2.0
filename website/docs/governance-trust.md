@@ -1,7 +1,7 @@
 ---
 id: governance-trust
 title: Governance, Trust & Reproducibility
-sidebar_position: 9
+sidebar_position: 11
 ---
 
 # Governance, Trust & Reproducibility

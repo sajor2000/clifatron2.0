@@ -1,7 +1,7 @@
 ---
 id: federated-validation
 title: Federated Validation
-sidebar_position: 6
+sidebar_position: 7
 ---
 
 # Federated Validation (model-to-data)
@@ -25,7 +25,7 @@ flowchart TB
 
     subgraph SITE["External CLIF site (runs locally)"]
         direction TB
-        T["tokenize (tokenETL / clifpy)<br/>frozen mCIDE vocab"] --> Z["zero-shot threshold / CR heads<br/>(no local training)"]
+        T["tokenize (src/data/tokenize.py)<br/>frozen vocab, hash-verified, no refit"] --> Z["zero-shot threshold / CR heads<br/>(no local training)"]
         RAW["site's CLIF tables"] --> T
         RAW --> AL["auto-label from standard CLIF fields"]
         Z --> SC["score: metrics.full_panel"]

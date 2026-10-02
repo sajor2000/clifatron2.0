@@ -9,15 +9,16 @@ sidebar_position: 1
 
 CLIFATRON 2.0 is a **methods-upgrade layer** on
 [CLIFATRON](https://github.com/Common-Longitudinal-ICU-data-Format/CLIFATRON), the CLIF
-consortium's compact (~30M-parameter) CLIF-native ICU foundation model. Two paths:
+consortium's CLIF-native ICU foundation model (a 0.5B Qwen2 checkpoint). Two paths:
 
-- **Primary — from-scratch ~30M Qwen3 decoder** with marked time-to-event objective, fully
-  ours, no upstream dependency. This is the novel headline.
+- **Primary — from-scratch ~30M Qwen2-arch decoder** (d512×8L×8H, standard pre-norm, no QK-Norm)
+  with marked time-to-event objective, fully ours, no upstream dependency. This is the novel
+  headline. A Qwen3-arch (QK-Norm) trunk is a measured ablation row only.
 - **Wedge — attach our survival heads to CLIFATRON's released Qwen2 checkpoint** (0.5B, a
   larger comparator) for a cheap first result that de-risks the objective.
 
-From CLIFATRON we **keep**: the fused `code=bin` token format, the physician-designed
-clinical-segment CSV (1268 bins), the mCIDE vocabulary, CLIF 2.1 data format, treatment-as-input
+From CLIFATRON we **keep**: the physician-designed clinical-segment CSV (1268 segment rows; the
+bin design, not v1's token strings), the one-token-per-event fused idea, the mCIDE vocabulary, CLIF 2.1 data format, treatment-as-input
 rule, and document-isolation packing. What we add: threshold-conditioned time-to-event + CR CIF
 + value-regression heads, zero-shot survival, model-to-data federation, and full TRIPOD+AI eval.
 
@@ -50,8 +51,8 @@ GPU / governance, not code. See **[Governance, Trust & Reproducibility](./govern
 flowchart TB
     subgraph DEV["DEVELOPMENT (data we hold — 3 sites)"]
         direction TB
-        A["CLIF 2.1 parquet<br/>Site 1 · Site 2 · Site 3"] --> B["Tokenization<br/>fused code=bin · deciles<br/>soft discretization · RoPE"]
-        B --> C["Backbone<br/>from-scratch Qwen3 ~30M (primary)<br/>· CLIFATRON Qwen2 0.5B wedge<br/>8192 ctx · untied emb"]
+        A["CLIF 2.1 parquet<br/>Site 1 · Site 2 · Site 3"] --> B["Tokenization<br/>fused code=bin · clinical segments<br/>soft discretization · minute RoPE"]
+        B --> C["Backbone<br/>from-scratch Qwen2-arch ~30M (primary)<br/>· CLIFATRON Qwen2 0.5B wedge<br/>8192 ctx · untied emb"]
         C --> D["Our heads<br/>threshold-hazard · competing-risk<br/>value-regression · next-event"]
         D --> E["Joint pretrain<br/>NTP → TTE curriculum<br/>uncertainty + grad-norm balancing"]
     end
@@ -94,7 +95,7 @@ mindmap
       vitals / labs / meds as events
       pre-anchor notes only
     ~30M efficient
-      utility saturates ~28M on Site 1 (arXiv:2505.22964)
+      sat["utility saturates ~28M on Site 1 (arXiv:2505.22964)"]
       one node, 2× L40
     Federated real-data
       model-to-data validation
@@ -170,17 +171,21 @@ These constrain every stage of the pipeline.
 | 1 | **Treatments are model inputs, never prediction targets** | Tokenization, target-concept selection |
 | 2 | **Vocab = frozen CLIF mCIDE, applied identically to all sites — no cross-site raw pooling** | Tokenization, federation |
 | 3 | **Retrospective reports / discharge summaries = label source only; only pre-anchor notes are features** | Notes modality, eval labeling |
-| 4 | **`storetime`/availability ordering, not `charttime`** | Tokenization (no look-ahead) |
+| 4 | **`storetime`/availability ordering, not `charttime`** (CLIF vitals have no store time; `recorded_dttm` is the proxy) | Tokenization (no look-ahead) |
 | 5 | **Development sites are governed-study-credentialed; no data leaves its node** | Federation, compute |
 
 ---
 
 ## Read next
 
-1. **[Data & Tokenization](./data-tokenization.md)** — CLIF parquet → fused decile tokens
-2. **[Architecture](./architecture.md)** — CLIFATRON Qwen2 backbone + our four heads
-3. **[Objectives & Training](./objectives-training.md)** — the marked-TTE loss stack + curriculum
-4. **[Method 3 Wedge](./method3-wedge.md)** — the smallest publishable unit
-5. **[Federated Validation](./federated-validation.md)** — model-to-data across the federation
-6. **[Evaluation Panel](./evaluation-panel.md)** — TRIPOD+AI metrics
-7. **[Ablations](./ablations.md)** — finetune-vs-scratch and tokenization arms
+1. **[CLIFATRON v1 → v2](./v1-vs-v2.md)** — what changed and why it matters
+2. **[Data & Tokenization](./data-tokenization.md)** — CLIF parquet → fused clinical-segment tokens (canonical tokenizer spec)
+3. **[Architecture](./architecture.md)** — from-scratch Qwen2-arch trunk (primary), CLIFATRON 0.5B wedge, and our four heads
+4. **[Objectives & Training](./objectives-training.md)** — the marked-TTE loss stack + curriculum
+5. **[Method 3 Wedge](./method3-wedge.md)** — the smallest publishable unit
+6. **[Federated Validation](./federated-validation.md)** — model-to-data across the federation
+7. **[Evaluation Panel](./evaluation-panel.md)** — TRIPOD+AI metrics
+8. **[Ablations](./ablations.md)** — finetune-vs-scratch, Qwen2-vs-Qwen3, and tokenization arms
+9. **[GEM Local Validation](./gem-local-validation.md)** — the generative stack proven on a dev Mac
+10. **[Governance, Trust & Reproducibility](./governance-trust.md)** — signing, ledgers, fail-closed gates
+11. **[Project Status & Roadmap](./project-status.md)** — what landed, what is gated

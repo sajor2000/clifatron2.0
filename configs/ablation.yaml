@@ -57,7 +57,7 @@ arms:
   # (3) FROM-SCRATCH — CLIFEncoder from random init on CLIF data only.
   # Test: can our compact ~30M encoder close the gap without a checkpoint?
   # TOO-BERT (PMC12177421) showed from-scratch can beat pretrained on specific
-  # clinical tasks. Keeps our tokenizer (fused decile + soft + RoPE).
+  # clinical tasks. Keeps our tokenizer (fused clinical-segment + soft + RoPE).
   from_scratch:
     description: "Random-init CLIFEncoder on CLIF 2.1 data, NTP→TTE curriculum"
     trunk: clif_encoder

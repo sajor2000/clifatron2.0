@@ -3,9 +3,10 @@
 [![CI](https://github.com/sajor2000/clifatron2.0/actions/workflows/ci.yml/badge.svg)](https://github.com/sajor2000/clifatron2.0/actions/workflows/ci.yml)
 
 A **methods-upgrade layer** on [CLIFATRON](https://github.com/Common-Longitudinal-ICU-data-Format/CLIFATRON),
-the CLIF consortium's compact (~30M-param) CLIF-native ICU foundation model. We keep CLIFATRON's
-tokenizer / sequence-packing / DeepSpeed training / benchmark and add the pieces that make a small
-ICU model **transportable and clinically deployable**:
+the CLIF consortium's CLIF-native ICU foundation model (released Qwen2 checkpoint: 0.5B). We keep
+CLIFATRON's physician-designed clinical-segment bins + fused `code=bin` token idea (the tokenizer itself is
+rewritten as `src/data/tokenize.py`), its sequence-packing approach and benchmark, and add the pieces
+that make a small (~30M, from-scratch) ICU model **transportable and clinically deployable**:
 
 - a **threshold-conditioned time-to-event** objective (ICareFM) + **competing-risk CIF** (SurvivEHR)
   + a **value-regression "mark"** head (ORA) — replacing pure next-token prediction, the weakest objective;
@@ -18,9 +19,9 @@ ICU model **transportable and clinically deployable**:
 
 **Thesis:** one small model → many outcomes → many hospitals → one node (2× L40, no cluster).
 
-> **Taking this over? Start with [`notes/NEXT_STEPS.md`](notes/NEXT_STEPS.md)** — a full handoff:
-> finalized token/architecture decisions, the 2026 evidence base with citations, and ordered,
-> file-level next steps. Read it before touching code.
+> **Taking this over? Start with [`AGENTS.md`](AGENTS.md)** (goal, locked decisions, hard rules), then
+> [`MEMORY.md`](MEMORY.md) (single source of truth). `notes/` (incl. `NEXT_STEPS.md`) is the
+> historical pre-2026-09 design record — evidence tables still useful, decisions superseded.
 
 ## Design principle — clinically derived
 The model must be most sensitive where clinical **danger** is, and legible to a clinician. Concretely:
@@ -31,26 +32,28 @@ outcomes are states doctors *act on* (never treatments — those are inputs only
 ## Sites — develop on 3, validate on the whole CLIF federation
 - **Development cohort:** MIMIC-IV-Ext-CLIF v2.1 · Rush · UChicago (CLIF origin site). *Currently
   only MIMIC is staged on the training box; Rush + UChicago are planned dev sites, not yet staged.*
-- **External validation:** *all other CLIF consortium sites* via model-to-data — each runs a turnkey
-  `clifpy`/tokenETL eval script on its **local** CLIF tables and returns only aggregate + subgroup metrics.
+- **External validation:** *all other CLIF consortium sites* via model-to-data — each runs the turnkey
+  `clif-validate` package on its **local** CLIF tables and returns only aggregate + subgroup metrics.
 - Vocab = a **frozen** CLIF-native mCIDE, applied identically everywhere; **raw data is never pooled.**
 
-## Tokenizer & trunk (2026-preprint spec — see `MEMORY.md` + `notes/`)
-- **Tokens:** fused `code=bin` · **population deciles frozen from a reference site** (not clinical-range
-  bins — no consistent gain, Lee 2026) · **soft discretization** for tail/threshold sensitivity ·
-  ICU decision thresholds forced as bin edges (lactate 2/4, MAP 65, SpO₂ 88/90, KDIGO, P/F Berlin).
-- **Time:** admission-relative-minute **time-aware RoPE** (drop inserted `day_N/hour_N` tokens).
-- **Trunk:** Qwen2/Llama-style transformer (keep — objective, not backbone, is the lever), d512 × 8L × 8H,
-  SwiGLU/RMSNorm/GQA, **untied embeddings**, context 8192.
+## Tokenizer & trunk (see `MEMORY.md` §E + `AGENTS.md`)
+Full tokenizer spec: [`website/docs/data-tokenization.md`](website/docs/data-tokenization.md).
+- **Tokens:** fused `code=bin` · **physician-designed clinical-segment bins** from the CLIF consortium CSV
+  (primary, revised 2026-09-02; population deciles = `decile_ablation` arm) · **soft discretization** for
+  tail/threshold sensitivity · ICU decision thresholds forced as bin edges (lactate 2/4, MAP 65,
+  SpO₂ 88/90, creatinine 1.5/2/3).
+- **Time:** minutes-since-ICU-admission **time-aware RoPE** (drop inserted `day_N/hour_N` tokens).
+- **Trunk:** from-scratch Qwen2-arch decoder (~30M; objective, not backbone, is the lever), d512 × 8L × 8H,
+  SwiGLU/RMSNorm, no QK-Norm, **untied embeddings**, context 8192. Qwen3-arch = measured ablation row.
 
 ## Layout
 ```
 external/clifatron/      vendored upstream CLIFATRON (tokenETL, AR trainers, benchmark) — see its VENDORED.md
 configs/                data.yaml · model.yaml · train.yaml
-src/data/tokenize.py     CLIF parquet → fused event-token shards + vocab (decile ablation arm)
+src/data/tokenize.py     CLIF parquet → fused event-token shards + vocab (primary tokenizer)
 src/data/dataset.py       8192-row document-isolated sequence packing → shards (MPS/CUDA loaders)
 src/data/value_stats.py   per-token robust value stats, vocab-hash-bound (training fails closed if missing)
-src/model/encoder.py     from-scratch time-aware decoder (ablation arm; default = CLIFATRON Qwen2)
+src/model/encoder.py     from-scratch time-aware Qwen2-arch decoder (~30M primary trunk)
 src/model/heads.py       threshold-hazard · competing-risk · value-regression · task heads   [KEEPER]
 src/model/head_adapter.py  attach our heads to a CLIFATRON checkpoint's hidden states          [KEEPER]
 src/model/generate.py     guarded rollout generation: observed-transition masks · repetition penalty · closed-world sampling
@@ -82,25 +85,11 @@ real data or GPU needed to exercise it:
 - **Model card:** [`MODEL_CARD.md`](MODEL_CARD.md) · **Architecture + reproducibility guide:**
   [`docs/architecture.md`](docs/architecture.md).
 
-### Reproduce the synthetic federated-validation result (one command)
+### Reproduce + test
 
-```bash
-uv sync --group dev
-python -m src.eval.reproduce_synthetic
-```
-
-Runs the whole **releaser → site → aggregator** loop on synthetic fixtures (data-free, CPU) and prints
-the disclosure-controlled two-site aggregate. Every trust gate is exercised on the governed path.
-
-### Run the test suites
-
-```bash
-uv run --frozen --group dev pytest tests/ -q                 # the repo's data-free suite
-uv run --frozen --group dev pytest clif-validate/tests/ -q   # the site-package suite (+ vendor-drift guard)
-```
-
-CI (`.github/workflows/ci.yml`) runs both suites on every push and pull request across Python 3.11 and
-3.13, installing from the committed `uv.lock` with `--frozen` for reproducibility.
+One command (`python -m src.eval.reproduce_synthetic`) runs the whole releaser → site → aggregator loop
+on synthetic fixtures; both data-free test suites run in CI. Exact commands:
+[`docs/architecture.md` → Reproduce the synthetic result](docs/architecture.md#reproduce-the-synthetic-result).
 
 ## Local GEM validation stack — proven on real MIMIC
 

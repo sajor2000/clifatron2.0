@@ -1,7 +1,7 @@
 ---
 id: method3-wedge
 title: Method 3 — the wedge
-sidebar_position: 5
+sidebar_position: 6
 ---
 
 # Method 3 — the wedge (smallest publishable unit)
@@ -68,8 +68,8 @@ Two head modes:
 - **`probe`** — a binary `TaskHead` on the frozen anchor state. Runs on any checkpoint today; the
   fair head-to-head vs XGBoost.
 - **`zero_shot`** — `CompetingRiskHead` / `ThresholdHazardHead`. Needs a checkpoint pretrained
-  *with* our heads (the joint phase); gives label-free predictions — the mechanism that makes
-  external federation validation possible.
+  *with* our heads (the joint phase); predicts with no local training — the mechanism that makes
+  external federation validation possible. Scoring still uses labels each site auto-derives locally.
 
 ---
 
@@ -111,7 +111,7 @@ most-adapted — plus the Local Patient Equivalence (LPE) at each rung.
 
 ```mermaid
 flowchart LR
-    Z["Rung 1 · as-is zero-shot<br/>no source data, no local labels"] --> T["Rung 2 · recalibrate only<br/>temperature scaling (cheap)"]
+    Z["Rung 1 · as-is zero-shot<br/>no source data, no local training"] --> T["Rung 2 · recalibrate only<br/>temperature scaling (cheap)"]
     T --> F["Rung 3 · fine-tune<br/>on local labels"]
     Z -. "LPE" .-> M["Local Patient Equivalence<br/>= smallest local-LightGBM<br/>training size matching the FM"]
     T -. "LPE" .-> M
@@ -131,9 +131,9 @@ not omitted.
 ```bash
 python -m src.eval.method3 \
   --checkpoint /path/to/clifatron_checkpoint \
-  --site MIMIC=/path/mimic_narratives.parquet \
-  --site Rush=/path/rush_narratives.parquet \
-  --site UChicago=/path/uchicago_narratives.parquet \
+  --site site1=/path/site1_narratives.parquet \
+  --site site2=/path/site2_narratives.parquet \
+  --site site3=/path/site3_narratives.parquet \
   --method both
 ```
 

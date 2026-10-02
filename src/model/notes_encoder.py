@@ -17,7 +17,7 @@ for notes instead of genomic variants.
 
 Usage:
     from src.model.notes_encoder import NotesEncoder
-    encoder = NotesEncoder(d_model=512, model_name="thomas-sounack/BioClinical-ModernBERT-large")
+    encoder = NotesEncoder(d_model=512, model_name="thomas-sounack/BioClinical-ModernBERT-base")
     embeddings = encoder.encode(["Patient presents with acute respiratory distress..."])
 """
 

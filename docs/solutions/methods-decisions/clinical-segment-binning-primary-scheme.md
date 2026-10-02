@@ -23,8 +23,9 @@ progressively wider intervals above/below normal, extreme-value quintiles at tai
 The code had been changed to deciles as default with clinical segments relegated to an
 "ablation arm." This was a mistake: the clinical team's 1268 segments encode measurement-
 density domain expertise that data-driven deciles cannot recover. For example, lactate has 15
-physician-designed bins (vs 10 deciles), with 5 extreme-value quintiles above 5.0 mmol/L that
-capture the physiologically dangerous tail the model must be most sensitive at.
+physician-designed CSV segments (16 bins once the forced 4.0 edge is added, vs 10 deciles), with 5
+extreme-value quintiles above 5.4 mmol/L that capture the physiologically dangerous tail the model
+must be most sensitive at.
 
 ## Guidance
 
@@ -33,7 +34,8 @@ capture the physiologically dangerous tail the model must be most sensitive at.
 
 1. `build_clinical_segment_bins()` reads the CSV, extracts interior bin edges per concept,
    filters to the 10 target concepts from `data.yaml`, and pins any additional forced
-   clinical thresholds (lactate 2.0/4.0, MAP 65, SpO₂ 88/90) as guaranteed edges.
+   clinical thresholds (lactate 2.0/4.0, MAP 65, SpO₂ 88/90, creatinine 1.5/2.0/3.0) as
+   guaranteed edges.
 2. `build_edges()` dispatches on `value_binning.scheme` — `clinical_segment` is the default.
 3. `build_value_bins()` (decile quantile estimator) is retained as the `decile_ablation` path.
 4. Soft discretization (Gaussian-weight spread to ±1 neighbor bin) is applied on top of the
@@ -47,8 +49,8 @@ this model from an auto-regressive token predictor on EHR sequences — they are
 clinician trusts the output at a lactate of 2.1 or a MAP of 64.
 
 Lee (2026) found deciles ≈ clinical reference ranges "at matched granularity." But the CLIF
-consortium's segments are finer-grained than 10-bin deciles (lactate: 15 vs 10, MAP: 25 vs
-10, temp: 26 vs 10) and invest granularity where it matters — decision zones and dangerous
+consortium's segments are finer-grained than 10-bin deciles (lactate: 16 vs 10, MAP: 23 vs
+10, temp: 24 vs 10) and invest granularity where it matters — decision zones and dangerous
 tails. The decile ablation arm exists specifically to measure the head-to-head difference on
 this consortium's data rather than asserting one is better.
 
@@ -84,11 +86,14 @@ def build_edges(bin_cfg, fit_events, target_concepts):
         return build_value_bins(fit_events, n_bins, forced)
 ```
 
-**Bins produced (10 target concepts):**
+**Bins produced (10 target concepts; recomputed from code 2026-10-02 — 185 numeric tokens total):**
 | Concept | Bins | Notable edges |
 |---------|------|---------------|
-| lactate | 17 | 2.0, 4.0; 5 extreme quintiles above 5.0 |
-| MAP | 25 | 65 hypotension threshold; tight 60–80 zone |
-| SpO₂ | 13 | 88, 90 hypoxemia thresholds |
-| creatinine | 17 | 1.5, 2.0, 3.0 KDIGO stages |
-| temp_c | 26 | Tight febrile-range intervals |
+| lactate | 16 | 2.0 (CSV), 4.0 (forced); 5 extreme quintiles above 5.4 |
+| MAP | 23 | 65 hypotension threshold (already in CSV) |
+| SpO₂ | 11 | 88, 90 hypoxemia thresholds (already in CSV) |
+| creatinine | 18 | 1.5, 2.0, 3.0 forced (≈ KDIGO) |
+| temp_c | 24 | tight febrile-range intervals (°F boundaries converted to °C) |
+
+The full per-concept edge table, the bin-assignment rule, and the known gaps (only target
+concepts are binned; `[a,b)` vs the CSV's `(a,b]`) are in `website/docs/data-tokenization.md`.

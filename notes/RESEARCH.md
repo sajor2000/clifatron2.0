@@ -1,18 +1,14 @@
 # Deep Research Synthesis — Compact Multimodal ICU Foundation Model on Federated CLIF
 
-> **⚠️ PRE-PIVOT DOCUMENT — evidence base is current; the design spec in §2–§7 is SUPERSEDED.**
-> This synthesis was written **before** the 2026-08-27 decision to build ON CLIFATRON
-> (see `notes/INTEGRATION.md`) and before the two focused 2026-preprint threads
-> (tokenization a76bb9 / architecture aeb4d2). Its **literature/evidence** remains the
-> reference of record, but several **design decisions here are now overridden**. Where this
-> file disagrees with `MEMORY.md`, **`MEMORY.md` wins.** Specifically superseded:
-> - **Embeddings:** this file says *tied* (§2, §7) → **now UNTIED** (+4–7% AUPRC, widens under federation).
-> - **Context:** this file says *4096 primary* (§2) → **now 8192 primary** (match CLIFATRON trunk); 4096 = ablation.
-> - **Trunk:** this file says *from-scratch flat Llama-style decoder is primary* (§2, §6 "Track A") →
->   **now attach heads to CLIFATRON's Qwen2 backbone** as the primary path; from-scratch is an ablation arm.
-> - **Sites:** this file frames *2 sites (Rush + MIMIC)* → **now 3 dev sites (MIMIC + Rush + UChicago)** + federated external validation.
->
-> The finalized, current spec lives in `MEMORY.md` ("Design spec — REVISED") and `notes/NEXT_STEPS.md` §2.
+> **HISTORICAL (pre-2026-09 design record) — not current guidance.** Written 2026-08-27, before the
+> build-on-CLIFATRON pivot. Its literature/evidence remains a useful record; its design spec (§2–§7)
+> is superseded — notably embeddings are now **untied**, context **8192**, and sites are **3 dev sites
+> (MIMIC + Rush + UChicago)** + federated external validation.
+> Current decisions live in `MEMORY.md` §B/§E + `AGENTS.md` (where anything here disagrees, they win):
+> **from-scratch Qwen2-arch ~30M decoder is PRIMARY** (Qwen3-arch = measured ablation row; CLIFATRON's
+> Qwen2 0.5B checkpoint = Method-3 wedge / larger comparator) · **physician-designed clinical-segment
+> bins PRIMARY** (population deciles = `decile_ablation` arm) · **tokenizer = `src/data/tokenize.py`**
+> (spec: `website/docs/data-tokenization.md`).
 
 Five parallel research threads (2026-08-27): landscape/novelty, tokenization/architecture,
 pretraining objectives/multi-task, multimodal fusion, benchmarks/fairness/assets. This

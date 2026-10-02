@@ -8,18 +8,24 @@ today versus what is **pending** hardware, real data, or governance.
 ## Model details
 
 - **What it is.** A methods-upgrade layer on [CLIFATRON](https://github.com/Common-Longitudinal-ICU-data-Format/CLIFATRON),
-  the CLIF consortium's compact (~30M-param) CLIF-native ICU foundation model. It replaces pure
+  the CLIF consortium's CLIF-native ICU foundation model (released Qwen2 checkpoint: 0.5B). It replaces pure
   next-token prediction with a **threshold-conditioned time-to-event** objective, a **competing-risk
   cumulative-incidence** head, and a **value-regression** head, and adds **zero-shot, training-free**
   survival/threshold heads so a new hospital needs no local model training and no manually-annotated
   labels to run the model.
 - **Input.** Sequences of fused CLIF event tokens (`code=bin`) over a frozen CLIF-native mCIDE
   vocabulary, applied identically at every site.
+- **Tokenization.** Fused `code=bin` tokens with physician-designed clinical-segment bins from the CLIF
+  consortium CSV (population deciles = ablation arm), produced by `src/data/tokenize.py`. Full spec:
+  [`website/docs/data-tokenization.md`](website/docs/data-tokenization.md).
 - **Output.** Per-stay, per-outcome risk at a clinical horizon (e.g. 48h), and — at a coordinating
   center — disclosure-controlled **aggregate** metrics across sites (AUROC/AUPRC/ECE and a
   TRIPOD+AI calibration / decision-curve / fairness panel). Raw data, labels, and gradients never
   leave a node.
-- **Backbone.** Qwen2/Llama-style transformer (the objective, not the backbone, is the lever).
+- **Backbone.** Primary: a from-scratch **Qwen2-arch ~30M** decoder (d512×8L×8H, RMSNorm/SwiGLU,
+  time-aware RoPE, no QK-Norm, untied embeddings, 8192 context); Qwen3-arch is a measured ablation row.
+  The Method-3 wedge attaches our heads to CLIFATRON's released **Qwen2 0.5B** checkpoint — a
+  **larger comparator**, not our compact model. The objective, not the backbone, is the lever.
 
 ## Intended use
 

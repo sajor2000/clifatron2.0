@@ -1,7 +1,7 @@
 ---
 id: project-status
 title: Project Status & Roadmap
-sidebar_position: 10
+sidebar_position: 12
 ---
 
 # Project Status & Roadmap
@@ -28,14 +28,14 @@ GPU hardware, and one governance decision.**
 | **U2** dataset / targets / collator / document isolation | **U6** core architecture ablations (tied/untied · separate/joint) |
 | **U3** objective semantics (threshold / CR / value heads) | **U7** PORTER portability arm (language-grounded vs frozen mCIDE) |
 | **U4** training engine / checkpoints / manifest | **U8** scaling · label-efficiency · multi-horizon studies |
-| **value-stats** per-concept normalization | **U10** release milestone (after model selection) |
+| **value-stats** per-token normalization | **U10** release milestone (after model selection) |
 | **U5** evaluation / calibration / validation gate | GPU qualification reports (U13-FA2, U14 on 2× L40) |
 | **U9** validator core (`clif-validate/`) | Governance / ops exit criteria |
 | **U11** release-trust (Ed25519 · anti-rollback · content-hash approval) | |
 | **U13 / U14** varlen attention + resume/DDP (CPU-qualified) | |
 | **U15** synthetic federation harness (releaser→site→aggregator) | |
 | **U16–U19** CI · reproducible lock · model card · one-command repro | |
-| **GEM stack** ETL → 8192-row shards → MPS smoke train (6k steps) → guarded closed-world generate → plausibility/viewer — proven end-to-end on real MIMIC on the dev Mac | **G2** L40 base run — exact commands frozen in `docs/plans/l40-g2-runbook.md`; launch is a user decision |
+| **GEM stack** ETL → 8192-row shards → MPS smoke train (6k steps) → guarded closed-world generate → plausibility/viewer — proven end-to-end on real Site 1 data on the dev Mac | **G2** L40 base run — exact commands frozen in `docs/plans/l40-g2-runbook.md`; launch is a user decision |
 | **G3** generative eval + baselines (JS 0.43 · top-32 overlap 0.47 · 0 OOV / 0 gen-only under guarded sampling) | **G4/G5** prefix conditioning + RL — the anchoring levers (NTP steps alone don't improve key-event recall) |
 
 ---

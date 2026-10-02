@@ -1,12 +1,13 @@
 # Methods — copied recipe from 2025–26 preprints
 
-> **⚠️ PRE-PIVOT for the trunk choice.** The per-paper method recipes below (§1–§5) are current
-> and remain the source of truth for what each HEAD/objective implements. The **"Our synthesis"**
-> section originally proposed a HealthFormer dual-level trunk — that trunk choice is **SUPERSEDED**:
-> we now attach these heads to **CLIFATRON's flat Qwen2 backbone** (see `notes/INTEGRATION.md`,
-> `MEMORY.md`). The heads (ICareFM threshold-hazard, SurvivEHR competing-risk, ORA value-mark) are
-> unchanged; only the backbone they sit on changed. Where this file's synthesis disagrees with
-> `MEMORY.md`, `MEMORY.md` wins.
+> **HISTORICAL (pre-2026-09 design record) — not current guidance.** Written 2026-08-27. The per-paper
+> method recipes (§1–§5) remain a useful reference for what each head/objective implements; the
+> "Our synthesis" trunk choice (HealthFormer dual-level trunk) is superseded.
+> Current decisions live in `MEMORY.md` §B/§E + `AGENTS.md` (where anything here disagrees, they win):
+> **from-scratch Qwen2-arch ~30M decoder is PRIMARY** (Qwen3-arch = measured ablation row; CLIFATRON's
+> Qwen2 0.5B checkpoint = Method-3 wedge / larger comparator) · **physician-designed clinical-segment
+> bins PRIMARY** (population deciles = `decile_ablation` arm) · **tokenizer = `src/data/tokenize.py`**
+> (spec: `website/docs/data-tokenization.md`).
 
 Line-level citations from full text (Paperclip). This is the source of truth for
 what each **head/objective** implements; when in doubt, match the paper. (For the **trunk**,

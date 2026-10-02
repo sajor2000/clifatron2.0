@@ -1,7 +1,7 @@
 ---
 id: evaluation-panel
 title: Evaluation Panel (TRIPOD+AI)
-sidebar_position: 7
+sidebar_position: 8
 ---
 
 # Evaluation Panel — TRIPOD+AI
@@ -47,7 +47,7 @@ mindmap
   root((TRIPOD+AI panel))
     Discrimination
       AUROC
-      AUPRC (imbalanced ICU)
+      auprc["AUPRC (imbalanced ICU)"]
     Calibration
       ECE
       Brier
@@ -59,7 +59,7 @@ mindmap
     Clinical utility
       net benefit / DCA
     Label efficiency
-      LPE (ICareFM)
+      lpe["LPE (ICareFM)"]
     Fairness
       per-subgroup AUROC/AUPRC/calibration
     Competing-risk calibration

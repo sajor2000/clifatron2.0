@@ -1,7 +1,7 @@
 ---
 id: objectives-training
 title: Objectives & Training
-sidebar_position: 4
+sidebar_position: 5
 ---
 
 # Objectives & Training
@@ -112,30 +112,36 @@ flowchart TB
 
 ```mermaid
 flowchart TB
-    CKPT["Released CLIFATRON checkpoint"] --> MODE{Training mode}
+    SHARDS["v2 event shards<br/>(src/data/tokenize.py)"] --> SCRATCH["From-scratch pretrain (PRIMARY)<br/>random-init Qwen2-arch ~30M<br/>+ heads · NTP→TTE curriculum<br/>src/train/pretrain.py"]
+    CKPT["Released CLIFATRON checkpoint<br/>(Qwen2 0.5B, larger comparator)"] --> MODE{Training mode}
 
     MODE -->|"freeze_backbone=True"| FROZEN["Frozen probe<br/>train only the heads on local labels<br/>→ runs on ANY checkpoint TODAY"]
     MODE -->|"freeze_backbone=False"| JOINT["Joint fine-tune<br/>unfreeze + NTP→TTE curriculum<br/>→ produces zero-shot survival heads"]
 
     FROZEN --> M3["Method 3 wedge (probe mode)"]
-    JOINT --> FED["Frozen zero-shot model<br/>for federated validation"]
+    SCRATCH --> FED["Frozen zero-shot model<br/>for federated validation"]
+    JOINT --> FED
 
     classDef a fill:#e3f2fd,stroke:#1565c0,color:#0d1b2a;
     classDef b fill:#e8f5e9,stroke:#2e7d32,color:#0d1b2a;
     class FROZEN,M3 a;
-    class JOINT,FED b;
+    class SCRATCH,JOINT,FED b;
 ```
+
+Both pretrained paths produce zero-shot threshold / competing-risk heads; the from-scratch model is
+the primary federation candidate and the CLIFATRON joint fine-tune is its comparator. The two use
+different token streams
+([details](./data-tokenization.md#8--two-token-streams-from-scratch-vs-the-wedge)).
 
 **Systems:** 2× L40 (48GB, no NVLink), bf16, DDP via `torchrun`, per-patient sequence packing.
 FSDP is *not* used (only pays off past ~2.3B params and is worse without NVLink).
-`src/train/joint_pretrain.py` drives the joint path; `src/train/run_arm.py` drives the ablation
-arms.
+`src/train/pretrain.py` drives the from-scratch path; `src/train/joint_pretrain.py` drives the
+CLIFATRON joint path; `src/train/run_arm.py` drives the ablation arms.
 
 :::tip Value-head normalization — resolved
-The value-regression loss was unnormalized on real Site 1 (raw lab magnitudes — creatinine ~1,
-platelet counts ~2×10⁵ — made it dominate, `val≈46000`). **Fixed:** `src/data/value_stats.py`
-freezes per-token robust (median/IQR) value statistics from a reference site, vocab-hash-bound;
-training standardizes `(value − center) / scale` and fails closed on a missing/stale map.
-Standardization collapses mean raw value² from ~1.4×10¹⁰ to ~0.95 (O(1) NLL). See
-**[Data & Tokenization → Value-head normalization](./data-tokenization.md)**.
+Value targets are standardized with per-token robust statistics frozen from the reference site's
+train partition (`src/data/value_stats.py`, vocab-hash-bound). `pretrain.py` rejects a stats file
+whose vocabulary hash or fit partition does not match, and refuses real (non-dry-run) training on
+numeric values when no `--value-stats` file is given. Details in
+**[Data & Tokenization → training targets](./data-tokenization.md#7--how-the-tokens-become-training-targets)**.
 :::

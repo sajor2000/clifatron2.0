@@ -1,4 +1,9 @@
-"""Map-style adapters for canonical decile shards and packed CLIFATRON rows."""
+"""Map-style adapters for canonical fused-token shards and packed CLIFATRON rows.
+
+`representation="decile"` is a legacy name for the canonical shards written by
+`src/data/tokenize.py`, whatever `value_binning.scheme` produced them (clinical
+segments by default).
+"""
 
 from __future__ import annotations
 

@@ -13,7 +13,8 @@ Our implementation: concept token gets a standard embedding; value gets a
 are summed before entering the transformer. No value tokens - sequence length
 is number of events, not bin-expanded.
 
-This is the ABLATION arm - our DEFAULT is discrete+soft (Lee 2026).
+This is the ABLATION arm - our DEFAULT is physician clinical-segment bins + soft
+discretization (configs/data.yaml, MEMORY.md §E1a).
 """
 
 from __future__ import annotations

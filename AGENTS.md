@@ -125,7 +125,8 @@ DUA-gated ICareFM — treat it as a deliverable, not plumbing.
   GitHub Pages on push to `main` (when the repo is public / Pages is enabled).
 - **Git:** work is done across machines — `git pull` at session start, commit + push after each change.
   Data / checkpoints / `clif_config.json` are per-machine and git-ignored; only code + configs are committed.
-- **Do NOT commit:** data (`*.parquet`), checkpoints, `bin/` binaries, `.venv/`, `node_modules/`, `.agents/`.
+- **Do NOT commit:** data (`*.parquet`), checkpoints, `bin/` binaries, `.venv/`, `node_modules/`, `.agents/`,
+  vendored agent skills (`agent/`, `.claude/skills/`, `skills-lock.json`) — install those globally.
 
 ---
 

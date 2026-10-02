@@ -6,10 +6,13 @@ is skipped (requires network download), but the lazy-load pattern and
 the insertion/guard functions are fully exercised.
 """
 
+import inspect
 import unittest
+from pathlib import Path
 
 import numpy as np
 import torch
+import yaml
 
 
 class NotesSmokeTest(unittest.TestCase):
@@ -69,6 +72,18 @@ class NotesSmokeTest(unittest.TestCase):
         mask = filter_pre_anchor_notes(note_times, admission, obs_hours=24)
         self.assertTrue(mask[0])
         self.assertFalse(mask[1])
+
+    def test_06_configured_encoder_matches_notes_encoder_default(self):
+        """configs/data.yaml notes.encoder names the NotesEncoder default (no download)."""
+        from src.model.notes_encoder import NotesEncoder
+
+        root = Path(__file__).parents[1]
+        configured = yaml.safe_load((root / "configs/data.yaml").read_text())["notes"]["encoder"]
+        default = inspect.signature(NotesEncoder.__init__).parameters["model_name"].default
+        self.assertEqual(
+            configured, default,
+            f"configs/data.yaml notes.encoder={configured!r} but NotesEncoder default={default!r}",
+        )
 
 
 if __name__ == "__main__":

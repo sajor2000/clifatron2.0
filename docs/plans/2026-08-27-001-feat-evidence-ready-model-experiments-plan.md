@@ -4,7 +4,7 @@ type: feat
 status: active
 date: 2026-08-27
 deepened: 2026-08-29
-landed: U1, U2, U3, U4, value-stats follow-up, U5
+landed: U1, U2, U3, U4, value-stats follow-up, U5, U9, U11, U13, U14, U15, U16-U19
 ---
 
 # feat: Establish evidence-ready CLIFATRON model experiments

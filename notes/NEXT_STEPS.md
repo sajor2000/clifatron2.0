@@ -1,13 +1,14 @@
 # Handoff — CLIFATRON 2.0: research, decisions, and next steps
 
-> **⚠️ STALE ORIENTATION (2026-08-27) — the "current state" and "next steps" here are SUPERSEDED.**
-> This was written before any code ran on real data. Since then almost everything landed: U1–U5,
-> value-stats normalization, U9, U11, U13–U19 are all merged and CI-enforced, and 42+ tests pass on
-> real MIMIC. Its **§3 evidence tables and §2 finalized decisions remain valid**; its **§1 "nothing has
-> been run" and §4 "next steps" (Steps 1–5) are DONE.** For current state + what's left, read
-> `docs/plans/2026-09-01-001-feat-completion-roadmap-plan.md` and `MEMORY.md` (§LOCKED DECISIONS +
-> §Status). Backbone: the primary paper is now the **from-scratch Qwen3** decoder (this file's Qwen2/
-> from-scratch-as-ablation framing predates that lock — `MEMORY.md` §B wins).
+> **HISTORICAL (pre-2026-09 design record) — not current guidance.** Written 2026-08-27, before any
+> code ran on real data. Its §3 evidence tables remain a useful literature record; its §2 decisions,
+> §1 state, and §4 next steps are superseded (U1–U5, U9, U11, U13–U19 have since landed). For status,
+> see `MEMORY.md` §Status and `docs/plans/2026-09-01-001-feat-completion-roadmap-plan.md`.
+> Current decisions live in `MEMORY.md` §B/§E + `AGENTS.md` (where anything here disagrees, they win):
+> **from-scratch Qwen2-arch ~30M decoder is PRIMARY** (Qwen3-arch = measured ablation row; CLIFATRON's
+> Qwen2 0.5B checkpoint = Method-3 wedge / larger comparator) · **physician-designed clinical-segment
+> bins PRIMARY** (population deciles = `decile_ablation` arm) · **tokenizer = `src/data/tokenize.py`**
+> (spec: `website/docs/data-tokenization.md`).
 
 **Audience:** the next agent (or engineer) taking this over cold. Read this top-to-bottom before
 touching code. It carries the *why* behind every decision plus the 2026 evidence, so you can

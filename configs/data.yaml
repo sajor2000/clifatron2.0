@@ -31,8 +31,8 @@ tables:
     file: "clif_medication_admin_continuous"
     availability_col: "admin_dttm"
     concept_col: "med_category"          # norepinephrine, propofol, heparin, furosemide...
-    value_col: null                       # ablation emits category only; default tokenETL normalizes doses
-    dose_tokenization: "tokenetl_only"    # weight-aware preferred-unit conversion in vendored tokenETL
+    value_col: null                       # v2 emits med_category only (no dose) — see data-tokenization T4
+    dose_tokenization: "tokenetl_only"    # dose bins exist only in vendored v1 tokenETL (not run by v2)
     input_only: true
   adt:
     file: "clif_adt"
@@ -80,7 +80,7 @@ value_binning:
   # THIS is the default — it encodes clinical domain expertise that data-driven binning
   # cannot recover, and it is what differentiates this model from an auto-regressive token
   # predictor on EHR sequences.
-  scheme: "clinical_segment"               # {clinical_segment | decile_ablation | continuous_fused_ablation}
+  scheme: "clinical_segment"               # {clinical_segment | decile_ablation}; continuous_fused is not a build_edges scheme yet
   segment_source: "external/clifatron/tokenETL/config/critical_illness_tokenization_final_with_intervals.csv"
   n_bins: 10                               # ignored by clinical_segment; used by the decile_ablation arm
   build_from_site: "mimic"                 # freeze bin edges on reference site, apply identically everywhere
@@ -91,8 +91,10 @@ value_binning:
   soft_discretization: true
   soft_kernel_bins: 1                     # +/- neighbor bins to receive soft mass
   # guaranteed bin edges so tokens are legible at decision points AND boundaries align with the
-  # threshold-hazard head's queries. Does not contradict Lee (he anchored the WHOLE scheme; we only
-  # pin a few cutpoints on top of the decile grid).
+  # threshold-hazard head's queries. clinical_segment: ADDED to the CSV grid (bin count grows);
+  # decile_ablation: REPLACES the nearest quantile edge (n_bins is an upper bound: duplicate
+  # quantiles from repeated values are deduplicated, so a concept can end up with fewer bins).
+  # NOTE: clinical_segment bins ONLY target_concepts; other numeric concepts become bare tokens.
   forced_edges:                           # concept: [physical-value cutpoints guaranteed to be bin boundaries]
     lactate:    [2.0, 4.0]                # Sepsis-3 / Surviving Sepsis
     map:        [65.0]                    # vasopressor trigger
@@ -109,4 +111,4 @@ notes:
   time_col: "note_dttm"
   text_col: "note_text"
   leakage_guard: "note_dttm <= anchor + obs_hours"   # pre-anchor notes only (rule 3)
-  encoder: "abhinand/MedEmbed-small-v0.1"            # small clinical sentence encoder
+  encoder: "thomas-sounack/BioClinical-ModernBERT-base"  # frozen; MEMORY.md multimodal decision = NotesEncoder default (test-locked)
