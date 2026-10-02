@@ -6,10 +6,13 @@ is skipped (requires network download), but the lazy-load pattern and
 the insertion/guard functions are fully exercised.
 """
 
+import inspect
 import unittest
+from pathlib import Path
 
 import numpy as np
 import torch
+import yaml
 
 
 class NotesSmokeTest(unittest.TestCase):
@@ -72,11 +75,6 @@ class NotesSmokeTest(unittest.TestCase):
 
     def test_06_configured_encoder_matches_notes_encoder_default(self):
         """configs/data.yaml notes.encoder names the NotesEncoder default (no download)."""
-        import inspect
-        from pathlib import Path
-
-        import yaml
-
         from src.model.notes_encoder import NotesEncoder
 
         root = Path(__file__).parents[1]
