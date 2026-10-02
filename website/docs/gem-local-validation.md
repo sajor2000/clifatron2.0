@@ -83,6 +83,9 @@ python -m src.viewer.sequence_viewer \
   --vocab-lock output/intermediate_phi/mimic/vocab.json --port 8042
 ```
 
+`output/intermediate_phi/mimic/` is the Site 1 artifact directory: it is named after the
+`--site` value used when tokenizing (see [Data & Tokenization → Run it](./data-tokenization.md#run-it)).
+
 The local inspection surface for the whole track: real and generated sequences side by
 side, plausibility score + warning explanations, concept-grouped timelines, fused
 `concept=bin` decoding against the frozen numeric edges, and observed-vs-generated

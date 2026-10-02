@@ -234,8 +234,8 @@ Its raw value is still written to the `value` column, so the value-regression he
 predict it. But the encoder **input** carries no information about its magnitude: "potassium"
 looks the same at 2.4 as at 6.8.
 
-This differs from the `decile_ablation` arm, which bins **every** numeric concept present in the
-training data. Until the two arms bin the same concept set, a clinical-segment vs decile
+This differs from the `decile_ablation` arm, which bins every numeric concept with at least `n_bins`
+non-null training values (rarer concepts are skipped and stay bare tokens). Until the two arms bin the same concept set, a clinical-segment vs decile
 comparison confounds the binning scheme with binning coverage.
 
 ### Forced clinical edges
@@ -253,7 +253,7 @@ boundaries up with the threshold-hazard head's queries: `outcome_join` computes 
 with the same `searchsorted(..., side="right")` rule, so a query such as "MAP < 65" lands exactly
 on a token boundary. Under `clinical_segment`, a forced edge is **added** to the CSV grid and the
 bin count grows. Under `decile_ablation`, it **replaces** the nearest quantile edge, so the bin
-count stays at `n_bins`.
+count stays at most `n_bins` (repeated values can collapse duplicate quantiles into fewer bins).
 
 ### Missing and non-finite values
 
@@ -491,20 +491,20 @@ that difference on CLIF data rather than assert it.
 ## Run it
 
 ```bash
-# 1. Reference site (Site 1; --site must equal value_binning.build_from_site): build the frozen vocab and shards
+# 1. Reference site (Site 1; --site must equal value_binning.build_from_site, so its artifacts land in .../mimic)
 uv run python -m src.data.tokenize --site mimic --in "$SITE1_DIR" \
-  --out output/intermediate_phi/site1 --build-vocab \
+  --out output/intermediate_phi/mimic --build-vocab \
   --episodes output/intermediate_phi/episodes.parquet
 
 # 2. Every other site: reuse the frozen vocab (hash-verified, no refit)
 uv run python -m src.data.tokenize --site site2 --in "$SITE2_DIR" \
   --out output/intermediate_phi/site2 \
-  --vocab output/intermediate_phi/site1/vocab.json \
+  --vocab output/intermediate_phi/mimic/vocab.json \
   --episodes output/intermediate_phi/site2_episodes.parquet
 
 # 3. Value-head stats from the reference site's train partition
 uv run python -m src.data.value_stats \
-  --events output/intermediate_phi/site1/events.parquet --out value_stats.json
+  --events output/intermediate_phi/mimic/events.parquet --out value_stats.json
 
 # Inspect without writing anything
 uv run python -m src.data.tokenize --site mimic --in "$SITE1_DIR" --out /tmp/x \

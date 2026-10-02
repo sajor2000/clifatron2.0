@@ -140,7 +140,8 @@ CLIFATRON joint path; `src/train/run_arm.py` drives the ablation arms.
 
 :::tip Value-head normalization — resolved
 Value targets are standardized with per-token robust statistics frozen from the reference site's
-train partition (`src/data/value_stats.py`, vocab-hash-bound); `pretrain.py --value-stats` fails
-closed if they are missing or stale. Details in
+train partition (`src/data/value_stats.py`, vocab-hash-bound). `pretrain.py` rejects a stats file
+whose vocabulary hash or fit partition does not match, and refuses real (non-dry-run) training on
+numeric values when no `--value-stats` file is given. Details in
 **[Data & Tokenization → training targets](./data-tokenization.md#7--how-the-tokens-become-training-targets)**.
 :::

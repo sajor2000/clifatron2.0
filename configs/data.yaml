@@ -92,7 +92,8 @@ value_binning:
   soft_kernel_bins: 1                     # +/- neighbor bins to receive soft mass
   # guaranteed bin edges so tokens are legible at decision points AND boundaries align with the
   # threshold-hazard head's queries. clinical_segment: ADDED to the CSV grid (bin count grows);
-  # decile_ablation: REPLACES the nearest quantile edge (bin count stays n_bins).
+  # decile_ablation: REPLACES the nearest quantile edge (n_bins is an upper bound: duplicate
+  # quantiles from repeated values are deduplicated, so a concept can end up with fewer bins).
   # NOTE: clinical_segment bins ONLY target_concepts; other numeric concepts become bare tokens.
   forced_edges:                           # concept: [physical-value cutpoints guaranteed to be bin boundaries]
     lactate:    [2.0, 4.0]                # Sepsis-3 / Surviving Sepsis
