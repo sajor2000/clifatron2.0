@@ -8,7 +8,7 @@ trains well.
 
 Fix: standardize each numeric event to ~N(0,1) using per-**token** center/scale frozen
 from a reference site (the same "freeze on MIMIC, apply identically everywhere" pattern
-as the decile bin edges). `TargetBuilder.value_stats` consumes exactly this map
+as the frozen bin edges and vocabulary). `TargetBuilder.value_stats` consumes exactly this map
 (`token_id -> (center, scale)`), applying `(value - center) / scale`, and refuses to
 build a numeric target whose token lacks stats — so this generator is what unblocks
 real value-head pretraining.

@@ -11,6 +11,10 @@ hospitals → one node (2× L40, no cluster). Nature-Medicine framing: efficienc
 federated-fairness + CLIF-native + deployable multimodal SLM.
 
 ## PIVOT 2026-08-27 — build ON CLIFATRON (see notes/INTEGRATION.md)
+> **⚠️ HISTORICAL — partly superseded.** The "SUPERSEDED = our encoder.py + tokenize.py" line below was
+> reversed: `src/data/tokenize.py` is THE tokenizer (tokenETL is vendored but not executed by v2 code;
+> only the Method-3 wedge consumes tokenETL output), and `src/model/encoder.py` is the from-scratch
+> Qwen2-arch trunk (§B). Current decisions = LOCKED DECISIONS below.
 **CLIFATRON** (github.com/Common-Longitudinal-ICU-data-Format/CLIFATRON, MIT, PyPI
 `clifatron`) is the consortium's WORKING CLIF-native ICU FM, built by our lab's data
 scientist (vchaudha) — **we control it**. It already occupies "compact CLIF-native ~30M AR
@@ -26,6 +30,9 @@ hidden states, beat their Method 1 (XGBoost-on-emb) on AUPRC/calibration + Metho
 on cost/calibration, on their own benchmark.
 
 ## Design spec — REVISED 2026-08-27 (full synthesis in notes/RESEARCH.md)
+> **⚠️ HISTORICAL.** Binning reversed 2026-09-02 (clinical segments primary, deciles = ablation — §E1a);
+> from-scratch backbone settled as Qwen2-arch 2026-09-07 (§B). The tokenizer as built is specified in
+> `website/docs/data-tokenization.md`. Bullets below are the 2026-08-27 record, not current truth.
 Five-thread deep research + 2 focused 2026-preprint threads (tokenization a76bb9 / architecture aeb4d2) → these changes:
 - **Tokenizer:** FUSED single token `concept=bin` (settled: Lee 0.891→0.915, Guo 73/74 tasks −39.5% FLOPs);
   DECILE bins frozen from reference site (NOT clinical bins — Lee: no gain from ref-range anchoring);
@@ -84,7 +91,8 @@ metrics. No raw data, labels, or gradients ever leave any node. This IS the thes
   Mortality enters only as the competing-risk death event.** Roadmap: add more organ-failure cutpoints
   (creatinine/KDIGO, bilirubin, platelets) as coverage allows. These derived labels are noisy phenotypes
   that vary by site coding; report each outcome's definition + provenance alongside its metrics.
-- **Vocab:** CLIFATRON frozen mCIDE across ALL sites → turnkey everywhere, no refitting.
+- **Vocab:** frozen mCIDE-concept fused vocab built once by `src/data/tokenize.py` on the Site 1 train
+  partition, SHA-256-manifested, applied identically at ALL sites → turnkey everywhere, no refitting.
 - **Governance:** only aggregate + subgroup metrics return; fairness reported aggregate (ICareFM precedent).
 - **Internal eval (3 held sites):** 3×3 train-A/test-B matrix + adaptation ladder
   (as-is/recalibrate/finetune) + LPE + Elemento ensemble column.
@@ -112,11 +120,13 @@ clinical bins are NOT how you achieve it. CORRECTED tokenization decision (SUPER
 - Principle still governs the rest: outcomes = states doctors act on (not treatments); threshold heads
   DIRECTIONAL (crossing into danger); eval headline = net benefit/DCA (clinical good/bad, not just AUROC).
 
-## Hard rules (do not violate)
+## Hard rules (do not violate) — numbering matches AGENTS.md
 1. Treatments = model inputs, NEVER prediction targets.
-2. Vocab = CLIFATRON frozen mCIDE, applied identically to all 3 sites — no cross-site pooling of raw data.
+2. Vocab = frozen mCIDE-concept vocab (built once on the reference site, hash-verified), applied
+   identically to all sites — no cross-site pooling of raw data.
 3. Retrospective reports/discharge summaries = LABEL source only; only pre-anchor notes may be features.
-4. Site 1 is governance-credentialed; Site 2 + Site 3 institutional — none leave their node.
+4. Availability-time (`storetime`) ordering, not `charttime` — no look-ahead on when a value was knowable.
+5. Site 1 is governance-credentialed; Site 2 + Site 3 institutional — none leave their node.
    Compute = 3 tiers: MacBook (dev, MPS), 2× L40 Linux box (default training, DDP), and Azure hourly GPU
    (burst) — Azure ONLY inside a BAA/DUA-covered lab tenant (never an ad-hoc personal sub for real PHI).
 
@@ -143,12 +153,14 @@ These resolve every open design question as of this date. Change only with new e
 **B. Backbone & pretraining (LOCKED)**
 - B1. Backbone = Qwen-family transformer; it is a **footnote, not novelty** (ORA: objective>backbone,
   within-noise at ~30M/8k). Do not spend novelty budget here.
-- B2. **From-scratch path → Qwen3 architecture** (free QK-Norm training stability; `Qwen3Config`/`Qwen3ForCausalLM`
-  confirmed present in transformers 5.16.1). **Attach/wedge path → Qwen2** (must match CLIFATRON's checkpoint).
-  Keep a Qwen2-arch from-scratch arm too → "Qwen2 vs Qwen3" becomes one MEASURED ablation row, not an assertion.
-- B3/B4. **PRIMARY PAPER = from-scratch Qwen3-arch decoder + objective D (marked-TTE), ~30M, fully ours,
+- B2. **From-scratch path → Qwen2 architecture** (standard pre-norm, no QK-Norm — what `src/model/encoder.py`
+  implements). **Attach/wedge path → Qwen2** (must match CLIFATRON's checkpoint). Qwen3-arch (free QK-Norm;
+  `Qwen3Config` present in transformers 5.16.1) is a MEASURED ablation row, so "Qwen2 vs Qwen3" is quantified,
+  not asserted. *(REVISED 2026-09-07, commit b15d340: was "from-scratch → Qwen3"; aligned with the encoder
+  actually built.)*
+- B3/B4. **PRIMARY PAPER = from-scratch Qwen2-arch decoder + objective D (marked-TTE), ~30M, fully ours,
   no upstream dependency.** Run it as a LADDER: (1) frozen-probe Method-3 wedge on a CLIFATRON Qwen2 ckpt
-  (cheap, de-risks the objective, first result) → (2) from-scratch Qwen3 pretrain (novel headline) →
+  (cheap, de-risks the objective, first result) → (2) from-scratch Qwen2-arch pretrain (novel headline) →
   (3) the two together ARE the finetune-vs-scratch ablation.
 
 **C. Size coherence (LOCKED)**
@@ -170,7 +182,7 @@ These resolve every open design question as of this date. Change only with new e
 - **E1a. PRIMARY binning = physician-designed CLINICAL SEGMENTS (revised 2026-09-02).** The CLIF
   consortium's `critical_illness_tokenization_final_with_intervals.csv` (1268 clinician-designed
   segments across labs/vitals) is the default (`configs/data.yaml → value_binning.scheme:
-  clinical_segment`; `src/data/build_clinical_segment_bins`). These encode measurement-density
+  clinical_segment`; `src/data/tokenize.py::build_clinical_segment_bins`). These encode measurement-density
   granularity — tighter intervals in decision zones, extreme-value quintiles at the tails — that
   the team judges **more clinically relevant** than data-driven deciles, and it is what differentiates
   this model from a plain AR token predictor. **Population deciles are demoted to the `decile_ablation`
@@ -178,8 +190,13 @@ These resolve every open design question as of this date. Change only with new e
   in the tokenization ablation rather than assert either; whichever wins under the frozen protocol
   stays the default). *This supersedes the earlier "frozen deciles PRIMARY, clinical bins = ablation"
   decision (2026-08-27) — reversed on clinical-relevance grounds; the ablation keeps it honest.*
-  Clinical decision thresholds (lactate 2/4, MAP 65, SpO₂ 88/90, KDIGO, P/F Berlin) are guaranteed
-  bin edges under either scheme.
+  Clinical decision thresholds (lactate 2/4, MAP 65, SpO₂ 88/90, creatinine 1.5/2/3 ≈ KDIGO) are
+  guaranteed bin edges under either scheme; P/F Berlin is deferred until P/F is in `target_concepts`.
+- **E1b. Tokenizer as built (audited 2026-10-02) — full spec `website/docs/data-tokenization.md`.**
+  Only the 10 `target_concepts` get clinical-segment bins (185 numeric tokens); all other numeric labs/vitals
+  are bare concept tokens (value kept for the mark head only). Bins are `[a,b)` vs the CSV's `(a,b]`. No med
+  doses / vent settings yet. Same-timestamp tie order is unstable. The tokenization-ablation runner is not
+  wired. These are tracked as T1–T7 on that page — resolve before any ablation or paper claim.
 - E2. **TextCode / language-grounded arm ELEVATED from future-work to a real transfer-robustness arm.**
   PORTER (arXiv:2606.24102, 2026): frozen-vocab models drop ~69% of events on cross-site transfer;
   language-grounded recovers 97.1% AUROC without vocab mapping. Frozen mCIDE stays PRIMARY (turnkey, matches
@@ -202,7 +219,8 @@ These resolve every open design question as of this date. Change only with new e
 > (institutional), Site 3 = UChicago (institutional, CLIF origin site). Website docs refer to sites by
 > generic ID only. Internal notes, configs, and code use the real names.
 
-## HANDOFF → notes/NEXT_STEPS.md (2026-08-27)
+## HANDOFF → notes/NEXT_STEPS.md (2026-08-27) — HISTORICAL
+> Superseded: start from AGENTS.md + this file; `notes/NEXT_STEPS.md` is the 2026-08-27 record.
 Full agent-handoff written: finalized token+arch decisions (with the 2026 evidence tables + citations
 from research threads a76bb9/aeb4d2), ordered file-level next steps (config↔code reconcile → run Method-3
 on real ckpt → phase-2 head pretrain → tokenization ablation → clif-validate/ → notes modality), open

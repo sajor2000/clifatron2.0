@@ -1,30 +1,35 @@
 ---
 id: architecture
 title: Model Architecture
-sidebar_position: 3
+sidebar_position: 4
 ---
 
 # Model Architecture
 
-The trunk is a flat causal decoder in the Llama/Qwen family (RoPE, SwiGLU, RMSNorm, GQA), 8192
-context, **untied** embeddings. Two backbone paths, run as a ladder:
+The trunk is a flat causal decoder in the Llama/Qwen family, 8192 context, **untied** embeddings.
+Two backbone paths, run as a ladder:
 
-- **Primary paper — from-scratch Qwen3-arch decoder, ~30M, fully ours** (`src/model/encoder.py`).
-  Qwen3 adds free QK-Norm training stability; no upstream dependency. This is the headline.
+- **Primary paper — from-scratch Qwen2-arch decoder, ~30M, fully ours** (`src/model/encoder.py`,
+  d512 × 8L × 8H). Standard pre-norm RMSNorm, SwiGLU, time-aware RoPE (rotation angle = minutes
+  since ICU admission), plain multi-head attention (no GQA), **no QK-Norm**. No upstream
+  dependency. This is the headline (locked 2026-09-07, `b15d340`).
 - **Wedge / cheap first result — attach heads to CLIFATRON's released Qwen2 checkpoint** (`head_adapter.py`).
   CLIFATRON's Qwen2 is **0.5B** — a *larger comparator*, never our ~30M model. This is the fast first
   rung (Method 3) and half of the finetune-vs-scratch ablation.
 
-From CLIFATRON v1 we **keep** the Qwen2 architecture for the wedge path, the fused `code=bin`
-token format, the mCIDE vocabulary, and the document-isolation packing approach. The from-scratch
-Qwen3 path is new and fully independent.
+From CLIFATRON v1 we **keep** the Qwen2 checkpoint for the wedge path, the physician-designed bin
+CSV and one-token-per-event idea, the mCIDE vocabulary, and the document-isolation packing
+approach. The two paths use **different token streams** and vocabularies
+([details](./data-tokenization.md#8--two-token-streams-from-scratch-vs-the-wedge)). The from-scratch
+path is new and fully independent.
 
-We attach the same four heads to either backbone's per-token hidden states. "Qwen2 vs Qwen3" is itself
-a **measured ablation row**, not an assertion.
+We attach the same four heads to either backbone's per-token hidden states. A Qwen3-arch trunk
+(adds QK-Norm) is a **measured ablation row** ([Ablations](./ablations.md)), so "Qwen2 vs Qwen3" is
+a quantified finding, not an assertion.
 
 :::info Objective, not backbone, is the lever
 ORA (arXiv:2602.00541) shows the gains are backbone-agnostic — so the backbone is a footnote and the
-*objective* is where the novelty lives. The from-scratch Qwen3 model is the primary contribution; the
+*objective* is where the novelty lives. The from-scratch Qwen2-arch model is the primary contribution; the
 CLIFATRON-Qwen2 attach is the cheap wedge that de-risks it first. See `MEMORY.md` §B.
 :::
 
@@ -36,9 +41,9 @@ CLIFATRON-Qwen2 attach is the cheap wedge that de-risks it first. See `MEMORY.md
 flowchart TB
     IN["input_ids · attention_mask<br/>(fused CLIF tokens, ≤8192)"] --> BB
 
-    subgraph BB["Backbone (from-scratch Qwen3 ~30M · OR · CLIFATRON Qwen2 0.5B wedge)"]
+    subgraph BB["Backbone (from-scratch Qwen2-arch ~30M · OR · CLIFATRON Qwen2 0.5B wedge)"]
         direction TB
-        EMB["Untied token embeddings"] --> L1["Decoder layers<br/>RoPE · SwiGLU · RMSNorm · GQA"]
+        EMB["Untied token embeddings"] --> L1["Decoder layers (pre-norm)<br/>time-aware RoPE · SwiGLU · RMSNorm<br/>multi-head attention"]
         L1 --> HS["Per-token hidden states H<br/>output_hidden_states=True"]
     end
 
@@ -147,7 +152,9 @@ flowchart LR
 ```
 
 Resolution: **untied + ~10k vocab** (≈8–12M emb + ~25M trunk ≈ 33–37M, still the "~30M
-neighborhood"). Documented in `notes/NEXT_STEPS.md §2.3`.
+neighborhood"). Documented in `notes/NEXT_STEPS.md §2.3`. The current frozen v2 vocab is only a
+few hundred ids ([vocabulary](./data-tokenization.md#4--fused-vocabulary-and-the-frozen-manifest)),
+so ~10k is headroom, not today's size.
 
 ---
 

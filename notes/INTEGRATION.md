@@ -1,12 +1,13 @@
 # Integration Plan — Build ON CLIFATRON (not parallel to it)
 
-> **⚠️ PARTIALLY SUPERSEDED (see `MEMORY.md`).** Two things here are now out of date:
-> (1) **Backbone** — this doc treats the from-scratch decoder as an ablation arm only; the locked
-> decision (`MEMORY.md` §B) makes the **from-scratch Qwen3-arch decoder the PRIMARY paper**, with the
-> CLIFATRON-Qwen2 attach as the cheap wedge / first rung. (2) **"Immediate next code tasks"** and the
-> "new deliverable" `clif-validate/` are **DONE** — `head_adapter.py`, the metric panel, and the U9
-> validator core have all landed. The build-on-CLIFATRON *integration approach* below is still accurate;
-> only its status framing and backbone hierarchy are stale.
+> **HISTORICAL (pre-2026-09 design record) — not current guidance.** Written 2026-08-27. Its backbone
+> hierarchy (from-scratch decoder as an ablation arm only) and its tokenizer plan (reuse CLIFATRON
+> `tokenETL`) are superseded; its "immediate next code tasks" and `clif-validate/` deliverable are done.
+> Current decisions live in `MEMORY.md` §B/§E + `AGENTS.md` (where anything here disagrees, they win):
+> **from-scratch Qwen2-arch ~30M decoder is PRIMARY** (Qwen3-arch = measured ablation row; CLIFATRON's
+> Qwen2 0.5B checkpoint = Method-3 wedge / larger comparator) · **physician-designed clinical-segment
+> bins PRIMARY** (population deciles = `decile_ablation` arm) · **tokenizer = `src/data/tokenize.py`**
+> (spec: `website/docs/data-tokenization.md`).
 
 **Decision (2026-08-27):** CLIFATRON (github.com/Common-Longitudinal-ICU-data-Format/CLIFATRON,
 MIT, PyPI `clifatron`) is the consortium's working CLIF-native ICU FM — built by our lab's

@@ -1,15 +1,17 @@
-"""Flat Llama-style causal decoder over FUSED code=value tokens (~30M params).
+"""Flat Qwen2-arch (Llama-style) causal decoder over FUSED code=value tokens (~30M params).
 
 REVISED per Lee et al. 2026 (arXiv:2604.16775), the CLIF-native tokenization
 ablation (28 matched decoders on MIMIC-IV-Ext-CLIF):
   - FUSED single token per (concept, value-bin) — biggest win (mortality 0.891->0.915).
     The old split (concept-token + value-token) and the dual-level intra-event pool are
     retired; a fused token makes a flat sequence sufficient.
-  - admission-relative RoPE at 1-min-resolution position ids  >=  inserted time tokens,
+  - ICU-admission-relative RoPE at 1-min-resolution position ids  >=  inserted time tokens,
     and ~11% shorter sequences (replaces the continuous-time Delta-t ALiBi bias).
-  - context 4096 tokens covers >99.95% of first-24h stays.
+  - context: 8192 tokens (configs/model.yaml max_tokens; 4096 = Lee-tokenizer ablation arm).
 
-Backbone: Llama-style — RMSNorm, RoPE, SwiGLU, untied embeddings by default, causal SDPA.
+Backbone: Qwen2-arch / Llama-style — pre-norm RMSNorm, RoPE, SwiGLU, full multi-head
+attention (no GQA, no QK-Norm), untied embeddings by default, causal SDPA.
+Note: unlike HF Qwen2, the fused qkv projection has no bias.
 Returns per-token hidden states H_t; heads (see heads.py) consume the state at the
 anchor/last position (ICareFM-style per-step patient state).
 """

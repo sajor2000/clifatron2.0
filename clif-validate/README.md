@@ -13,7 +13,8 @@ this package verifies and runs a bundle; it does not contain one.
 ## What a site runs
 
 ```bash
-pip install clif-validate   # Linux x86_64 / Python 3.11+ (POSIX-only: uses fcntl)
+# No PyPI release yet: install offline from the shipped wheelhouse (see PACKAGING.md)
+pip install --no-index --find-links wheelhouse clif-validate   # Linux x86_64 / Python 3.11+ (POSIX-only: uses fcntl)
 
 clif-validate \
   --checkpoint /path/to/bundle \
@@ -57,7 +58,7 @@ A green synthetic run proves the machinery (and only the machinery).
 ## Provenance of this code
 
 Everything under `clif_validate/_vendor/` is a byte-identical, import-rewritten
-copy of the [CLIFATRON repository](https://github.com/sajor2000/clifatron2.0)'s
+copy of the [CLIFATRON 2.0 repository](https://github.com/sajor2000/clifatron2.0)'s
 `src/` modules, produced by `scripts/sync_vendor.py` and guarded by
 `vendor_manifest.json` — the repo and the wheel run the same implementation, and
 drift on either side fails a test. Do not edit vendored files by hand.

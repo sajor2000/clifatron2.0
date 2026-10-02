@@ -1,4 +1,7 @@
 # Tokenization ablation design (NEXT_STEPS.md §4).
+# STATUS 2026-10-02: DESIGN ONLY — src/train/run_tokenization_ablation.py builds models and exits at
+# "TODO: wire DataLoader"; continuous_fused + textcode inputs are stubs. Primary scheme is physician
+# clinical segments (MEMORY.md §E1a, revised 2026-09-02); see website/docs/data-tokenization.md §9.
 # Evidence: Lee 2026 (arxiv:2604.16775) — deciles+soft wins tails; McCann 2026
 # (medRxiv 2026.08.04) — continuous-fused better numeric, worse calibration;
 # Al Attrach 2025 (arxiv:2512.05217) — frozen text encoders beat trainable.
@@ -25,8 +28,10 @@ shared:
 
 # --------------------------------------------------------------------- arms
 arms:
-  # (1) CLIFATRON clinical bins — baseline (vendored tokenETL).
-  # Their scheme: clinical-segment-anchored *quantiles*, not fixed ranges.
+  # (1) Physician clinical-segment bins — the PRIMARY scheme (data.yaml scheme: clinical_segment).
+  # Fixed min/max segments from the CLIF consortium CSV, built by src/data/tokenize.py (NOT vendored
+  # tokenETL). NOTE: soft_discretization is false here but true in data.yaml — the primary config
+  # (clinical + soft) has no arm of its own yet.
   # Bins from external/clifatron/tokenETL/config/critical_illness_tokenization_final_with_intervals.csv
   clifatron_clinical_bins:
     description: "CLIFATRON clinical-segment bins (baseline)"
@@ -50,7 +55,7 @@ arms:
     tags: [tokenization, decile, lee-2026]
 
   # (3) Deciles + soft discretization — Lee's best encoder on dangerous tails.
-  # This is our DEFAULT tokenizer (configs/data.yaml).
+  # Was the default 2026-08-27 → 2026-09-02; now an ablation arm (data.yaml scheme: decile_ablation).
   # Wins on severe hypokalemia / hypernatremia / hypotension / CRRT / K-extremes.
   deciles_plus_soft:
     description: "Deciles with soft discretization (kernel=1) + forced clinical edges"

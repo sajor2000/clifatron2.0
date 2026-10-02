@@ -92,7 +92,7 @@ the U11 channel to a real external site, and return only disclosure-controlled a
 
 ### Phase B — Method experiments (U6, U7 — parallel)
 **U6 · core architecture ablations** (tied vs untied embeddings; separate vs joint objective), naming
-the representation/backbone family (checkpoint-attached Qwen2 vs from-scratch ~30M Qwen3) on every arm.
+the representation/backbone family (checkpoint-attached Qwen2 vs from-scratch ~30M Qwen2-arch; Qwen3-arch = ablation row) on every arm.
 **U7 · PORTER portability arm** (language-grounded TextCode vs frozen mCIDE, the cross-site
 transfer-robustness test).
 - **Unblock on:** U12 complete · real CLIF data staged + `ce-data-qa` (G3) · 2× L40 qualification (G4) ·

@@ -5,10 +5,12 @@ Value bins are per-concept **clinician-designed segments** (the CLIF consortium'
 labs/vitals) — NOT data-driven deciles. The scheme is physician-defined: normal
 range subdivided by measurement density, above/below with progressively wider
 intervals, extreme-value quintiles at the tails. Population deciles are retained
-as an ablation arm (`scheme: decile` in data.yaml).
+as an ablation arm (`scheme: decile_ablation` in data.yaml).
 
 Each event is ONE FUSED token `concept=bin` (numeric) or `concept` (categorical).
-Position is admission-relative minutes (`pos_min`). Events are storetime-ordered.
+Position is minutes since ICU admission (`pos_min`). Events are ordered by their
+availability timestamp (storetime semantics). Full spec, including known issues:
+website/docs/data-tokenization.md.
 
 Usage:
     python -m src.data.tokenize --site mimic --in $MIMIC_DIR --out output/intermediate_phi/mimic --build-vocab --episodes output/intermediate_phi/episodes.parquet
@@ -219,7 +221,7 @@ def build_value_bins(events: pl.DataFrame, n_bins: int,
                      forced_edges: dict[str, list[float]] | None = None) -> dict[str, list[float]]:
     """Per-concept quantile edges (decile ablation arm only).
 
-    The default scheme is clinical_segment (load_clinical_segments); this function
+    The default scheme is clinical_segment (build_clinical_segment_bins); this function
     exists for the decile ablation arm. Finite forced edges are retained regardless
     of the reference data range so frozen vocab remains valid across sites."""
     if n_bins < 2:

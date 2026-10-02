@@ -6,6 +6,8 @@
 /benchmark/results/
 *.parquet
 *.csv
+# ...except the physician-designed bin definitions the tokenizer reads (configs/data.yaml segment_source)
+!external/clifatron/tokenETL/config/critical_illness_tokenization_final_with_intervals.csv
 *.pt
 *.bin
 *.ckpt

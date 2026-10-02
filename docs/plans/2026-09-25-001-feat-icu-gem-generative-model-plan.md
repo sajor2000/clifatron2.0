@@ -46,7 +46,7 @@ release-trust + federation E2E, 389 + 32 data-free tests green, token-sequence v
 2. No RL/reward hooks anywhere in `src/`.
 3. No instruction conditioning; no prefix-LM (infilling) attention support.
 4. No generative evals (perplexity, event-rate calibration, key-event recall, distance-to-observed).
-5. No bridge packing OUR decile shards into 8192-row packs for the dense trunk.
+5. No bridge packing our canonical fused-token shards (clinical-segment bins) into 8192-row packs for the dense trunk.
 
 **Bugs found and fixed in G0:** inert NTP warmup in `joint_pretrain.py` (frozen-toggle → no trunk
 gradients), `"total": None` crash in `run_arm.py`, duplicated (shadowed) `build_clinical_segment_bins`

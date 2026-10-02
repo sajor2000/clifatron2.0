@@ -1,5 +1,8 @@
 # CLIFATRON 2.0 — Complete Handoff Prompt (2026-08-27)
 
+> **ARCHIVED (2026-10-02): superseded by `AGENTS.md` + `MEMORY.md`.** A 2026-08-27 handoff prompt kept for
+> history only; its build-status and next-step claims are stale. Do not follow it.
+
 Use the CE DataScience plugin for all work. Clone and enter the repo, then `uv sync`.
 
 ## Environment

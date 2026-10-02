@@ -1,5 +1,9 @@
 # Coding Handoff - Evidence-Ready Model Experiments U1-U10
 
+> **ARCHIVED (2026-10-02): superseded by `MEMORY.md` (§LOCKED DECISIONS + §Status), `AGENTS.md`, and
+> `docs/plans/2026-09-01-001-feat-completion-roadmap-plan.md`.** A 2026-08-28 execution handoff kept for
+> history only; its backbone (Qwen3 headline) and tokenizer (deciles) decisions are stale.
+
 **Status date:** 2026-08-28  
 **Current baseline:** `main` includes PR #2 (`feat/evidence-ready-model-experiments`) and PR #3 (`fix/value-head-normalization`).  
 **Verification at handoff:** U1-U4 and value-stats fixes were merged after `uv run --with pytest pytest tests/ -q` passed with `108 passed, 3 skipped` on the feature branch and value-stats focused tests passed on the follow-up branch.

@@ -1,13 +1,13 @@
 ---
 id: gem-local-validation
 title: GEM Local Validation (MPS)
-sidebar_position: 11
+sidebar_position: 10
 ---
 
 # GEM Local Validation — the stack proven before the L40 run
 
 The whole generative stack was proven end-to-end on a single dev Mac (MPS, fp32) against the
-**real staged MIMIC CLIF tables** — 546,028 stays / ~134M events staged on the node, a
+**real staged Site 1 CLIF tables** — 546,028 stays / ~134M events staged on the node, a
 50,986-stay dev slice exercised locally — before any code moves to the 2× L40 training box.
 The dated evidence trail lives in
 [`docs/plans/gem-overnight-log.md`](https://github.com/sajor2000/clifatron2.0/blob/main/docs/plans/gem-overnight-log.md);
