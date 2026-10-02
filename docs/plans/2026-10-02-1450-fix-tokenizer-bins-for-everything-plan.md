@@ -70,6 +70,11 @@ The evidence supports binning every value as a fused token. Guo et al. 2026 foun
 - R9. Patient assessments enter the stream: numeric scales binned per R4 and non-numeric results fused per R5. Assessments are target-eligible measurements, not treatments.
 - R10. CRRT and ECMO/MCS numeric settings are tokenized as input-only events. ECMO/MCS metrics are qualified by device group, so an ECMO pump speed and a VAD pump speed are different concepts.
 
+- R21. Code status and patient position enter the stream as input-only fused events.
+  - Code status is keyed by patient. The status in effect at admission is emitted at admission, and each later change is emitted at its `start_dttm`.
+  - Position emits only on prone/not-prone transitions.
+  - Both artifacts start with static admission tokens: age decile, sex, race, ethnicity, admission type. These follow BBJ's CLIF GEM.
+
 **Order and availability**
 - R11. Event order within a stay is fully specified by availability time, then a stable tiebreak (source, concept, value). The sort is applied after the observation-window join.
 - R12. Every table declares its availability semantics: `result` or `recorded`, plus `missing_storetime` where CLIF has no store time. Each table also declares an optional conservative lag (default 0). The tokenization report states the availability semantics per table, and the real-data gate fails if any table lacks a declaration.
@@ -114,7 +119,7 @@ The evidence supports binning every value as a fused token. Guo et al. 2026 foun
 
 ### Scope Boundaries
 
-- Demographics, Elixhauser comorbidities, and other static context tokens are excluded.
+- Elixhauser comorbidities and a discretized SOFA score are excluded. Demographic admission tokens are now included (R21).
 - New outcome definitions are excluded. Outcomes stay `configs/cohort.yaml` as-is.
 - Changes to the hazard-head target set are excluded.
 - Post-discharge deaths (`clif_patient.death_dttm` after discharge) are excluded, because the trajectory unit ends at hospital disposition.
@@ -123,7 +128,7 @@ The evidence supports binning every value as a fused token. Guo et al. 2026 foun
 
 ### Deferred to Follow-Up Work
 
-- Static context tokens (demographics, comorbidities) as a sequence prefix.
+- Comorbidity (Elixhauser) context tokens and discretized SOFA tokens.
 - A derived norepinephrine-equivalent (NEE) shock-severity event (Kotani et al. 2023, PMID 36670410). It requires concurrent-infusion state tracking.
 - Clinician review of the data-driven bins for non-CSV concepts. Physician segments added to the CSV would replace them.
 - Fixing the `angiotension` spelling upstream in the consortium CSV. This plan aliases it locally.
@@ -208,6 +213,15 @@ The evidence supports binning every value as a fused token. Guo et al. 2026 foun
 
   Governs R17, R18, R19, R20.
 
+- KTD11. **Match BBJ's CLIF GEM event coverage while the vocabulary is open.**
+  - Burkhart et al. 2026 (UChicago BBJ lab, arXiv 2608.02939) tokenize BOS, then age, sex, race, ethnicity and admission type at admission, then binned meds, labs, vitals, CRRT, assessments and resp settings, then transfers, code status and proning, then EOS. They freeze the vocabulary on MIMIC training data.
+  - Adding code status, position and static tokens now avoids a second vocabulary break.
+  - Demographic inputs are the agent's evidence-based choice, not a user-settled decision. They are config-switchable (`static_tokens`), and the existing subgroup fairness panel evaluates their effect.
+  - `clif_code_status` joins through `patient_id`.
+  - Every new event source is input-only except assessments.
+
+  Governs R21.
+
 ### High-Level Technical Design
 
 ```mermaid
@@ -250,6 +264,9 @@ flowchart TB
 - Kotani et al. 2023, PMID 36670410: updated NEE.
 - Chou et al. 2017, PMID 28089112: GCS motor vs total.
 - Code: v1 `external/clifatron/tokenETL/utils/polars_utils.py` interval semantics, `builders/medication_builder.py` weight ASOF.
+- Burkhart, Beaulieu-Jones et al. 2026, *Federated generative event models for tokenized EHRs* (arXiv 2608.02939; `bbj-lab/coreopsis`): the CLIF GEM tokenization recipe, a frozen MIMIC vocabulary, and transportability results.
+- DuckDB `ASOF JOIN` docs (Context7 `/duckdb/duckdb-web`): an equality on the stay plus `dose_time >= weight_time` returns the most recent prior weight.
+- Polars docs (Context7): row order for equal keys is not guaranteed unless explicitly maintained, which supports the KTD6 sort after the join.
 
 ---
 
@@ -322,7 +339,7 @@ flowchart TB
 ### U4. New event sources: doses, ventilator, assessments, CRRT, ECMO/MCS
 
 - **Goal:** treatments and assessments the model was missing enter the stream with values.
-- **Requirements:** R6, R7, R8, R9, R10 (KTD5)
+- **Requirements:** R6, R7, R8, R9, R10, R21 (KTD5, KTD11)
 - **Dependencies:** U2, U3
 - **Files:** `src/data/tokenize.py` (`_read_table` melt, dose and assessment paths), `src/data/units.py` (new), `configs/data.yaml` (tables: `meds` dose block, `meds_intermittent`, `resp_support`, `assessments`, `crrt`, `ecmo`), `src/eval/bundle.py` (identifier validator), `tests/test_units.py` (new), `tests/test_data_config.py`, `clif-validate/scripts/sync_vendor.py`
 - **Approach:**
@@ -331,7 +348,8 @@ flowchart TB
   3. Resp: melt the 17 numeric columns, plus fused mode, device and tracheostomy.
   4. Assessments: numeric value → numeric event, else categorical → fused. Target-eligible.
   5. CRRT: melt the numeric columns, plus fused mode. ECMO/MCS: `{mcs_group}_{column}`. Both input-only.
-  6. `input_only` stays true for meds, intermittent meds, resp, CRRT, ECMO and ADT.
+  6. Add code status (via `patient_id`, the status in effect at admission plus changes) and position (prone/not-prone transitions only) as input-only fused events. Add static admission tokens (age decile, sex, race, ethnicity, admission type) when `static_tokens` is on.
+  7. `input_only` stays true for meds, intermittent meds, resp, CRRT, ECMO, code status, position and ADT.
 - **Execution note:** test-first on the unit table, then the synthetic-parquet integration.
 - **Patterns to follow:** v1 `medication_builder.py` and `respiratory_support_builder.py` behavior (re-implemented). `_read_table`'s parameterized SQL.
 - **Test scenarios:**
@@ -344,7 +362,10 @@ flowchart TB
   - A resp row with fio2_set 0.4, peep_set 8 and mode AC/VC → three events plus the fused mode.
   - GCS total 8 → ordinal, target-eligible. CAM "Positive" → fused.
   - ECMO `device_rate` for an ECMO group and a VAD group → two distinct concepts.
-  - Every med, resp, CRRT and ECMO event has `target_eligible == False`.
+  - Every med, resp, CRRT, ECMO, code-status and position event has `target_eligible == False`.
+  - A DNR status set two days before admission → `code_status=dnr` emitted at admission. A change to DNR/DNI mid-stay → emitted at its time.
+  - 100 repeated `not_prone` rows then one `prone` → exactly one `position=prone` event.
+  - Static tokens appear once at the start of the stay, in a fixed order. With `static_tokens: []`, none appear.
   - A config field containing `;DROP` → rejected by the bundle identifier validator.
 - **Verification:** unit and config tests pass. A synthetic multi-table tokenization emits events from every new source.
 
