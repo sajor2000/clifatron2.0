@@ -22,12 +22,18 @@ from src.model.encoder import CLIFEncoder
 from src.model.generate import (
     KVCache,
     SimulationWriter,
+    TerminalVocabularyError,
     _cached_forward,
+    classify_rollouts,
+    gem_anchor_prompt,
     generate,
     load_transition_index,
     load_vocab,
     make_decoder,
+    rollout_to_disposition,
     sample_logits,
+    stop_token_ids_for,
+    terminal_token_ids,
 )
 from src.viewer.sequence_viewer import ParquetSource
 
@@ -270,3 +276,172 @@ class TestVocabAndWriter:
         events = tmp_path / "events.parquet"
         pl.DataFrame({"token": [[1, 4, 5], [1, 4, 6], [2]]}).write_parquet(events)
         assert load_transition_index(events) == {1: (4,), 4: (5, 6)}
+
+
+# ------------------------------------------- U9: generate until disposition (R19)
+
+DISPOSITIONS = ("home", "facility", "hospice", "expired", "ama", "other", "unknown")
+GEM_VOCAB = {
+    "<pad>": 0, "<bos>": 1, "<eos>": 2, "<unk>": 3,
+    "hr=1": 4, "hr=2": 5, "ADMISSION//ed": 6,
+    **{f"DISCHARGE//{d}": 10 + i for i, d in enumerate(DISPOSITIONS)},
+}
+EXPIRED, HOME, EOS, FILLER = 13, 10, 2, 4
+
+
+class ScriptedEncoder(CLIFEncoder):
+    """A tiny trunk whose next-token logits are scripted per batch row: the k-th
+    `lm_logits` call (k = 0 after prefill) puts all mass on `scripts[row][k]`, and on
+    a filler token once a row's script is exhausted — so "emits DISCHARGE//expired at
+    step 5" is exact under greedy decoding, independent of the random weights."""
+
+    def __init__(self, scripts):
+        torch.manual_seed(0)
+        super().__init__(VOCAB, {"trunk": {"d_model": 32, "n_heads": 4, "n_layers": 1,
+                                           "ffn_mult": 2, "dropout": 0.0,
+                                           "tied_embeddings": False}})
+        self.scripts = [list(script) for script in scripts]
+        self.calls = 0
+        self.prefills = 0
+        self.tok_emb.register_forward_pre_hook(self._on_embed)
+
+    def _on_embed(self, module, inputs):
+        if inputs[0].size(1) > 1:  # a multi-token chunk = a new prefill: restart script
+            self.calls = 0
+            self.prefills += 1
+
+    def lm_logits(self, H):
+        out = torch.full((H.size(0), VOCAB), -50.0)
+        for row in range(H.size(0)):
+            script = self.scripts[row % len(self.scripts)]
+            token = script[self.calls] if self.calls < len(script) else FILLER
+            out[row, token] = 50.0
+        self.calls += 1
+        return out
+
+
+def gem_prompt():
+    return [1, 6, 4, 5], [0, 0, 30, 90]  # <bos> ADMISSION//ed hr=1 hr=2
+
+
+class TestTerminalStopIds:
+    def test_every_discharge_token_and_eos_are_stop_ids(self):
+        ids = terminal_token_ids(GEM_VOCAB, DISPOSITIONS)
+        assert ids == {10 + i: d for i, d in enumerate(DISPOSITIONS)}
+        assert stop_token_ids_for(GEM_VOCAB) == tuple(sorted([*ids, EOS]))
+
+    def test_vocab_without_terminal_tokens_is_refused(self):
+        plain = {k: v for k, v in GEM_VOCAB.items() if not k.startswith("DISCHARGE//")}
+        with pytest.raises(TerminalVocabularyError, match="DISCHARGE//"):
+            terminal_token_ids(plain)
+
+    def test_vocab_missing_one_allowlisted_disposition_is_refused(self):
+        partial = {k: v for k, v in GEM_VOCAB.items() if k != "DISCHARGE//hospice"}
+        with pytest.raises(TerminalVocabularyError, match="hospice"):
+            terminal_token_ids(partial, DISPOSITIONS)
+
+
+class TestRolloutToDisposition:
+    def run(self, scripts, n, **kw):
+        ids, pos = gem_prompt()
+        kw.setdefault("max_new_tokens", 12)
+        return rollout_to_disposition(
+            ScriptedEncoder(scripts), ids, pos, vocab=GEM_VOCAB, dispositions=DISPOSITIONS,
+            n_rollouts=n, seed=0, temperature=0.0, **kw)
+
+    def test_expired_at_step_five_is_a_terminal_stop(self):
+        [record] = self.run([[FILLER, 5, FILLER, 5, EXPIRED]], 1)
+        assert record["stop_reason"] == "terminal"
+        assert record["terminal_type"] == "expired"
+        assert record["step"] == 5
+        assert record["token_ids"][-1] == EXPIRED and len(record["token_ids"]) == 5
+
+    def test_eos_without_a_disposition_is_an_eos_stop(self):
+        [record] = self.run([[FILLER, EOS]], 1)
+        assert record["stop_reason"] == "eos"
+        assert record["terminal_type"] is None
+        assert record["step"] == 2
+
+    def test_never_terminating_rollout_is_censored_at_the_cap(self):
+        [record] = self.run([[]], 1, max_new_tokens=7)
+        assert record["stop_reason"] == "censored"
+        assert record["terminal_type"] is None  # never read as survival (home)
+        assert record["step"] == 7
+
+    def test_time_to_terminal_is_unavailable_without_a_time_model(self):
+        """The sampler advances a FIXED pos_step_min clock — it does not predict time,
+        so a rollout's elapsed minutes are not reported as a model estimate."""
+        [record] = self.run([[FILLER, EXPIRED]], 1)
+        assert record["elapsed_min"] is None
+
+    def test_rows_in_one_batch_stop_independently(self):
+        records = self.run([[EXPIRED], [FILLER, FILLER, HOME], []], 3, max_new_tokens=5)
+        assert [r["rollout"] for r in records] == [0, 1, 2]
+        assert [(r["stop_reason"], r["terminal_type"], r["step"]) for r in records] == [
+            ("terminal", "expired", 1), ("terminal", "home", 3), ("censored", None, 5)]
+
+    def test_batch_size_chunks_do_not_change_rollouts(self):
+        whole = self.run([[EXPIRED], [FILLER, HOME]], 4)
+        # each chunk is a fresh prefill, so the scripted rows replay per chunk
+        chunked = self.run([[EXPIRED], [FILLER, HOME]], 4, batch_size=2)
+        assert [(r["stop_reason"], r["terminal_type"], r["step"]) for r in whole] == \
+            [(r["stop_reason"], r["terminal_type"], r["step"]) for r in chunked]
+
+    def test_rollouts_are_deterministic_under_a_seed(self):
+        enc = tiny_encoder()
+        ids, pos = gem_prompt()
+
+        def run(seed):
+            return rollout_to_disposition(
+                enc, ids, pos, vocab=GEM_VOCAB, dispositions=DISPOSITIONS, n_rollouts=6,
+                seed=seed, max_new_tokens=10, temperature=1.0,
+                allowed_token_ids=tuple(sorted(GEM_VOCAB.values())))
+
+        assert run(3) == run(3)
+
+    def test_driver_refuses_a_vocab_without_terminal_tokens(self):
+        plain = {k: v for k, v in GEM_VOCAB.items() if not k.startswith("DISCHARGE//")}
+        ids, pos = gem_prompt()
+        enc = ScriptedEncoder([[EXPIRED]])
+        with pytest.raises(TerminalVocabularyError):
+            rollout_to_disposition(enc, ids, pos, vocab=plain, dispositions=DISPOSITIONS,
+                                   n_rollouts=2, seed=0, max_new_tokens=4)
+        assert enc.prefills == 0  # refused before any generation
+
+    def test_driver_refuses_a_prompt_that_already_holds_the_outcome(self):
+        ids, pos = gem_prompt()
+        with pytest.raises(ValueError, match="terminal"):
+            rollout_to_disposition(
+                ScriptedEncoder([[EXPIRED]]), [*ids, EXPIRED], [*pos, 120],
+                vocab=GEM_VOCAB, dispositions=DISPOSITIONS, n_rollouts=1, seed=0,
+                max_new_tokens=4)
+
+    def test_classify_rollouts_from_a_generate_result(self):
+        result = {"tokens": torch.tensor([[4, 13, 0], [4, 2, 0], [4, 5, 4]]),
+                  "lengths": torch.tensor([2, 2, 3]),
+                  "stopped": torch.tensor([True, True, False])}
+        records = classify_rollouts(result, terminal_ids=terminal_token_ids(GEM_VOCAB),
+                                    end_ids=(EOS,))
+        assert [(r["stop_reason"], r["terminal_type"], r["step"]) for r in records] == [
+            ("terminal", "expired", 2), ("eos", None, 2), ("censored", None, 3)]
+
+
+class TestGemAnchorPrompt:
+    def windows(self):
+        # stay stream: <bos> ADM hr=1 hr=2 | hr=1 DISCHARGE//expired <eos>, anchor_idx=3
+        return [
+            {"continuation_index": 1, "source_start": 4, "token": [4, 13, 2],
+             "pos_min": [200, 400, 400], "anchor_idx": 3},
+            {"continuation_index": 0, "source_start": 0, "token": [1, 6, 4, 5],
+             "pos_min": [0, 0, 30, 90], "anchor_idx": 3},
+        ]
+
+    def test_prefix_is_truncated_at_the_anchor_across_windows(self):
+        assert gem_anchor_prompt(self.windows()) == ([1, 6, 4, 5], [0, 0, 30, 90])
+
+    def test_a_prefix_reaching_the_terminal_is_refused(self):
+        windows = self.windows()
+        for window in windows:
+            window["anchor_idx"] = 5
+        with pytest.raises(ValueError, match="terminal"):
+            gem_anchor_prompt(windows, terminal_ids=terminal_token_ids(GEM_VOCAB))

@@ -20,6 +20,17 @@ generation-side scores):
     distance is later G3 work.
   - rollout_hygiene: length stats, <eos> termination rate, <unk> rate,
     distinct-2 (repetition).
+  - rollout mortality (U9, R20; KTD10): per stay, the death-before-discharge
+    frequency over N generate-until-disposition rollouts — expired / rollouts that
+    reached a KNOWN disposition — with a Wilson 95% CI. Censored rollouts (token cap),
+    `<eos>` without a disposition and DISCHARGE//unknown are end of observation, never
+    survival: counted separately and excluded from the denominator. Across stays with
+    a known observed disposition: AUROC / AUPRC vs observed `expired`, calibration
+    slope / intercept (src/eval/metrics.py), the terminal-type confusion matrix
+    (modal rollout terminal vs observed), the nontermination (censoring) rate, and the
+    time-to-terminal MAE when rollouts carry model-estimated elapsed minutes (the
+    current sampler does not — see src/model/generate.py — so it reports unavailable).
+    The summary is aggregate-only; per-stay rows carry only the caller's opaque keys.
 
 CLI (site-local; reports stay under output/ — PHI-derived, never committed):
     uv run --frozen --group dev python -m src.eval.generative \
@@ -45,6 +56,16 @@ import polars as pl
 
 from src.data.segments import vocab_segments
 from src.eval.clinical_plausibility import split_sequence
+from src.eval.metrics import calibration_slope_intercept
+from src.eval.metrics import score as discrimination
+from src.model.generate import (
+    STOP_CENSORED,
+    STOP_EOS,
+    STOP_TERMINAL,
+    TIME_UNAVAILABLE_REASON,
+    stay_stream,
+    terminal_token_ids,
+)
 
 
 _SPECIALS = {"<pad>", "<bos>", "<eos>", "<unk>"}
@@ -317,6 +338,170 @@ def evaluate(sims: list[dict], real: list[dict], groups: dict[str, str], *,
             "worst": max(distances, key=lambda d: d["nearest_jaccard_distance"]),
         }
     return report
+
+
+# ------------------------------------------------ rollout mortality (U9, R20)
+
+EXPIRED = "expired"
+UNKNOWN = "unknown"
+NO_TERMINAL = "none"  # confusion column for a stay whose rollouts never terminated
+
+
+def wilson_interval(k: int, n: int, z: float = 1.959964) -> tuple[float | None, float | None]:
+    """Wilson score interval for k successes in n trials (95% by default); (None, None)
+    when n == 0. Stays inside [0, 1] and is defined at k = 0 and k = n, unlike Wald."""
+    if n <= 0:
+        return None, None
+    p = k / n
+    denom = 1.0 + z * z / n
+    center = (p + z * z / (2 * n)) / denom
+    half = z * math.sqrt(p * (1 - p) / n + z * z / (4 * n * n)) / denom
+    return max(0.0, center - half), min(1.0, center + half)
+
+
+def _modal(counts: Counter, order: tuple[str, ...]) -> str | None:
+    """Most frequent label; ties break by `order` (the disposition allowlist), then
+    alphabetically — deterministic."""
+    if not counts:
+        return None
+    rank = {label: i for i, label in enumerate(order)}
+    return min(counts, key=lambda label: (-counts[label], rank.get(label, len(rank)), label))
+
+
+def rollout_mortality(records: list[dict], *, dispositions: tuple[str, ...] = ()) -> dict:
+    """Mortality from one stay's rollouts (`rollout_to_disposition` records).
+
+    mortality = expired / rollouts that reached a known disposition. Censored rollouts,
+    `<eos>` stops without a disposition and DISCHARGE//unknown terminals are reported
+    separately and never counted as survival. `mortality` and its Wilson CI are None
+    when no rollout reached a known disposition."""
+    reasons = Counter(r["stop_reason"] for r in records)
+    unexpected = set(reasons) - {STOP_TERMINAL, STOP_EOS, STOP_CENSORED}
+    if unexpected:
+        raise ValueError(f"unknown stop_reason(s): {sorted(unexpected)}")
+    terminals = Counter(r["terminal_type"] for r in records
+                        if r["stop_reason"] == STOP_TERMINAL)
+    n_expired = terminals.get(EXPIRED, 0)
+    n_unknown = terminals.get(UNKNOWN, 0)
+    n_terminated = sum(terminals.values()) - n_unknown
+    lo, hi = wilson_interval(n_expired, n_terminated)
+    return {
+        "n_rollouts": len(records),
+        "n_terminated": n_terminated,
+        "n_expired": n_expired,
+        "n_unknown": n_unknown,
+        "n_eos": reasons.get(STOP_EOS, 0),
+        "n_censored": reasons.get(STOP_CENSORED, 0),
+        "nontermination_rate": reasons.get(STOP_CENSORED, 0) / len(records) if records else None,
+        "mortality": n_expired / n_terminated if n_terminated else None,
+        "ci_low": lo,
+        "ci_high": hi,
+        "terminal_distribution": dict(sorted(terminals.items())),
+        "modal_terminal": _modal(terminals, dispositions),
+    }
+
+
+def _finite_or_none(value: float) -> float | None:
+    return None if value is None or not math.isfinite(value) else float(value)
+
+
+def _time_to_terminal(stays: list[dict]) -> dict:
+    """MAE (minutes) between each stay's median terminal-rollout elapsed minutes and
+    its observed anchor-to-discharge minutes. Censored / eos rollouts never enter the
+    median. Unavailable when no rollout carries a model-estimated elapsed time."""
+    errors = []
+    for stay in stays:
+        observed = stay.get("observed_minutes")
+        elapsed = sorted(float(r["elapsed_min"]) for r in stay["rollouts"]
+                         if r["stop_reason"] == STOP_TERMINAL
+                         and r.get("elapsed_min") is not None)
+        if observed is None or not elapsed:
+            continue
+        mid = len(elapsed) // 2
+        median = elapsed[mid] if len(elapsed) % 2 else (elapsed[mid - 1] + elapsed[mid]) / 2
+        errors.append(abs(median - float(observed)))
+    if not errors:
+        return {"available": False, "n": 0, "mae_min": None,
+                "reason": TIME_UNAVAILABLE_REASON}
+    return {"available": True, "n": len(errors), "mae_min": sum(errors) / len(errors)}
+
+
+def evaluate_rollout_mortality(stays: list[dict], *, dispositions: tuple[str, ...]) -> dict:
+    """R20 evaluation over stays with rollouts and an observed disposition.
+
+    Each stay: ``{"key": opaque id, "rollouts": [records], "observed": disposition,
+    "observed_minutes": optional anchor-to-discharge minutes}``. Discrimination and
+    calibration use stays whose observed disposition is known (not ``unknown``) and
+    whose rollouts reached a known disposition at least once. Returns
+    ``{"summary": aggregate-only metrics, "per_stay": rows keyed by the caller's key}``."""
+    import numpy as np
+
+    dispositions = tuple(dispositions)
+    per_stay = []
+    p, y = [], []
+    n_unknown_observed = n_no_termination = 0
+    predicted_labels = (*dispositions, NO_TERMINAL)
+    confusion = {obs: {pred: 0 for pred in predicted_labels} for obs in dispositions}
+    totals = Counter()
+    for stay in stays:
+        observed = stay.get("observed")
+        if observed not in dispositions:
+            raise ValueError(f"observed disposition {observed!r} is not in the allowlist")
+        result = rollout_mortality(stay["rollouts"], dispositions=dispositions)
+        per_stay.append({"key": stay.get("key"), "observed": observed, **result})
+        totals.update({"n_rollouts": result["n_rollouts"],
+                       "n_censored": result["n_censored"], "n_eos": result["n_eos"]})
+        confusion[observed][result["modal_terminal"] or NO_TERMINAL] += 1
+        if observed == UNKNOWN:
+            n_unknown_observed += 1
+        elif result["mortality"] is None:
+            n_no_termination += 1
+        else:
+            p.append(result["mortality"])
+            y.append(int(observed == EXPIRED))
+    summary = {
+        "n_stays": len(stays),
+        "n_evaluable": len(p),
+        "n_excluded_unknown_observed": n_unknown_observed,
+        "n_excluded_no_termination": n_no_termination,
+        "n_rollouts": totals["n_rollouts"],
+        "n_censored": totals["n_censored"],
+        "n_eos": totals["n_eos"],
+        "nontermination_rate": (totals["n_censored"] / totals["n_rollouts"]
+                                if totals["n_rollouts"] else None),
+        "observed_mortality": sum(y) / len(y) if y else None,
+        "auroc": None, "auprc": None,
+        "calibration_slope": None, "calibration_intercept": None,
+        "terminal_confusion": {"observed_labels": list(dispositions),
+                               "predicted_labels": list(predicted_labels),
+                               "counts": confusion},
+        "time_to_terminal": _time_to_terminal(stays),
+    }
+    if len(set(y)) == 2:
+        p_arr, y_arr = np.asarray(p, dtype=float), np.asarray(y, dtype=int)
+        disc = discrimination(p_arr, y_arr)
+        slope, intercept = calibration_slope_intercept(p_arr, y_arr)
+        summary.update(auroc=_finite_or_none(disc["auroc"]),
+                       auprc=_finite_or_none(disc["auprc"]),
+                       calibration_slope=_finite_or_none(slope),
+                       calibration_intercept=_finite_or_none(intercept))
+    return {"summary": summary, "per_stay": per_stay}
+
+
+def observed_gem_outcome(windows: list[dict], vocab: dict[str, int]) -> dict:
+    """A stay's observed outcome from its GEM windows: the disposition of its
+    `DISCHARGE//*` token and the minutes from the anchor token to it."""
+    terminal_ids = terminal_token_ids(vocab)
+    stream = stay_stream(windows)
+    hits = [i for i, t in enumerate(stream["token"]) if t in terminal_ids]
+    if len(hits) != 1:
+        raise ValueError(f"a GEM stay has exactly one terminal token, found {len(hits)}")
+    at = hits[0]
+    if at <= stream["anchor_idx"]:
+        raise ValueError("the terminal token is at or before the anchor")
+    return {"disposition": terminal_ids[stream["token"][at]],
+            "minutes_after_anchor": stream["pos_min"][at]
+            - stream["pos_min"][stream["anchor_idx"]]}
 
 
 def main(argv: list[str] | None = None) -> None:

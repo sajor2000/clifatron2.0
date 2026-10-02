@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from collections import Counter
 
 import polars as pl
@@ -9,6 +10,10 @@ import pytest
 
 from src.eval.generative import (
     concept_groups,
+    evaluate_rollout_mortality,
+    observed_gem_outcome,
+    rollout_mortality,
+    wilson_interval,
     distinct_n,
     distance_to_observed,
     evaluate,
@@ -217,3 +222,149 @@ def test_calibration_reports_the_treatment_group_and_recall_counts_it_as_key():
     # key events: device_category + norepinephrine (treatments); gen hits the infusion
     assert ker["n_real_categorical"] == 2
     assert ker["categorical_recall"] == pytest.approx(0.5)
+
+
+# ------------------------------------------- U9: rollout mortality evaluation (R20)
+
+DISPOSITIONS = ("home", "facility", "hospice", "expired", "ama", "other", "unknown")
+
+
+def rec(reason, kind=None, step=5, elapsed=None):
+    return {"stop_reason": reason, "terminal_type": kind, "step": step, "elapsed_min": elapsed}
+
+
+def rollouts(**counts):
+    """terminal rollouts by disposition, plus `censored=` / `eos=` non-terminal ones."""
+    out = []
+    for kind, n in counts.items():
+        if kind in ("censored", "eos"):
+            out += [rec(kind) for _ in range(n)]
+        else:
+            out += [rec("terminal", kind) for _ in range(n)]
+    return out
+
+
+def test_wilson_interval_matches_the_closed_form():
+    lo, hi = wilson_interval(3, 8)
+    assert lo == pytest.approx(0.13684, abs=1e-4)
+    assert hi == pytest.approx(0.69426, abs=1e-4)
+    assert wilson_interval(0, 0) == (None, None)
+    lo, hi = wilson_interval(0, 5)
+    assert lo == 0.0 and 0.0 < hi < 1.0
+
+
+def test_rollout_mortality_divides_by_terminated_rollouts_only():
+    result = rollout_mortality(rollouts(expired=3, home=5, censored=2))
+    assert result["n_rollouts"] == 10
+    assert result["n_expired"] == 3
+    assert result["n_terminated"] == 8
+    assert result["n_censored"] == 2
+    assert result["mortality"] == pytest.approx(3 / 8)
+    assert result["ci_low"] == pytest.approx(0.13684, abs=1e-4)
+    assert result["ci_high"] == pytest.approx(0.69426, abs=1e-4)
+    assert result["nontermination_rate"] == pytest.approx(0.2)
+    assert result["terminal_distribution"] == {"expired": 3, "home": 5}
+    assert result["modal_terminal"] == "home"
+
+
+def test_censored_rollouts_are_never_counted_as_survival():
+    result = rollout_mortality(rollouts(expired=1, censored=5))
+    assert result["mortality"] == 1.0  # 1/1, not 1/6
+    all_censored = rollout_mortality(rollouts(censored=4))
+    assert all_censored["mortality"] is None
+    assert all_censored["ci_low"] is None and all_censored["modal_terminal"] is None
+
+
+def test_eos_and_unknown_disposition_are_excluded_from_the_denominator():
+    """`<eos>` without a disposition and DISCHARGE//unknown are end of observation, not
+    survival (R18): reported separately, excluded like censoring."""
+    result = rollout_mortality(rollouts(expired=1, home=1, unknown=2, eos=3))
+    assert result["n_terminated"] == 2
+    assert result["n_unknown"] == 2 and result["n_eos"] == 3
+    assert result["mortality"] == pytest.approx(0.5)
+    assert result["terminal_distribution"] == {"expired": 1, "home": 1, "unknown": 2}
+
+
+def four_stays():
+    return [
+        {"key": "s1", "observed": "expired", "rollouts": rollouts(expired=3, home=1)},
+        {"key": "s2", "observed": "expired", "rollouts": rollouts(expired=2, home=1, facility=1)},
+        {"key": "s3", "observed": "home", "rollouts": rollouts(expired=1, home=3, censored=2)},
+        {"key": "s4", "observed": "facility", "rollouts": rollouts(expired=3, facility=2)},
+    ]
+
+
+def test_evaluation_on_four_stays_gives_expected_auroc_and_confusion():
+    report = evaluate_rollout_mortality(four_stays(), dispositions=DISPOSITIONS)
+    summary = report["summary"]
+    # p = .75, .5 (expired) vs .25, .6 (survived): 3 of 4 pairs ordered
+    assert summary["n_evaluable"] == 4
+    assert summary["auroc"] == pytest.approx(0.75)
+    assert summary["auprc"] == pytest.approx(5 / 6)
+    assert summary["observed_mortality"] == pytest.approx(0.5)
+    assert isinstance(summary["calibration_slope"], float)
+    assert isinstance(summary["calibration_intercept"], float)
+    confusion = summary["terminal_confusion"]["counts"]
+    assert confusion["expired"]["expired"] == 2
+    assert confusion["home"]["home"] == 1
+    assert confusion["facility"]["expired"] == 1
+    assert sum(sum(row.values()) for row in confusion.values()) == 4
+    # 2 censored of 4 + 4 + 6 + 5 = 19 rollouts
+    assert summary["n_rollouts"] == 19 and summary["n_censored"] == 2
+    assert summary["nontermination_rate"] == pytest.approx(2 / 19)
+    per = {row["key"]: row for row in report["per_stay"]}
+    assert per["s3"]["mortality"] == pytest.approx(0.25) and per["s3"]["n_censored"] == 2
+
+
+def test_evaluation_excludes_unknown_outcomes_and_stays_without_terminations():
+    stays = [*four_stays(),
+             {"key": "s5", "observed": "unknown", "rollouts": rollouts(expired=4)},
+             {"key": "s6", "observed": "expired", "rollouts": rollouts(censored=3)}]
+    summary = evaluate_rollout_mortality(stays, dispositions=DISPOSITIONS)["summary"]
+    assert summary["n_stays"] == 6 and summary["n_evaluable"] == 4
+    assert summary["n_excluded_unknown_observed"] == 1
+    assert summary["n_excluded_no_termination"] == 1
+    assert summary["auroc"] == pytest.approx(0.75)
+    # the all-censored stay's modal terminal is "none", never a disposition
+    assert summary["terminal_confusion"]["counts"]["expired"]["none"] == 1
+
+
+def test_summary_is_aggregate_only():
+    report = evaluate_rollout_mortality(four_stays(), dispositions=DISPOSITIONS)
+    assert "s1" not in json.dumps(report["summary"])
+
+
+def test_time_to_terminal_mae_is_marked_unavailable_without_elapsed_minutes():
+    stays = [dict(stay, observed_minutes=600.0) for stay in four_stays()]
+    ttt = evaluate_rollout_mortality(stays, dispositions=DISPOSITIONS)["summary"][
+        "time_to_terminal"]
+    assert ttt["available"] is False and ttt["mae_min"] is None
+    assert "reason" in ttt
+
+
+def test_time_to_terminal_mae_uses_the_median_terminal_elapsed_minutes():
+    stays = [
+        {"key": "a", "observed": "home", "observed_minutes": 100.0,
+         "rollouts": [rec("terminal", "home", elapsed=e) for e in (80.0, 120.0, 400.0)]
+         + [rec("censored", elapsed=999.0)]},
+        {"key": "b", "observed": "expired", "observed_minutes": 50.0,
+         "rollouts": [rec("terminal", "expired", elapsed=110.0)]},
+    ]
+    ttt = evaluate_rollout_mortality(stays, dispositions=DISPOSITIONS)["summary"][
+        "time_to_terminal"]
+    # |120 - 100| = 20 and |110 - 50| = 60; censored minutes never enter the median
+    assert ttt["available"] is True and ttt["n"] == 2
+    assert ttt["mae_min"] == pytest.approx(40.0)
+
+
+def test_observed_gem_outcome_reads_the_terminal_after_the_anchor():
+    vocab = {"<bos>": 1, "<eos>": 2, "hr=1": 4, "ADMISSION//ed": 6,
+             **{f"DISCHARGE//{d}": 10 + i for i, d in enumerate(DISPOSITIONS)}}
+    windows = [
+        {"continuation_index": 0, "source_start": 0, "token": [1, 6, 4, 4],
+         "pos_min": [0, 0, 30, 90], "anchor_idx": 3},
+        {"continuation_index": 1, "source_start": 4, "token": [4, 13, 2],
+         "pos_min": [200, 400, 400], "anchor_idx": 3},
+    ]
+    assert observed_gem_outcome(windows, vocab) == {"disposition": "expired",
+                                                    "minutes_after_anchor": 310}
