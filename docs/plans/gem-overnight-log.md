@@ -725,3 +725,22 @@ Corresponding regenerated sample arms appeared in `output/intermediate_phi/`
 tests/ 430 passed 4 skipped, clif-validate/ 32. origin/main in sync at
 `8ec3866` after this entry's push; viewer alive, all five sources. Loop work
 remains gated on user infrastructure (19:00).
+
+### 2026-10-02 20:00 — PR #16 (tokenizer v2 program) merged; absorbed, re-verified 715/34
+
+origin/main advanced 17 commits (`d428d7c` → `4e499df`): PR #16 merged
+`t3code/tokenizer-fixes` — the tokenizer-v2 program (U1–U9, 91 files,
++16,892/−1,843): bins for every numeric concept, vocab v2 contract with
+single `bin_index` + stale-artifact rejection, deterministic event order,
+dose/ventilator/assessments/CRRT/ECMO/code-status/position tokens, fused
+categoricals, six-arm tokenization ablation, full-hospitalization GEM
+artifact with ADMISSION/DISCHARGE terminal framing, disposition/censoring/
+mortality rollout eval, suppression-safe aggregate reports, new
+`src/train/real_data_smoke.py`, vendored parity tests. Inspected read-only
+then fast-forwarded clean; no log changes upstream (19:00 entry stayed
+last). Both suites re-verified on the new main: tests/ **715 passed** 4
+skipped (was 430; +285 new tests), clif-validate/ **34 passed** (was 32;
++tokenizer parity). Guardrails on the new tree: zero tracked data files,
+working tree clean, `/output/` ignored. Artifacts unchanged (r2 sample
+arms present); viewer alive with all five sources. Launch remains gated
+on user infrastructure (20:00).
