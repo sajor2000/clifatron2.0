@@ -704,6 +704,409 @@ def banded_status_counts(counts: dict[str, int]) -> dict[str, object]:
     }
 
 
+# ================================================================ audit export (U13, KTD10)
+# A second export type for the extubation design audit and the causal results built on it.
+# It is NOT the prediction export: there is no model-bundle envelope (the classical audit
+# runs before any model exists), and its unit of disclosure is a declared count cell rather
+# than an outcome block. `validate_export` above is untouched and refuses this payload;
+# `validate_audit_export` refuses a prediction payload.
+#
+# Why cells are declared with their parents. The prediction export can refuse crosstabs
+# outright, because marginals over the same rows never determine a joint cell. The audit
+# cannot: its tables ARE nested and crossed by design -- arm within unit, trial-eligible
+# within all-comer, held-out within all, site within pooled -- and every one of those
+# pairs is a subtraction that can return a suppressed count. So each cell names the cells
+# that contain it (`parents`), and each exact additive decomposition is declared
+# (`partitions`: a total and the parts that sum to it). Suppression and the gate then run
+# over every declared pair and decomposition:
+#
+#   1. floor       a cell with n < MIN_CELL_SIZE is suppressed (zero included).
+#   2. pair        a parent and a child both released with 0 < parent - child < floor
+#                  would publish the small complement: both are suppressed. A difference
+#                  of exactly 0 is two names for one population and discloses nothing.
+#   3. partition   a decomposition with exactly one hidden member gives it back by
+#                  subtraction: the smallest released part (else the total) is hidden too.
+#
+# Rules 2 and 3 run to a fixpoint, because a cell hidden for one declaration can leave a
+# single unknown in another. The gate re-derives all three; it does not trust the producer.
+#
+# What this does NOT cover: relations nobody declared. A producer that releases two
+# overlapping cells without declaring the relation defeats rule 2; the declaration is part
+# of the producer's contract, the same way the prediction export's crosstab refusal is.
+AUDIT_EXPORT_TYPE = "extubation_audit"
+AUDIT_SCHEMA_VERSION = "u13.1"
+AUDIT_STAGES = frozenset({"blind", "simulate", "unblinded"})
+
+AUDIT_ENVELOPE_FIELDS = frozenset({
+    "export_type", "schema_version", "stage", "sites", "site_roles", "release_id",
+    "disclosure_status", "generated_by", "registry_version", "registry_status",
+    "margins_status", "thresholds_status", "config_hashes", "cohort_hashes", "authorization",
+    "cells", "partitions", "results", "tables", "stop_rules", "triggers", "notes", "signature",
+})
+REQUIRED_AUDIT_ENVELOPE_FIELDS = frozenset({
+    "export_type", "schema_version", "stage", "sites", "release_id", "disclosure_status",
+    "cells", "partitions", "results", "stop_rules",
+})
+
+AUDIT_CELL_FIELDS = frozenset({
+    "table", "site", "dimensions", "parents", "status", "reason", "n", "n_band", "share",
+    "share_of",
+})
+AUDIT_PARTITION_FIELDS = frozenset({"total", "parts"})
+
+# Result statistics. Each result names the count cells it was computed from (`basis`); it
+# may carry statistics only while every basis cell is released, because an effective
+# sample size or a detectable effect computed on a hidden arm bounds that arm's count.
+AUDIT_RESULT_IDENTITY_FIELDS = frozenset({
+    "kind", "site", "scope", "trial_id", "arm", "basis", "status", "reason",
+    # Pass/fail of the R25 screen and its reasons carry no count, so a result whose basis
+    # is suppressed still reports them.
+    "evaluable", "reasons",
+})
+AUDIT_RESULT_STAT_FIELDS = frozenset({
+    # outcome-blind
+    "effective_sample_size", "minimal_detectable_effect", "baseline_risk",
+    "baseline_risk_source", "covariate_coverage", "overlap", "balance", "checks",
+    "thresholds_status",
+    # simulation (planted effects; no outcome is read by arm)
+    "pass_rates", "n_reps", "n_completed", "n_sim", "bias",
+    # unblinded (authorized comparisons only)
+    "estimates", "diagnostics", "primary", "horizon_hours", "event", "discharge_alive_rule",
+    "authorization_basis", "unresolved_handling", "agreement", "margins_status", "notes",
+})
+AUDIT_RESULT_FIELDS = AUDIT_RESULT_IDENTITY_FIELDS | AUDIT_RESULT_STAT_FIELDS
+
+# The blind stage may not cross an outcome with anything: no cell dimension, result kind
+# or field that carries an outcome is accepted in a `blind` (or `simulate`) payload.
+AUDIT_OUTCOME_DIMENSIONS = frozenset({
+    "outcome", "event", "label", "reintubation", "death", "status_at_horizon",
+})
+AUDIT_OUTCOME_RESULT_KINDS = frozenset({"effect_estimate", "outcome_rate", "negative_control"})
+AUDIT_OUTCOME_RESULT_FIELDS = frozenset({
+    "estimates", "agreement", "event", "horizon_hours", "discharge_alive_rule",
+    "unresolved_handling",
+})
+AUDIT_OUTCOME_STAGES = frozenset({"unblinded"})
+
+AUDIT_TABLE_FIELDS = frozenset({"status", "reason", "site", "scope"})
+AUDIT_TABLE_STATUSES = frozenset({"evaluable", "not_evaluable"})
+AUDIT_RULE_FIELDS = frozenset({
+    "status", "fired", "triggered", "threshold", "threshold_status", "observed", "reason",
+    "site", "table", "contrast_status", "requirement",
+})
+AUDIT_RULE_STATUSES = frozenset({"evaluated", "not_evaluated", "not_evaluable"})
+AUDIT_AUTHORIZATION_FIELDS = frozenset({"basis", "protocol_hash", "freeze_verified", "trial_id"})
+
+
+def _audit_hidden_reason(kind: str, floor: int) -> str:
+    return {
+        "floor": f"n < {floor}",
+        "pair": f"differencing: a declared parent and child differ by fewer than {floor}",
+        "partition": "differencing: complementary suppression, a single hidden member of a "
+                     "declared partition would be recoverable by subtraction",
+        "sticky": "suppressed in a prior release; releasing it now would difference against it",
+    }[kind]
+
+
+def _audit_pairs(cells: dict[str, dict]) -> list[tuple[str, str]]:
+    """(parent, child) for every declared nesting whose two cells are both present."""
+    return [(parent, child) for child, c in cells.items()
+            for parent in c.get("parents") or () if parent in cells]
+
+
+def suppress_audit_cells(
+    cells: dict[str, dict],
+    partitions: list[dict],
+    *,
+    prior_released: dict[str, int] | None = None,
+    prior_suppressed: set[str] | None = None,
+) -> dict[str, dict]:
+    """Apply floor, pair and partition suppression to raw audit cells; return new cells.
+
+    `cells` carry their raw `n`. Released cells keep it; suppressed cells lose it for an
+    `n_band` and get a status and reason. `share` is added to a released cell whose
+    `share_of` cell is released too.
+
+    `prior_released` / `prior_suppressed` come from the release ledger
+    (`attestation.prior_audit_cells`). A cell suppressed before stays suppressed (sticky).
+    A cell already released cannot be withdrawn, so it is never chosen for complementary
+    suppression; the other side of its pair or partition is hidden instead, and when no
+    other side is left the export is refused.
+    """
+    floor = min_cell_size()
+    prior_released = dict(prior_released or {})
+    prior_suppressed = set(prior_suppressed or ())
+    for key, c in cells.items():
+        if not isinstance(c.get("n"), int) or isinstance(c.get("n"), bool) or c["n"] < 0:
+            raise DisclosureError(f"cells.{key}: suppression needs the raw non-negative integer n")
+    _check_partitions_declared(cells, partitions)
+
+    n = {key: c["n"] for key, c in cells.items()}
+    hidden: dict[str, str] = {}
+    for key in cells:
+        if key in prior_suppressed:
+            hidden[key] = "sticky"
+        elif n[key] < floor:
+            hidden[key] = "floor"
+    fixed = {key for key in cells if key in prior_released and key not in hidden}
+
+    pairs = _audit_pairs(cells)
+    changed = True
+    while changed:
+        changed = False
+        for parent, child in pairs:
+            if parent in hidden or child in hidden:
+                continue
+            if 0 < n[parent] - n[child] < floor:
+                movable = [key for key in (parent, child) if key not in fixed]
+                if not movable:
+                    raise DisclosureError(
+                        f"cells {parent!r} and {child!r} were both released before and differ "
+                        f"by fewer than {floor}; the earlier releases already disclose the "
+                        "difference. Obtain a disclosure-review exception."
+                    )
+                for key in movable:
+                    hidden[key] = "pair"
+                changed = True
+        for partition in partitions:
+            members = [partition["total"], *partition["parts"]]
+            if sum(member in hidden for member in members) != 1:
+                continue
+            candidates = sorted(
+                (n[key], key) for key in partition["parts"] if key not in hidden and key not in fixed)
+            if not candidates and partition["total"] not in hidden and partition["total"] not in fixed:
+                candidates = [(n[partition["total"]], partition["total"])]
+            if not candidates:
+                raise DisclosureError(
+                    f"partition of {partition['total']!r} has one hidden member and every other "
+                    "member was released before; the hidden count is already recoverable"
+                )
+            hidden[candidates[0][1]] = "partition"
+            changed = True
+
+    out: dict[str, dict] = {}
+    for key, c in cells.items():
+        cell = {k: v for k, v in c.items() if k not in ("n", "share", "status", "reason", "n_band")}
+        if key in hidden:
+            cell.update(status=SMALL_CELL_SUPPRESSED if hidden[key] != "floor" else INSUFFICIENT_N,
+                        reason=_audit_hidden_reason(hidden[key], floor), n_band=n_band(n[key]))
+        else:
+            cell.update(status=EVALUABLE, n=n[key])
+        out[key] = cell
+    for key, cell in out.items():
+        base = cell.get("share_of")
+        if (base is not None and cell["status"] == EVALUABLE and base in out
+                and out[base]["status"] == EVALUABLE and out[base]["n"] > 0):
+            cell["share"] = round(cell["n"] / out[base]["n"], 4)
+    return out
+
+
+def finalize_audit_result(result: dict, cells: dict[str, dict]) -> dict:
+    """Strip a result's statistics when any of its basis cells is suppressed."""
+    basis = result.get("basis") or []
+    hidden = [key for key in basis if cells.get(key, {}).get("status") != EVALUABLE]
+    if not hidden and result.get("status", EVALUABLE) == EVALUABLE:
+        return {**result, "status": EVALUABLE}
+    kept = {k: v for k, v in result.items() if k in AUDIT_RESULT_IDENTITY_FIELDS}
+    if hidden:
+        kept.update(status=SMALL_CELL_SUPPRESSED,
+                    reason="a basis cell is suppressed; statistics computed on it would bound its count")
+    return kept
+
+
+def _check_partitions_declared(cells: dict[str, dict], partitions: object) -> None:
+    if not isinstance(partitions, list):
+        raise DisclosureError("partitions: must be a list of {total, parts}")
+    for i, partition in enumerate(partitions):
+        where = f"partitions[{i}]"
+        if not isinstance(partition, dict):
+            raise DisclosureError(f"{where}: must be a mapping")
+        for key in partition:
+            _check_key(key, AUDIT_PARTITION_FIELDS, where)
+        parts = partition.get("parts")
+        if not isinstance(parts, list) or not parts:
+            raise DisclosureError(f"{where}.parts: must be a non-empty list of cell ids")
+        for member in [partition.get("total"), *parts]:
+            if member not in cells:
+                raise DisclosureError(f"{where}: names cell {member!r}, which is not in the payload")
+
+
+def _validate_audit_cells(cells: object, stage: str) -> dict[str, dict]:
+    if not isinstance(cells, dict):
+        raise DisclosureError("cells: must be a mapping of cell id -> cell")
+    floor = min_cell_size()
+    for key, c in cells.items():
+        where = f"cells.{key}"
+        _check_dynamic_key(key, "cells")
+        if not isinstance(c, dict):
+            raise DisclosureError(f"{where}: must be a mapping")
+        for field, value in c.items():
+            _check_key(field, AUDIT_CELL_FIELDS, where)
+            _check_value(field, value, where)
+        status = c.get("status")
+        if status not in OUTCOME_STATUSES:
+            raise DisclosureError(f"{where}.status: {status!r} is not a recognised status")
+        dims = c.get("dimensions") or {}
+        if not isinstance(dims, dict):
+            raise DisclosureError(f"{where}.dimensions: must be a mapping")
+        if stage not in AUDIT_OUTCOME_STAGES:
+            crossed = sorted(set(dims) & AUDIT_OUTCOME_DIMENSIONS)
+            if crossed:
+                raise DisclosureError(
+                    f"{where}: a {stage} payload may not cross an outcome with anything "
+                    f"(dimension {crossed}); outcome-by-arm cells need the unblinded stage"
+                )
+        parents = c.get("parents") or []
+        if not isinstance(parents, list) or any(p not in cells for p in parents):
+            raise DisclosureError(f"{where}.parents: every declared parent must be a cell in the payload")
+        if status == EVALUABLE:
+            n = c.get("n")
+            if not isinstance(n, int) or isinstance(n, bool):
+                raise DisclosureError(f"{where}: a released cell must carry an integer n")
+            if n < floor:
+                raise DisclosureError(f"{where}: released count {n} is below the floor ({floor})")
+        else:
+            if "n" in c or "share" in c:
+                raise DisclosureError(
+                    f"{where}: suppressed cell carries an exact n or share. The count is what "
+                    "suppression exists to hide; export n_band instead."
+                )
+        if "share" in c:
+            base = c.get("share_of")
+            if base not in cells or cells[base].get("status") != EVALUABLE:
+                raise DisclosureError(f"{where}.share: released only beside a released share_of cell")
+    return cells
+
+
+def _audit_released_n(cells: dict[str, dict], key: str) -> int | None:
+    c = cells[key]
+    return c["n"] if c.get("status") == EVALUABLE else None
+
+
+def _validate_audit_differencing(cells: dict[str, dict], partitions: list[dict]) -> None:
+    """The gate's own re-derivation of rules 2 and 3 over every declaration."""
+    floor = min_cell_size()
+    for parent, child in _audit_pairs(cells):
+        n_parent, n_child = _audit_released_n(cells, parent), _audit_released_n(cells, child)
+        if n_parent is None or n_child is None:
+            continue
+        if n_child > n_parent:
+            raise DisclosureError(f"cells.{child}: declared inside {parent!r} but larger than it")
+        if 0 < n_parent - n_child < floor:
+            raise DisclosureError(
+                f"differencing: released cells {parent!r} and {child!r} differ by "
+                f"{n_parent - n_child} (< {floor}); the difference is a suppressed count"
+            )
+    for i, partition in enumerate(partitions):
+        members = [partition["total"], *partition["parts"]]
+        hidden = [m for m in members if cells[m].get("status") != EVALUABLE]
+        if len(hidden) == 1:
+            raise DisclosureError(
+                f"differencing: partitions[{i}] hides only {hidden[0]!r}; the total minus the "
+                "released parts recovers it (complementary suppression is missing)"
+            )
+        if not hidden:
+            total = cells[partition["total"]]["n"]
+            if total != sum(cells[p]["n"] for p in partition["parts"]):
+                raise DisclosureError(f"partitions[{i}]: the parts do not sum to the total")
+
+
+def _validate_audit_results(results: object, cells: dict[str, dict], stage: str) -> None:
+    if not isinstance(results, dict):
+        raise DisclosureError("results: must be a mapping of result id -> result")
+    for key, r in results.items():
+        where = f"results.{key}"
+        _check_dynamic_key(key, "results")
+        if not isinstance(r, dict):
+            raise DisclosureError(f"{where}: must be a mapping")
+        for field, value in r.items():
+            _check_key(field, AUDIT_RESULT_FIELDS, where)
+            _check_value(field, value, where)
+        basis = r.get("basis")
+        if not isinstance(basis, list) or any(b not in cells for b in basis):
+            raise DisclosureError(f"{where}.basis: must list the payload's cells the result was computed on")
+        if stage not in AUDIT_OUTCOME_STAGES:
+            if r.get("kind") in AUDIT_OUTCOME_RESULT_KINDS or set(r) & AUDIT_OUTCOME_RESULT_FIELDS:
+                raise DisclosureError(
+                    f"{where}: a {stage} payload may not carry an outcome result; outcome-by-arm "
+                    "comparisons run only in the unblinded stage, through the authorization gate"
+                )
+        status = r.get("status")
+        if status not in OUTCOME_STATUSES:
+            raise DisclosureError(f"{where}.status: {status!r} is not a recognised status")
+        stats = set(r) & AUDIT_RESULT_STAT_FIELDS
+        if status != EVALUABLE and stats:
+            raise DisclosureError(f"{where}: a suppressed result carries statistics {sorted(stats)}")
+        if status == EVALUABLE and any(cells[b].get("status") != EVALUABLE for b in basis):
+            raise DisclosureError(
+                f"{where}: released while a basis cell is suppressed; its statistics would bound "
+                "the hidden count"
+            )
+
+
+def _validate_audit_block(block: object, allowed: frozenset[str], where: str,
+                          statuses: frozenset[str]) -> None:
+    if not isinstance(block, dict):
+        raise DisclosureError(f"{where}: must be a mapping")
+    for key, entry in block.items():
+        _check_dynamic_key(key, where)
+        if not isinstance(entry, dict):
+            raise DisclosureError(f"{where}.{key}: must be a mapping")
+        for field, value in entry.items():
+            _check_key(field, allowed, f"{where}.{key}")
+            _check_value(field, value, f"{where}.{key}")
+        if entry.get("status") not in statuses:
+            raise DisclosureError(f"{where}.{key}.status: {entry.get('status')!r} is not one of {sorted(statuses)}")
+
+
+def validate_audit_export(payload: dict) -> dict:
+    """Validate an audit/causal aggregate before it is written. Returns it unchanged.
+
+    Allow-list on every level, the recursive value scan, and a re-derivation of floor, pair
+    and partition suppression over the declared cells. No model-bundle envelope is accepted.
+    """
+    if not isinstance(payload, dict):
+        raise DisclosureError("audit payload must be a mapping")
+    for key in payload:
+        _check_key(key, AUDIT_ENVELOPE_FIELDS, "audit envelope")
+    missing = REQUIRED_AUDIT_ENVELOPE_FIELDS - set(payload)
+    if missing:
+        raise DisclosureError(f"audit envelope: missing required fields {sorted(missing)}")
+    if payload["export_type"] != AUDIT_EXPORT_TYPE:
+        raise DisclosureError(f"audit envelope.export_type must be {AUDIT_EXPORT_TYPE!r}")
+    stage = payload["stage"]
+    if stage not in AUDIT_STAGES:
+        raise DisclosureError(f"audit envelope.stage: {stage!r} is not one of {sorted(AUDIT_STAGES)}")
+    if payload["disclosure_status"] not in DISCLOSURE_STATUSES:
+        raise DisclosureError(
+            f"audit envelope.disclosure_status: {payload['disclosure_status']!r} is not one of "
+            f"{sorted(DISCLOSURE_STATUSES)}"
+        )
+    for key, value in payload.items():
+        if key in ("cells", "partitions", "results", "tables", "stop_rules", "triggers"):
+            continue
+        if key == "signature":
+            if not isinstance(value, str) or not _SIGNATURE_RE.match(value):
+                raise DisclosureError("audit envelope.signature: must be 64 lowercase hex characters")
+            continue
+        _check_value(key, value, "audit envelope")
+    if stage in AUDIT_OUTCOME_STAGES:
+        auth = payload.get("authorization")
+        if not isinstance(auth, dict) or not auth.get("basis"):
+            raise DisclosureError("an unblinded payload must record the authorization it ran under")
+        for key in auth:
+            _check_key(key, AUDIT_AUTHORIZATION_FIELDS, "audit envelope.authorization")
+
+    cells = _validate_audit_cells(payload["cells"], stage)
+    _check_partitions_declared(cells, payload["partitions"])
+    _validate_audit_differencing(cells, payload["partitions"])
+    _validate_audit_results(payload["results"], cells, stage)
+    _validate_audit_block(payload.get("tables", {}), AUDIT_TABLE_FIELDS, "tables", AUDIT_TABLE_STATUSES)
+    _validate_audit_block(payload["stop_rules"], AUDIT_RULE_FIELDS, "stop_rules", AUDIT_RULE_STATUSES)
+    _validate_audit_block(payload.get("triggers", {}), AUDIT_RULE_FIELDS, "triggers", AUDIT_RULE_STATUSES)
+    return payload
+
+
 # Backwards-compatible re-exports: log sanitization moved to its own module (finding #34).
 from src.eval.log_sanitizer import (  # noqa: E402,F401
     SanitizingFilter,

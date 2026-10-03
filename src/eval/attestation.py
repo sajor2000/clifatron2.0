@@ -49,6 +49,7 @@ import os
 from pathlib import Path
 
 from src.eval.schema import (
+    AUDIT_EXPORT_TYPE,
     EVALUABLE,
     NON_EVALUABLE_STATUSES,
     DisclosureError,
@@ -404,12 +405,96 @@ def _cell_n(block: dict) -> int | None:
     return block.get("n")
 
 
+def _audit_cell_key(cell_id: str) -> str:
+    return f"{AUDIT_EXPORT_TYPE}|{cell_id}"
+
+
+def _audit_ledger_entries(payload: dict) -> list[dict]:
+    """Ledger records of an audit export (U13, KTD10): one per declared count cell.
+
+    Same shape as a prediction record -- cell definition, reported n (None when
+    suppressed), status -- plus the cell's declared parents, so a later release can be
+    checked for differencing against a parent or child released earlier. No share, no
+    statistic, no dimension value beyond what the cell id already names.
+    """
+    release = payload.get("release_id")
+    out: list[dict] = []
+    for cell_id, cell in (payload.get("cells") or {}).items():
+        out.append({
+            "export_type": AUDIT_EXPORT_TYPE, "site_id": cell.get("site"), "model_version": None,
+            "release_id": release, "outcome_spec_hash": None, "outcome": cell.get("table"),
+            "cell": _audit_cell_key(cell_id),
+            "n": cell.get("n") if cell.get("status") == EVALUABLE else None,
+            "status": cell.get("status"),
+            "parents": [_audit_cell_key(p) for p in cell.get("parents") or ()],
+        })
+    return out
+
+
+def prior_audit_cells(ledger_path: str | Path) -> tuple[dict[str, int], set[str]]:
+    """Audit cells that may already be public: (released id -> n, suppressed ids).
+
+    Read the way the differencing check reads the ledger: ANY record counts as possibly
+    public (an unconfirmed intent may have published), so suppression is sticky over all
+    of them, and a released size is taken from any record because the producer must not
+    withdraw or contradict a count that might be visible. Ids are returned without the
+    ledger's export-type prefix, ready for `schema.suppress_audit_cells`.
+    """
+    prefix = f"{AUDIT_EXPORT_TYPE}|"
+    released: dict[str, int] = {}
+    suppressed: set[str] = set()
+    for entry in read_ledger(ledger_path):
+        cell = entry.get("cell")
+        if not isinstance(cell, str) or not cell.startswith(prefix):
+            continue
+        key = cell[len(prefix):]
+        if entry.get("status") in NON_EVALUABLE_STATUSES:
+            suppressed.add(key)
+        elif entry.get("status") == EVALUABLE and isinstance(entry.get("n"), int):
+            released[key] = entry["n"]
+    return {k: v for k, v in released.items() if k not in suppressed}, suppressed
+
+
+def _check_audit_pairs_across_releases(current: list[dict], confirmed_by_cell: dict[str, dict],
+                                       floor: int) -> None:
+    """A parent and a child released in different releases must not differ by < floor.
+
+    Covers the declared pairs only. A partition whose members are spread across releases
+    is not reconstructed here: each release's own gate checks its partitions, and a
+    member suppressed in one release stays suppressed in every later one (sticky), which
+    is what keeps a cross-release partition from ending with a single unknown.
+    """
+    children: dict[str, list[dict]] = {}
+    for record in confirmed_by_cell.values():
+        for parent in record.get("parents") or ():
+            children.setdefault(parent, []).append(record)
+    for entry in current:
+        if entry.get("status") != EVALUABLE or not isinstance(entry.get("n"), int):
+            continue
+        comparisons = [(confirmed_by_cell.get(p), entry, p) for p in entry.get("parents") or ()]
+        comparisons += [(entry, child, child["cell"]) for child in children.get(entry["cell"], ())]
+        for parent, child, other in comparisons:
+            if parent is None or parent.get("status") != EVALUABLE or child.get("status") != EVALUABLE:
+                continue
+            if parent.get("release_id") == child.get("release_id"):
+                continue
+            n_parent, n_child = parent.get("n"), child.get("n")
+            if isinstance(n_parent, int) and isinstance(n_child, int) and 0 < n_parent - n_child < floor:
+                raise DisclosureError(
+                    f"cell {entry['cell']!r} and the earlier released cell {other!r} are a "
+                    f"declared parent and child differing by {n_parent - n_child} (< {floor}); "
+                    "together the two releases publish a suppressed count."
+                )
+
+
 def ledger_entries(payload: dict) -> list[dict]:
     """Extract the ledger records implied by one export.
 
     Records the *shape* of what was released — site, model version, outcome, cell
     definition, reported n, suppression status — and never a metric value.
     """
+    if payload.get("export_type") == AUDIT_EXPORT_TYPE:
+        return _audit_ledger_entries(payload)
     site = payload["site_id"]
     version = payload["model_version"]
     release = payload.get("release_id")
@@ -555,6 +640,11 @@ def check_cross_release_differencing(payload: dict, ledger_path: str | Path) -> 
                     "the patients who entered or left the cell."
                 )
 
+    # Audit exports (U13) also declare which cells nest inside which; check those pairs
+    # across releases. Prediction payloads carry no declarations and skip this.
+    if payload.get("export_type") == AUDIT_EXPORT_TYPE:
+        _check_audit_pairs_across_releases(current, confirmed_by_cell, floor)
+
 
 def confirm_publication(payload: dict, ledger_path: str | Path) -> None:
     """Mark a release's ledger entries as actually published.
@@ -641,6 +731,7 @@ __all__ = [
     "ledger_entries",
     "ledger_lock",
     "preflight_access_log",
+    "prior_audit_cells",
     "read_ledger",
     "reconcile_ledger",
     "record_access",

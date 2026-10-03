@@ -1,0 +1,41 @@
+# Go/no-go design audit for the extubation application (plan U13; R32, R40, KTD6, KTD9).
+#
+# The thresholds the audit runner (src/eval/extubation_audit.py) reads to decide its
+# stop rules and the adoption-era trigger. Every value carries `status: proposed`; it
+# becomes final only when the emulation protocol is registered
+# (docs/protocols/extubation-emulation-protocol.md). The benchmark trials, the R25
+# feasibility screen and the agreement margins live in configs/extubation_benchmarks.yaml
+# and are not repeated here.
+
+audit_version: "0.1.0"
+status: proposed
+
+# KTD6: model-based estimators use only patients outside the pretraining partition. The
+# blind stage sizes the arms of every partition and of the held-out union (every
+# partition except this one) so the split can be decided before the first L40 run.
+pretraining_partition: "train"
+
+stop_rules:
+  # R32 (1): most emulations fail the R25 requirement. Fires at a site when the share of
+  # registered trials that fail the feasibility screen is above this value.
+  precision:
+    max_share_not_evaluable: {value: 0.5, status: proposed}
+  # R32 (2): the unblinded all-comer estimate (Casey 2021, HFNC vs conventional oxygen)
+  # stays clearly on the harmful side. Fires when the lower bound of the primary risk
+  # ratio interval is above this ratio: the whole interval says HFNC is worse.
+  harmful_side:
+    lower_bound_ratio_above: {value: 1.0, status: proposed}
+  # R32 (3): the negative controls fail. Fires when more than this many registered
+  # negative controls fail their check. Negative-control outcome comparisons by arm need
+  # the registered protocol (KTD9), so before registration this rule is not evaluated.
+  negative_controls:
+    max_failed: {value: 0, status: proposed}
+
+# R40: a sharp shift in first-device use by calendar period or by unit triggers the
+# adoption-era contrast as a supporting analysis. For each arm, the spread of its share
+# of first devices across levels (largest share minus smallest) is computed over the
+# released cells of levels with at least `min_level_n` patients; the trigger fires when
+# the largest spread is above `share_spread_above`.
+adoption_era:
+  share_spread_above: {value: 0.20, status: proposed}
+  min_level_n: {value: 50, status: proposed}
