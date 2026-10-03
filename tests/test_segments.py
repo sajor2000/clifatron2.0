@@ -322,11 +322,12 @@ def test_non_csv_dose_with_many_zeros_keeps_zero_distinct_and_fits_on_positive_v
     import numpy as np
 
     rng = np.random.default_rng(1)
+    # A dose concept with no physician-CSV or literature bins falls back to quantiles.
     doses = [0.0] * 200 + list(rng.uniform(100.0, 2500.0, 300))   # 40% zeros
-    fit = _fit_events({"heparin_u_hr": ("meds", doses)})
+    fit = _fit_events({"synthdrug_u_hr": ("meds", doses)})
     segs, sources = _build_all(fit)
-    hep = segs["heparin_u_hr"]
-    assert sources["heparin_u_hr"] == "quantile"
+    hep = segs["synthdrug_u_hr"]
+    assert sources["synthdrug_u_hr"] == "quantile"
     S.validate_partition(hep)
     assert hep[0] == S.make_segment(0.0, 0.0, True, True)
     assert S.bin_index(0.0, hep) == 0
@@ -470,7 +471,7 @@ def test_every_numeric_concept_gets_a_binning_source():
     numeric = {"potassium", "gcs_total", "synth_lab", "rare_lab", "heparin_u_hr"}
     assert numeric <= set(sources)
     assert "cam_total" not in sources and "cam_total" not in segs
-    assert set(sources.values()) <= {"csv", "ordinal", "quantile", "single"}
+    assert set(sources.values()) <= {"csv", "literature", "ordinal", "quantile", "single"}
     for concept in sources:
         S.validate_partition(segs[concept])
 
