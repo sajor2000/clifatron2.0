@@ -24,6 +24,7 @@ anchor per episode; ``gem_tte`` windows have several; ``gem`` windows have no su
 
 from __future__ import annotations
 
+import math
 from collections.abc import Mapping, Sequence
 from copy import deepcopy
 from pathlib import Path
@@ -61,14 +62,16 @@ class ModelDataset(Dataset):
         epoch: int = 0,
         value_channel: bool = False,
     ) -> None:
-        """`value_channel` (continuous-fused arm, U6): each canonical sample also carries
-        `input_value` / `input_value_mask`, the CURRENT event's value normalized with the
-        target builder's frozen per-token stats (`tokenize_continuous.normalize_value`);
-        missing, categorical (NaN) and implausible values are masked to 0."""
+        """`value_channel` (continuous-fused arm, U6): each canonical or full-hospitalization
+        sample also carries `input_value` / `input_value_mask`, the CURRENT event's value
+        normalized with the target builder's frozen per-token stats
+        (`tokenize_continuous.normalize_value`); missing, categorical (NaN) and
+        implausible values are masked to 0."""
         if representation not in {"decile", "clifatron_packed", "gem"}:
             raise ValueError("representation must be 'decile', 'clifatron_packed' or 'gem'")
-        if value_channel and representation != "decile":
-            raise ValueError("the input value channel is defined for canonical shards only")
+        if value_channel and representation == "clifatron_packed":
+            raise ValueError("the input value channel is defined for canonical and "
+                             "full-hospitalization shards only")
         if (representation == "gem") != (getattr(target_builder, "mode", "icu_24h") in GEM_MODES):
             raise TargetContractError(
                 "the gem representation requires TargetBuilder(mode='gem') or "
@@ -177,14 +180,17 @@ class ModelDataset(Dataset):
             ],
         }
         if self.value_channel:
-            stats = self.target_builder.value_stats
-            values = record.get("value") or [None] * length
-            channel = [normalize_value(value, token, stats,
-                                       max_abs_z=self.target_builder.max_abs_value_z)
-                       for token, value in zip(record["token"], values)]
-            sample["input_value"] = [value for value, _ in channel]
-            sample["input_value_mask"] = [mask for _, mask in channel]
+            self._add_value_channel(sample, record)
         return sample
+
+    def _add_value_channel(self, sample: dict[str, Any], record: Mapping[str, Any]) -> None:
+        stats = self.target_builder.value_stats
+        values = record.get("value") or [None] * len(record["token"])
+        channel = [normalize_value(value, token, stats,
+                                   max_abs_z=self.target_builder.max_abs_value_z)
+                   for token, value in zip(record["token"], values)]
+        sample["input_value"] = [value for value, _ in channel]
+        sample["input_value_mask"] = [mask for _, mask in channel]
 
     def _gem_sample(self, record: Mapping[str, Any]) -> dict[str, Any]:
         key = _episode_key(record)
@@ -229,6 +235,8 @@ class ModelDataset(Dataset):
                  "queries": item["queries"]}
                 for item in built["anchors"] if start <= item["anchor_idx"] < end
             ]
+        if self.value_channel:
+            self._add_value_channel(sample, record)
         return sample
 
     def _packed_sample(self, record: dict[str, Any]) -> dict[str, Any]:
@@ -373,8 +381,8 @@ class LengthGroupedSampler(Sampler):
     (gem-overnight-log 2026-09-26). Grouping bounds both: padded shapes recycle
     across batches and long stays only ever share a batch with other long stays.
 
-    Single-process sampler (dev boxes). DDP ranks keep DistributedSampler for
-    now; fold world-awareness in during G2 L40 bring-up.
+    Single-process sampler (dev boxes). DDP ranks use
+    `DistributedTokenBudgetBatchSampler` (U5).
     """
 
     def __init__(self, lengths, batch_size, *, seed=42, mega_batch_mult=50):
@@ -412,8 +420,9 @@ class TokenBudgetBatchSampler(Sampler):
     layer for backward (~40 GiB for one 4x6413 batch), and uniform per_gpu batching
     over heavy-tailed CLIF lengths OOM'd three overnight runs (86 GiB watermark,
     updates ~205/~410/~2300 — gem-overnight-log). Token budgets bound the live
-    transients AND cut padding waste to ~zero. opt-in via runtime.token_budget
-    (CUDA flash attention doesn't need it; keep uniform per_gpu batches there).
+    transients AND cut padding waste to ~zero. opt-in via runtime.token_budget on a
+    single process; under DDP `DistributedTokenBudgetBatchSampler` deals these batches
+    to the ranks.
 
     A single sequence longer than the budget still forms its own batch (allowed
     oversize; nothing is dropped).
@@ -476,6 +485,73 @@ class TokenBudgetBatchSampler(Sampler):
             batch_order = list(range(len(batches)))
         for b in batch_order:
             yield batches[b]
+
+
+class DistributedTokenBudgetBatchSampler(Sampler):
+    """Rank-aware batch sampler (DataLoader(batch_sampler=...)) for DDP training (U5).
+
+    Batches are formed GLOBALLY, exactly as `TokenBudgetBatchSampler` forms them (length-
+    grouped, B x max_len <= `max_batch_tokens`, at most `max_batch_size` rows, shuffled per
+    `seed + epoch`), so every rank computes the same list without communicating. When the
+    count is not a multiple of `num_replicas`, the first batches of the shuffled list are
+    repeated — at most `num_replicas - 1` of them — and rank r takes batches r, r+W, ...
+    Every rank therefore yields the same number of batches per pass, which the engine
+    needs: it finds the epoch's last (synchronized) microbatch from `len(dl)` (KTD2).
+
+    `set_epoch` works like DistributedSampler's: call it before each pass. Batch packing
+    depends on the shuffle, so the count can differ by a few batches between epochs;
+    `len()` is the current epoch's. `max_batch_tokens` None/0 caps rows only.
+    """
+
+    def __init__(self, lengths, *, max_batch_tokens=None, max_batch_size=None,
+                 num_replicas: int | None = None, rank: int | None = None, seed: int = 42,
+                 mega_batch_mult: int = 50, shuffle: bool = True):
+        import torch.distributed as dist
+
+        initialized = dist.is_available() and dist.is_initialized()
+        self.num_replicas = int(num_replicas if num_replicas is not None
+                                else dist.get_world_size() if initialized else 1)
+        self.rank = int(rank if rank is not None else dist.get_rank() if initialized else 0)
+        if self.num_replicas < 1 or not 0 <= self.rank < self.num_replicas:
+            raise ValueError(f"rank {self.rank} is outside [0, {self.num_replicas})")
+        if not max_batch_tokens and not max_batch_size:
+            raise ValueError("pass max_batch_tokens or max_batch_size")
+        if not len(lengths):
+            raise ValueError("cannot sample batches from an empty dataset")
+        self._packer = TokenBudgetBatchSampler(
+            lengths, max_batch_tokens=int(max_batch_tokens or 2 ** 62),
+            max_batch_size=max_batch_size, seed=seed, mega_batch_mult=mega_batch_mult,
+            shuffle=shuffle)
+        self.epoch = 0
+        self._cache: tuple[int, list[list[int]]] | None = None
+
+    def set_epoch(self, epoch: int) -> None:
+        self.epoch = int(epoch)
+
+    def global_batches(self) -> list[list[int]]:
+        """This epoch's batches over the whole dataset, in order, before evening out."""
+        if self._cache is None or self._cache[0] != self.epoch:
+            self._packer.set_epoch(self.epoch)
+            self._cache = (self.epoch, list(iter(self._packer)))
+        return self._cache[1]
+
+    @property
+    def padding_batches(self) -> int:
+        """How many batches this epoch repeats to even the per-rank count."""
+        return -len(self.global_batches()) % self.num_replicas
+
+    def _rank_batches(self) -> list[list[int]]:
+        batches = self.global_batches()
+        pad = self.padding_batches
+        if pad:
+            batches = batches + (batches * math.ceil(pad / len(batches)))[:pad]
+        return batches[self.rank::self.num_replicas]
+
+    def __len__(self) -> int:
+        return len(self._rank_batches())
+
+    def __iter__(self):
+        yield from self._rank_batches()
 
 
 def make_dataloader(

@@ -9,6 +9,9 @@ optimizer:
 schedule:
   warmup_steps: 2000
   total_steps: 60000
+  # Run length in passes over the training data (U5). When set, it replaces total_steps:
+  # updates = ceil(passes x ceil(batches per pass per rank / grad_accum)).
+  passes: null
   cosine_decay: true
 
 batch:

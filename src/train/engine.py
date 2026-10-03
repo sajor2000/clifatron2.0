@@ -12,6 +12,7 @@ that head's weight is zero.
 from __future__ import annotations
 
 import contextlib
+import math
 import os
 import time
 from pathlib import Path
@@ -116,10 +117,31 @@ class TrainConfig:
         self.cache_clear_every = int(tcfg["runtime"].get("cache_clear_every", 0) or 0)
         self.warmup_steps = tcfg["schedule"].get("warmup_steps", 2000)
         self.total_steps = total_steps
+        # Run length in passes over the data (`schedule.passes`), when the run was sized
+        # that way; `total_steps` is then `resolve_total_steps`'s update count.
+        self.passes = tcfg["schedule"].get("passes")
         self.grad_clip = tcfg["optimizer"].get("grad_clip", 1.0)
         self.cosine = tcfg["schedule"].get("cosine_decay", True)
         self.compile = mcfg.get("compile", False)
         self.effective_batch_size = eff_batch
+
+
+def resolve_total_steps(tcfg: dict, batches_per_pass: int) -> int:
+    """The run's optimizer-update count. With `schedule.passes` (a positive number of
+    passes over the training data) it is ceil(passes x updates per pass), one pass being
+    ceil(`batches_per_pass` / `batch.grad_accum`) updates — the engine applies a partial
+    accumulation at the end of each pass. Batches per pass are the training loader's
+    `len()` on this rank (equal on every rank). Without it, `schedule.total_steps`."""
+    schedule = tcfg["schedule"]
+    passes = schedule.get("passes")
+    if passes is None:
+        return int(schedule.get("total_steps", 60000))
+    passes = float(passes)
+    if not math.isfinite(passes) or passes <= 0:
+        raise ValueError(f"schedule.passes must be a positive number, got {passes}")
+    grad_accum = int(tcfg["batch"].get("grad_accum", 1))
+    updates_per_pass = -(-int(batches_per_pass) // grad_accum)
+    return max(1, math.ceil(passes * updates_per_pass))
 
 
 def _get_step(opt) -> int:
@@ -360,6 +382,7 @@ def train(model, train_dl, val_dl, opt, scheduler, tcfg: TrainConfig, dev, *,
         ckpt_dir=str(tcfg.ckpt_dir),
     )
     manifest.record_env()
+    manifest.record_parameters(model)
 
     start_epoch = 0
     start_step = 0

@@ -16,6 +16,7 @@ class Manifest:
         self.env = {}
         self.validation = []
         self.ledger = {}
+        self.parameters = {}
 
     def record_env(self):
         self.env = {
@@ -25,6 +26,22 @@ class Manifest:
             "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
             "hostname": os.uname().nodename,
         }
+
+    def record_parameters(self, model):
+        """The MEASURED parameter count (R37): summed numels of the unwrapped model's
+        parameters, split into the time-to-event / value heads (`head_parameters()`, when
+        the model has it) and the trunk (everything else, embeddings and next-event
+        projection included)."""
+        module = getattr(model, "module", model)
+        module = getattr(module, "_orig_mod", module)
+        head_ids = set()
+        if hasattr(module, "head_parameters"):
+            head_ids = {id(p) for params in module.head_parameters().values() for p in params}
+        params = list(module.parameters())
+        total = sum(p.numel() for p in params)
+        heads = sum(p.numel() for p in params if id(p) in head_ids)
+        self.parameters = {"trunk": total - heads, "heads": heads, "total": total}
+        return self.parameters
 
     def record_validation(self, epoch, val_loss):
         self.validation.append({"epoch": epoch, "val_loss": val_loss})
@@ -48,4 +65,5 @@ class Manifest:
             "env": self.env,
             "validation": self.validation,
             "ledger": self.ledger,
+            "parameters": self.parameters,
         }

@@ -1,11 +1,21 @@
-"""Self-supervised pretraining on one site's event shards (2x L40, DDP).
+"""Self-supervised pretraining on event shards (2x L40, DDP).
 
 Loss = w_A*next_event + w_B*competing_risk + w_C*threshold_hazard + w_D*value_regression
 (ORA marked-TTE; RESEARCH.md §3). Uses the training engine for resumable DDP training.
 
-Run:
+Run (24-hour representation, one site):
     torchrun --nproc_per_node=2 -m src.train.pretrain --config configs/train.yaml \
         --model-config configs/model.yaml --data data/mimic --site mimic
+
+Run (full-hospitalization representation, in-stream labels, one or more sites sharing ONE
+frozen vocabulary; the first --data directory's vocab.json unless --vocab is given):
+    torchrun --nproc_per_node=2 -m src.train.pretrain --trajectory hospitalization \
+        --data output/intermediate_phi/mimic output/intermediate_phi/rush \
+        --site mimic rush --value-stats output/intermediate_phi/mimic/gem_value_stats.json
+
+Value stats for this path are fit on the reference site's gem_events.parquet train stays
+(`python -m src.data.value_stats --events <gem_events.parquet>`): the 24-hour stats lack
+tokens seen only outside the ICU window, and target building refuses such a token.
 
 A torchrun launch without CUDA is refused unless `--allow-cpu-ddp` is passed (a CPU / gloo
 rehearsal); a single process (no torchrun) runs on CUDA, MPS or CPU as before.
@@ -13,8 +23,11 @@ rehearsal); a single process (no torchrun) runs on CUDA, MPS or CPU as before.
 from __future__ import annotations
 
 import argparse
+import gc
 import logging
 import math
+import os
+import subprocess
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -23,7 +36,7 @@ import torch
 import torch.distributed as dist
 import polars as pl
 import yaml
-from torch.utils.data import DataLoader, DistributedSampler
+from torch.utils.data import DataLoader
 from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 
 from src.model.encoder import CLIFEncoder, count_params
@@ -34,7 +47,12 @@ from src.model.heads import (
     next_event_loss,
     time_bin,
 )
-from src.data.dataset import LengthGroupedSampler, ModelDataset, TokenBudgetBatchSampler
+from src.data.dataset import (
+    DistributedTokenBudgetBatchSampler,
+    LengthGroupedSampler,
+    ModelDataset,
+    TokenBudgetBatchSampler,
+)
 from src.data.collate import collate_model_samples
 from src.data.segments import (
     SAMPLE_VOCAB_REFUSAL,
@@ -45,7 +63,7 @@ from src.data.segments import (
     n_value_bins,
 )
 from src.data.targets import InStreamTargets, TargetBuilder
-from src.data.threshold_grid import ThresholdGrid
+from src.data.threshold_grid import ThresholdGrid, load_thresholds
 from src.train.curriculum import (
     HEADS,
     apply_objective_arm,
@@ -58,6 +76,7 @@ from src.train.engine import (
     ALLOW_CPU_DDP_FLAG,
     TrainConfig,
     is_distributed,
+    resolve_total_steps,
     select_device,
     setup_ddp,
     train,
@@ -442,15 +461,54 @@ class Model(ObjectiveSchedule, torch.nn.Module):
 
 @dataclass
 class Loaders:
-    """What `build_loaders` returns: the train/validation loaders and what built them."""
+    """What `build_loaders` returns: the train/validation loaders and what built them.
+
+    On the full-hospitalization representation `validation` is None when no site has a
+    validation stay, `sites` lists the site names in load order and `memory` is
+    `loader_memory`'s resident-memory measurement of the loaded windows."""
 
     train: DataLoader
-    validation: DataLoader
+    validation: DataLoader | None
     train_dataset: ModelDataset
-    validation_dataset: ModelDataset
+    validation_dataset: ModelDataset | None
     records: list[dict]
     data_path: Path
     value_stats: dict[int, tuple[float, float]]
+    sites: list[str] | None = None
+    memory: dict | None = None
+
+
+def embedding_vocab_size(vocab_blob: Mapping, mcfg: Mapping) -> int:
+    """The embedding / output-projection size: the frozen vocabulary's largest id + 1
+    (R37: the reported model size is the measured one, not a padded `target_vocab`).
+    `trunk.target_vocab` stays the budget cap: a vocabulary above it is refused."""
+    size = max(int(i) for i in vocab_blob["vocab"].values()) + 1
+    cap = int(mcfg["trunk"].get("target_vocab", 10000))
+    if size > cap:
+        raise SystemExit(f"the vocabulary needs {size} embedding rows, above the model "
+                         f"config's trunk.target_vocab budget cap {cap}")
+    return size
+
+
+def resident_set_bytes() -> int:
+    """This process's current resident set size in bytes (Linux /proc, else `ps`)."""
+    statm = Path("/proc/self/statm")
+    if statm.exists():
+        return int(statm.read_text().split()[1]) * os.sysconf("SC_PAGE_SIZE")
+    out = subprocess.run(["ps", "-o", "rss=", "-p", str(os.getpid())],
+                         capture_output=True, text=True, check=True).stdout
+    return int(out.strip()) * 1024
+
+
+def loader_memory(before: int, datasets) -> dict:
+    """Resident memory the loaded windows added (bytes, and bytes per event) — rough: it
+    is a process RSS delta, so allocator reuse can hide or inflate a little. Each DDP rank
+    holds its own copy (no sharing between ranks)."""
+    gc.collect()
+    after = resident_set_bytes()
+    events = sum(len(r["token"]) for ds in datasets if ds is not None for r in ds.records)
+    return {"rss_before_bytes": before, "rss_after_bytes": after, "events": events,
+            "bytes_per_event": (after - before) / max(events, 1)}
 
 
 def _apply_soft_policy(records: list[dict], soft: bool | None) -> None:
@@ -483,8 +541,16 @@ def build_loaders(
     is_main: bool = True,
     soft: bool | None = None,
     value_channel: bool = False,
+    representation: str = "decile",
+    dcfg: Mapping | None = None,
+    thresholds: Mapping | None = None,
 ) -> Loaders:
     """Shard records -> TargetBuilder -> ModelDataset -> samplers -> DataLoaders.
+
+    `representation="decile"` (default) is the 24-hour path described below.
+    `representation="gem"` is the full-hospitalization path (`_build_gem_loaders`):
+    `events_path` is then ``{site: gem_events.parquet}`` and `dcfg` (the data config, for
+    its target concepts) is required; `thresholds` defaults to `load_thresholds()`.
 
     The one data path shared by `pretrain.py` and the tokenization ablation (KTD8).
     `binding` (`segments.artifact_binding` of the vocab.json the shard was encoded with)
@@ -497,9 +563,21 @@ def build_loaders(
     fit on a verification sample (`provenance.sample: true`, KTD9) is refused unless
     `dry_run` — a sample vocabulary is smoke-only.
     """
+    if representation not in ("decile", "gem"):
+        raise ValueError(f"representation must be 'decile' or 'gem', got {representation!r}")
     compare_binding(binding, artifact_binding(vocab_blob), what="training binding")
     if is_sample_vocab(vocab_blob) and not dry_run:
         raise SystemExit(f"refusing to train: the vocabulary {SAMPLE_VOCAB_REFUSAL}")
+    if representation == "gem":
+        if not isinstance(events_path, Mapping):
+            raise ValueError("the gem representation reads {site: gem_events.parquet}")
+        if dcfg is None:
+            raise ValueError("the gem representation needs the data config (dcfg)")
+        return _build_gem_loaders(
+            events_path, binding=binding, vocab_blob=vocab_blob, tcfg=tcfg, mcfg=mcfg,
+            dcfg=dcfg, thresholds=load_thresholds() if thresholds is None else thresholds,
+            vocab_size=vocab_size, value_stats_path=value_stats_path, dry_run=dry_run,
+            soft=soft, value_channel=value_channel)
     # Bind value-stats to the data's vocabulary AND segments so a stale /
     # cross-vocabulary / cross-bin stats file is rejected rather than silently applying
     # unrelated centers/scales.
@@ -589,15 +667,7 @@ def build_loaders(
 
     token_budget = int(tcfg["runtime"].get("token_budget", 0) or 0)
     if is_distributed():
-        sampler = DistributedSampler(dataset)
-        dl = DataLoader(
-            dataset,
-            batch_size=tcfg["batch"]["per_gpu"],
-            sampler=sampler,
-            collate_fn=collate_model_samples,
-            num_workers=tcfg["runtime"].get("num_workers", 0),
-            pin_memory=torch.cuda.is_available(),
-        )
+        dl = _batched_loader(dataset, tcfg)
     elif token_budget > 0:
         # Token-budget batches: B x max_len <= budget — long stays batch alone,
         # short stays pack tight. Bounds MPS math-path attention transients (three
@@ -669,6 +739,126 @@ def build_loaders(
     )
 
 
+def _batched_loader(dataset: ModelDataset, tcfg: dict, *, seed: int = 42) -> DataLoader:
+    """Training loader over `DistributedTokenBudgetBatchSampler`: batches formed globally
+    under `runtime.token_budget` (rows only when it is 0) and `batch.per_gpu`, dealt to
+    the ranks of the process group (one rank outside DDP), every rank the same count."""
+    sampler = DistributedTokenBudgetBatchSampler(
+        [len(record["token"]) for record in dataset.records],
+        max_batch_tokens=int(tcfg["runtime"].get("token_budget", 0) or 0) or None,
+        max_batch_size=tcfg["batch"]["per_gpu"],
+        seed=seed,
+    )
+    return DataLoader(
+        dataset,
+        batch_sampler=sampler,
+        collate_fn=collate_model_samples,
+        num_workers=tcfg["runtime"].get("num_workers", 0),
+        pin_memory=torch.cuda.is_available(),
+    )
+
+
+def _load_gem_records(
+    path: Path, site: str, *, partition: str, drop_values: bool,
+) -> list[dict]:
+    """One site's GEM window rows of `partition`, keyed ``<site>:<hosp_id>`` so the same
+    raw identifier at two sites stays two stays. Only that partition is materialized."""
+    frame = pl.scan_parquet(path).filter(pl.col("partition") == partition).collect()
+    records = []
+    for row in frame.iter_rows(named=True):
+        row["episode_key"] = f"{site}:{row.pop('hosp_id')}"
+        if drop_values:
+            row["value"] = [None] * len(row["token"])
+        records.append(row)
+    return records
+
+
+def _build_gem_loaders(
+    sites: Mapping[str, str | Path],
+    *,
+    binding: dict[str, str],
+    vocab_blob: Mapping,
+    tcfg: dict,
+    mcfg: dict,
+    dcfg: Mapping,
+    thresholds: Mapping,
+    vocab_size: int,
+    value_stats_path: str | Path | None,
+    dry_run: bool,
+    soft: bool | None,
+    value_channel: bool,
+) -> Loaders:
+    """The full-hospitalization path (U5, KTD1): one or more sites' `gem_events.parquet`,
+    each beside a vocab.json that must be the training vocabulary (same binding; a sample
+    vocabulary is refused unless `dry_run`), read side by side into ONE dataset — sites
+    are never pooled on disk; both development sites live on the node that trains. Every
+    window of every stay stays in memory: the `gem_tte` labels of a window read events
+    from later windows, so whole stays are assembled before labelling. Each shard row is
+    checked against the binding by `ModelDataset`."""
+    names = list(sites)
+    if not names or len(set(names)) != len(names) or any(
+            not name or ":" in str(name) for name in names):
+        raise ValueError(f"site names must be unique, non-empty and free of ':': {names}")
+    for name, path in sites.items():
+        site_vocab = Path(path).parent / "vocab.json"
+        if site_vocab.exists():
+            site_blob = load_vocab_blob(site_vocab)
+            compare_binding(artifact_binding(site_blob), binding,
+                            what=f"site {name} vocabulary")
+            if is_sample_vocab(site_blob) and not dry_run:
+                raise SystemExit(f"refusing to train on site {name}: its vocabulary "
+                                 f"{SAMPLE_VOCAB_REFUSAL}")
+    value_stats = _load_value_stats(
+        None if value_stats_path is None else str(value_stats_path),
+        expected_vocab_hash=binding["vocabulary"],
+        expected_segments_hash=binding["numeric_edges"],
+        expected_fit_partition="train",
+    )
+    target_builder = in_stream_target_builder(
+        vocab_blob=vocab_blob, mcfg=mcfg, dcfg=dcfg, thresholds=thresholds,
+        vocab_size=vocab_size, value_stats=value_stats)
+    rss_before = resident_set_bytes()
+    datasets = {}
+    for partition in ("train", "validation"):
+        records = [record for name, path in sites.items()
+                   for record in _load_gem_records(Path(path), name, partition=partition,
+                                                   drop_values=dry_run and not value_stats)]
+        if partition == "train":
+            if not records:
+                raise ValueError("no train-partition windows in the given sites")
+            if not dry_run and not value_stats and _has_numeric_values(records):
+                raise SystemExit("value-head normalization is required before real "
+                                 "training; pass --value-stats")
+        _apply_soft_policy(records, soft)
+        datasets[partition] = ModelDataset(
+            records, representation="gem", target_builder=target_builder,
+            expected_hashes=dict(binding), value_channel=value_channel,
+        ) if records else None
+    memory = loader_memory(rss_before, datasets.values())
+    validation = datasets["validation"]
+    validation_dl = None if validation is None else DataLoader(
+        validation,
+        batch_sampler=TokenBudgetBatchSampler(
+            [len(record["token"]) for record in validation.records],
+            max_batch_tokens=int(tcfg["runtime"].get("token_budget", 0) or 0) or 2 ** 62,
+            max_batch_size=tcfg["batch"]["per_gpu"], seed=42, shuffle=False),
+        collate_fn=collate_model_samples,
+        num_workers=tcfg["runtime"].get("num_workers", 0),
+        pin_memory=torch.cuda.is_available(),
+    )
+    return Loaders(
+        train=_batched_loader(datasets["train"], tcfg),
+        validation=validation_dl,
+        train_dataset=datasets["train"],
+        validation_dataset=validation,
+        records=datasets["train"].records,
+        data_path=Path(next(iter(sites.values()))),
+        value_stats=value_stats,
+        sites=names,
+        memory=memory,
+    )
+
+
 def build_optimizer(model, *, lr: float, weight_decay: float, betas, head_lr: float | None = None,
                     trunk_prefixes: tuple[str, ...] | None = None) -> torch.optim.AdamW:
     """AdamW with one parameter group per time-to-event / value head (KTD5).
@@ -722,8 +912,16 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", default="configs/train.yaml")
     ap.add_argument("--model-config", default="configs/model.yaml")
-    ap.add_argument("--data", required=True)
-    ap.add_argument("--site", required=True)
+    ap.add_argument("--data", required=True, nargs="+",
+                    help="site shard directory (several with --trajectory hospitalization)")
+    ap.add_argument("--site", required=True, nargs="+",
+                    help="site name per --data directory, in the same order")
+    ap.add_argument("--trajectory", choices=("icu_24h", "hospitalization"), default="icu_24h",
+                    help="icu_24h: events.parquet (one site); hospitalization: "
+                         "gem_events.parquet with in-stream time-to-event labels (U5)")
+    ap.add_argument("--vocab", default=None,
+                    help="the frozen vocab.json (default: the first --data directory's)")
+    ap.add_argument("--data-config", default="configs/data.yaml")
     ap.add_argument("--resume", default=None, help="path to checkpoint to resume")
     ap.add_argument("--fresh-schedule", action="store_true",
                     help="with --resume: load model+optimizer but keep THIS run's "
@@ -749,22 +947,27 @@ def main():
     if args.objective_arm is not None:
         mcfg = apply_objective_arm(mcfg, resolve_objective_arm(args.objective_arm))
     curriculum_enabled(mcfg)  # refuse an unknown loss_balancing / curriculum before work
-    dcfg = yaml.safe_load(Path("configs/data.yaml").read_text())
+    dcfg = yaml.safe_load(Path(args.data_config).read_text())
     n_targets = len(dcfg["target_concepts"])
-    vocab_size = mcfg["trunk"].get("target_vocab", 10000)
+    gem = args.trajectory == "hospitalization"
+    if len(args.site) != len(args.data) or (not gem and len(args.data) != 1):
+        raise SystemExit("pass one --site per --data directory; several sites need "
+                         "--trajectory hospitalization")
 
     # KTD7: the data's tokenizer-v2 vocabulary binds everything below — the threshold
     # head's value-bin count, the shard rows, the value stats and every checkpoint.
-    vblob = load_vocab_blob(Path(args.data) / "vocab.json",
+    vblob = load_vocab_blob(args.vocab or Path(args.data[0]) / "vocab.json",
                             required_for="training is bound to its vocabulary and segments")
     binding = artifact_binding(vblob)  # refuses a pre-v2 vocabulary (re-tokenize)
+    vocab_size = embedding_vocab_size(vblob, mcfg)
 
     model = Model(vocab_size, n_targets, mcfg, n_value_bins=n_value_bins(vblob)).to(dev)
     if is_main:
-        print(f"params: {count_params(model)/1e6:.1f}M")
+        print(f"params: {count_params(model)/1e6:.2f}M (embedding rows {vocab_size})")
 
     loaders = build_loaders(
-        Path(args.data) / "events.parquet",
+        {site: Path(d) / "gem_events.parquet" for site, d in zip(args.site, args.data)}
+        if gem else Path(args.data[0]) / "events.parquet",
         binding=binding,
         vocab_blob=vblob,
         tcfg=tcfg,
@@ -773,8 +976,15 @@ def main():
         value_stats_path=args.value_stats,
         dry_run=args.dry_run,
         is_main=is_main,
+        representation="gem" if gem else "decile",
+        dcfg=dcfg,
     )
     dataset, dl, validation_dl = loaders.train_dataset, loaders.train, loaders.validation
+    if is_main and loaders.memory is not None:
+        memory = loaders.memory
+        print(f"loader: {memory['events']:,} events, resident +"
+              f"{(memory['rss_after_bytes'] - memory['rss_before_bytes']) / 2**20:.0f} MiB "
+              f"(~{memory['bytes_per_event']:.0f} B/event, per rank)")
 
     if args.dry_run:
         if is_main:
@@ -797,11 +1007,20 @@ def main():
         weight_decay=tcfg["optimizer"]["weight_decay"], betas=tcfg["optimizer"]["betas"],
     )
 
-    total_steps = tcfg["schedule"].get("total_steps", 60000)
+    total_steps = resolve_total_steps(tcfg, len(dl))
     warmup_steps = tcfg["schedule"].get("warmup_steps", 2000)
     scheduler = build_scheduler(opt, total_steps, warmup_steps)
+    if is_main and tcfg["schedule"].get("passes") is not None:
+        print(f"run length: {tcfg['schedule']['passes']} passes x {len(dl)} batches per rank "
+              f"-> {total_steps} optimizer updates")
 
     train_cfg = TrainConfig({}, tcfg, mcfg, total_steps)
+    # Recorded in every checkpoint manifest (config): what a consumer needs to rebuild the
+    # model, and the loader's measured memory.
+    train_cfg.vocab_size = vocab_size
+    train_cfg.trajectory = args.trajectory
+    train_cfg.sites = list(args.site)
+    train_cfg.loader_memory = loaders.memory
 
     model, manifest = train(
         model, dl, validation_dl, opt, scheduler, train_cfg, dev,

@@ -394,19 +394,22 @@ def _free_port() -> int:
         return sock.getsockname()[1]
 
 
-def launch_two_ranks(scenario: str, out_dir: Path, *, timeout: float = LAUNCH_TIMEOUT_S):
+def launch_two_ranks(scenario: str, out_dir: Path, *, timeout: float = LAUNCH_TIMEOUT_S,
+                     script: Path | None = None):
     """Run `scenario` on two gloo ranks. Returns (returncodes, logs, timed_out); a rank
     still alive at the deadline — or left blocked in a collective by a dead peer — is
-    killed, so the launch can neither hang nor leak a process."""
+    killed, so the launch can neither hang nor leak a process. `script` (default: this
+    file) is the test module each rank runs as ``script scenario out_dir``."""
     for _ in range(3):
-        codes, logs, timed_out = _launch_once(scenario, out_dir, timeout)
+        codes, logs, timed_out = _launch_once(scenario, out_dir, timeout,
+                                              script or Path(__file__).resolve())
         # Another process can take the free port between probing and rank 0 binding it.
         if not any("address already in use" in log.lower() for log in logs):
             break
     return codes, logs, timed_out
 
 
-def _launch_once(scenario: str, out_dir: Path, timeout: float):
+def _launch_once(scenario: str, out_dir: Path, timeout: float, script: Path):
     port = _free_port()
     procs, handles = [], []
     try:
@@ -423,7 +426,7 @@ def _launch_once(scenario: str, out_dir: Path, timeout: float):
             handle = open(out_dir / f"rank_{rank}.log", "w")
             handles.append(handle)
             procs.append(subprocess.Popen(
-                [sys.executable, str(Path(__file__).resolve()), scenario, str(out_dir)],
+                [sys.executable, str(script), scenario, str(out_dir)],
                 cwd=ROOT, env=env, stdout=handle, stderr=subprocess.STDOUT))
         deadline = time.monotonic() + timeout
         peer_grace = None
