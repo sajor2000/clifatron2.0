@@ -1,0 +1,447 @@
+# Literature-grounded segments for LABS, CLINICAL SCORES and AGE concepts that are NOT in the
+# physician-designed CSV (external/clifatron/tokenETL/config/critical_illness_tokenization_final_with_intervals.csv).
+# Schema: /tmp/litseg/SCHEMA.md. Every edge needs ICU physician sign-off before the first L40 run.
+#
+# Units: the input TSV (/tmp/noncsv_concepts_units.tsv) lists unit = None for every row. The units
+# below were read from the CLIF `reference_unit` column of the local MIMIC-IV-Ext-CLIF clif_labs.parquet
+# (aggregate group-by only): calcium_ionized mg/dL, troponin_t ng/L, pt sec, so2_mixed_venous %,
+# *_percent %, basophils_absolute K/uL (= 10^3/uL = 10^9/L), bilirubin_unconjugated mg/dL.
+# Scores carry scale points; age_decile is hospitalization.age_at_admission in years.
+#
+# Concepts named in the task brief but ABSENT from the TSV (they are already in the physician CSV,
+# so are out of scope here): inr, ptt, so2_central_venous, bilirubin_conjugated, crp, ferritin, esr,
+# ldh, total_protein, phosphate, magnesium, pco2_venous, ph_venous, so2_arterial, height_cm, weight_kg.
+# magnesium_mg / magnesium_ml in the TSV are medication doses (medications group), not the lab.
+group: labs
+reviewed: 2026-10-03
+status: literature_proposed
+concepts:
+
+  # ---------------------------------------------------------------- Glasgow Coma Scale
+  gcs_total:
+    unit: points (3-15)
+    decision: keep_ordinal
+    valid_range: [3, 15]
+    clinical_cutoffs:
+      - "<= 8: severe impairment / coma; airway-protection threshold (GCS < 9)"
+      - "9-12: moderate"
+      - ">= 13: mild"
+      - "SOFA CNS bands: 15 | 13-14 | 10-12 | 6-9 | < 6"
+      - "< 15: altered mentation (qSOFA)"
+    rationale: >-
+      GCS is a validated 13-level ordinal scale; each level is already a clinical category, so one token
+      per level is kept. The cut-offs above (severe <= 8, SOFA CNS bands, qSOFA < 15) all fall on level
+      boundaries, so no information is lost and threshold queries can be expressed on the levels.
+    sources:
+      - id: "PMCID:PMC5700862"   # Marehbian 2017 Neurocrit Care, PMID 28573388
+        supports: ["<= 8", "9-12", ">= 13"]
+        quote: "The American Congress of Rehabilitation Medicine defined mild TBI as GCS >=13 and moderate TBI as a GCS of 9-12 ... The contemporary clinical definition of severe TBI (sTBI) ... is GCS <=8 after resuscitation ... secure airway ... for patients with a GCS <9"
+        verified: true
+      - id: "PMID:26903338"      # Singer 2016 JAMA, Sepsis-3, Table 1 (SOFA, adapted from Vincent 1996 PMID 8844239)
+        supports: ["SOFA CNS bands", "< 15"]
+        quote: "Glasgow Coma Scale score: 15 | 13-14 | 10-12 | 6-9 | <6 ... the task force chose to emphasize altered mentation because it represents any Glasgow Coma Scale score less than 15"
+        verified: true
+      - id: "PMID:4136544"       # Teasdale & Jennett 1974 Lancet, original scale
+        supports: []
+        quote: "(original scale paper; no abstract in PubMed, full text not retrieved)"
+        verified: false
+    notes: >-
+      Intubated patients cannot give a verbal response; sites chart them as verbal = 1 (or 'T'), which
+      pulls gcs_total down to <= 10 regardless of true consciousness (Marehbian notes confounding by
+      'sedation, and intubation'). The model sees ventilation as an input, but physicians should decide
+      whether a separate intubated-verbal token is needed. Teasdale 2014 (PMID 25030516) recommends
+      describing individuals by the three components rather than the total.
+
+  gcs_eye:
+    unit: points (1-4)
+    decision: keep_ordinal
+    valid_range: [1, 4]
+    clinical_cutoffs:
+      - "1 none | 2 to pain | 3 to speech | 4 spontaneous"
+    rationale: >-
+      Validated component scale with four defined levels; each level is the clinical category.
+    sources:
+      - id: "PMCID:PMC9699885"   # Kutty 2022, summary of neurosurgical grading systems
+        supports: ["1-4"]
+        quote: "The GCS has three components to assess; eye opening - which can be graded from 1 point to 4 points, verbal response from 1 point to 5 points, and motor responsiveness from 1 point to 6 points."
+        verified: true
+      - id: "PMID:25030516"
+        supports: []
+        quote: "Individual patients are best described by the three components of the coma scale; whereas the derived total coma score should be used to characterise groups."
+        verified: true
+
+  gcs_verbal:
+    unit: points (1-5)
+    decision: keep_ordinal
+    valid_range: [1, 5]
+    clinical_cutoffs:
+      - "1 none | 2 incomprehensible | 3 inappropriate words | 4 confused | 5 oriented"
+    rationale: >-
+      Validated component scale with five defined levels; each level is the clinical category.
+    sources:
+      - id: "PMCID:PMC9699885"
+        supports: ["1-5"]
+        quote: "verbal response from 1 point to 5 points"
+        verified: true
+    notes: >-
+      Level 1 conflates 'no response' with 'intubated, not testable' at most sites; see gcs_total notes.
+
+  gcs_motor:
+    unit: points (1-6)
+    decision: keep_ordinal
+    valid_range: [1, 6]
+    clinical_cutoffs:
+      - "6 obeys commands | 5 localizes | 4 withdraws | 3 abnormal flexion | 2 extension | 1 none"
+    rationale: >-
+      Validated component scale with six defined levels; 'obeys commands' (6) is the level most used in
+      weaning and extubation-readiness assessment, and each level is a clinical category.
+    sources:
+      - id: "PMCID:PMC9699885"
+        supports: ["1-6"]
+        quote: "motor responsiveness from 1 point to 6 points. The sum of each component is used to calculate an overall score. A minimum score is 3 and a maximum score is 15"
+        verified: true
+      - id: "PMCID:PMC4776917"   # Zali 2012, APACHE II table with GCS components
+        supports: ["level labels"]
+        quote: "Best motor response | 6: obey commands ... 5: localizes ... 4: withdraws ... 3: abnormal flexion ... 2: extension ... 1: none"
+        verified: true
+
+  # ---------------------------------------------------------------- RASS
+  rass:
+    unit: points (-5 to +4)
+    decision: keep_ordinal
+    valid_range: [-5, 4]
+    clinical_cutoffs:
+      - "-5 to -3: deep sedation (RASS <= -3)"
+      - "-2 to 0: light sedation / calm (the usual target)"
+      - "+1 to +4: restless to combative (agitation)"
+    rationale: >-
+      RASS is a validated 10-level ordinal scale; each level is a clinical category. The deep-sedation
+      threshold (<= -3) used in outcome studies falls on a level boundary, so one token per level is kept.
+    sources:
+      - id: "PMID:12421743"      # Sessler 2002 AJRCCM, original validation
+        supports: ["-5 to +4"]
+        quote: "a new 10-level (+4 \"combative\" to -5 \"unarousable\") scale, the Richmond Agitation-Sedation Scale (RASS)"
+        verified: true
+      - id: "PMCID:PMC4435917"   # Balzer 2015 Crit Care, early deep sedation and survival
+        supports: ["<= -3", "-2 to 0"]
+        quote: "The Richmond Agitation-Sedation Score (RASS) was used to assess sedation depth (light sedation: -2 to 0; deep: -3 or below)."
+        verified: true
+      - id: "PMCID:PMC9419605"   # Palakshappa 2022, ROSE secondary analysis
+        supports: []
+        quote: "While previous studies have defined light sedation to include a RASS of -2 ... we defined our cases as \"early light sedation\" as recommended in the protocol: RASS of 0 to -1"
+        verified: true
+    notes: >-
+      Whether -2 counts as light or deep varies across studies (Balzer: light; ROSE protocol: deep).
+      Keeping per-level tokens avoids choosing.
+
+  # ---------------------------------------------------------------- Braden
+  braden_total:
+    unit: points (6-23)
+    decision: keep_ordinal
+    valid_range: [6, 23]
+    clinical_cutoffs:
+      - "<= 9 very high risk | 10-12 high | 13-14 moderate | 15-18 mild | 19-23 no risk"
+      - "<= 18: at risk (multisite predictive-validity cut-off)"
+      - "<= 16: original cut-off (Bergstrom 1987)"
+    rationale: >-
+      Validated 18-level ordinal score; the risk bands that trigger prevention protocols fall on level
+      boundaries, so one token per level is kept.
+    sources:
+      - id: "PMID:3299278"       # Bergstrom 1987 Nurs Res, original scale
+        supports: ["<= 16"]
+        quote: "Using a cut-off point of 16, sensitivity was 100% in both studies."
+        verified: true
+      - id: "PMID:9766454"       # Bergstrom 1998 Nurs Res, multisite
+        supports: ["<= 18"]
+        quote: "Overall, the critical cutoff score for predicting risk was 18."
+        verified: true
+      - id: "PMCID:PMC13333212"  # Sonmez 2026, restates the Braden & Bergstrom categories
+        supports: ["risk bands", "6-23"]
+        quote: "the total score ranging from 6 to 23 ... Risk categories were classified as follows: no risk (19-23), mild risk (15-18), moderate risk (13-14), high risk (10-12) and very high risk (<= 9)"
+        verified: true
+
+  braden_sensory:
+    unit: points (1-4)
+    decision: keep_ordinal
+    valid_range: [1, 4]
+    clinical_cutoffs: ["1 completely limited | 2 very limited | 3 slightly limited | 4 no impairment"]
+    rationale: Validated Braden subscale; four defined levels are the clinical categories.
+    sources: &braden_sub
+      - id: "PMCID:PMC9690319"   # Kennerly 2022, Braden subscales
+        supports: ["1-4", "friction 1-3"]
+        quote: "six discrete subscales (Sensory Perception, Activity, Mobility, Moisture, Nutrition, and Friction and Shear) with five of the six scored on a scale of 1-4 progressing from most to least severity of alteration; Friction and Shear scores range from 1-3"
+        verified: true
+      - id: "PMID:3299278"
+        supports: []
+        quote: "The Braden Scale ... is composed of six subscales that reflect sensory perception, skin moisture, activity, mobility, friction and shear, and nutritional status."
+        verified: true
+
+  braden_moisture:
+    unit: points (1-4)
+    decision: keep_ordinal
+    valid_range: [1, 4]
+    clinical_cutoffs: ["1 constantly moist | 2 very moist | 3 occasionally moist | 4 rarely moist"]
+    rationale: Validated Braden subscale; four defined levels are the clinical categories.
+    sources: *braden_sub
+
+  braden_mobility:
+    unit: points (1-4)
+    decision: keep_ordinal
+    valid_range: [1, 4]
+    clinical_cutoffs: ["1 completely immobile | 2 very limited | 3 slightly limited | 4 no limitation"]
+    rationale: Validated Braden subscale; four defined levels are the clinical categories.
+    sources: *braden_sub
+
+  braden_activity:
+    unit: points (1-4)
+    decision: keep_ordinal
+    valid_range: [1, 4]
+    clinical_cutoffs: ["1 bedfast | 2 chairfast | 3 walks occasionally | 4 walks frequently"]
+    rationale: Validated Braden subscale; four defined levels are the clinical categories.
+    sources: *braden_sub
+
+  braden_nutrition:
+    unit: points (1-4)
+    decision: keep_ordinal
+    valid_range: [1, 4]
+    clinical_cutoffs: ["1 very poor | 2 probably inadequate | 3 adequate | 4 excellent"]
+    rationale: Validated Braden subscale; four defined levels are the clinical categories.
+    sources: *braden_sub
+
+  braden_friction:
+    unit: points (1-3)
+    decision: keep_ordinal
+    valid_range: [1, 3]
+    clinical_cutoffs: ["1 problem | 2 potential problem | 3 no apparent problem"]
+    rationale: Validated Braden subscale (friction and shear); three defined levels are the clinical categories.
+    sources: *braden_sub
+
+  # ---------------------------------------------------------------- Coagulation
+  pt:
+    unit: sec
+    decision: keep_quantile
+    rationale: >-
+      PT in seconds has no portable decision threshold: its normal range and prolongation depend on the
+      thromboplastin reagent, which is why decisions are made on the INR (already physician-binned in the
+      CSV). The one seconds-based rule, the ISTH overt-DIC score, is defined relative to each lab's upper
+      limit of normal (+3 s, +6 s), so fixed edges would mean different things at different sites.
+    sources:
+      - id: "PMCID:PMC4260302"   # Thiruvenkatarajan 2014, coagulation testing review
+        supports: []
+        quote: "INR was introduced to standardise the PT results across different laboratories as thromboplastin test reagents differ in sensitivity."
+        verified: true
+      - id: "PMCID:PMC5896996"   # Mayne 2018, reproduces ISTH DIC table (Taylor 2001, PMID 11816725)
+        supports: []
+        quote: "Prothrombin Time Prolongation | 3 seconds or less | 0 > 3 seconds but < 6 seconds | 1 Greater than 6 seconds | 2"
+        verified: true
+    notes: >-
+      If physicians want PT edges anyway, the defensible form is site ULN + 3 s and ULN + 6 s (ISTH),
+      which needs a per-site ULN the tokenizer does not have. MIMIC median 14.2 s (p05 10.9, p95 32.6).
+
+  # ---------------------------------------------------------------- Ionized calcium
+  calcium_ionized:
+    unit: mg/dL
+    decision: segments
+    edges: [3.36, 4.00, 4.64, 5.20]
+    closure: left
+    rationale: >-
+      Edges are published mmol/L thresholds converted to mg/dL: 0.84 mmol/L (below it, trauma-resuscitation
+      mortality rises sharply), 1.0 mmol/L (lower limit of a hospital normal range, usual repletion
+      trigger), 1.16 mmol/L (lower limit of normal; ICU hypocalcemia definition), 1.30 mmol/L (above it,
+      hypercalcemia linked to mortality).
+    sources:
+      - id: "PMID:28704250"      # MacKay 2017 Anesth Analg
+        supports: [3.36, 4.00, 5.20]
+        quote: "Hypocalcemia and hypercalcemia were defined as any level outside the normal range of Ca at our institution (1-1.25 mmol/L). ... Receiver operator curve analysis identified inflection points in mortality outside a Ca range of 0.84 to 1.30 mmol/L."
+        verified: true
+      - id: "PMID:11273867"      # Zivin 2001 Am J Kidney Dis
+        supports: [4.64]
+        quote: "Incidences of hypocalcemia (ionized calcium [Ca] < 1.16 mmol/L [less than normal]) were 88%, 66%, and 26% ... hazard ratio for death, 1.65 for Ca decrements of 0.1 mmol/L"
+        verified: true
+    notes: >-
+      UNIT: the literature is in mmol/L; CLIF stores mg/dL. Exact factor is 4.008 mg/dL per mmol/L
+      (0.84->3.367, 1.00->4.008, 1.16->4.649, 1.30->5.210), but MIMIC values sit on a 0.04 grid
+      (4.48, 4.52, ...), i.e. the site converted with factor 4.0. An exact-factor edge of 4.008 would push
+      a MIMIC 1.00 mmol/L (stored 4.00) into the lower bin. Edges are therefore floor(min(x*4.0, x*4.008))
+      to 2 dp = 3.36, 4.00, 4.64, 5.20, which bins both conventions identically under left closure.
+      Using a left-closed bin puts exactly 1.30 mmol/L in the upper bin, whereas MacKay treats > 1.30 as
+      abnormal; the difference is one 0.01 step. MIMIC: p05 3.84, median 4.48, p95 5.20 mg/dL.
+
+  # ---------------------------------------------------------------- Mixed venous saturation
+  so2_mixed_venous:
+    unit: "%"
+    decision: segments
+    edges: [60.0, 65.0, 80.0]
+    closure: left
+    rationale: >-
+      65% is the Surviving Sepsis SvO2 resuscitation target; < 60% is the low-SvO2 threshold that triggers
+      goal-directed therapy after cardiac surgery and predicts mortality; >= 80% marks the high-saturation,
+      impaired-extraction state linked to higher septic-shock mortality.
+    sources:
+      - id: "PMID:18058085"      # Dellinger 2008 SSC guidelines (full text, PMC)
+        supports: [65.0]
+        quote: "Central venous (superior vena cava) or mixed venous oxygen saturation >= 70% or >= 65%, respectively (Grade 1C)"
+        verified: true
+      - id: "PMCID:PMC9580133"   # Kaakinen 2022, SvO2 after cardiac surgery
+        supports: [60.0]
+        quote: "SvO2 values < 60% at ICU admission and 4 h after admission are associated with increased 30-day and 1-year mortality after cardiac surgery. ... SvO2 values < 60% are considered low and constitute a threshold for initiating the local GDT protocol"
+        verified: true
+      - id: "PMID:21791065"      # Textoris 2011 Crit Care
+        supports: [80.0]
+        quote: "According to this cut-off, the rates of mortality were 30% (ScvO2max < 80%) and 48% (ScvO2max >= 80%) ... In our study, we used an arbitrary cut-off at 80%."
+        verified: true
+    notes: >-
+      The 80% edge comes from ScvO2, not SvO2, and the authors call it arbitrary; weaker evidence than
+      60/65. ScvO2 is about 5 points higher than SvO2 (hence SSC's 70 vs 65). MIMIC so2_mixed_venous
+      (p05 48, median 65, p95 82) may include central-venous samples labelled as mixed venous; a site-level
+      label audit is advised. No well-sourced lower edge (e.g. < 50%) was found, so none was added.
+
+  # ---------------------------------------------------------------- WBC differential
+  eosinophils_percent:
+    unit: "%"
+    decision: segments
+    edges: [2.0]
+    closure: right
+    rationale: >-
+      Blood eosinophils > 2% define a biomarker-positive COPD exacerbation in which systemic
+      corticosteroids help; <= 2% exacerbations did better without prednisolone. Relevant to the
+      respiratory-failure and extubation population.
+    sources:
+      - id: "PMID:22447964"      # Bafadhel 2012 AJRCCM RCT
+        supports: [2.0]
+        quote: "biomarker-positive and -negative exacerbations (blood eosinophil count > and <= 2%, respectively) ... In biomarker-negative exacerbations, treatment failures occurred in 15% given prednisolone and 2% of those given placebo"
+        verified: true
+    notes: >-
+      Single edge, so this concept goes from about 10 quantile bins to 2. If physicians prefer more
+      resolution, keep_quantile is the fallback. GOLD now uses absolute counts (100 / 300 cells/uL), which
+      CLIF does not carry as an eosinophils_absolute concept in this TSV.
+
+  lymphocytes_percent:
+    unit: "%"
+    decision: keep_quantile
+    rationale: >-
+      No guideline decision threshold is defined on the lymphocyte percentage; lymphopenia is defined on
+      the absolute count, and ratios (NLR) are prognostic markers without an accepted action threshold.
+    sources: []
+
+  neutrophils_percent:
+    unit: "%"
+    decision: keep_quantile
+    rationale: >-
+      Neutropenia (ANC < 500/uL) and SIRS band criteria are defined on absolute counts or band forms, not on
+      the segmented-neutrophil percentage; no percentage threshold drives a decision.
+    sources: []
+
+  monocytes_percent:
+    unit: "%"
+    decision: keep_quantile
+    rationale: No ICU decision threshold exists for the monocyte percentage.
+    sources: []
+
+  basophils_percent:
+    unit: "%"
+    decision: keep_quantile
+    rationale: No ICU decision threshold exists for the basophil percentage (MIMIC median 0.2%).
+    sources: []
+
+  basophils_absolute:
+    unit: K/uL
+    decision: keep_quantile
+    rationale: >-
+      No ICU decision threshold exists; values are mostly 0.00-0.09 K/uL on a 0.01 grid, so data-driven
+      bins already resolve each reported step.
+    sources: []
+
+  # ---------------------------------------------------------------- Troponin T
+  troponin_t:
+    unit: ng/L
+    decision: segments
+    edges: [5.0, 14.0, 52.0, 140.0]
+    closure: left
+    rationale: >-
+      5 ng/L = hs-cTnT limit of detection / single-sample rule-out; 14 ng/L = Roche hs-cTnT 99th-percentile
+      upper reference limit (myocardial injury); 52 ng/L = ESC 0/1-h rule-in at presentation;
+      140 ng/L = 10 x URL (Fourth UDMI type 5, post-CABG, MI threshold).
+    sources:
+      - id: "PMID:19959623"      # Giannitsis 2010 Clin Chem
+        supports: [14.0]
+        quote: "We established the 99th percentile cutoff from healthy reference populations (n = 616). ... At the 99th percentile value of 13.5 ng/L, the CV was 9%"
+        verified: true
+      - id: "PMID:26794233"      # Kimenai 2016 Heart
+        supports: [14.0]
+        quote: "Accepted current thresholds of hs-cTnT (Roche) and hs-cTnI (Abbott) are 14 and 26 ng/L ... Upper reference limits were higher in men than women (hs-cTnT: 16 vs 12 ng/L)"
+        verified: true
+      - id: "PMID:30618277"      # Arslan 2020 meta-analysis (PMC7008551, full text read)
+        supports: [5.0, 52.0]
+        quote: "when the cut-off for rule-out of AMI was set below the limit of detection, i.e. <5 ng/l for the hs-cTnT assay, the sensitivities were generally high ... a single baseline high-sensitivity cardiac troponin T value>50 ng/l to rule in acute myocardial infarction has a high specificity"
+        verified: true
+      - id: "PMCID:PMC13163366"  # 2026 study restating the ESC 0h/1h hs-cTnT cut-offs
+        supports: [5.0, 52.0]
+        quote: "AMI was ruled out in patients with very low levels of hs-cTnT upon presentation (hs-cTnT < 5 ng/L) ... AMI was ruled in when patients demonstrated high levels of hs-cTnT upon presentation (hs-cTnT >= 52 ng/L)"
+        verified: true
+      - id: "PMID:32860058"      # Collet 2021 ESC NSTE-ACS guideline (primary source for 5 / 52)
+        supports: [5.0, 52.0]
+        quote: "(guideline full text not retrieved; cut-offs read via the secondary sources above)"
+        verified: false
+      - id: "guideline:Fourth UDMI 2018 (Thygesen; PMID 30153967) author copy https://repository.arizona.edu/bitstream/handle/10150/631736/2018UDMI-Mastercopy_with_updated_Tables_Figures_23_04_2018.pdf"
+        supports: [14.0, 140.0]
+        quote: "it is suggested to apply a cTn value >10 times 99th percentile URL as the cut-point during the first 48 h following CABG ... sex specific 99th percentile URLs are recommended for hs-cTn assays"
+        verified: true
+    notes: >-
+      ASSAY CAVEAT: MIMIC troponin_t is the conventional 4th-generation cTnT reported in ng/mL on a
+      0.01 grid and converted x1000 (values 10, 20, 30 ... ng/L; 114k of 244k rows are exactly 10 =
+      '<0.01 ng/mL'). At MIMIC the [5,14) bin therefore holds every 'undetectable/0.01' result and the
+      [0,5) bin is empty; the 14 ng/L hs-URL cannot be resolved by that assay. Rush/UChicago are expected
+      to run hs-cTnT (Roche Gen 5) in ng/L, where all four edges apply. Edges assume Roche cTnT; they do
+      not transfer to troponin I. Sex-specific URLs (about 9-12 ng/L women, 16-22 ng/L men by cohort) are
+      not encoded; 14 is the single overall URL. Type 4a (PCI) MI uses 5 x URL = 70 ng/L, omitted to keep
+      bins coarse. A Fifth UDMI (2026, ESC page) exists and was not reviewed; physicians should confirm
+      whether it changes any multiple-of-URL threshold.
+
+  # ---------------------------------------------------------------- Bilirubin
+  bilirubin_unconjugated:
+    unit: mg/dL
+    decision: keep_quantile
+    rationale: >-
+      Adult ICU decisions use total bilirubin (SOFA liver: 1.2 / 2.0 / 6.0 / 12.0 mg/dL, physician-binned);
+      the unconjugated fraction is used to classify jaundice (hemolysis, Gilbert) rather than to trigger a
+      threshold action in adults. Neonatal thresholds do not apply.
+    sources:
+      - id: "PMID:26903338"
+        supports: []
+        quote: "Bilirubin, mg/dL (umol/L) | <1.2 (20) | 1.2-1.9 (20-32) | 2.0-5.9 (33-101) | 6.0-11.9 (102-204) | >12.0 (204)"
+        verified: true
+
+  # ---------------------------------------------------------------- Age (static token)
+  age_decile:
+    unit: years
+    decision: segments
+    edges: [45.0, 55.0, 65.0, 75.0, 80.0]
+    closure: left
+    rationale: >-
+      APACHE II age bands (<= 44, 45-54, 55-64, 65-74, >= 75) are the standard ICU severity age breaks;
+      65 also marks the post-extubation high-risk factor used to enrol the HFNC-vs-NIV trial; 80 marks the
+      'very old intensive care patient' group studied by ESICM (VIP1).
+    sources:
+      - id: "PMCID:PMC4776917"   # Zali 2012, reproduces APACHE II (Knaus 1985, PMID 3928249) age points
+        supports: [45.0, 55.0, 65.0, 75.0]
+        quote: "B. Age points (years) <=44=0; 45 to 54=2; 55 to 64=3; 65 to 74=5; >=75=6"
+        verified: true
+      - id: "PMID:3928249"       # Knaus 1985 APACHE II
+        supports: []
+        quote: "APACHE II uses a point score based upon initial values of 12 routine physiologic measurements, age, and previous health status"
+        verified: true
+      - id: "PMID:27706464"      # Hernandez 2016 JAMA
+        supports: [65.0]
+        quote: "critically ill patients ready for planned extubation with at least 1 of the following high-risk factors for reintubation: older than 65 years"
+        verified: true
+      - id: "PMID:28936626"      # Flaatten 2017 ICM, VIP1
+        supports: [80.0]
+        quote: "The ICUs included the first consecutive 20 very old (>= 80 years) patients admitted to the ICU"
+        verified: true
+    notes: >-
+      The concept name says 'decile' but the edges are now clinical (configs/data.yaml documents it as
+      decile bins; rename or update that comment if adopted). Closure conflict at 65: APACHE puts 65 in
+      the 65-74 band (left closure) while Hernandez enrols 'older than 65' (>= 66 for integer ages);
+      left closure was chosen to match APACHE, so the 65-year-olds sit in the trial-risk bin. No edge
+      below 45 because adult ICU scores assign no extra risk under 45.

@@ -1,0 +1,333 @@
+# Literature-grounded segments: organ-support INPUTS (CRRT, ECMO / MCS) not covered by the
+# physician clinical-segment CSV. All concepts here are model INPUTS only (hard rule #1).
+#
+# Scope note: every ventilator setting/observation (fio2_set, peep_set/obs, tidal_volume_set/obs,
+# plateau_pressure_obs, peak_inspiratory_pressure_*, pressure_support_set, pressure_control_set,
+# resp_rate_set/obs, inspiratory_time_set, minute_vent_obs, mean_airway_pressure_obs, lpm_set,
+# flow_rate_set) and every vital (dbp, sbp, map, heart_rate, respiratory_rate, spo2, temp_c,
+# height_cm, weight_kg) already has physician-designed bins in
+# external/clifatron/tokenETL/config/critical_illness_tokenization_final_with_intervals.csv and is
+# therefore absent from /tmp/noncsv_concepts_units.tsv. Only the 15 support rows below remain.
+#
+# Units: the TSV reference unit is None for every row here. Units below are the CLIF 2.1.0 data
+# dictionary units (https://clif-icu.com/data-dictionary/data-dictionary-2.1.0, read 2026-10-03)
+# and the clifpy 2.1 outlier config. Two staged-data unit mismatches were found (blood_flow_rate
+# stored in mL/h, fdO2 stored in percent) -- see each concept's notes. They must be normalised in
+# the ETL before these edges are applied.
+group: support
+reviewed: 2026-10-03
+status: literature_proposed
+reference_adult:
+  weight_kg: 80      # ELSO VV guideline worked example ("an 80 kg adult"); used ONLY to translate
+                     # per-kg thresholds into raw-unit edges where CLIF stores raw rates
+  bsa_m2: 1.9        # used ONLY to translate a cardiac-index target (2.2 L/min/m2) into a flow
+concepts:
+
+  # ------------------------------------------------------------------ CRRT (clif_crrt_therapy)
+  blood_flow_rate:
+    unit: mL/min
+    decision: segments
+    edges: [150.0, 200.0, 250.0, 300.0]
+    closure: left
+    rationale: >-
+      Below 150 mL/min is a low circuit blood flow (citrate-CVVHDF prescriptions near 120 mL/min,
+      and the range where filter clotting rises); 150-250 is the typical CRRT range, 200 the usual
+      target with anticoagulation; 200-300 is used without anticoagulation; above 300 shortens
+      filter life.
+    sources:
+      - id: "PMID:32704215"   # Murugan, Indian J Crit Care Med 2020 (PMC7347058)
+        supports: [150.0, 200.0, 300.0]
+        quote: "We suggest maintaining a blood flow rate of 200 mL/minute in patients who are on anticoagulation. However, a higher blood flow rate (200–300 mL/minute) is required if anticoagulation is not used ... Low blood flow rates (<100–150 mL/minute) can increase hemofilter and circuit failures ... Blood flow rates greater than 300 mL/minute may decrease the hemofilter life span."
+        verified: true
+      - id: "PMID:33388077"   # See & Bellomo, Crit Care 2021, How I prescribe CRRT (PMC7777364)
+        supports: [150.0, 250.0]
+        quote: "Once established, typical blood flow rates (150–250 mL/min) do not affect haemodynamics. For citrate CVVHDF, we prescribe a lower blood flow rate of 120 mL/min"
+        verified: true
+      - id: "guideline:CLIF 2.1.0 data dictionary https://clif-icu.com/data-dictionary/data-dictionary-2.1.0"
+        supports: []
+        quote: "blood_flow_rate | FLOAT | Rate of blood flow through the CRRT circuit (mL/min) | 10-500"
+        verified: true
+    notes: >-
+      UNIT MISMATCH: the staged MIMIC-IV-Ext-CLIF table (546,028 hospitalizations) stores this
+      column in mL/h -- >99.9% of values exceed 500 and the quantiles divided by 60 are 120 / 200 /
+      250 mL/min. The CLIF-MIMIC source comment says "keep unit in mL/min", so the staged copy
+      predates or diverges from that release. Divide by 60 (or use edges 9000/12000/15000/18000
+      mL/h) before binning; check Rush/UChicago separately. The clifpy outlier range is 150-300.
+
+  dialysate_flow_rate:
+    unit: mL/hr
+    decision: keep_quantile
+    rationale: >-
+      The clinical dose threshold (KDIGO effluent 20-25 mL/kg/h) applies to TOTAL effluent per kg,
+      i.e. dialysate + pre- + post-filter replacement + net UF divided by weight; one component in
+      raw mL/h has no threshold of its own and its share varies by modality. Keep data-driven bins
+      (with 0 = component not used as its own token) and derive dose separately (see notes).
+    sources:
+      - id: "guideline:KDIGO AKI 2012 rec 5.8.4 https://kdigo.org/wp-content/uploads/2016/10/KDIGO-2012-AKI-Guideline-English.pdf"
+        supports: []
+        quote: "5.8.4: We recommend delivering an effluent volume of 20–25 ml/kg/h for CRRT in AKI (1A). This will usually require a higher prescription of effluent volume. (Not Graded)"
+        verified: true
+    notes: >-
+      Proposal (needs a new derived concept, not in the TSV): crrt_effluent_dose_ml_kg_h =
+      (dialysate + pre + post + ultrafiltration_out) / weight_kg, closure left, edges
+      [20.0, 25.0, 35.0] -- below KDIGO / at KDIGO / above KDIGO up to the ATN intensive arm
+      (35) / at or above high intensity (RENAL 40). Sources: KDIGO 5.8.4; ATN PMID:18492867
+      ("continuous venovenous hemodiafiltration at 35 ml per kilogram ... 20 ml per kilogram per
+      hour"); RENAL PMID:19846848 ("effluent flow of either 40 ml per kilogram of body weight per
+      hour (higher intensity) or 25 ml per kilogram per hour"). All three verified (abstract/text).
+      Pre-filter replacement lowers delivered clearance 15-20% (PMID:32704215). CLIF unit mL/hr,
+      range 0-10000; the staged values (median 800) are consistent with mL/hr.
+
+  pre_filter_replacement_fluid_rate:
+    unit: mL/hr
+    decision: keep_quantile
+    rationale: >-
+      One component of effluent; no component-level clinical threshold exists in raw mL/h.
+      Dose grounding belongs to the derived per-kg effluent concept (see dialysate_flow_rate notes).
+    sources:
+      - id: "guideline:KDIGO AKI 2012 rec 5.8.4 https://kdigo.org/wp-content/uploads/2016/10/KDIGO-2012-AKI-Guideline-English.pdf"
+        supports: []
+        quote: "In clinical practice, in order to achieve a delivered dose of 20–25 ml/kg/h, it is generally necessary to prescribe in the range of 25–30 ml/kg/h"
+        verified: true
+    notes: CLIF 2.1 unit mL/hr (0-10000); staged median 1500 mL/h, consistent.
+
+  post_filter_replacement_fluid_rate:
+    unit: mL/hr
+    decision: keep_quantile
+    rationale: >-
+      One component of effluent; no component-level clinical threshold exists in raw mL/h.
+      In the staged data it is mostly a fixed 200 mL/h value (citrate/calcium-protocol style), so
+      quantile bins already isolate the common setting.
+    sources:
+      - id: "guideline:KDIGO AKI 2012 rec 5.8.4 https://kdigo.org/wp-content/uploads/2016/10/KDIGO-2012-AKI-Guideline-English.pdf"
+        supports: []
+        quote: "We recommend delivering an effluent volume of 20–25 ml/kg/h for CRRT in AKI (1A)."
+        verified: true
+    notes: CLIF 2.1 unit mL/hr (0-10000); staged quantiles 200 (p1-p75) to 1300 (p99).
+
+  ultrafiltration_out:
+    unit: mL/hr
+    decision: segments
+    edges: [1.0, 80.0, 140.0]
+    closure: left
+    rationale: >-
+      Net ultrafiltration (fluid actually removed). Below 1 mL/h = no net removal (even balance);
+      the RENAL secondary-analysis tertile cut points 1.01 and 1.75 mL/kg/h, translated at the 80 kg
+      reference adult, give 80 and 140 mL/h: low / middle (lowest-risk) / high NUF, the high tertile
+      being associated with lower 90-day survival.
+    sources:
+      - id: "PMID:31173127"   # Murugan, JAMA Netw Open 2019 (RENAL secondary analysis)
+        supports: [80.0, 140.0]
+        quote: "Using tertiles, 3 groups were defined: high, NUF rate greater than 1.75 mL/kg/h; middle, NUF rate from 1.01 to 1.75 mL/kg/h; and low, NUF rate less than 1.01 mL/kg/h. ... NUF rates greater than 1.75 mL/kg/h compared with NUF rates less than 1.01 mL/kg/h were associated with lower survival."
+        verified: true
+      - id: "PMID:32704215"
+        supports: [1.0, 80.0, 140.0]
+        quote: "We use the term net ultrafiltration to denote the net volume of fluid removed from the patient after discounting fluids administered to facilitate the dialysis ... the rate of UFNET must be prescribed based on patient body weight (e.g., mL/kg/hour) ... Moderate UFNET rates between 1.01 and 1.75 mL/kg/hour appear to be associated with the lowest risk of death."
+        verified: true
+      - id: "PMID:33388077"
+        supports: [140.0]
+        quote: "We avoid very high NUF rates (> 2 mL/kg/h), unless aggressive fluid removal is indicated by life-threatening fluid overload."
+        verified: true
+    notes: >-
+      The thresholds are per kg; raw mL/h edges are coarse and misclassify patients far from 80 kg.
+      Preferred: a derived ultrafiltration_out / weight_kg concept with edges [1.01, 1.75] mL/kg/h.
+      SEMANTIC UNCERTAINTY: CLIF defines this as NET UF (permissible 0-500 mL/h), but the staged
+      MIMIC median is 352 mL/h (p25 246, p99 781), ~4.4 mL/kg/h at 80 kg, so more than half of
+      events fall in the top bin; it is not total effluent (that would be ~1600-2000 mL/h), but it
+      may include charting of gross patient fluid removal. Confirm the MIMIC item mapping; a
+      physician may want one more upper edge (no source found for one).
+
+  # ------------------------------------------------------------------ ECMO / MCS (clif_ecmo_mcs)
+  ecmo_flow:
+    unit: L/min
+    decision: segments
+    edges: [2.0, 4.0, 5.0, 6.0]
+    closure: left
+    rationale: >-
+      Below 2 L/min = weaning/minimal-support flow (VV weaning trial 1-1.5 LPM; VA daily weaning
+      floor 2 LPM); 2-4 partial support; about 4 L/min = full support for an 80 kg adult; 5-6 L/min
+      = the usual cannula-limited ceiling; 6 or more = at/above typical maximum.
+    sources:
+      - id: "PMID:33965970"   # Tonna et al., ELSO VV ECMO guideline, ASAIO J 2021 (PMC8315725)
+        supports: [2.0, 4.0, 5.0, 6.0]
+        quote: "an 80 kg adult with a hemoglobin level of 12 grams/dL would require an ECMO flow of about 4 L/min to reach those goals ... VV ECMO flows are typically limited by cannula size to 5–6 liters per minute (LPM) ... To initially assess oxygenation ability, ECMO flow can be decreased to 1–1.5 LPM"
+        verified: true
+      - id: "PMID:32513218"   # Fried et al., How I approach weaning from VA ECMO, Crit Care 2020
+        supports: [2.0]
+        quote: "We reduce flow rates in increments of 0.5 LPM. At each incremental drop in blood flow to a minimum of 2 LPM ... After a patient has tolerated a trial of 2 LPM for a minimum of 8 h with stable end-organ function, a bedside assessment for decannulation is performed."
+        verified: true
+    notes: >-
+      CLIF 2.1 'flow' is blood flow in L/min (clifpy outlier range for ECMO 1-10). Staged ECMO flow
+      p1 2.46 / p50 4.34 / p99 6.04, consistent. VA and VV runs share this concept (no
+      configuration in CLIF 2.1); the edges hold for both. The ELSO VA guideline (Lorusso 2021,
+      PMID:34339398) was not retrievable in full text and is not cited.
+
+  ecmo_sweep:
+    unit: L/min
+    decision: segments
+    edges: [0.0, 1.0, 2.0, 9.0]
+    closure: right
+    rationale: >-
+      0 = sweep off (off-sweep challenge before decannulation); up to 1 L/min = ELSO VV weaning goal;
+      up to 2 L/min = low sweep that tests native ventilatory reserve; 2-9 L/min = usual operating
+      range; above 9 = high CO2-removal demand.
+    sources:
+      - id: "PMID:33965970"
+        supports: [0.0, 1.0, 2.0, 9.0]
+        quote: "Sweep gas typically ranges from 1–9+ LPM ... To assess ventilatory reserve, the patient should tolerate a low sweep gas flow (<2 LPM) ... Stepwise reduction in sweep gas flow rate by 0.5 – 1 L/min to goal of 1 L/min ... trial off sweep gas for 2–3 hours or longer."
+        verified: true
+    notes: >-
+      CLIF 2.1: gas flow in L/min (clifpy outlier range 0.5-20). Staged ECMO sweep p50 4.0, p99 9.0.
+      Right closure is used so exactly 0 is its own bin and exactly 1.0 lands with the weaning goal;
+      ELSO's "<2 LPM" puts 2.0 itself in the low bin here (accepted approximation). The 2-9 bin holds
+      most events; ELSO's "start sweep at 2 LPM" gives no further sourced split.
+
+  ecmo_fdo2:
+    unit: fraction (0-1)
+    decision: segments
+    edges: [0.22, 1.0]
+    closure: left
+    rationale: >-
+      FdO2 0.21 = room-air sweep (end of the ELSO FdO2 weaning step); 0.22-0.99 = partially weaned;
+      1.0 = full oxygen through the oxygenator (standard VV setting).
+    sources:
+      - id: "PMID:33965970"
+        supports: [0.22, 1.0]
+        quote: "Stepwise reduction in FDO2 from 1.0 to 0.21 in decrements of approximately 20% ... Sweep gas typically ranges from 1–9+ LPM, and for VV is typically 100% O2."
+        verified: true
+    notes: >-
+      0.22 is a numeric separator meaning "above 0.21", not a clinical value. UNIT MISMATCH: CLIF
+      2.1 says fraction 0-1 (clifpy outlier range 0.21-1.0) but the staged MIMIC table stores percent
+      (p1 21, p50 100). Divide by 100 before binning (or use edges [22, 100] in percent).
+
+  ecmo_device_rate:
+    unit: RPM
+    decision: keep_quantile
+    rationale: >-
+      Pump speed has no device-independent clinical threshold; the clinically managed quantity is
+      blood flow (ecmo_flow), which depends on speed, cannula size and preload.
+    sources:
+      - id: "PMID:33965970"
+        supports: []
+        quote: "Within a given cannula, increasing pump speed results in increasing flow, though at higher pressure. Assuming adequate filling, larger cannulas have greater flow at lower pump speed."
+        verified: true
+    notes: CLIF 2.1 'device_rate' carries no unit; staged ECMO values 2700-5000 are centrifugal-pump RPM.
+
+  lvad_flow:
+    unit: L/min
+    decision: segments
+    edges: [2.0, 2.5, 4.0]
+    closure: left
+    rationale: >-
+      Below 2 L/min = venting-level or minimal support (Impella kept at 1.5-2 LPM for LV
+      decompression); below 2.5 L/min = HeartMate 3 LOW FLOW hazard-alarm range; 4 L/min is
+      about a cardiac index of 2.2 L/min/m2 at a 1.9 m2 reference adult (full support).
+    sources:
+      - id: "fda:P160054 HeartMate 3 LVAS Instructions for Use (Paperclip fda_785e3e01fa11)"
+        supports: [2.5]
+        quote: "LOW FLOW—Pump flow is less than 2.5 lpm, the pump has stopped, the pump is not operating properly, or the Driveline is disconnected from the System Controller."
+        verified: true
+      - id: "PMID:32513218"
+        supports: [2.0, 4.0]
+        quote: "Concomitant pLVADs ... are generally maintained at relatively low levels of flow (1.5–2 LPM) as its primary use in this setting is LV decompression rather than circulatory support ... We generally target a cardiac index > 2.2 L/min/m2"
+        verified: true
+      - id: "PMID:33965970"
+        supports: [4.0]
+        quote: "Inotropic and vasopressor support are often required to achieve standard circulatory goals (e.g., mean arterial pressure [MAP] ≥ 65 mmHg, cardiac index [CI] > 2.2 L/min/m2, normal lactate)."
+        verified: true
+    notes: >-
+      The 4.0 edge is DERIVED (CI 2.2 x BSA 1.9 = 4.2, rounded down) and is the weakest edge. The
+      LVAD group mixes durable (HeartMate) and temporary/percutaneous devices in the staged data
+      (device_category mostly "Other"), so no single IFU applies; staged p5 1.6 / p50 3.3 / p95 5.8.
+      CLIF 2.1 unit L/min.
+
+  rvad_flow:
+    unit: L/min
+    decision: segments
+    edges: [2.0, 4.0]
+    closure: left
+    rationale: >-
+      Below 2 L/min = minimal/weaning-level support; 2-4 partial; 4 L/min or more is about full
+      cardiac output (CI 2.2 L/min/m2 at a 1.9 m2 reference adult), since RVAD flow is pulmonary
+      blood flow.
+    sources:
+      - id: "PMID:32513218"
+        supports: [2.0, 4.0]
+        quote: "At each incremental drop in blood flow to a minimum of 2 LPM ... We generally target a cardiac index > 2.2 L/min/m2"
+        verified: true
+    notes: >-
+      Weak evidence: no RVAD-specific flow threshold was found; the 2 LPM floor comes from VA-ECMO
+      weaning and 4.0 is derived from a cardiac-index target. Staged p5 2.67 / p50 4.1 / p99 5.81.
+      Consider keep_quantile if the physician reviewer prefers.
+
+  unknown_flow:
+    unit: L/min
+    decision: segments
+    edges: [2.0, 4.0, 6.0]
+    closure: left
+    rationale: >-
+      Flow from an MCS device with no mcs_group (mixture of ECMO and VADs): under 2 L/min =
+      minimal/weaning support for all of them, 4 L/min = about full support, 6 L/min = the usual
+      ECMO cannula-limited ceiling.
+    sources:
+      - id: "PMID:33965970"
+        supports: [2.0, 4.0, 6.0]
+        quote: "an 80 kg adult ... would require an ECMO flow of about 4 L/min ... VV ECMO flows are typically limited by cannula size to 5–6 liters per minute (LPM) ... ECMO flow can be decreased to 1–1.5 LPM"
+        verified: true
+      - id: "PMID:32513218"
+        supports: [2.0]
+        quote: "At each incremental drop in blood flow to a minimum of 2 LPM"
+        verified: true
+    notes: >-
+      Only the cut points shared by ECMO and VADs are used because the device is unknown. Fix the
+      upstream mcs_group mapping where possible (34,648 staged rows have no group).
+
+  unknown_device_rate:
+    unit: RPM (device-dependent)
+    decision: keep_quantile
+    rationale: >-
+      Pump speed of an unidentified device: RPM ranges differ by device (centrifugal ECMO pumps
+      about 2000-5000, HeartMate 3 about 5000-9000), so no shared clinical threshold exists.
+    sources:
+      - id: "fda:P160054 HeartMate 3 LVAS Instructions for Use (Paperclip fda_785e3e01fa11)"
+        supports: []
+        quote: "This situation only occurs when pump speed is below 4000 rpm AND the Pulse Index is greater than 9.0."
+        verified: true
+    notes: Staged values cluster at device-specific settings (2585, 2600, 6800 ...); quantile/exact bins are appropriate.
+
+  unknown_sweep:
+    unit: L/min
+    decision: segments
+    edges: [0.0, 1.0, 2.0, 9.0]
+    closure: right
+    rationale: >-
+      Sweep gas exists only on ECMO circuits, so a sweep value with no mcs_group is ECMO; the ECMO
+      sweep edges apply unchanged (off / weaning goal 1 / low under 2 / usual up to 9 / high).
+    sources:
+      - id: "PMID:33965970"
+        supports: [0.0, 1.0, 2.0, 9.0]
+        quote: "Sweep gas typically ranges from 1–9+ LPM ... the patient should tolerate a low sweep gas flow (<2 LPM) ... to goal of 1 L/min ... trial off sweep gas for 2–3 hours or longer."
+        verified: true
+      - id: "guideline:CLIF 2.1.0 data dictionary https://clif-icu.com/data-dictionary/data-dictionary-2.1.0"
+        supports: []
+        quote: "sweep_set FLOAT Gas flow (L/min) set. Applies to ECMO only."
+        verified: true
+
+  unknown_fdo2:
+    unit: fraction (0-1)
+    decision: segments
+    edges: [0.22, 1.0]
+    closure: left
+    rationale: >-
+      FdO2 applies only to ECMO, so the ECMO FdO2 edges apply: room-air sweep / partially weaned /
+      100% oxygen.
+    sources:
+      - id: "PMID:33965970"
+        supports: [0.22, 1.0]
+        quote: "Stepwise reduction in FDO2 from 1.0 to 0.21 in decrements of approximately 20%"
+        verified: true
+      - id: "guideline:CLIF 2.1.0 data dictionary https://clif-icu.com/data-dictionary/data-dictionary-2.1.0"
+        supports: []
+        quote: "fdO2_set FLOAT Fraction of delivered oxygen set. Applies to ECMO only. Numeric values (0-1)"
+        verified: true
+    notes: Same percent-vs-fraction mismatch as ecmo_fdo2 (staged values are 21-100).

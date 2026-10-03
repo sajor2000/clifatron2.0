@@ -12,6 +12,15 @@ partition is binned (CSV segments, else ordinal point bins, else frozen quantile
 concepts always get a [0,0] stop bin) and the per-concept choice is recorded in vocab.json
 `binning_sources` (see `build_segments`).
 
+Concepts the CSV does not cover may be binned on literature-grounded edges
+(`value_binning.literature_source`, configs/literature_segments/*.yaml; precedence csv ->
+literature -> ordinal -> quantile -> single; recorded and hashed as vocab.json
+`literature_segments`). Unit-less wide-table columns (CRRT, ECMO/MCS) have a declared
+canonical unit and plausible range (`column_units`), medication doses a plausible range
+per converted concept (`dose_plausibility`); a site on another scale declares its
+conversion explicitly (`site_unit_conversions.<site>`), validated fail-closed per site
+(`check_column_units`, `check_dose_plausibility`) and reported in the data-quality section.
+
 vocab.json is the tokenizer-v2 artifact (KTD7): `vocab`, `segments` (closure-aware, per
 binned concept), `binning_sources`, `reference_units` (per binned concept, plus the dose
 target units), `concept_sources` (charting tables + the input-only tables),
@@ -62,6 +71,7 @@ import math
 import multiprocessing
 import os
 import re
+import warnings
 from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 
@@ -75,6 +85,7 @@ from clif_validate._vendor.data.cohort import (
     validate_artifact_destination,
     validate_episode_artifact,
 )
+from clif_validate._vendor.data.segments import _apply_forced_edge  # policy step 3, shared with quantile segments
 from clif_validate._vendor.data.segments import (
     ADMISSION_PREFIX,
     DEVICE_METRIC_PREFIX,
@@ -93,6 +104,7 @@ from clif_validate._vendor.data.segments import (
     is_ordinal,
     json_sha256,
     load_csv_segments,
+    make_segment,
     n_bins as segment_count,
     ordinal_segments,
     segments_from_edges,
@@ -124,7 +136,13 @@ ROOT = Path(__file__).parents[2]
 # partition (KTD3); "targets_only" is the pre-v2 behaviour (CSV segments for the target
 # concepts only, or the legacy decile arm), kept for back-compat comparisons.
 COVERAGES = ("all", "targets_only")
-BINNING_SOURCES = ("csv", "ordinal", "quantile", "single")
+# Per-concept binning source, in precedence order: the physician CSV, then the
+# literature-grounded fragments (configs/literature_segments/*.yaml), then the data-driven
+# rules. A fragment's keep_ordinal / keep_quantile decision is recorded as ordinal /
+# quantile (its provenance is in vocab.json `literature_segments`).
+BINNING_SOURCES = ("csv", "literature", "ordinal", "quantile", "single")
+LITERATURE_DECISIONS = ("segments", "keep_ordinal", "keep_quantile")
+LITERATURE_CLOSURES = ("left", "right")
 DEFAULT_DOSE_SOURCES = ("meds", "meds_intermittent")
 # R12: what a table's `availability_col` means. `result` = the time a result became
 # available (e.g. lab_result_dttm); `recorded` = the time the event was charted
@@ -285,7 +303,42 @@ def validate_vocabulary_artifact(
     cohort_cfg = yaml.safe_load((ROOT / cfg["cohort_contract"]).read_text())
     if hashes.get("outcome_spec") != json_sha256(cohort_cfg["outcomes"]):
         raise QualificationError("outcome-spec compatibility hash mismatch")
+    _check_unit_repair_binding(blob["reference_units"], cfg, provenance.get("source_site"))
+    _check_literature_binding(blob, hashes)
     return blob["vocab"], blob["segments"], manifest
+
+
+def _check_unit_repair_binding(units: dict, cfg: dict, source_site: str | None) -> None:
+    """The frozen segments of a unit-less column are in its canonical unit, as repaired
+    by the reference site's declared conversions. A config declaring other canonical
+    units, or other conversions for the reference site, does not bind the vocabulary."""
+    declared = column_units(cfg)
+    if (units.get("column_units") or {}) != declared:
+        raise QualificationError(
+            "vocabulary was built under different canonical column units (column_units) "
+            f"than this config declares; {RETOKENIZE}")
+    recorded = units.get("site_conversions") or {}
+    expected = site_unit_conversions(cfg, source_site) if source_site else {}
+    if (declared or recorded) and recorded != expected:
+        raise QualificationError(
+            f"vocabulary was built with different unit conversions for its reference site "
+            f"{source_site!r} (site_unit_conversions) than this config declares; "
+            f"{RETOKENIZE}")
+
+
+def _check_literature_binding(blob: dict, hashes: dict) -> None:
+    """The literature record (fragment hashes, applied edges and sources) is hashed; a
+    vocabulary with literature-binned concepts must carry it."""
+    record = blob.get("literature_segments")
+    uses = "literature" in (blob.get("binning_sources") or {}).values()
+    if record is None and "literature_segments" not in hashes and not uses:
+        return
+    if not isinstance(record, dict) or "literature_segments" not in hashes:
+        raise QualificationError(
+            "vocabulary bins concepts from literature segments but lacks the hashed "
+            f"literature record; {RETOKENIZE}")
+    if hashes["literature_segments"] != json_sha256(record):
+        raise QualificationError("literature-segments hash mismatch")
 
 
 def validate_table_availability(tables: dict) -> dict[str, dict]:
@@ -489,7 +542,12 @@ def _melt_sql(fp: Path, spec: dict, keep_ids: list | None, cols: list, *,
     if qual:
         name = f"coalesce(nullif({_name_sql('_qual')}, ''), 'unknown') || '_' || lower(_col)"
     cast = "DOUBLE" if numeric else "VARCHAR"
-    casts = ", ".join(f"CAST({c} AS {cast}) AS {c}" for c in cols)
+    # Declared per-site unit conversions of unit-less numeric columns, applied before the
+    # melt so every downstream step (fit, binning, reference units) sees canonical units.
+    factors = (spec.get("_column_factors") or {}) if numeric else {}
+    casts = ", ".join(
+        f"{_convert_sql(f'CAST({c} AS DOUBLE)', factors[c])} AS {c}" if c in factors
+        else f"CAST({c} AS {cast}) AS {c}" for c in cols)
     id_sql, params = _id_filter(keep_ids)
     value_sql, cat_sql = ("_val", "CAST(NULL AS VARCHAR)") if numeric else (
         "CAST(NULL AS DOUBLE)", "_val")
@@ -572,7 +630,8 @@ def _transitions_sql(inner: str) -> str:
 
 def _read_dose_table(con, base: Path, fp: Path, spec: dict, keep_ids: list | None,
                      tables: dict | None, target_units: dict[str, str] | None,
-                     fit_shadows: bool) -> tuple[pl.DataFrame, pl.DataFrame | None, dict]:
+                     fit_shadows: bool, corrections: dict | None = None,
+                     ) -> tuple[pl.DataFrame, pl.DataFrame | None, dict]:
     """R6/R7 (KTD5): medication doses with unit conversion.
 
     SQL reads the doses (a stop action is a dose of 0) and, for continuous doses, ASOF
@@ -583,7 +642,13 @@ def _read_dose_table(con, base: Path, fp: Path, spec: dict, keep_ids: list | Non
 
     Returns (events, fit-only shadow events, {status: count}). Shadows (reference-site
     build only) are the native-unit fallback rows of every weight-dependent conversion,
-    so fallback concepts get frozen bins even when this site converted every row."""
+    so fallback concepts get frozen bins even when this site converted every row.
+
+    `corrections` (`dose_corrections`: this site's declarations for this table) are
+    applied to the matching (med_category, charted unit) rows BEFORE conversion: a
+    correction rewrites the charted unit to its `to` and multiplies the dose by `factor`
+    (counted under ``corrected``); a quarantine keeps the rows in their native-unit
+    concept (status ``quarantined``)."""
     dose = spec["dose"]
     kind = dose.get("kind")
     if kind not in DOSE_KINDS:
@@ -642,6 +707,7 @@ def _read_dose_table(con, base: Path, fp: Path, spec: dict, keep_ids: list | Non
         sql = f"""SELECT hosp_id, dttm, med, dose, unit_raw,
                          CAST(NULL AS DOUBLE) AS weight_kg FROM ({doses})"""
     frame = con.execute(sql, params).pl()
+    frame, n_corrected = _apply_dose_corrections(frame, corrections or {})
 
     target_units = target_units or {}
     pairs = frame.select("med", "unit_raw").unique().iter_rows()
@@ -661,15 +727,17 @@ def _read_dose_table(con, base: Path, fp: Path, spec: dict, keep_ids: list | Non
     })
     needs_weight = pl.col("weight_power") != 0
     joined = frame.join(mapping, on=["med", "unit_raw"], how="left").with_columns(
-        pl.when((pl.col("status") == "converted") & needs_weight
-                & pl.col("weight_kg").is_null())
+        pl.when(pl.col("_quarantine"))
+        .then(pl.lit("quarantined"))
+        .when((pl.col("status") == "converted") & needs_weight
+              & pl.col("weight_kg").is_null())
         .then(pl.lit("no_weight")).otherwise(pl.col("status")).alias("status")
     )
     converted = pl.col("status") == "converted"
     scale = (pl.when(needs_weight)
              .then(pl.col("factor") * pl.col("weight_kg").pow(pl.col("weight_power")))
              .otherwise(pl.col("factor")))
-    native = pl.col("status").is_in(["no_weight", "unconvertible"])
+    native = pl.col("status").is_in(["no_weight", "unconvertible", "quarantined"])
     events = joined.select(
         "hosp_id", "dttm",
         pl.when(native).then(pl.col("native_concept"))
@@ -681,6 +749,8 @@ def _read_dose_table(con, base: Path, fp: Path, spec: dict, keep_ids: list | Non
         pl.lit(None, dtype=pl.String).alias("cat_value"),
     )
     counts = dict.fromkeys(DOSE_STATUSES, 0)
+    if corrections:
+        counts.update(corrected=n_corrected, quarantined=0)
     for status, n in joined.group_by("status").len().iter_rows():
         counts[status] = int(n)
     shadows = None
@@ -691,6 +761,35 @@ def _read_dose_table(con, base: Path, fp: Path, spec: dict, keep_ids: list | Non
             pl.lit(None, dtype=pl.String).alias("cat_value"),
         )
     return events, shadows, counts
+
+
+def _apply_dose_corrections(frame: pl.DataFrame, corrections: dict,
+                            ) -> tuple[pl.DataFrame, int]:
+    """Apply the declared (med_category, charted unit) corrections: ``(frame with a
+    `_quarantine` flag, corrected row count)``. Pairs are resolved once, joined back."""
+    rows = []
+    for med, raw in frame.select("med", "unit_raw").unique().iter_rows():
+        decl = corrections.get((normalize_name(med), normalize_unit(raw)))
+        if decl is None:
+            continue
+        quarantine = decl.get("action") == "quarantine"
+        rows.append({"med": med, "unit_raw": raw,
+                     "_to": raw if quarantine else decl["to"],
+                     "_factor": 1.0 if quarantine else float(decl["factor"]),
+                     "_q": quarantine})
+    plan = pl.DataFrame(rows, schema={"med": pl.String, "unit_raw": pl.String,
+                                      "_to": pl.String, "_factor": pl.Float64,
+                                      "_q": pl.Boolean})
+    joined = frame.join(plan, on=["med", "unit_raw"], how="left")
+    corrected = pl.col("_to").is_not_null() & ~pl.col("_q").fill_null(False)
+    n_corrected = int(joined.select(corrected.sum()).item())
+    out = joined.with_columns(
+        pl.when(corrected).then(_scale_expr(pl.col("dose"), pl.col("_factor")))
+        .otherwise(pl.col("dose")).alias("dose"),
+        pl.when(corrected).then(pl.col("_to")).otherwise(pl.col("unit_raw")).alias("unit_raw"),
+        pl.col("_q").fill_null(False).alias("_quarantine"),
+    ).drop("_to", "_factor", "_q")
+    return out, n_corrected
 
 
 def _parquet_columns(con, fp: Path) -> set[str]:
@@ -725,18 +824,22 @@ def _present_columns(con, fp: Path, spec: dict) -> tuple[dict, list[str]]:
 def _read_source(con, base: Path, spec: dict, keep_ids: list | None = None, *,
                  tables: dict | None = None, target_units: dict[str, str] | None = None,
                  fit_shadows: bool = False, missing: list[str] | None = None,
+                 column_factors: dict[str, dict] | None = None,
+                 dose_corrections: dict | None = None,
                  ) -> tuple[pl.DataFrame, pl.DataFrame | None, dict | None]:
     """Read one configured table -> (events, fit-only shadows or None, dose status
     counts or None). See `_read_table`. Configured optional columns (`value_cols`,
     `categorical_value_cols`, `categorical_value_col`, `concept_qualifier_col`) the
-    site's parquet lacks are skipped, logged, and appended to `missing`."""
+    site's parquet lacks are skipped, logged, and appended to `missing`.
+    `column_factors` / `dose_corrections`: the site's declared unit conversions for this
+    table (`column_factors`, `dose_corrections`)."""
     fp = base / f"{spec['file']}.parquet"
     if not fp.exists():
         print(f"  [skip] {fp.name} not found")
         return _empty_events(), None, None
     if spec.get("dose"):
         return _read_dose_table(con, base, fp, spec, keep_ids, tables, target_units,
-                                fit_shadows)
+                                fit_shadows, dose_corrections)
     key = spec.get("key", "hospitalization")
     if key not in TABLE_KEYS:
         raise QualificationError(f"table key must be one of {TABLE_KEYS}, got {key!r}")
@@ -754,6 +857,8 @@ def _read_source(con, base: Path, spec: dict, keep_ids: list | None = None, *,
     else:
         declared = any(spec.get(k) for k in ("concept_col", "concept", *_OPTIONAL_LIST_COLS))
         spec, absent = _present_columns(con, fp, spec)
+        if column_factors:
+            spec["_column_factors"] = dict(column_factors)
         if absent:
             print(f"  [skip] {fp.name}: configured column(s) not found: {', '.join(absent)}")
             if missing is not None:
@@ -951,15 +1056,324 @@ def unit_mismatches(events: pl.DataFrame, cfg: dict,
     return sorted(mismatches)
 
 
-def reference_units(fit_events: pl.DataFrame, segments: dict, cfg: dict,
-                    dose_targets: dict[str, str]) -> dict:
-    """R14: the reference unit of every binned concept, plus the dose target units.
+# ---- explicit unit repair: unit-less wide-table columns and medication doses ----------
+#
+# CRRT and ECMO/MCS rows carry no unit column, so their canonical unit and plausible range
+# come from the config (`column_units`, keyed `table.column`, CLIF 2.1 data dictionary).
+# A site storing another scale declares the conversion (`site_unit_conversions.<site>`);
+# nothing is detected or converted silently. Declarations are per site: the reference
+# site's are recorded (and hashed) in the vocabulary's `reference_units`, and every other
+# site applies only its own.
 
-    Per concept: the config's canonical unit; else the reference site's most frequent
-    charted unit (ties -> lexicographically first); else, for a wide device table
-    qualified by `concept_qualifier_col` (ECMO/MCS), ``device_metric:<column>``; else
-    None. Hashed into the vocabulary manifest so every site checks units identically."""
-    canonical = cfg.get("unit_normalization", {}).get("concepts", {}) or {}
+DEFAULT_MAX_OUT_OF_RANGE_SHARE = 0.01
+DEFAULT_MAX_IMPLAUSIBLE_DOSE_SHARE = 0.02
+_RANGE_TOL = 1e-6   # relative slack on plausible-range bounds (float32 storage)
+# Scale hints offered when a column fails its plausible range: (factor, label).
+SCALE_HINTS = ((1 / 60, "x1/60"), (60.0, "x60"), (0.01, "x1/100"), (100.0, "x100"),
+               (0.001, "x1/1000"), (1000.0, "x1000"))
+_COLUMN_KEY_RE = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)\.([A-Za-z_][A-Za-z0-9_]*)$")
+_DOSE_KEY_RE = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)\.([a-z0-9_]+)\[([^\]]+)\]$")
+OUT_OF_RANGE_ACTIONS = ("error", "report")
+
+
+def _positive_number(value: object) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    value = float(value)
+    return value if math.isfinite(value) and value > 0 else None
+
+
+def _range_pair(value: object, what: str) -> list[float]:
+    if (not isinstance(value, (list, tuple)) or len(value) != 2
+            or any(isinstance(v, bool) or not isinstance(v, (int, float))
+                   or not math.isfinite(float(v)) for v in value)
+            or float(value[0]) >= float(value[1])):
+        raise QualificationError(f"{what} range must be [low, high] with low < high, "
+                                 f"got {value!r}")
+    return [float(value[0]), float(value[1])]
+
+
+def column_units(cfg: dict) -> dict[str, dict]:
+    """The validated `column_units` block: ``{"table.column": {"unit", "range": [lo, hi],
+    "on_out_of_range": "error" | "report", "flag": str | None}}``. The table must be
+    configured and the column one of its `value_cols`."""
+    raw = cfg.get("column_units") or {}
+    if not isinstance(raw, dict):
+        raise QualificationError("column_units must map `table.column` to {unit, range}")
+    tables = cfg.get("tables") or {}
+    out: dict[str, dict] = {}
+    for key, spec in sorted(raw.items()):
+        match = _COLUMN_KEY_RE.match(str(key))
+        if not match or not isinstance(spec, dict):
+            raise QualificationError(f"column_units key {key!r} must be `table.column`")
+        table, column = match.groups()
+        if column not in ((tables.get(table) or {}).get("value_cols") or ()):
+            raise QualificationError(
+                f"column_units {key!r}: {column!r} is not a value_col of table {table!r}")
+        unit = spec.get("unit")
+        if not isinstance(unit, str) or not unit.strip():
+            raise QualificationError(f"column_units {key!r} needs a unit")
+        action = spec.get("on_out_of_range", "error")
+        if action not in OUT_OF_RANGE_ACTIONS:
+            raise QualificationError(f"column_units {key!r} on_out_of_range must be one of "
+                                     f"{OUT_OF_RANGE_ACTIONS}")
+        flag = spec.get("flag")
+        out[key] = {"unit": unit.strip(), "range": _range_pair(spec.get("range"), key),
+                    "on_out_of_range": action,
+                    "flag": str(flag).strip() if flag else None}
+    return out
+
+
+def site_unit_conversions(cfg: dict, site: str) -> dict[str, dict]:
+    """The validated declarations of ONE site (`site_unit_conversions.<site>`), keyed as
+    declared. Two kinds:
+
+    - ``table.column`` (a `column_units` column): ``{from, to, factor}``; `to` must be
+      the column's canonical unit; canonical value = charted value x factor.
+    - ``table.med_category[charted unit]`` (a dose table): ``{from, to, factor}`` (the
+      rows' true unit is `to` and their value x factor is in it; ``factor: 1`` relabels a
+      mislabeled unit), or ``{from, action: quarantine}`` (the rows keep their native
+      unit concept, ``{med}_{unit}``, and never reach the converted concept).
+
+    Another site's declarations are never returned."""
+    every = cfg.get("site_unit_conversions") or {}
+    if not isinstance(every, dict):
+        raise QualificationError("site_unit_conversions must map site -> declarations")
+    raw = every.get(site) or {}
+    if not isinstance(raw, dict):
+        raise QualificationError(f"site_unit_conversions.{site} must be a mapping")
+    columns = column_units(cfg)
+    tables = cfg.get("tables") or {}
+    out: dict[str, dict] = {}
+    for key, decl in sorted(raw.items()):
+        where = f"site_unit_conversions.{site}.{key}"
+        if not isinstance(decl, dict) or not isinstance(decl.get("from"), str):
+            raise QualificationError(f"{where} must declare `from` (the charted unit)")
+        dose = _DOSE_KEY_RE.match(str(key))
+        if dose:
+            table, med, unit = dose.groups()
+            if not (tables.get(table) or {}).get("dose"):
+                raise QualificationError(f"{where}: {table!r} is not a dose table")
+            if normalize_unit(decl["from"]) != normalize_unit(unit):
+                raise QualificationError(f"{where}: `from` must be the charted unit {unit!r}")
+            if decl.get("action") == "quarantine":
+                out[key] = {"from": decl["from"], "action": "quarantine",
+                            **({"note": str(decl["note"])} if decl.get("note") else {})}
+                continue
+            if decl.get("action") is not None:
+                raise QualificationError(f"{where}: action must be `quarantine` if given")
+        elif str(key) in columns:
+            if not isinstance(decl.get("to"), str) or (
+                    _normalized_unit(decl["to"]) != _normalized_unit(columns[key]["unit"])):
+                raise QualificationError(
+                    f"{where}: `to` must be the column's canonical unit "
+                    f"{columns[key]['unit']!r}")
+        else:
+            raise QualificationError(
+                f"{where}: not a column_units column nor a `dose_table.med_category[unit]`")
+        factor = _positive_number(decl.get("factor"))
+        if factor is None or not isinstance(decl.get("to"), str):
+            raise QualificationError(f"{where} needs `to` and a positive finite `factor`")
+        when = decl.get("when")
+        if when is not None:
+            if dose:
+                raise QualificationError(f"{where}: `when` applies to column conversions only")
+            if (not isinstance(when, dict) or len(when) != 1
+                    or next(iter(when)) not in _WHEN_OPS
+                    or _finite_number(next(iter(when.values()))) is None):
+                raise QualificationError(
+                    f"{where}: `when` must be one condition {{op: value}}, op one of "
+                    f"{sorted(_WHEN_OPS)}")
+            when = {next(iter(when)): float(next(iter(when.values())))}
+        out[key] = {"from": decl["from"], "to": decl["to"], "factor": factor,
+                    **({"when": when} if when else {}),
+                    **({"note": str(decl["note"])} if decl.get("note") else {})}
+    return out
+
+
+# A column conversion's optional condition: convert only charted values satisfying it
+# (e.g. a site charting FdO2 mostly as percent but sometimes already as a fraction:
+# `when: {gt: 1.0}`); every other value is taken as already canonical.
+_WHEN_OPS = {"gt": ">", "ge": ">=", "lt": "<", "le": "<="}
+
+
+def _convert_sql(expr: str, decl: dict) -> str:
+    """SQL for one declared column conversion (factor, optional `when` condition)."""
+    scaled = _scale_sql(expr, decl["factor"])
+    when = decl.get("when")
+    if not when:
+        return scaled
+    (op, value), = when.items()
+    return f"(CASE WHEN {expr} {_WHEN_OPS[op]} {value!r} THEN {scaled} ELSE {expr} END)"
+
+
+def _scale_sql(expr: str, factor: float) -> str:
+    """`expr` x `factor`, dividing by the integer when `factor` is 1/n so a value on a
+    published edge (12000 mL/h -> 200 mL/min) lands exactly on it."""
+    inverse = 1.0 / factor
+    if factor < 1 and abs(inverse - round(inverse)) < 1e-9 * inverse:
+        return f"({expr} / CAST({float(round(inverse))!r} AS DOUBLE))"
+    return f"({expr} * CAST({factor!r} AS DOUBLE))"
+
+
+def _scale_expr(expr: pl.Expr, factor: pl.Expr) -> pl.Expr:
+    inverse = 1.0 / factor
+    exact = (factor < 1) & ((inverse - inverse.round(0)).abs() < 1e-9 * inverse)
+    return pl.when(exact).then(expr / inverse.round(0)).otherwise(expr * factor)
+
+
+def column_factors(cfg: dict, site: str, table: str) -> dict[str, dict]:
+    """``{column: declaration}`` the site declared for `table`'s unit-less value columns."""
+    return {key.split(".", 1)[1]: decl
+            for key, decl in site_unit_conversions(cfg, site).items()
+            if _COLUMN_KEY_RE.match(key) and key.split(".", 1)[0] == table}
+
+
+def dose_corrections(cfg: dict, site: str, table: str) -> dict[tuple[str, str], dict]:
+    """``{(normalized med_category, normalized charted unit): declaration}`` the site
+    declared for dose table `table`."""
+    out = {}
+    for key, decl in site_unit_conversions(cfg, site).items():
+        match = _DOSE_KEY_RE.match(key)
+        if match and match.group(1) == table:
+            out[(normalize_name(match.group(2)), normalize_unit(match.group(3)))] = decl
+    return out
+
+
+def _scale_hint(con, source_sql: str, params: list, lo: float, hi: float,
+                current: float) -> tuple[str, float] | None:
+    """The `SCALE_HINTS` factor putting the largest share of values in [lo, hi], when it
+    beats the current share."""
+    shares = ", ".join(
+        f"avg(CASE WHEN {_scale_sql('v', f)} BETWEEN {lo!r} AND {hi!r} THEN 1.0 ELSE 0.0 END)"
+        for f, _ in SCALE_HINTS)
+    row = con.execute(f"SELECT {shares} FROM ({source_sql}) WHERE v IS NOT NULL",
+                      params).fetchone()
+    best = max(zip(row, SCALE_HINTS), key=lambda x: (x[0] or 0.0))
+    if best[0] is None or best[0] <= max(current, 0.0) or best[0] == 0:
+        return None
+    return best[1][1], float(best[0])
+
+
+def check_column_units(con, base: Path, cfg: dict, site: str,
+                       keep_ids: list | None = None) -> dict:
+    """Validate every `column_units` column a site charts, AFTER its declared conversion
+    (aggregate-only). A column with more than `unit_normalization.max_out_of_range_share`
+    of its non-null values outside the plausible range is refused (under
+    ``on_mismatch: error``) with the site, column, observed quantiles and a likely scale
+    factor; a column declared ``on_out_of_range: report`` is only reported. Returns the
+    data-quality record: ``{site, conversions, columns, semantic_flags}``."""
+    columns = column_units(cfg)
+    conversions = site_unit_conversions(cfg, site)
+    norm = cfg.get("unit_normalization") or {}
+    max_share = float(norm.get("max_out_of_range_share", DEFAULT_MAX_OUT_OF_RANGE_SHARE))
+    record: dict = {"site": site, "conversions": conversions, "columns": {},
+                    "semantic_flags": {k: v["flag"] for k, v in columns.items() if v["flag"]}}
+    failures = []
+    for key, spec in columns.items():
+        table, column = key.split(".", 1)
+        tspec = cfg["tables"][table]
+        fp = base / f"{tspec['file']}.parquet"
+        if not fp.exists() or column.lower() not in {
+                c.lower() for c in _parquet_columns(con, fp)}:
+            continue
+        decl = conversions.get(key)
+        id_sql, params = _id_filter(keep_ids)
+        raw = f"CAST({column} AS DOUBLE)"
+        source = (f"SELECT {_convert_sql(raw, decl) if decl else raw} AS v "
+                  f"FROM read_parquet('{fp}') WHERE {tspec['availability_col']} IS NOT NULL "
+                  f"{id_sql}")
+        lo, hi = spec["range"]
+        # float32 storage (0.21 -> 0.2099999...) must not read as out of range.
+        lo_t, hi_t = lo - _RANGE_TOL * max(1.0, abs(lo)), hi + _RANGE_TOL * max(1.0, abs(hi))
+        n, out, q = con.execute(
+            f"SELECT count(v), count(v) FILTER (WHERE v < {lo_t!r} OR v > {hi_t!r}), "
+            f"quantile_cont(v, [0.01, 0.5, 0.99]) FROM ({source})", params).fetchone()
+        share = out / n if n else 0.0
+        entry = {"unit": spec["unit"], "range": [lo, hi], "n": int(n),
+                 "out_of_range": int(out), "share": round(share, 6),
+                 "p01": None if q is None else round(float(q[0]), 6),
+                 "p50": None if q is None else round(float(q[1]), 6),
+                 "p99": None if q is None else round(float(q[2]), 6),
+                 "conversion": conversions.get(key), "status": "ok"}
+        if n and share > max_share:
+            entry["status"] = ("reported" if spec["on_out_of_range"] == "report"
+                               else "refused")
+            hint = _scale_hint(con, source, params, lo, hi, 1.0 - share)
+            entry["hint"] = None if hint is None else hint[0]
+            if entry["status"] == "refused":
+                suggestion = (f"likely scale {hint[0]} ({hint[1]:.1%} in range after it)"
+                              if hint else "no simple scale factor fits")
+                failures.append(
+                    f"site {site!r} column {key}: {share:.1%} of {n:,} values outside the "
+                    f"plausible range [{lo:g}, {hi:g}] {spec['unit']} (p1={entry['p01']}, "
+                    f"p50={entry['p50']}, p99={entry['p99']}); {suggestion}. Declare it "
+                    f"explicitly: site_unit_conversions.{site}.{key}: {{from: <charted "
+                    f"unit>, to: {spec['unit']}, factor: <factor>}}")
+        record["columns"][key] = entry
+    if failures and norm.get("on_mismatch", "error") == "error":
+        raise QualificationError("Implausible unit-less column values: " + "; ".join(failures))
+    return record
+
+
+def check_dose_plausibility(dose_events: dict[str, pl.DataFrame], cfg: dict,
+                            site: str) -> dict:
+    """Per declared dose concept (`dose_plausibility.ranges`, the unit after conversion),
+    count running doses (value > 0; 0 is the stop bin) outside the plausible range.
+    A share above `max_implausible_share` is refused (under ``on_mismatch: error``) with
+    the site, concept and a scale hint, unless the range says ``on_implausible: report``;
+    a smaller share is reported. Aggregate-only.
+    Returns ``{"doses": {concept: {unit, range, n, implausible, share, status}}}``."""
+    block = cfg.get("dose_plausibility") or {}
+    ranges = block.get("ranges") or {}
+    max_share = float(block.get("max_implausible_share", DEFAULT_MAX_IMPLAUSIBLE_DOSE_SHARE))
+    frames = [f.select("concept", "value") for f in dose_events.values()
+              if f is not None and len(f)]
+    events = pl.concat(frames) if frames else pl.DataFrame(
+        schema={"concept": pl.String, "value": pl.Float64})
+    record, failures = {}, []
+    for concept, spec in sorted(ranges.items()):
+        if not isinstance(spec, dict):
+            raise QualificationError(f"dose_plausibility.ranges.{concept} must be a mapping")
+        lo, hi = _range_pair(spec.get("range"), f"dose_plausibility.ranges.{concept}")
+        vals = events.filter((pl.col("concept") == concept) & pl.col("value").is_finite()
+                             & (pl.col("value") > 0))["value"]
+        n = len(vals)
+        if not n:
+            continue
+        bad = int(((vals < lo - _RANGE_TOL * max(1.0, abs(lo)))
+                   | (vals > hi + _RANGE_TOL * max(1.0, abs(hi)))).sum())
+        share = bad / n
+        entry = {"unit": spec.get("unit"), "range": [lo, hi], "n": n, "implausible": bad,
+                 "share": round(share, 6), "status": "ok" if not bad else "reported"}
+        action = spec.get("on_implausible", "error")
+        if action not in OUT_OF_RANGE_ACTIONS:
+            raise QualificationError(f"dose_plausibility.ranges.{concept} on_implausible "
+                                     f"must be one of {OUT_OF_RANGE_ACTIONS}")
+        if share > max_share and action == "error":
+            entry["status"] = "refused"
+            arr = vals.to_numpy()
+            fits = max(((float(((arr * f >= lo) & (arr * f <= hi)).mean()), label)
+                        for f, label in SCALE_HINTS))
+            hint = (f"best scale {fits[1]} puts {fits[0]:.1%} in range" if fits[0] > 0
+                    else "no simple scale factor fits")
+            failures.append(
+                f"site {site!r} dose {concept}: {share:.1%} of {n:,} running doses outside "
+                f"[{lo:g}, {hi:g}] {spec.get('unit')} (p1={np.quantile(arr, 0.01):.4g}, "
+                f"p50={np.quantile(arr, 0.5):.4g}, p99={np.quantile(arr, 0.99):.4g}); "
+                f"{hint}. Declare a correction "
+                f"for the mislabeled charted unit: site_unit_conversions.{site}."
+                "<dose_table>.<med_category>[<charted unit>]: {from, to, factor} or "
+                "{from, action: quarantine}")
+        record[concept] = entry
+    if failures and (cfg.get("unit_normalization") or {}).get("on_mismatch",
+                                                              "error") == "error":
+        raise QualificationError("Implausible medication doses: " + "; ".join(failures))
+    return {"doses": record}
+
+
+def _observed_units(fit_events: pl.DataFrame) -> dict[str, str]:
+    """Per concept, the most frequent charted unit (ties -> lexicographically first)."""
     observed: dict[str, str] = {}
     if "unit" in fit_events.columns:
         counts = (
@@ -969,21 +1383,61 @@ def reference_units(fit_events: pl.DataFrame, segments: dict, cfg: dict,
         )
         for concept, unit, _ in counts.iter_rows():
             observed.setdefault(concept, unit)
+    return observed
+
+
+def reference_units(fit_events: pl.DataFrame, segments: dict, cfg: dict,
+                    dose_targets: dict[str, str], site: str | None = None) -> dict:
+    """R14: the reference unit of every binned concept, plus the dose target units.
+
+    Per concept: the config's canonical unit; else the reference site's most frequent
+    charted unit (ties -> lexicographically first); else, for a unit-less wide-table
+    column, its declared canonical unit (`column_units`, after the site's conversions);
+    else, for a wide device table qualified by `concept_qualifier_col` (ECMO/MCS),
+    ``device_metric:<column>``; else None. Hashed into the vocabulary manifest so every
+    site checks units identically.
+
+    When the config declares `column_units`, the record also carries them
+    (``column_units``) and the reference `site`'s declared conversions
+    (``site_conversions``), so a vocabulary built under different unit repairs has a
+    different hash and is refused by `validate_vocabulary_artifact`."""
+    canonical = cfg.get("unit_normalization", {}).get("concepts", {}) or {}
+    observed = _observed_units(fit_events)
+    declared = column_units(cfg)
     metrics: dict[str, str] = {}
     sources = _concept_tables(fit_events)
     for name, spec in (cfg.get("tables") or {}).items():
-        if not spec.get("concept_qualifier_col"):
-            continue
+        qualified = bool(spec.get("concept_qualifier_col"))
         for col in spec.get("value_cols") or ():
+            unit = (declared.get(f"{name}.{col}") or {}).get("unit")
+            if not qualified and unit is None:
+                continue
             suffix = f"_{col.lower()}"
             for concept, tables in sources.items():
-                if name in tables and concept.endswith(suffix):
-                    metrics.setdefault(concept, f"{DEVICE_METRIC_PREFIX}{col}")
+                if name not in tables:
+                    continue
+                if (concept == col.lower() and not qualified) or (
+                        qualified and concept.endswith(suffix)):
+                    metrics.setdefault(concept, unit or f"{DEVICE_METRIC_PREFIX}{col}")
     units = {
         concept: canonical.get(concept) or observed.get(concept) or metrics.get(concept)
         for concept in sorted(segments)
     }
-    return {"concepts": units, "dose_targets": dict(sorted(dose_targets.items()))}
+    record = {"concepts": units, "dose_targets": dict(sorted(dose_targets.items()))}
+    if declared:
+        record["column_units"] = declared
+        record["site_conversions"] = (site_unit_conversions(cfg, site)
+                                      if site is not None else {})
+    return record
+
+
+def _unit_plan(fit_events: pl.DataFrame, cfg: dict, dose_targets: dict[str, str],
+               site: str | None) -> dict[str, str | None]:
+    """Every fit concept's reference unit (`reference_units`) BEFORE segments exist: the
+    unit a literature fragment must match."""
+    names = fit_events["concept"].drop_nulls().unique().to_list() if len(fit_events) else []
+    return reference_units(fit_events, dict.fromkeys(names), cfg, dose_targets,
+                           site)["concepts"]
 
 
 def _concept_tables(fit_events: pl.DataFrame) -> dict[str, list[str]]:
@@ -1174,6 +1628,208 @@ def _matched_quantile_edges(vals: np.ndarray, n_edges: int, forced: list[float],
     return sorted(used)
 
 
+# ---- literature-grounded segments (configs/literature_segments/*.yaml) ----------------
+
+def _finite_number(value: object) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    value = float(value)
+    return value if math.isfinite(value) else None
+
+
+def _literature_path(source: str | Path) -> Path:
+    path = Path(source)
+    return path if path.is_absolute() else ROOT / path
+
+
+def load_literature_segments(source: str | Path) -> dict:
+    """Load and validate every literature fragment (`*.yaml` in a directory, or one file).
+
+    Each concept declares `unit`, `decision` (segments | keep_ordinal | keep_quantile) and
+    `sources` [{id, supports, verified}]; `segments` also needs `edges` (finite, strictly
+    ascending) and `closure` (left = ``[a, b)``, right = ``(a, b]``), and every edge must be
+    supported by at least one source (``verified: false`` sources count, and are reported).
+    `keep_ordinal` may give `valid_range` [low, high] (integers) and `clinical_cutoffs`.
+    A concept named by two fragments is refused. Returns ``{"source", "fragments":
+    {file: sha256 of its bytes}, "concepts": {concept: spec + {"fragment": file}}}``."""
+    path = _literature_path(source)
+    files = sorted(path.glob("*.yaml")) if path.is_dir() else [path]
+    if not files or not all(f.is_file() for f in files):
+        raise QualificationError(f"no literature fragments found at {source}")
+    fragments: dict[str, str] = {}
+    concepts: dict[str, dict] = {}
+    for fp in files:
+        data = fp.read_bytes()
+        fragments[fp.name] = hashlib.sha256(data).hexdigest()
+        doc = yaml.safe_load(data) or {}
+        if not isinstance(doc, dict) or not isinstance(doc.get("concepts"), dict):
+            raise QualificationError(f"literature fragment {fp.name} has no `concepts` mapping")
+        for concept, spec in doc["concepts"].items():
+            where = f"literature fragment {fp.name}, concept {concept!r}"
+            if concept in concepts:
+                raise QualificationError(
+                    f"{where}: already defined in {concepts[concept]['fragment']}")
+            concepts[concept] = {**_validate_literature_concept(spec, where),
+                                 "fragment": fp.name}
+    return {"source": str(source), "fragments": fragments,
+            "concepts": dict(sorted(concepts.items()))}
+
+
+def _validate_literature_concept(spec: object, where: str) -> dict:
+    if not isinstance(spec, dict):
+        raise QualificationError(f"{where} must be a mapping")
+    decision = spec.get("decision")
+    if decision not in LITERATURE_DECISIONS:
+        raise QualificationError(f"{where}: decision must be one of {LITERATURE_DECISIONS}")
+    unit = spec.get("unit")
+    if not isinstance(unit, str) or not unit.strip():
+        raise QualificationError(f"{where} needs a unit")
+    sources = spec.get("sources") or []
+    if not isinstance(sources, list) or any(
+            not isinstance(src, dict) or not isinstance(src.get("id"), str)
+            or not isinstance(src.get("verified"), bool) for src in sources):
+        raise QualificationError(f"{where}: every source needs an `id` and `verified`")
+    out = {"decision": decision, "unit": unit.strip(),
+           "rationale": str(spec.get("rationale") or "").strip(),
+           "sources": [{"id": src["id"], "verified": src["verified"],
+                        "supports": list(src.get("supports") or [])} for src in sources]}
+    if decision == "segments":
+        edges = spec.get("edges")
+        values = [_finite_number(e) for e in edges] if isinstance(edges, list) else []
+        if not values or any(v is None for v in values) or any(
+                b <= a for a, b in zip(values, values[1:])):
+            raise QualificationError(f"{where}: edges must be finite and strictly ascending")
+        if spec.get("closure") not in LITERATURE_CLOSURES:
+            raise QualificationError(f"{where}: closure must be one of {LITERATURE_CLOSURES}")
+        by_edge = {e: [src for src in sources
+                       if any(_finite_number(x) is not None and np.isclose(float(x), e)
+                              for x in src.get("supports") or ())] for e in values}
+        unsupported = [e for e, srcs in by_edge.items() if not srcs]
+        if unsupported:
+            raise QualificationError(
+                f"{where}: edge(s) {unsupported} are not supported by any source")
+        out.update(edges=values, closure=spec["closure"],
+                   unverified_only_edges=[e for e, srcs in by_edge.items()
+                                          if not any(s["verified"] for s in srcs)])
+    elif decision == "keep_ordinal":
+        rng = spec.get("valid_range")
+        if rng is not None:
+            if (not isinstance(rng, list) or len(rng) != 2
+                    or any(_finite_number(v) is None or float(v) != round(float(v))
+                           for v in rng) or float(rng[0]) >= float(rng[1])
+                    or float(rng[1]) - float(rng[0]) > 100):
+                raise QualificationError(
+                    f"{where}: valid_range must be two integers [low, high], low < high")
+            out["valid_range"] = [float(rng[0]), float(rng[1])]
+        out["clinical_cutoffs"] = [str(c) for c in spec.get("clinical_cutoffs") or ()]
+    return out
+
+
+def _unit_text(unit: str) -> str:
+    """A fragment unit without its trailing parenthetical qualifier (``fraction (0-1)``
+    -> ``fraction``, ``points (3-15)`` -> ``points``)."""
+    return re.sub(r"\s*\([^)]*\)\s*$", "", unit).strip() or unit
+
+
+def literature_segments(edges: list[float], closure: str, *, dose: bool = False,
+                        forced: tuple | list = (), direction: str | None = None) -> list[dict]:
+    """Interior `edges` -> segments with unbounded ends; ``closure: left`` puts a value on
+    an edge in the bin above (``[a, b)``), ``right`` in the bin below (``(a, b]``), as the
+    CSV interval flags are honoured. A dose concept keeps its ``[0, 0]`` stop bin with an
+    open running-dose segment ``(0, e0)`` / ``(0, e0]`` below the first edge (policy
+    step 8: a running dose never bins as stopped)."""
+    left = closure == "left"
+    bounds = [float(e) for e in edges]
+    segs = [make_segment(None, bounds[0], False, not left)]
+    segs += [make_segment(a, b, left, not left) for a, b in zip(bounds, bounds[1:])]
+    segs.append(make_segment(bounds[-1], None, left, False))
+    for t in sorted({float(e) for e in forced if math.isfinite(float(e))}):
+        segs = _apply_forced_edge(segs, t, direction)
+    if dose:
+        if bounds[0] <= 0.0:
+            raise QualificationError("a dose concept's literature edges must be positive")
+        segs[0] = make_segment(0.0, segs[0]["hi"], False, segs[0]["hi_closed"])
+        segs = [make_segment(0.0, 0.0, True, True), *segs]
+    validate_partition(segs)
+    return segs
+
+
+def _plan_literature(loaded: dict, values: dict, csv_named: set[str],
+                     concept_units: dict) -> tuple[dict, dict]:
+    """Which fragment concepts apply, after the CSV-wins and unit rules: ``(plan
+    {concept: spec}, record)``. A CSV concept is ignored with a warning; a concept with
+    no fitting value is skipped with a warning; a unit that differs from the concept's
+    reference unit (after declared unit conversions) is refused. A concept with no
+    reference unit (scores, age) keeps the fragment's stated unit, recorded as assumed."""
+    plan: dict[str, dict] = {}
+    ignored, absent = [], []
+    for concept, spec in loaded["concepts"].items():
+        if concept in csv_named:
+            warnings.warn(f"literature fragment {spec['fragment']}: {concept!r} is defined "
+                          "by the physician CSV, which wins; the fragment entry is ignored")
+            ignored.append(concept)
+            continue
+        if concept not in values:
+            absent.append(concept)
+            continue
+        expected = concept_units.get(concept)
+        if not expected or str(expected).startswith(DEVICE_METRIC_PREFIX):
+            unit_check = "assumed"
+        elif _normalized_unit(_unit_text(spec["unit"])) == _normalized_unit(expected):
+            unit_check = "matched"
+        else:
+            raise QualificationError(
+                f"literature fragment {spec['fragment']}: {concept!r} unit "
+                f"{spec['unit']!r} is not the concept's reference unit {expected!r} (after "
+                "declared unit conversions); fix the fragment or the unit repair")
+        plan[concept] = {**spec, "unit_check": unit_check, "reference_unit": expected}
+    if absent:
+        warnings.warn(f"{len(absent)} literature fragment concept(s) are not numeric "
+                      f"concepts in the fit events and were skipped: {', '.join(absent)}")
+    record = {
+        "source": loaded["source"],
+        "precedence": list(BINNING_SOURCES),
+        "fragments": dict(loaded["fragments"]),
+        "concepts": {c: _literature_entry(spec) for c, spec in sorted(plan.items())},
+        "ignored_csv": sorted(ignored),
+        "absent": sorted(absent),
+    }
+    return plan, record
+
+
+def _literature_entry(spec: dict) -> dict:
+    """Provenance of one applied fragment concept (source ids only, never quotes)."""
+    entry = {"decision": spec["decision"], "unit": spec["unit"],
+             "unit_check": spec["unit_check"], "reference_unit": spec["reference_unit"],
+             "fragment": spec["fragment"],
+             "sources": [s["id"] for s in spec["sources"]],
+             "verified": sum(1 for s in spec["sources"] if s["verified"]),
+             "unverified": sum(1 for s in spec["sources"] if not s["verified"])}
+    if spec["decision"] == "segments":
+        entry.update(edges=spec["edges"], closure=spec["closure"],
+                     unverified_only_edges=spec["unverified_only_edges"])
+    elif spec["decision"] == "keep_ordinal":
+        entry.update(valid_range=spec.get("valid_range"),
+                     clinical_cutoffs=spec["clinical_cutoffs"])
+    else:
+        entry["rationale"] = spec["rationale"]
+    return entry
+
+
+def merge_literature_records(main: dict, extra: dict) -> dict:
+    """The 24 h build's literature record extended by the GEM extension's (concepts
+    charted only outside the 24 h window)."""
+    if not extra:
+        return main
+    if not main:
+        return extra
+    concepts = {**extra.get("concepts", {}), **main.get("concepts", {})}
+    return {**main, "concepts": dict(sorted(concepts.items())),
+            "absent": sorted(set(main.get("absent", ())) - set(concepts)),
+            "ignored_csv": sorted(set(main.get("ignored_csv", ()))
+                                  | set(extra.get("ignored_csv", ())))}
+
+
 def build_clinical_segment_bins(
     csv_path: str | Path,
     target_concepts: list[str],
@@ -1257,6 +1913,8 @@ def build_segments(bin_cfg: dict, fit_events: pl.DataFrame,
                    *, tables: dict | None = None,
                    quantile_concepts: set[str] | None = None,
                    granularity: dict | None = None,
+                   concept_units: dict | None = None,
+                   literature_out: dict | None = None,
                    ) -> tuple[dict[str, list[dict]], dict[str, str]]:
     """Segments for every numeric concept + its binning source (R4; KTD3).
 
@@ -1265,6 +1923,16 @@ def build_segments(bin_cfg: dict, fit_events: pl.DataFrame,
     choosing its source in priority order:
 
     1. ``csv``: the physician CSV defines the concept (clinical_segment scheme only).
+    1b. ``literature`` (clinical_segment scheme with `literature_source`): a fragment in
+       configs/literature_segments/ gives published edges and a closure
+       (`load_literature_segments`, `literature_segments`); never overrides a CSV concept
+       (warned, ignored); its unit must equal the concept's reference unit
+       (`concept_units`, after declared unit conversions; default: the most frequent
+       charted unit in `fit_events`). A fragment's ``keep_ordinal`` gives one point bin per
+       scale level of its `valid_range` (source ``ordinal``) and ``keep_quantile`` skips
+       the ordinal rule (source ``quantile``). `literature_out`, when given, is filled with
+       the hashed provenance record (fragment hashes, applied concepts with edges,
+       closure, source ids and verified counts, ignored CSV and absent concepts).
     2. ``single``: fewer than `min_count` fitting values -> one segment (reported).
     3. ``ordinal``: integer-valued with <= `ordinal_max_distinct` distinct values -> one
        point segment per value (clinical_segment scheme only).
@@ -1336,16 +2004,28 @@ def build_segments(bin_cfg: dict, fit_events: pl.DataFrame,
                                     forced, directions)
         if csv_source else {}
     )
+    literature: dict[str, dict] = {}
+    if csv_source and bin_cfg.get("literature_source"):
+        loaded = load_literature_segments(bin_cfg["literature_source"])
+        csv_named = set(csv_segments) | set(build_clinical_segment_bins(
+            ROOT / csv_source, sorted(loaded["concepts"])))
+        literature, record = _plan_literature(
+            loaded, values, csv_named,
+            _observed_units(fit_events) if concept_units is None else concept_units)
+        if literature_out is not None:
+            literature_out.update(record)
 
     reference = None
     if csv_source is None and bin_cfg.get("matched_granularity"):
         if not bin_cfg.get("segment_source"):
             raise ValueError("matched_granularity needs value_binning.segment_source: the "
                              "decile arm requests each concept's clinical-arm bin count")
-        reference, _ = build_segments(
-            {**bin_cfg, "scheme": "clinical_segment", "matched_granularity": False},
-            fit_events, target_concepts, directions, tables=tables,
-            quantile_concepts=quantile_concepts)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")   # the clinical arm's own build warns
+            reference, _ = build_segments(
+                {**bin_cfg, "scheme": "clinical_segment", "matched_granularity": False},
+                fit_events, target_concepts, directions, tables=tables,
+                quantile_concepts=quantile_concepts, concept_units=concept_units)
         if granularity is not None:
             granularity.update({"reference_scheme": "clinical_segment",
                                 "forced_edges": bool(forced), "matched": 0,
@@ -1362,13 +2042,30 @@ def build_segments(bin_cfg: dict, fit_events: pl.DataFrame,
             segments[concept] = with_zero_point(segs) if is_dose else segs
             sources[concept] = "csv"
             continue
+        lit = literature.get(concept)
+        if lit is not None and lit["decision"] == "segments":
+            segments[concept] = literature_segments(
+                lit["edges"], lit["closure"], dose=is_dose, forced=concept_forced,
+                direction=direction)
+            sources[concept] = "literature"
+            continue
         vals = np.sort(values[concept])
+        if lit is not None and lit["decision"] == "keep_ordinal" and (
+                lit.get("valid_range") or is_ordinal(vals, max_distinct)):
+            lo, hi = lit.get("valid_range") or (None, None)
+            points = (ordinal_segments(np.arange(lo, hi + 1).tolist()) if lo is not None
+                      else ordinal_segments(vals.tolist()))
+            segments[concept] = with_zero_point(points) if is_dose else points
+            sources[concept] = "ordinal"
+            continue
+        force_quantile = (concept in (quantile_concepts or ())
+                          or (lit is not None and lit["decision"] == "keep_quantile"))
         fit_vals = vals[vals > 0] if is_dose else vals
         to_segments = dose_segments_from_edges if is_dose else segments_from_edges
         if len(fit_vals) < min_count:
             segments[concept] = to_segments([], concept_forced, direction)
             sources[concept] = "single"
-        elif (csv_source and concept not in (quantile_concepts or ())
+        elif (csv_source and not force_quantile
               and is_ordinal(vals, max_distinct)):
             # Point bins already separate every integer, so forced edges add nothing.
             points = ordinal_segments(vals.tolist())
@@ -1531,6 +2228,7 @@ def _extend_for_gem(gem_cfg: dict, gem_fit: pl.DataFrame, fit_events: pl.DataFra
                     treatment_sources: set[str], quantile_concepts: set[str],
                     min_category_stays: int = MIN_CATEGORY_STAYS,
                     granularity: dict | None = None,
+                    literature: dict | None = None, site: str | None = None,
                     ) -> tuple[dict, dict, dict, dict, dict]:
     """U8: extend the 24 h-fit vocabulary so the GEM artifact shares it.
 
@@ -1541,7 +2239,8 @@ def _extend_for_gem(gem_cfg: dict, gem_fit: pl.DataFrame, fit_events: pl.DataFra
     only outside the 24 h window (each in at least `min_category_stays` distinct
     full-hospitalization train stays), are appended after every 24 h token. The fixed
     ADMISSION// / DISCHARGE// allowlist is appended last, present even when no stay has
-    that admission type or disposition. Returns ``(vocab, segments, binning_sources,
+    that admission type or disposition. `literature` (the 24 h build's literature record)
+    is extended in place with the fragment concepts the extension applies. Returns ``(vocab, segments, binning_sources,
     reference_units, concept_sources)``."""
     known = set(fit_events["concept"].drop_nulls().unique().to_list()) | set(edges)
     extra_fit = gem_fit.filter(pl.col("concept").is_not_null()
@@ -1549,9 +2248,22 @@ def _extend_for_gem(gem_cfg: dict, gem_fit: pl.DataFrame, fit_events: pl.DataFra
     extra_edges: dict = {}
     if not extra_fit.is_empty():
         extra_granularity: dict = {}
-        built, built_sources = build_segments(
-            bin_cfg, extra_fit, [], directions, tables=cfg["tables"],
-            quantile_concepts=quantile_concepts, granularity=extra_granularity)
+        extra_literature: dict = {}
+        with warnings.catch_warnings():
+            # Fragment concepts absent here were already reported by the 24 h build.
+            warnings.simplefilter("ignore")
+            built, built_sources = build_segments(
+                bin_cfg, extra_fit, [], directions, tables=cfg["tables"],
+                quantile_concepts=quantile_concepts, granularity=extra_granularity,
+                concept_units=_unit_plan(extra_fit, cfg, target_units, site),
+                literature_out=extra_literature)
+        if literature is not None and literature:
+            merged = merge_literature_records(literature, {
+                **extra_literature,
+                "concepts": {c: e for c, e in extra_literature.get("concepts", {}).items()
+                             if c not in edges}})
+            literature.clear()
+            literature.update(merged)
         if granularity and extra_granularity:
             granularity["matched"] += extra_granularity["matched"]
             granularity["exceptions"].update(extra_granularity["exceptions"])
@@ -1561,9 +2273,10 @@ def _extend_for_gem(gem_cfg: dict, gem_fit: pl.DataFrame, fit_events: pl.DataFra
             edges = dict(sorted({**edges, **extra_edges}.items()))
             binning_sources = dict(sorted(
                 {**binning_sources, **{c: built_sources[c] for c in extra_edges}}.items()))
-            units = {"concepts": dict(sorted({**units["concepts"],
-                                              **extra_units["concepts"]}.items())),
-                     "dose_targets": units["dose_targets"]}
+            # Every other field (dose targets, column units, site conversions) is the
+            # 24 h build's, unchanged.
+            units = {**units, "concepts": dict(sorted({**units["concepts"],
+                                                       **extra_units["concepts"]}.items()))}
     vocab = dict(vocab)
     nxt = max(vocab.values()) + 1
     for token in [*build_vocab(gem_fit, edges, min_category_stays=min_category_stays),
@@ -2106,6 +2819,11 @@ def tokenize_site(cfg: dict, site: str, base: Path, out: Path,
     building = vocab is None
     target_units = _dose_target_units(cfg, None if building else vocab_artifact)
     frames, shadow_frames, dose_stats = [], [], {}
+    # Explicit unit repair (per site, fail closed): unit-less wide-table columns are
+    # validated AFTER this site's declared conversions, before anything is read for
+    # binning; dose plausibility is checked after conversion, below.
+    data_quality = check_column_units(con, base, cfg, site, keep_ids)
+    dose_frames: dict[str, pl.DataFrame] = {}
     # Configured columns a site's parquet lacks, per table (report: `missing_columns`).
     missing_columns: dict[str, list[str]] = {}
     for name, spec in cfg["tables"].items():
@@ -2113,11 +2831,14 @@ def tokenize_site(cfg: dict, site: str, base: Path, out: Path,
         df, shadows, counts = _read_source(
             con, base, spec, keep_ids, tables=cfg["tables"], target_units=target_units,
             fit_shadows=building, missing=absent,
+            column_factors=column_factors(cfg, site, name),
+            dose_corrections=dose_corrections(cfg, site, name) if spec.get("dose") else None,
         )
         if absent:
             missing_columns[name] = absent
         if counts is not None:
             dose_stats[name] = counts
+            dose_frames[name] = df.select("concept", "value")
         lag = availability[name]["lag_minutes"]
         for frame, sink in ((df, frames), (shadows, shadow_frames)):
             if frame is None or not len(frame):
@@ -2129,8 +2850,11 @@ def tokenize_site(cfg: dict, site: str, base: Path, out: Path,
                 # is positioned at its shifted time.
                 frame = frame.with_columns(pl.col("dttm") + pl.duration(minutes=lag))
             sink.append(frame.with_columns(source=pl.lit(name)))
+    data_quality.update(check_dose_plausibility(dose_frames, cfg, site))
+    dose_frames.clear()
     if stats is not None:
         stats["dose_conversion"] = dose_stats
+        stats["data_quality"] = data_quality
     if not frames:
         raise QualificationError("no configured CLIF event tables were found")
     static_tokens = list(cfg.get("static_tokens") or ())
@@ -2234,12 +2958,15 @@ def tokenize_site(cfg: dict, site: str, base: Path, out: Path,
         quantile_concepts = {c for c, (_, _, numeric) in STATIC_TOKENS.items()
                              if numeric and c in static_tokens}
         granularity: dict = {}
+        literature: dict = {}
         edges, binning_sources = build_segments(
             bin_cfg, fit_events, target_concepts, directions, tables=cfg["tables"],
             quantile_concepts=quantile_concepts, granularity=granularity,
+            concept_units=_unit_plan(fit_events, cfg, target_units, site),
+            literature_out=literature,
         )
         vocab = build_vocab(fit_events, edges, min_category_stays=min_cell)
-        units = reference_units(fit_events, edges, cfg, target_units)
+        units = reference_units(fit_events, edges, cfg, target_units, site)
         sources = concept_sources(fit_events, treatment_sources)
         if gem_cfg is not None:
             # U8: one vocabulary for both artifacts. Extend it with what only the
@@ -2252,6 +2979,7 @@ def tokenize_site(cfg: dict, site: str, base: Path, out: Path,
                 bin_cfg=bin_cfg, cfg=cfg, directions=directions, target_units=target_units,
                 treatment_sources=treatment_sources, quantile_concepts=quantile_concepts,
                 min_category_stays=min_cell, granularity=granularity,
+                literature=literature, site=site,
             )
             del gem_fit
         raw_events = None   # last pre-window use was the GEM fit above
@@ -2270,6 +2998,10 @@ def tokenize_site(cfg: dict, site: str, base: Path, out: Path,
             "outcome_spec": json_sha256(cohort_cfg["outcomes"]),
             "clif_version": json_sha256(cfg["schema_version"]),
         }
+        if literature:
+            # Fragment file hashes + applied edges/closures/source ids: a changed
+            # fragment changes the vocabulary manifest.
+            hashes["literature_segments"] = json_sha256(literature)
         vocab_manifest = {
             "artifact_family": "experimental_representation",
             "tokenizer_version": TOKENIZER_VERSION,
@@ -2282,6 +3014,8 @@ def tokenize_site(cfg: dict, site: str, base: Path, out: Path,
                 "cohort_contract_version": episodes["cohort_contract_version"].item(0),
                 # Segment precedence policy (src/data/segments.py) the edges were built under.
                 "precedence_policy": POLICY_VERSION,
+                # Per-concept binning source precedence (csv -> literature -> ...).
+                "binning_source_order": list(BINNING_SOURCES),
                 # R12: per-table availability semantics and lag, for the tokenization
                 # report. Provenance only — deliberately not a compatibility hash.
                 "availability": {
@@ -2317,6 +3051,8 @@ def tokenize_site(cfg: dict, site: str, base: Path, out: Path,
             "precedence_policy": POLICY_VERSION,
             "manifest": vocab_manifest,
         }
+        if literature:
+            vocab_artifact["literature_segments"] = literature
 
     # The unknown-concept fallback below emits SPECIAL["<unk>"] for a concept+bin the
     # frozen vocab does not cover (cross-site coverage). That is only safe if the vocab
@@ -2353,7 +3089,8 @@ def tokenize_site(cfg: dict, site: str, base: Path, out: Path,
                               mismatched_units, unk_by_concept, keep_ids, episodes,
                               max_tokens,
                               (stats if stats is not None else gem_stats).get("gem"),
-                              min_cell=min_cell, missing_columns=missing_columns)
+                              min_cell=min_cell, missing_columns=missing_columns,
+                              data_quality=data_quality)
         return vocab, edges
     if len(shards):
         # KTD7: every shard row is bound to the tokenizer version, vocabulary and
@@ -2371,7 +3108,8 @@ def tokenize_site(cfg: dict, site: str, base: Path, out: Path,
         _write_run_report(out / REPORT_FILE, trajectory, events, shards, vocab_artifact,
                           site, availability, cfg, dose_stats, mismatched_units,
                           unk_by_concept, keep_ids, episodes, context, None,
-                          min_cell=min_cell, missing_columns=missing_columns)
+                          min_cell=min_cell, missing_columns=missing_columns,
+                          data_quality=data_quality)
     return vocab, edges
 
 
@@ -2381,7 +3119,8 @@ def _write_run_report(path: Path, trajectory: str, events: pl.DataFrame,
                       mismatched_units: list[str], unk_by_concept: dict,
                       keep_ids: list | None, episodes: pl.DataFrame, context: int,
                       gem: dict | None, *, min_cell: int,
-                      missing_columns: dict[str, list[str]]) -> None:
+                      missing_columns: dict[str, list[str]],
+                      data_quality: dict | None = None) -> None:
     """Build, disclosure-control and write the aggregate-only tokenization report (R16).
 
     The fit partition is the vocabulary's own when this site built it (the reference
@@ -2404,6 +3143,12 @@ def _write_run_report(path: Path, trajectory: str, events: pl.DataFrame,
         context=context, unit_key=_normalized_unit, gem=gem, min_cell=min_cell,
         missing_columns=missing_columns,
         matched_granularity=provenance.get("matched_granularity"),
+        data_quality={**(data_quality or {}),
+                      "dose_corrections": {t: c.get("corrected", 0) for t, c in
+                                           dose_stats.items() if "corrected" in c},
+                      "dose_quarantined": {t: c.get("quarantined", 0) for t, c in
+                                           dose_stats.items() if "quarantined" in c}},
+        literature=vocab_artifact.get("literature_segments"),
     )
     identifiers = {
         str(v) for column in ("hospitalization_id", "patient_id", "hospitalization_joined_id")

@@ -10,6 +10,13 @@ for the full-hospitalization GEM artifact. A report holds ONLY aggregates:
   missing numeric) and the numeric concepts emitted bare, split by fit / non-fit
   partition;
 - vocabulary size, binning sources per concept count, and the single-bin concepts;
+- ``binning``: per binning source (csv, literature, ordinal, quantile, single) the
+  concept count and this run's binned events and event share; ``literature``: the
+  literature-grounded concepts and those whose sources or edges are unverified;
+- ``data_quality``: the site's declared unit conversions and, per unit-less column
+  (`column_units`), values outside the plausible range after conversion (quantiles only
+  for cells of at least the minimum size), semantic flags (e.g. CRRT ultrafiltration),
+  and per dose concept the implausible running doses and applied unit corrections;
 - where `bin_index` placed each binned value (inside a segment, in a gap, clamped low
   or high) in total and per concept;
 - dose-conversion status counts per dose table (unconverted doses by reason);
@@ -66,9 +73,10 @@ DEFAULT_CONTEXT = 8192
 MAX_NON_FIT_UNK_RATE = 0.01
 # Sections whose integers are patient-derived counts (suppressed below MIN_CELL).
 COUNT_SECTIONS = ("sources", "events", "token_kinds", "unk", "value_placement",
-                  "dose_conversion", "multi_unit_concepts", "gem")
+                  "dose_conversion", "multi_unit_concepts", "gem", "binning",
+                  "data_quality")
 # Integer fields inside those sections that are configuration, not counts.
-NOT_COUNTS = frozenset({"context", "max_tokens", "low_coverage_threshold"})
+NOT_COUNTS = frozenset({"context", "max_tokens", "low_coverage_threshold", "concepts"})
 IDENTIFIER_KEYS = frozenset({"hosp_id", "hospitalization_id", "patient_id",
                              "hospitalization_joined_id", "episode_key", "mrn",
                              "encounter_id"})
@@ -166,6 +174,7 @@ def _equations(report: Mapping) -> list[list[CellPath]]:
                           for c in by_concept)])
     for section in ("dispositions", "admission_types"):
         eqs.append([("gem", "stays"), *children(("gem", section))])
+    eqs.append([("token_kinds", "binned"), *children(("binning", "by_source"), "events")])
     return [eq for eq in eqs if len(eq) > 2]
 
 
@@ -381,6 +390,62 @@ def _unk(token_frame: pl.DataFrame, fit_partition: str | None,
     }
 
 
+def _binning(events: pl.DataFrame, binning_sources: Mapping, min_cell: int) -> dict:
+    """Per binning source: concepts (structural), this run's binned events and their
+    share of all binned events."""
+    binned = sorted(binning_sources)
+    counts = dict(events.filter(_finite() & pl.col("concept").is_in(binned))
+                  .group_by("concept").len().iter_rows())
+    total = int(sum(counts.values()))
+    by_source: dict[str, dict] = {}
+    for concept, source in binning_sources.items():
+        row = by_source.setdefault(source, {"concepts": 0, "events": 0})
+        row["concepts"] += 1
+        row["events"] += int(counts.get(concept, 0))
+    for row in by_source.values():
+        row["event_share"] = _rate(row["events"], total, min_cell)
+    return {"by_source": dict(sorted(by_source.items()))}
+
+
+def _literature(binning_sources: Mapping, literature: Mapping | None) -> dict:
+    """The literature-grounded concepts (configuration, not patient counts): decisions,
+    and those with unverified sources or edges supported only by unverified sources."""
+    out: dict[str, Any] = {}
+    if literature:
+        concepts = literature.get("concepts") or {}
+        out = {
+            "fragments": sorted(literature.get("fragments") or ()),
+            "concepts": sorted(c for c, s in binning_sources.items() if s == "literature"),
+            "decisions": {c: e.get("decision") for c, e in sorted(concepts.items())},
+            "unverified_sources": {c: int(e.get("unverified", 0))
+                                   for c, e in sorted(concepts.items()) if e.get("unverified")},
+            "unverified_only_edges": {c: list(e["unverified_only_edges"])
+                                      for c, e in sorted(concepts.items())
+                                      if e.get("unverified_only_edges")},
+            "ignored_csv": sorted(literature.get("ignored_csv") or ()),
+            "absent": sorted(literature.get("absent") or ()),
+        }
+    return out
+
+
+def _data_quality(quality: Mapping | None, min_cell: int) -> dict:
+    """The site's unit-repair record with every statistic of a small cell withheld:
+    quantiles when fewer than `min_cell` values, a share whose base or numerator is a
+    small cell. (Counts are suppressed with the rest of the section.)"""
+    if not quality:
+        return {}
+    out = json.loads(json.dumps(dict(quality)))
+    for key, bad in (("columns", "out_of_range"), ("doses", "implausible")):
+        for entry in (out.get(key) or {}).values():
+            n, k = int(entry.get("n", 0)), int(entry.get(bad, 0))
+            entry["share"] = _rate(k, n, min_cell)
+            if n < min_cell:
+                for q in ("p01", "p50", "p99"):
+                    if q in entry:
+                        entry[q] = None
+    return out
+
+
 def build_report(*, trajectory: str, events: pl.DataFrame, records: pl.DataFrame,
                  vocab: Mapping, segments: Mapping, binning_sources: Mapping,
                  availability: Mapping, tables: Iterable[str], dose_conversion: Mapping,
@@ -390,7 +455,9 @@ def build_report(*, trajectory: str, events: pl.DataFrame, records: pl.DataFrame
                  unit_key: Callable[[str], str] = lambda u: u.strip().lower(),
                  gem: Mapping | None = None, min_cell: int = MIN_CELL,
                  missing_columns: Mapping[str, list[str]] | None = None,
-                 matched_granularity: Mapping | None = None) -> dict:
+                 matched_granularity: Mapping | None = None,
+                 data_quality: Mapping | None = None,
+                 literature: Mapping | None = None) -> dict:
     """Aggregate-only report (unsuppressed; `write_report` applies disclosure control at
     `min_cell`, recorded under ``suppression``). `missing_columns`: configured wide-table
     columns a site's parquet lacks (skipped, never a binder error), per table.
@@ -440,6 +507,9 @@ def build_report(*, trajectory: str, events: pl.DataFrame, records: pl.DataFrame
                             if c},
         "unk": {**_unk(records, fit_partition, min_cell),
                 "by_concept": {c: int(n) for c, n in sorted(unk_by_concept.items())}},
+        "binning": _binning(events, binning_sources, min_cell),
+        "literature": _literature(binning_sources, literature),
+        "data_quality": _data_quality(data_quality, min_cell),
     }
     if matched_granularity:
         report["vocab"]["matched_granularity"] = {

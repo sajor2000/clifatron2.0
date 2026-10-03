@@ -147,9 +147,12 @@ tables:
     input_only: true
 
 # Static admission tokens (R21, KTD11; BBJ CLIF GEM): emitted once at the stay start,
-# before any other event, in this fixed order. age_decile = quantile (decile) bins of
-# age_at_admission fit on the reference train partition; the rest are fused categoricals
-# (`sex=female`, ...). Input-only, never targets. `static_tokens: []` disables them.
+# before any other event, in this fixed order. `age_decile` bins age_at_admission (years)
+# on the CLINICAL AGE BANDS of configs/literature_segments/labs.yaml (<45, 45-54, 55-64,
+# 65-74, 75-79, >=80; source `literature`) under the clinical arm; the token keeps its
+# historical name because renaming it would break the vocabulary contract. The decile
+# arms still bin it by quantiles. The rest are fused categoricals (`sex=female`, ...).
+# Input-only, never targets. `static_tokens: []` disables them.
 static_tokens: [age_decile, sex, race, ethnicity, admission_type]
 static_source:
   hospitalization_file: "clif_hospitalization"   # age_at_admission, admission_type_category
@@ -213,6 +216,9 @@ target_concepts:
 # into reference-site bins; do not silently mix site-specific units.
 unit_normalization:
   on_mismatch: "error"
+  # A `column_units` column with more than this share of its non-null values (after the
+  # site's declared conversion) outside its plausible range is refused, with a scale hint.
+  max_out_of_range_share: 0.01
   concepts:
     map: mmHg
     lactate: mmol/L
@@ -224,6 +230,82 @@ unit_normalization:
     heart_rate: "beats per minute"
     sbp: mmHg
     temp_c: celsius
+
+# Unit-less wide-table value columns (CRRT, ECMO/MCS carry no unit column): canonical
+# unit and plausible range per `table.column`, from the CLIF 2.1 data dictionary
+# (https://clif-icu.com/data-dictionary/data-dictionary-2.1.0, crrt_therapy: blood flow
+# mL/min 10-500; replacement / dialysate rates mL/hr 0-10000; ultrafiltration_out "net
+# ultrafiltration output (mL/hr)" 0-500) and clifpy's outlier config
+# (https://github.com/Common-Longitudinal-ICU-data-Format/clifpy, clifpy/schemas/
+# outlier_config.yaml, ecmo_mcs: flow 0.5-10 L/min, sweep 0.5-20 L/min, fdO2 0.21-1.0).
+# Values are validated per site AFTER that site's `site_unit_conversions`; more than
+# unit_normalization.max_out_of_range_share outside the range is refused, unless the
+# column says `on_out_of_range: report`. `flag` is a semantic note carried into every
+# tokenization report's data-quality section. The canonical unit becomes the concept's
+# reference unit (hashed in vocab.json reference_units with these declarations).
+column_units:
+  crrt.blood_flow_rate: {unit: mL/min, range: [10, 500]}
+  crrt.pre_filter_replacement_fluid_rate: {unit: mL/hr, range: [0, 10000]}
+  crrt.post_filter_replacement_fluid_rate: {unit: mL/hr, range: [0, 10000]}
+  crrt.dialysate_flow_rate: {unit: mL/hr, range: [0, 10000]}
+  # Staged MIMIC median ~352 mL/hr with a p99 near 780: inside or near the plausible
+  # range, but high for NET ultrafiltration (the dictionary's own example rows chart
+  # 800-1500). Not converted; reported only, pending physician review.
+  crrt.ultrafiltration_out:
+    unit: mL/hr
+    range: [0, 500]
+    on_out_of_range: report
+    flag: >-
+      CLIF defines net ultrafiltration (0-500 mL/hr) but the staged values sit high for
+      net removal and may be total effluent; not converted, physician review needed
+  ecmo.device_rate: {unit: RPM, range: [0, 15000]}     # pump speed; HeartMate II tops out ~15000 RPM
+  ecmo.flow: {unit: L/min, range: [0, 10]}
+  ecmo.sweep: {unit: L/min, range: [0, 20]}            # 0 = sweep off (trial off); clifpy floor 0.5 is for running ECMO
+  ecmo.fdO2: {unit: fraction, range: [0.21, 1.0]}
+
+# EXPLICIT per-site unit repair (no auto-detection). Keys:
+#   table.column                    -> a column_units column: {from, to (= its unit), factor}
+#   dose_table.med_category[unit]   -> charted (med, unit) rows: {from, to, factor}
+#                                      (factor 1 relabels a mislabeled unit) or
+#                                      {from, action: quarantine} (rows keep their native
+#                                      `{med}_{unit}` concept, never the converted one)
+# canonical value = charted value x factor. Each site declares only its own; the
+# reference site's are hashed into the vocabulary, so a vocab built under other repairs
+# does not bind. Counts behind each MIMIC entry: aggregate queries of the staged
+# MIMIC-IV-Ext-CLIF, 2026-10-03.
+site_unit_conversions:
+  mimic:
+    # blood flow: >99.9% of values above 500; /60 gives p25/p50/p99 120/200/250 mL/min.
+    crrt.blood_flow_rate: {from: mL/hr, to: mL/min, factor: 0.016666666666666666}
+    # FdO2 charted as percent 21-100 (30,941 values >= 21), but 78 values are already
+    # fractions (<= 1): convert only values above 1, so those are not turned into <= 0.01.
+    ecmo.fdO2: {from: percent, to: fraction, factor: 0.01, when: {gt: 1.0}}
+    # ~300 propofol boluses charted "mcg" with values 10-60: mg doses with a wrong unit.
+    meds_intermittent.propofol[mcg]: {from: mcg, to: mg, factor: 1.0,
+                                      note: "bolus values 10-60 are mg; charted unit is wrong"}
+    # ~400 ketamine rows charted "mcg" with values ~0.1-0.2 (likely mg/kg): true unit
+    # unknown, so kept apart as `ketamine_mcg` rather than converted to mg.
+    meds_intermittent.ketamine[mcg]: {from: mcg, action: quarantine,
+                                      note: "values ~0.2 look weight-based; unit unknown"}
+
+# Plausible running-dose range per converted dose concept (value > 0; 0 is the stop bin),
+# checked per site after conversion and corrections. More than max_implausible_share
+# outside the range is refused (with a scale hint) unless `on_implausible: report`.
+# Upper bounds: clifpy outlier_config.yaml med_dose (propofol 400 mg, midazolam 20 mg,
+# fentanyl 500 mcg, hydromorphone 4 mg, lorazepam 10 mg); ketamine 500 mg = 4.5 mg/kg
+# induction (label maximum) at ~110 kg. Lower bounds (about a tenth of the smallest usual
+# ICU bolus) are NOT from a source: physician sign-off needed.
+dose_plausibility:
+  max_implausible_share: 0.02
+  ranges:
+    propofol_mg: {unit: mg, range: [1, 400]}
+    midazolam_mg: {unit: mg, range: [0.1, 20]}
+    fentanyl_mg: {unit: mg, range: [0.001, 0.5]}
+    hydromorphone_mg: {unit: mg, range: [0.05, 4]}
+    lorazepam_mg: {unit: mg, range: [0.1, 10]}
+    # MIMIC charts ~38% of ketamine "mg" boluses at 0.1-0.3 (weight-based analgesic
+    # dosing written as mg?): reported, not refused, pending physician review.
+    ketamine_mg: {unit: mg, range: [1, 500], on_implausible: report}
 
 value_binning:
   # PRIMARY SCHEME: physician-designed clinical-segment bins with measurement-density
@@ -238,8 +320,16 @@ value_binning:
   scheme: "clinical_segment"               # {clinical_segment | decile_ablation}; continuous_fused is not a build_edges scheme yet
   segment_source: "external/clifatron/tokenETL/config/critical_illness_tokenization_final_with_intervals.csv"
   n_bins: 10                               # ignored by clinical_segment; used by the decile_ablation arm
+  # LITERATURE-GROUNDED SEGMENTS for concepts the physician CSV does not cover: every
+  # configs/literature_segments/*.yaml fragment (labs/scores/age, medications, CRRT and
+  # ECMO support), each edge tied to a cited source (status literature_proposed: ICU
+  # physician sign-off pending). Precedence csv -> literature -> ordinal -> quantile ->
+  # single; a CSV concept is never overridden. Clinical arm only (the decile arms take the
+  # literature bin count under matched_granularity). Fragments are hashed into vocab.json.
+  literature_source: "configs/literature_segments"
   # COVERAGE (U2, R4/KTD3): `all` bins EVERY numeric concept in the reference-site train
-  # partition. Source priority per concept: (1) physician CSV segments; (2) one point bin
+  # partition. Source priority per concept: (1) physician CSV segments; (1b) literature
+  # fragment edges (above); (2) one point bin
   # per value for integer scales with <= ordinal_max_distinct distinct values (GCS, RASS,
   # Braden); (3) frozen quantile bins (quantile_n_bins target, deduplicated, [a,b),
   # forced edges pinned). Fewer than min_count fitting values -> one bin ("single").

@@ -348,7 +348,13 @@ class DataConfigTest(unittest.TestCase):
             {"lo": 65.0, "hi": None, "lo_closed": True, "hi_closed": False},
         ]}
         binning_sources = {"map": "csv"}
-        reference_units = {"concepts": {"map": "mmHg"}, "dose_targets": {}}
+        from src.data.tokenize import column_units, site_unit_conversions
+
+        # The config declares unit-less column units, so the vocabulary must record them
+        # and its reference site's (here: no) unit conversions.
+        reference_units = {"concepts": {"map": "mmHg"}, "dose_targets": {},
+                           "column_units": column_units(cfg),
+                           "site_conversions": site_unit_conversions(cfg, "synthetic-reference")}
         concept_sources = {"tables": {"map": ["vitals"]}, "treatment_sources": []}
 
         def digest(value):
@@ -395,6 +401,14 @@ class DataConfigTest(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "hash mismatch"):
             validate_vocabulary_artifact(artifact(vocab={**vocab, "new": 3}), cfg, policy)
+
+        # A vocabulary recording no column units does not bind a config that declares them.
+        bare_units = {"concepts": {"map": "mmHg"}, "dose_targets": {}}
+        bare = json.loads(json.dumps(manifest))
+        bare["hashes"]["reference_units"] = digest(bare_units)
+        with self.assertRaisesRegex(ValueError, "column units"):
+            validate_vocabulary_artifact(artifact(manifest=bare, reference_units=bare_units),
+                                         cfg, policy)
 
         moved = json.loads(json.dumps(segments))
         moved["map"][0]["hi"] = moved["map"][1]["lo"] = 66.0

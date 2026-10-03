@@ -1,0 +1,813 @@
+# Literature-grounded value segments: MEDICATIONS and FLUIDS
+# Schema: /tmp/litseg/SCHEMA.md. Covers every medication / fluid concept in
+# /tmp/noncsv_concepts_units.tsv whose binning source is not the physician CSV.
+#
+# Conventions used throughout this file
+# - Units. The TSV `unit` column is `None` for every row, so the unit here is the
+#   one encoded in the concept name by src/data/units.py (`{med}_{unit_suffix}`):
+#   intermittent mass doses are canonicalised to mg (mcg -> mg, g -> mg), units to u,
+#   volumes stay mL, and unrecognised units (`dose`) stay as-is. Every edge is in that
+#   unit; conversions are spelled out in `notes`.
+# - Weight. Fluid and drug RATES here are not weight-normalised. Where a source gives a
+#   per-kg dose, the edge is the dose for a 70 kg reference adult (stated per concept).
+# - Every concept already has a [0,0] zero/stop bin; all edges below are > 0 and are
+#   the interior cut points above that stop bin.
+# - Treatments are model INPUTS only. Edges separate clinically different dosing states
+#   (keep-vein-open vs maintenance vs bolus; prophylactic vs therapeutic), not outcomes.
+group: medications
+reviewed: 2026-10-03
+status: literature_proposed
+concepts:
+
+  # ------------------------------------------------------------------ IV fluids
+  sodium_chloride_ml_hr:
+    unit: mL/hr
+    decision: segments
+    edges: [30.0, 166.0, 500.0]
+    closure: right
+    rationale: >-
+      (0,30] mL/h is a keep-vein-open / drug-carrier rate; (30,166] is maintenance or
+      replacement (maintenance is about 1 mL/kg/h, 70 mL/h at 70 kg); (166,500] is a
+      resuscitation-rate infusion (above 1 L over 6 h); above 500 mL/h is a fluid bolus or
+      challenge (100-200 mL over 10 min, or 3-4 mL/kg over 10-15 min, is 600-1700 mL/h).
+    sources:
+      - id: "PMID:40931896"
+        supports: [30.0]
+        quote: "defined as continuous intravenous fluid therapy administered at a rate of up to 30 mL/h"
+        verified: true
+      - id: "PMID:29589054"
+        supports: [166.0]
+        quote: "we opted to consider these solutions resuscitation fluids when they were administered at a rate above 166 mL/h (equal to 1 L over 6 h) and replacement solutions when administered at lower rates."
+        verified: true
+      - id: "PMID:32449147"
+        supports: [166.0, 500.0]
+        quote: "If patients need IV fluids for routine maintenance alone, the initial prescription is restricted to 25–30 mL/kg/day (1 mL/kg/h) of water ... A rapid fluid bolus should be given (although the exact amount can vary, usually 3–4 mL/kg given over 10 to 15 min and repeated when necessary)"
+        verified: true
+    notes: >-
+      Rate in mL/h, not per kg; the 70 kg reference is used only to place the maintenance
+      bin. 500 mL/h sits below the slowest bolus rate in IFA (100 mL over 10 min = 600 mL/h).
+      The 166 mL/h edge is an operational resuscitation-vs-replacement split from one ICU
+      study, not a guideline threshold.
+
+  dextrose_ml_hr:
+    unit: mL/hr
+    decision: segments
+    edges: [30.0, 166.0]
+    closure: right
+    rationale: >-
+      Dextrose-containing infusions are carriers, keep-vein-open lines or maintenance
+      fluid, not resuscitation fluid: (0,30] keep-vein-open/carrier, (30,166] maintenance,
+      >166 a high-volume rate (free-water replacement or a dextrose rescue infusion).
+    sources:
+      - id: "PMID:40931896"
+        supports: [30.0]
+        quote: "defined as continuous intravenous fluid therapy administered at a rate of up to 30 mL/h"
+        verified: true
+      - id: "PMID:29589054"
+        supports: [166.0]
+        quote: "we opted to consider these solutions resuscitation fluids when they were administered at a rate above 166 mL/h (equal to 1 L over 6 h) and replacement solutions when administered at lower rates."
+        verified: true
+    notes: >-
+      The dextrose concentration (D5 vs D10 vs D50) is not in the concept, so mL/h is not a
+      glucose dose. Same edges as sodium_chloride_ml_hr minus the bolus edge, for
+      comparability. In the local MIMIC-IV-Ext-CLIF build `dextrose_ml_hr` and
+      `dextrose_in_water_d5w_ml_hr` have near-identical counts and quantiles, which suggests
+      the same rows are mapped to both categories; check the mCIDE mapping before training.
+
+  dextrose_in_water_d5w_ml_hr:
+    unit: mL/hr
+    decision: segments
+    edges: [30.0, 166.0]
+    closure: right
+    rationale: >-
+      D5W is used as a carrier / keep-vein-open fluid or as maintenance free water:
+      (0,30] keep-vein-open/carrier, (30,166] maintenance, >166 high-volume free-water rate.
+    sources:
+      - id: "PMID:40931896"
+        supports: [30.0]
+        quote: "defined as continuous intravenous fluid therapy administered at a rate of up to 30 mL/h"
+        verified: true
+      - id: "PMID:29589054"
+        supports: [166.0]
+        quote: "we opted to consider these solutions resuscitation fluids when they were administered at a rate above 166 mL/h (equal to 1 L over 6 h) and replacement solutions when administered at lower rates."
+        verified: true
+    notes: See dextrose_ml_hr (possible duplicate mapping).
+
+  sodium_chloride_ml:
+    unit: mL
+    decision: segments
+    edges: [100.0, 300.0]
+    closure: right
+    rationale: >-
+      Intermittent saline volumes: (0,100] mL is a drug diluent / minibag (fluid creep),
+      below the smallest fluid-challenge volume; (100,300] is a fluid challenge (100-200 mL)
+      or a single 4 mL/kg bolus (about 280 mL at 70 kg); >300 mL is a large-volume bolus
+      (500-1000 mL).
+    sources:
+      - id: "PMID:32449147"
+        supports: [100.0, 300.0]
+        quote: "Fluid challenges must be conducted carefully, bearing in mind the four essential components (TROL): Type of fluid (e.g., a balanced crystalloid-like PlasmaLyte); Rate (e100–200 mL over 10 min) ... A fluid bolus of 4 mL/kg of balanced crystalloids is given"
+        verified: true
+      - id: "PMID:29589054"
+        supports: [100.0]
+        quote: "We defined fluid creep as the sum of the volumes of these electrolytes, the small volumes to keep venous lines open (saline or glucose 5%), and the total volume used as a vehicle for medication."
+        verified: true
+    notes: Volume in mL per administration; 300 mL = 4 mL/kg at 70 kg rounded up.
+
+  sodium_chloride_ml_min:
+    unit: mL/min
+    decision: keep_quantile
+    rationale: >-
+      49 events; mixes mislabeled mL/h rates (median 0.28 mL/min) with true bolus rates.
+      Too sparse and too contaminated for clinical edges; the mL/h concept carries the signal.
+    notes: Converting mL/min to mL/hr at ETL would merge this into sodium_chloride_ml_hr.
+
+  dextrose_ml:
+    unit: mL
+    decision: keep_quantile
+    rationale: >-
+      Volume of a dextrose-containing vehicle whose concentration (D5 vs D50) is not
+      encoded, so the volume has no fixed glucose dose or clinical threshold.
+    notes: Same apparent duplicate mapping as dextrose_ml_hr (see dextrose_in_water_d5w_ml).
+
+  dextrose_in_water_d5w_ml:
+    unit: mL
+    decision: keep_quantile
+    rationale: >-
+      D5W intermittent volumes are mostly drug diluent bags (50-250 mL); no clinical decision
+      threshold applies to a diluent volume.
+    notes: Near-identical counts/quantiles to dextrose_ml in the local build.
+
+  dextrose_g_min:
+    unit: g/min
+    decision: keep_quantile
+    rationale: >-
+      376 events of dextrose infusion expressed as g/min; no verified glucose-delivery
+      threshold was retrieved in this review, and the concept is sparse.
+
+  albumin_infusion_ml_hr:
+    unit: mL/hr
+    decision: keep_quantile
+    rationale: >-
+      Albumin is dosed in grams, and 5% vs 25% albumin differ five-fold in grams per mL; the
+      rate in mL/h therefore has no fixed clinical meaning. Values are pump settings for
+      bottle infusions (100/250/500/1000 mL/h).
+
+  tpn_ml_hr:
+    unit: mL/hr
+    decision: keep_quantile
+    rationale: >-
+      Parenteral nutrition is prescribed in kcal and grams of protein per kg per day, and
+      formulation energy density varies by order, so mL/h does not map to a nutrition
+      target without the formula.
+
+  magnesium_ml:
+    unit: mL
+    decision: keep_quantile
+    rationale: >-
+      Diluent volume of a magnesium minibag (50-100 mL); the dose lives in magnesium_mg.
+
+  magnesium_mg:
+    unit: mg
+    decision: segments
+    edges: [2000.0, 4000.0]
+    closure: left
+    rationale: >-
+      Intermittent magnesium sulfate (grams canonicalised to mg): <2 g is a small top-up,
+      [2 g, 4 g) the standard 1-2 g IV bolus for hypomagnesemia or arrhythmia, >=4 g a large
+      repletion dose for a more severe deficit or the start of a 4-8 g/day infusion.
+    sources:
+      - id: "PMID:40868117"
+        supports: [2000.0, 4000.0]
+        quote: "Magnesium sulfate 1–2 g (8–16 mEq) can be given intravenously over 15 min. A continuous infusion should be given after the initial bolus, for example, with magnesium sulfate 4–8 g/24 h (32–64 mEq)."
+        verified: true
+      - id: "PMID:42032632"
+        supports: [4000.0]
+        quote: "2 g IV when serum magnesium < 2.0 mg/dL and 5 g IV when < 1.8 mg/dL."
+        verified: true
+    notes: >-
+      Unit pitfall: CLIF records grams; the tokenizer converts to mg, so 2 g = 2000 mg.
+      The 4 g edge rests on a review plus one single-centre protocol (weak).
+
+  magnesium_g_hr:
+    unit: g/hr
+    decision: keep_quantile
+    rationale: 31 events; too sparse for clinical edges.
+
+  sodium_bicarbonate_meq_min:
+    unit: mEq/min
+    decision: segments
+    edges: [0.35, 2.0]
+    closure: left
+    rationale: >-
+      <0.35 mEq/min is a slow continuous infusion (below the BICAR-ICU 24 h maximum of
+      1000 mL of 4.2% = 500 mEq/day, averaged); [0.35, 2.0) a faster infusion; >=2 mEq/min
+      is a bolus-correction rate (BICAR-ICU: 125-250 mL of 4.2% in 30 min = 2.1-4.2 mEq/min).
+    sources:
+      - id: "PMID:29910040"
+        supports: [0.35, 2.0]
+        quote: "Our protocol recommended that the volume of each infusion should be within the range of 125-250 mL in 30 min, with a maximum of 1000 mL within 24 h after inclusion."
+        verified: true
+    notes: >-
+      Edges derived by arithmetic: 4.2% NaHCO3 = 0.5 mEq/mL; 125 mL/30 min = 62.5 mEq/30 min
+      = 2.08 mEq/min; 500 mEq/1440 min = 0.347 mEq/min. Arithmetic, not a stated threshold.
+
+  sodium_bicarbonate_ml:
+    unit: mL
+    decision: keep_quantile
+    rationale: 370 events; volume without concentration (4.2% vs 8.4%) has no fixed mEq dose.
+
+  # ------------------------------------------------------------------ insulin
+  insulin_u_hr:
+    unit: u/hr
+    decision: segments
+    edges: [3.5, 7.0, 10.0]
+    closure: left
+    rationale: >-
+      <3.5 U/h is a low glycemic-control infusion (<=0.05 U/kg/h, the post-DKA maintenance
+      range); [3.5, 7) intermediate; [7, 10) the standard DKA dose of 0.1 U/kg/h; >=10 U/h the
+      0.14 U/kg/h no-bolus DKA dose or more (high insulin requirement).
+    sources:
+      - id: "PMID:19564476"
+        supports: [3.5, 7.0, 10.0]
+        quote: "followed by the infusion of 0.1 units · kg−1 · h−1 insulin ... an hourly insulin infusion of 0.14 units/kg body wt (equivalent to 10 units/h in a 70-kg patient) ... it may be possible to decrease the insulin infusion rate to 0.02– 0.05 units · kg−1 · h−1"
+        verified: true
+    notes: >-
+      70 kg reference: 0.05 U/kg/h = 3.5 U/h, 0.1 = 7 U/h, 0.14 = 10 U/h. ICU glycemic-control
+      infusions (NICE-SUGAR-type protocols) are titrated to glucose and have no fixed dose;
+      these edges mark the DKA dosing landmarks only.
+
+  insulin_u_min:
+    unit: u/min
+    decision: segments
+    edges: [0.0583, 0.1167, 0.1667]
+    closure: left
+    rationale: Same clinical states as insulin_u_hr (0.05 / 0.1 / 0.14 U/kg/h at 70 kg), divided by 60.
+    sources:
+      - id: "PMID:19564476"
+        supports: [0.0583, 0.1167, 0.1667]
+        quote: "an hourly insulin infusion of 0.14 units/kg body wt (equivalent to 10 units/h in a 70-kg patient)"
+        verified: true
+    notes: >-
+      228 events. Unit mismatch: u/min is the same drug in a different rate unit and is not
+      converted to u/hr at ETL because insulin has no CSV target unit. Preferred fix: give
+      insulin a target unit (u/hr) so both rows land in insulin_u_hr.
+
+  insulin_u:
+    unit: u
+    decision: segments
+    edges: [4.0, 8.0]
+    closure: right
+    rationale: >-
+      Intermittent insulin is mostly correctional (sliding-scale) doses: (0,4] U corrects
+      glucose up to 220 mg/dL on the usual scale; (4,8] corrects 221-300 mg/dL; >8 U corrects
+      >300 mg/dL or is a basal/scheduled dose (glargine 0.25 U/kg is about 17 U at 70 kg).
+    sources:
+      - id: "PMID:31168938"
+        supports: [4.0, 8.0]
+        quote: "Supplemental insulin scale BG (mg/dL) | Regular insulin (units) | ... | Sensitive | Usual | Resistant 141–180 | 0 | 2 | 4 181–220 | 2 | 4 | 6 221–260 | 4 | 6 | 8 261–300 | 6 | 8 | 10 301–350 | 8 | 10 | 12"
+        verified: true
+      - id: "PMID:23435159"
+        supports: [8.0]
+        quote: "Patients in the basal plus group received 0.25 units/kg of glargine plus corrective doses of glulisine before meals."
+        verified: true
+    notes: >-
+      Weak separation: correction and basal doses overlap above 8 U, and the route
+      (subcutaneous vs IV push) is not in the concept. The scale is the RABBIT-type
+      supplemental scale as reproduced in PMID 31168938.
+
+  # ------------------------------------------------------------------ anticoagulants
+  heparin_u_hr:
+    unit: u/hr
+    decision: segments
+    edges: [500.0, 1000.0, 1500.0]
+    closure: left
+    rationale: >-
+      <500 U/h delivers no more heparin per day than subcutaneous prophylaxis (5000 U every
+      8-12 h = 10,000-15,000 U/day) and covers circuit/low-intensity infusions; [500, 1000)
+      the ACS regimen (12 U/kg/h, max 1000 U/h); [1000, 1500) the VTE regimen (18 U/kg/h =
+      1260 U/h at 70 kg, or fixed 1000-1300 U/h); >=1500 U/h is above the 35,000 U/day
+      heparin-resistance definition.
+    sources:
+      - id: "PMID:21060742"
+        supports: [500.0]
+        quote: "LDUH 5,000 U every 8 to 12 hr SC"
+        verified: true
+      - id: "PMID:28400042"
+        supports: [1000.0]
+        quote: "Unfractionated heparin is given as bolus 60units/kg(maximum 4000 units) and infusion 12 units/kg/hour(maximum 1000 units/h)"
+        verified: true
+      - id: "PMID:8214998"
+        supports: [1000.0]
+        quote: "weight-based nomogram (starting dose, 80 units/kg body weight bolus, 18 units/kg per hour infusion) or the standard care nomogram (starting dose, 5000-unit bolus, 1000 units per hour infusion)"
+        verified: true
+      - id: "PMID:26780745"
+        supports: [1000.0, 1500.0]
+        quote: "For a 70 kg patient, the Raschke regimen translates into a heparin bolus of 5600 units followed by infusion of 1260 units/h. ... Heparin resistance is commonly defined as a daily dose in excess of 35,000 units/day"
+        verified: true
+    notes: >-
+      35,000 U/day / 24 = 1458 U/h, rounded to 1500. Smythe et al. note this threshold is
+      reached by 19 U/kg/h in an 80 kg patient, so the top bin mixes resistance with large body
+      weight. The 500 edge is a daily-dose equivalence argument, not a stated threshold.
+
+  heparin_u:
+    unit: u
+    decision: segments
+    edges: [4000.0, 5000.0]
+    closure: right
+    rationale: >-
+      IV heparin boluses: (0,4000] U covers the ACS bolus (60 U/kg, max 4000 U) and nomogram
+      re-boluses; (4000,5000] the fixed 5000 U VTE bolus; >5000 U the weight-based 80 U/kg
+      VTE bolus (5600 U at 70 kg).
+    sources:
+      - id: "PMID:28400042"
+        supports: [4000.0]
+        quote: "Unfractionated heparin is given as bolus 60units/kg(maximum 4000 units)"
+        verified: true
+      - id: "PMID:26780745"
+        supports: [5000.0]
+        quote: "a fixed regimen of 5000 unit bolus followed by a continuous infusion of at least 32,000 units/day ... For a 70 kg patient, the Raschke regimen translates into a heparin bolus of 5600 units"
+        verified: true
+    notes: >-
+      In MIMIC these rows are IV route (median 1900 U); subcutaneous prophylaxis is charted as
+      heparin_dose (unit "dose"), not here.
+
+  heparin_dose:
+    unit: dose
+    decision: keep_quantile
+    rationale: >-
+      Unit is "dose": a count of administrations (value 1 in essentially every row; in MIMIC
+      these are subcutaneous prophylaxis doses). No dose magnitude, so no clinical threshold;
+      the token works as a presence marker. Current ordinal point bins are adequate.
+
+  heparin_u_min:
+    unit: u/min
+    decision: keep_quantile
+    rationale: 10 events; too sparse. Should be converted to u/hr at ETL (see insulin_u_min).
+
+  argatroban_mcg_kg_min:
+    unit: mcg/kg/min
+    decision: keep_quantile
+    rationale: 402 events; titrated to aPTT with no fixed dose tiers reviewed here.
+
+  bivalirudin_mg_kg_hr:
+    unit: mg/kg/hr
+    decision: keep_quantile
+    rationale: 154 events; too sparse for clinical edges.
+
+  eptifibatide_mcg_kg_min:
+    unit: mcg/kg/min
+    decision: keep_quantile
+    rationale: 157 events; essentially one regimen (2 mcg/kg/min, or 1 with renal dosing), so bins add little.
+
+  alteplase_mg_hr:
+    unit: mg/hr
+    decision: keep_quantile
+    rationale: 93 events; mixes catheter-directed low-dose (about 1 mg/h) and systemic thrombolysis rates; too sparse.
+
+  aminocaproic_g_hr:
+    unit: g/hr
+    decision: keep_quantile
+    rationale: 56 events; too sparse.
+
+  # ------------------------------------------------------------------ opioids
+  fentanyl_mg:
+    unit: mg
+    decision: segments
+    edges: [0.05, 0.1]
+    closure: right
+    rationale: >-
+      Intermittent fentanyl (mcg canonicalised to mg): (0,0.05] mg = 25-50 mcg titration push;
+      (0.05,0.1] = 75-100 mcg, the top of the ICU loading-dose range; >0.1 mg (>100 mcg) is
+      above that range (procedural / intubation dosing).
+    sources:
+      - id: "PMID:23204873"
+        supports: [0.05, 0.1]
+        quote: "In general, loading doses of 25–100 μg of fentanyl are given every 5–10 minutes until the pain is controlled, followed by infusion rates of 25–250 μg/h."
+        verified: true
+    notes: >-
+      Unit pitfall: CLIF charts fentanyl boluses in mcg; the tokenizer canonicalises mass to
+      mg, so 50 mcg = 0.05 mg. The 0.05 edge splits the 25-100 mcg range at its common
+      values and is weaker than the 0.1 edge.
+
+  fentanyl_mcg_hr:
+    unit: mcg/hr
+    decision: keep_quantile
+    rationale: >-
+      0 events: continuous fentanyl is converted to the CSV concept fentanyl_mcg_kg_hr, so
+      only rows without a weight would land here. Nothing to bin.
+    notes: If no-weight fallback rows appear at another site, Hughes 2012 gives 25-250 mcg/h as the usual infusion range.
+
+  hydromorphone_mg:
+    unit: mg
+    decision: segments
+    edges: [0.5, 1.0]
+    closure: right
+    rationale: >-
+      (0,0.5] mg low intermittent dose; (0.5,1.0] the upper usual ICU dose; >1 mg is above the
+      usual 0.2-1.0 mg range (opioid-tolerant or escalated analgesia).
+    sources:
+      - id: "PMID:23204873"
+        supports: [0.5, 1.0]
+        quote: "typical dosing ranges of 0.2–1.0 mg IV every 10–15 minutes until pain is controlled, followed by similar doses every 2–4 hours."
+        verified: true
+    notes: The 0.5 edge splits the usual range; 1.0 is its upper bound.
+
+  morphine_mg:
+    unit: mg
+    decision: segments
+    edges: [2.0, 5.0]
+    closure: right
+    rationale: >-
+      (0,2] mg low dose; (2,5] the usual 2-5 mg IV dose; >5 mg above the usual range.
+    sources:
+      - id: "PMID:23204873"
+        supports: [2.0, 5.0]
+        quote: "Morphine is often given in doses of 2–5 mg IV every 5–15 minutes until the pain is controlled"
+        verified: true
+
+  morphine_mg_hr:
+    unit: mg/hr
+    decision: keep_quantile
+    rationale: 539 events; no verified infusion tiers retrieved in this review.
+
+  naloxone_mg:
+    unit: mg
+    decision: keep_quantile
+    rationale: 15 events; too sparse.
+
+  naloxone_mg_hr:
+    unit: mg/hr
+    decision: keep_quantile
+    rationale: 25 events; too sparse.
+
+  naloxone_mcg_kg_min:
+    unit: mcg/kg/min
+    decision: keep_quantile
+    rationale: 10 events; too sparse.
+
+  naloxone_dose:
+    unit: dose
+    decision: keep_quantile
+    rationale: 1 event; unit is a count of administrations.
+
+  # ------------------------------------------------------------------ sedatives
+  propofol_mg:
+    unit: mg
+    decision: segments
+    edges: [20.0, 50.0]
+    closure: right
+    rationale: >-
+      (0,20] mg is a sedation titration bolus (the label's slow-induction step is 20 mg every
+      10 s); (20,50] the 25-50 mg incremental bolus used for stimulation during anesthesia;
+      >50 mg an induction-range dose (1-1.5 mg/kg in elderly/ASA III-IV, 40-100 mg in ICU bolus
+      dosing).
+    sources:
+      - id: "FDA:NDA019627 (Diprivan label; Paperclip fda_40d3ac8866a2)"
+        supports: [20.0, 50.0]
+        quote: "may be controlled by the administration of 25 mg (2.5 mL) to 50 mg (5 mL) incremental boluses ... most of these patients require approximately 1 mg/kg to 1.5 mg/kg (approximately 20 mg every 10 seconds) of DIPRIVAN for induction"
+        verified: true
+      - id: "PMID:23204873"
+        supports: [50.0]
+        quote: "It is typically given as a bolus injection of 40–100 mg IV followed by an infusion of 25–75 μg/kg/min."
+        verified: true
+    notes: >-
+      Unit pitfall: about 300 MIMIC rows are charted in "mcg" with values 10-60, almost
+      certainly mg mislabeled; after canonicalisation they become 0.01-0.06 mg and land in
+      the lowest bin. Consider a unit sanity rule before training.
+
+  midazolam_mg:
+    unit: mg
+    decision: segments
+    edges: [2.5, 5.0]
+    closure: right
+    rationale: >-
+      (0,2.5] mg is a sedation/anxiolysis dose (label: initial IV sedation dose should not
+      exceed 2.5 mg); (2.5,5] a larger sedation dose; >5 mg a seizure-rescue dose (RAMPART
+      10 mg IM in adults) or an induction dose.
+    sources:
+      - id: "FDA:ANDA208878 (midazolam injection label; Paperclip fda_4fa9c0227838)"
+        supports: [2.5]
+        quote: "The initial intravenous dose for sedation in adult patients may be as little as 1 mg, but should not exceed 2.5 mg in a normal healthy adult."
+        verified: true
+      - id: "PMID:22335736"
+        supports: [5.0]
+        quote: "All adults and those children with an estimated body weight of more than 40 kg received either 10 mg of intramuscular midazolam followed by intravenous placebo or intramuscular placebo followed by 4 mg of intravenous lorazepam. In children with an estimated weight of 13 to 40 kg, the active treatment was 5 mg of intramuscular midazolam"
+        verified: true
+    notes: The 5 mg edge is the pediatric RAMPART dose, used as the lower bound of adult seizure dosing (weak).
+
+  lorazepam_mg:
+    unit: mg
+    decision: segments
+    edges: [2.0, 4.0]
+    closure: left
+    rationale: >-
+      <2 mg is anxiolysis / withdrawal-protocol dosing; [2, 4) the 2 mg sedation or partial
+      seizure dose; >=4 mg the status-epilepticus dose (4 mg IV in adults).
+    sources:
+      - id: "FDA:NDA018140 (Ativan injection label; Paperclip fda_08a9e327a244)"
+        supports: [2.0, 4.0]
+        quote: "Intravenous or intramuscular administration of the recommended dose of 2 mg to 4 mg of Ativan Injection to adult patients is followed by dose-related effects of sedation ... For the treatment of status epilepticus, the usual recommended dose of Ativan Injection is 4 mg given slowly (2 mg/min) for patients 18 years and older."
+        verified: true
+      - id: "PMID:22335736"
+        supports: [4.0]
+        quote: "intramuscular placebo followed by 4 mg of intravenous lorazepam"
+        verified: true
+
+  diazepam_mg:
+    unit: mg
+    decision: keep_quantile
+    rationale: 367 events; doses cluster at 5/10/20 mg across withdrawal and seizure indications that dose cannot separate.
+
+  ketamine_mg:
+    unit: mg
+    decision: keep_quantile
+    rationale: >-
+      30 events. Unit pitfall: about 400 MIMIC rows are charted in "mcg" with values like 0.2,
+      which are not plausible ketamine doses; they canonicalise to 0.0002 mg. Too sparse and
+      too contaminated for clinical edges.
+
+  pentobarbital_mg_min:
+    unit: mg/min
+    decision: keep_quantile
+    rationale: 0 events (continuous pentobarbital converts to the CSV concept pentobarbital_mcg_kg_hr).
+
+  # ------------------------------------------------------------------ diuretics
+  furosemide_mg:
+    unit: mg
+    decision: segments
+    edges: [40.0, 80.0, 150.0]
+    closure: right
+    rationale: >-
+      (0,40] mg is the diuretic-naive initial IV dose (20-40 mg); (40,80] the upper initial /
+      HF ceiling range (40-80 mg); (80,150] high dose; >150 mg the 160-200 mg ceiling dose used
+      in CKD / nephrotic syndrome / diuretic resistance.
+    sources:
+      - id: "PMID:37525390"
+        supports: [40.0]
+        quote: "The recommended initial doses of intravenous loop diuretics are 20–40 mg of furosemide for non-users of diuretics and an equivalent dose or more for those already on diuretics"
+        verified: true
+      - id: "PMID:21423563"
+        supports: [80.0]
+        quote: "Furosemide | 20–80 mg IV bolus | 20–400 mg boluses may repeat q6–8 H | Infusion is recommended at 5 to 40 mg/hr."
+        verified: true
+      - id: "PMID:26240596"
+        supports: [80.0, 150.0]
+        quote: "The ceiling dose of intravenous furosemide also varies in different diseases; this dose is 80-200mg in patients with CKD or nephrotic syndrome, and 40-80mg in patients with congestive heart failure or liver cirrhosis."
+        verified: true
+      - id: "PMID:26294976"
+        supports: [150.0]
+        quote: "The largest dose, also known as the ceiling dose, is an IV bolus of furosemide, 160 to 200 mg or the equivalent of bumetanide and torsemide."
+        verified: true
+    notes: >-
+      Currently ordinal point bins; the discrete values (10/20/40/80/120/160/200) fall cleanly
+      into these bins. 150 sits just below the 160 mg ceiling so that 160-200 share a bin.
+
+  furosemide_mg_hr:
+    unit: mg/hr
+    decision: segments
+    edges: [10.0, 20.0, 40.0]
+    closure: left
+    rationale: >-
+      <10 mg/h low-rate infusion; [10, 20) the usual starting infusion; [20, 40) escalated;
+      >=40 mg/h the recommended maximum hourly rate.
+    sources:
+      - id: "PMID:26240596"
+        supports: [10.0, 20.0, 40.0]
+        quote: "The infusion rate is 10-20mg/hr, which can be increased to hourly 40mg"
+        verified: true
+      - id: "PMID:21423563"
+        supports: [40.0]
+        quote: "Infusion is recommended at 5 to 40 mg/hr."
+        verified: true
+
+  bumetanide_mg_hr:
+    unit: mg/hr
+    decision: keep_quantile
+    rationale: >-
+      392 events. The one retrieved source gives 0.1-0.5 mg/h, but the local data median is
+      about 2 mg/h, so published tiers do not match practice; keep data-driven bins.
+
+  bumetanide_mg:
+    unit: mg
+    decision: keep_quantile
+    rationale: 33 events; too sparse (1 mg bumetanide = 40 mg IV furosemide, if a shared scale is wanted later).
+
+  # ------------------------------------------------------------------ vasodilators / antihypertensives / antiarrhythmics
+  nitroglycerin_mcg_kg_min:
+    unit: mcg/kg/min
+    decision: segments
+    edges: [0.3, 0.85, 3.5]
+    closure: left
+    rationale: >-
+      <0.3 mcg/kg/min is a starting dose (10-20 mcg/min); [0.3, 0.85) low-dose venodilation;
+      [0.85, 3.5) the range where arterial dilation appears (>60 mcg/min); >=3.5 the high
+      arteriolar-dilating dose (about 250 mcg/min).
+    sources:
+      - id: "PMID:21423563"
+        supports: [0.3]
+        quote: "Nitroglycerine | 10–20 μg/min | 20–400 μg/min"
+        verified: true
+      - id: "PMID:23806076"
+        supports: [0.85]
+        quote: "nitroglycerin causes weak direct arterial vasodilation, which is observed only with high doses (>60 μg/min intravenously)"
+        verified: true
+      - id: "PMID:24136770"
+        supports: [3.5]
+        quote: "Small doses (30 to 40μg/min) induce venodilatation, whereas higher doses (250μg/min) cause arteriolar dilatation."
+        verified: true
+    notes: >-
+      Sources give flat mcg/min; converted at 70 kg (20/70 = 0.29, 60/70 = 0.86,
+      250/70 = 3.57, rounded). MIMIC charts nitroglycerin per kg, so this concept is per-kg.
+
+  nicardipine_mcg_kg_min:
+    unit: mcg/kg/min
+    decision: keep_quantile
+    rationale: >-
+      0 events: per-kg nicardipine converts to the CSV concept nicardipine_mg_hr (needs weight).
+      Nothing to bin here.
+
+  clevidipine_mg_hr:
+    unit: mg/hr
+    decision: segments
+    edges: [2.0, 6.0, 16.0]
+    closure: right
+    rationale: >-
+      (0,2] mg/h the starting dose; (2,6] the usual maintenance dose (4-6 mg/h); (6,16]
+      escalated for severe hypertension; >16 mg/h beyond the usual maximum.
+    sources:
+      - id: "FDA:NDA022156 (Cleviprex label; Paperclip fda_ed54de323e06)"
+        supports: [2.0, 6.0, 16.0]
+        quote: "Initiate intravenous infusion of Cleviprex at 1-2 mg/hour. ... Most patients will achieve the desired therapeutic response at approximately 4-6 mg/hour. ... Most patients have received maximum doses of 16 mg/hour or less."
+        verified: true
+
+  labetalol_mg:
+    unit: mg
+    decision: segments
+    edges: [20.0, 40.0]
+    closure: right
+    rationale: >-
+      (0,20] mg is the initial IV injection (0.25 mg/kg up to 20 mg); (20,40] the first
+      escalation; >40 mg the 80 mg repeat injection.
+    sources:
+      - id: "FDA:NDA213330 (labetalol HCl injection label; Paperclip fda_efa1bb8c0304)"
+        supports: [20.0, 40.0]
+        quote: "Repeated Intravenous Injection: Administer 0.25 mg/kg up to 20 mg over 2 minutes. Administer 20 to 80 mg over 2 minutes at 10-minute intervals until a desired supine blood pressure is achieved."
+        verified: true
+
+  diltiazem_mg:
+    unit: mg
+    decision: keep_quantile
+    rationale: 370 events; the 0.25 then 0.35 mg/kg bolus is weight-based, and no verified source was retrieved in this review.
+
+  amiodarone_mg:
+    unit: mg
+    decision: keep_quantile
+    rationale: 366 events; essentially two values (150 mg rate-control/VT bolus, 300 mg arrest dose); no source was verified here, and ordinal point bins would capture them.
+
+  adenosine_mg:
+    unit: mg
+    decision: keep_quantile
+    rationale: 40 events; two fixed doses (6 and 12 mg).
+
+  lidocaine_mg:
+    unit: mg
+    decision: keep_quantile
+    rationale: 27 events; too sparse.
+
+  epinephrine_mg:
+    unit: mg
+    decision: keep_quantile
+    rationale: 8 events; intermittent epinephrine is essentially the 1 mg arrest dose (push-dose pressor rows are tiny).
+
+  epoprostenol_ng_kg_min:
+    unit: ng/kg/min
+    decision: keep_quantile
+    rationale: 978 events; inhaled/IV pulmonary vasodilator dosing is patient-titrated with no shared ICU dose tiers.
+
+  octreotide_mcg_hr:
+    unit: mcg/hr
+    decision: keep_quantile
+    rationale: 923 events; one regimen (50 mcg/h for variceal bleeding), so a dose threshold adds nothing.
+
+  # ------------------------------------------------------------------ GI / analgesic adjuncts
+  pantoprazole_mg_hr:
+    unit: mg/hr
+    decision: keep_quantile
+    rationale: 985 events; one regimen (8 mg/h after peptic-ulcer bleeding), so a dose threshold adds nothing.
+
+  pantoprazole_mg:
+    unit: mg
+    decision: keep_quantile
+    rationale: 38 events; two values (40 mg daily, 80 mg bolus).
+
+  pantoprazole_dose:
+    unit: dose
+    decision: keep_quantile
+    rationale: Unit "dose" (count of administrations, value 1); no magnitude, no clinical threshold.
+
+  acetaminophen_mg:
+    unit: mg
+    decision: segments
+    edges: [1000.0]
+    closure: left
+    rationale: >-
+      <1000 mg is the 650 mg (q4h) or weight-based (<50 kg) dose; >=1000 mg the maximum
+      single adult dose.
+    sources:
+      - id: "FDA:NDA022450 (Ofirmev label; Paperclip fda_1f34a3c52f56)"
+        supports: [1000.0]
+        quote: "the recommended dosage of OFIRMEV is 1000 mg every 6 hours or 650 mg every 4 hours, with a maximum single dose of OFIRMEV of 1000 mg"
+        verified: true
+
+  acetaminophen_mg_min:
+    unit: mg/min
+    decision: keep_quantile
+    rationale: >-
+      IV acetaminophen is labelled as a fixed 15-minute infusion, so the rate is
+      1000 mg / 15 min = 66.7 mg/min for almost every row and encodes no dosing decision.
+    notes: This is an intermittent dose charted as a rate; the mg dose is the informative quantity.
+
+  # ------------------------------------------------------------------ neuromuscular blockers
+  cisatracurium_mg:
+    unit: mg
+    decision: keep_quantile
+    rationale: 170 events; intermittent NMB doses are weight-based (mg/kg) and mix intubating and maintenance boluses; too sparse for flat-mg edges.
+
+  rocuronium_mg:
+    unit: mg
+    decision: keep_quantile
+    rationale: 106 events; intubating dose is weight-based (0.6 vs 1.2 mg/kg), so flat-mg edges would mislabel by body size.
+
+  vecuronium_mg:
+    unit: mg
+    decision: keep_quantile
+    rationale: 55 events; too sparse.
+
+  # ------------------------------------------------------------------ antimicrobials
+  # "*_dose" rows: unit "dose" = count of administrations (value 1). No magnitude, so no
+  # clinical threshold exists; the token is a presence marker. "*_mg" rows: sparse
+  # mass-dose fallbacks for sites/rows charted in g or mg; antimicrobial dosing is
+  # indication-, weight- and renal-function-dependent, so flat-mg edges are not meaningful.
+  vancomycin_dose: {unit: dose, decision: keep_quantile, rationale: "Count of administrations (value 1); no clinical threshold."}
+  cefepime_dose: {unit: dose, decision: keep_quantile, rationale: "Count of administrations (value 1); no clinical threshold."}
+  piperacillin_tazobactam_dose: {unit: dose, decision: keep_quantile, rationale: "Count of administrations (value 1); no clinical threshold."}
+  metronidazole_dose: {unit: dose, decision: keep_quantile, rationale: "Count of administrations (value 1); no clinical threshold."}
+  cefazolin_dose: {unit: dose, decision: keep_quantile, rationale: "Count of administrations (value 1); no clinical threshold."}
+  meropenem_dose: {unit: dose, decision: keep_quantile, rationale: "Count of administrations (value 1); no clinical threshold."}
+  ceftriaxone_dose: {unit: dose, decision: keep_quantile, rationale: "Count of administrations (value 1); no clinical threshold."}
+  ciprofloxacin_dose: {unit: dose, decision: keep_quantile, rationale: "Count of administrations (value 1); no clinical threshold."}
+  ampicillin_dose: {unit: dose, decision: keep_quantile, rationale: "Count of administrations (value 1); no clinical threshold."}
+  acyclovir_dose: {unit: dose, decision: keep_quantile, rationale: "Count of administrations (value 1); no clinical threshold."}
+  ceftazidime_dose: {unit: dose, decision: keep_quantile, rationale: "Count of administrations (value 1); no clinical threshold."}
+  nafcillin_dose: {unit: dose, decision: keep_quantile, rationale: "Count of administrations (value 1); no clinical threshold."}
+  clindamycin_dose: {unit: dose, decision: keep_quantile, rationale: "Count of administrations (value 1); no clinical threshold."}
+  ampicillin_sulbactam_dose: {unit: dose, decision: keep_quantile, rationale: "Count of administrations (value 1); no clinical threshold."}
+  fluconazole_dose: {unit: dose, decision: keep_quantile, rationale: "Count of administrations (value 1); no clinical threshold."}
+  micafungin_dose: {unit: dose, decision: keep_quantile, rationale: "Count of administrations (value 1); no clinical threshold."}
+  levofloxacin_dose: {unit: dose, decision: keep_quantile, rationale: "Count of administrations (value 1); no clinical threshold."}
+  linezolid_dose: {unit: dose, decision: keep_quantile, rationale: "Count of administrations (value 1); no clinical threshold."}
+  azithromycin_dose: {unit: dose, decision: keep_quantile, rationale: "Count of administrations (value 1); no clinical threshold."}
+  aztreonam_dose: {unit: dose, decision: keep_quantile, rationale: "Count of administrations (value 1); no clinical threshold."}
+  doxycycline_dose: {unit: dose, decision: keep_quantile, rationale: "Count of administrations (value 1); no clinical threshold."}
+  daptomycin_dose: {unit: dose, decision: keep_quantile, rationale: "Count of administrations (value 1); no clinical threshold."}
+  voriconazole_dose: {unit: dose, decision: keep_quantile, rationale: "Count of administrations (value 1); no clinical threshold."}
+  gentamicin_dose: {unit: dose, decision: keep_quantile, rationale: "Count of administrations (value 1); no clinical threshold."}
+  tobramycin_dose: {unit: dose, decision: keep_quantile, rationale: "Count of administrations (value 1); no clinical threshold."}
+  caspofungin_dose: {unit: dose, decision: keep_quantile, rationale: "Count of administrations (value 1); no clinical threshold."}
+  imipenem_dose: {unit: dose, decision: keep_quantile, rationale: "Count of administrations (value 1); no clinical threshold."}
+  amikacin_dose: {unit: dose, decision: keep_quantile, rationale: "Count of administrations (value 1); no clinical threshold."}
+  penicillin_dose: {unit: dose, decision: keep_quantile, rationale: "Count of administrations (value 1); no clinical threshold."}
+  tigecycline_dose: {unit: dose, decision: keep_quantile, rationale: "Count of administrations (value 1); no clinical threshold."}
+  rifampin_dose: {unit: dose, decision: keep_quantile, rationale: "Count of administrations (value 1); no clinical threshold."}
+  erythromycin_dose: {unit: dose, decision: keep_quantile, rationale: "Count of administrations (value 1); no clinical threshold."}
+  foscarnet_dose: {unit: dose, decision: keep_quantile, rationale: "Count of administrations (value 1); no clinical threshold."}
+  ertapenem_dose: {unit: dose, decision: keep_quantile, rationale: "Count of administrations (value 1); no clinical threshold."}
+  ceftaroline_dose: {unit: dose, decision: keep_quantile, rationale: "Count of administrations (value 1); no clinical threshold."}
+  vancomycin_mg: {unit: mg, decision: keep_quantile, rationale: "348 events; vancomycin is dosed by weight and renal function (loading vs maintenance), so flat-mg edges mislabel by body size."}
+  cefepime_mg: {unit: mg, decision: keep_quantile, rationale: "202 events (grams canonicalised to mg: 1 g vs 2 g); indication/renal-dependent, no ICU-state threshold."}
+  metronidazole_mg: {unit: mg, decision: keep_quantile, rationale: "109 events; a single 500 mg regimen."}
+  cefazolin_mg: {unit: mg, decision: keep_quantile, rationale: "78 events; too sparse."}
+  azithromycin_mg: {unit: mg, decision: keep_quantile, rationale: "76 events; too sparse."}
+  meropenem_mg: {unit: mg, decision: keep_quantile, rationale: "53 events; too sparse (some 1000 values are grams mislabeled as mg upstream)."}
+  ceftriaxone_mg: {unit: mg, decision: keep_quantile, rationale: "35 events; too sparse."}
+  ceftazidime_mg: {unit: mg, decision: keep_quantile, rationale: "32 events; too sparse."}
+  ampicillin_mg: {unit: mg, decision: keep_quantile, rationale: "26 events; too sparse."}
+  ampicillin_sulbactam_mg: {unit: mg, decision: keep_quantile, rationale: "26 events; too sparse."}
+  ciprofloxacin_mg: {unit: mg, decision: keep_quantile, rationale: "25 events; too sparse."}
+  acyclovir_mg: {unit: mg, decision: keep_quantile, rationale: "22 events; weight-based dosing; too sparse."}
+  clindamycin_mg: {unit: mg, decision: keep_quantile, rationale: "12 events; too sparse."}
+  piperacillin_tazobactam_mg: {unit: mg, decision: keep_quantile, rationale: "12 events; too sparse."}
+  erythromycin_mg: {unit: mg, decision: keep_quantile, rationale: "11 events; too sparse."}
+  linezolid_mg: {unit: mg, decision: keep_quantile, rationale: "9 events; fixed 600 mg dose."}
+  fluconazole_mg: {unit: mg, decision: keep_quantile, rationale: "8 events; too sparse."}
+  levofloxacin_mg: {unit: mg, decision: keep_quantile, rationale: "6 events; too sparse."}
+  voriconazole_mg: {unit: mg, decision: keep_quantile, rationale: "6 events; too sparse."}
+  gentamicin_mg: {unit: mg, decision: keep_quantile, rationale: "5 events; too sparse."}
+  daptomycin_mg: {unit: mg, decision: keep_quantile, rationale: "3 events; too sparse."}
+  doxycycline_mg: {unit: mg, decision: keep_quantile, rationale: "3 events; too sparse."}
+  micafungin_mg: {unit: mg, decision: keep_quantile, rationale: "3 events; too sparse."}
+  tobramycin_mg: {unit: mg, decision: keep_quantile, rationale: "3 events; too sparse."}
+  nafcillin_mg: {unit: mg, decision: keep_quantile, rationale: "2 events; too sparse."}
+  caspofungin_mg: {unit: mg, decision: keep_quantile, rationale: "1 event; too sparse."}
+  imipenem_mg: {unit: mg, decision: keep_quantile, rationale: "1 event; too sparse."}
