@@ -595,6 +595,81 @@ class KdigoCreatinineCauseTest(unittest.TestCase):
         self.assertEqual(meets.tolist(), [False, False, True])
 
 
+class SustainedCrossingTest(unittest.TestCase):
+    """Optional sustained-crossing rule for a competing-risk cause (product authority,
+    2026-10-03; off by default): k consecutive readings beyond the threshold within w
+    minutes; event at the completing reading; an unconfirmed crossing is never negative."""
+
+    SUSTAINED = __import__("dataclasses").replace(MAP_65, sustained=(2, 60))
+
+    def lab(self, future, query=None, **kw):
+        s, index = anchored(future, **kw)
+        return label(s, index, query or self.SUSTAINED)
+
+    def test_disabled_is_the_single_crossing_rule(self):
+        self.assertIsNone(MAP_65.sustained)
+        self.assertEqual(GRID.causes[0].sustained, None)
+        for future in ([(A + 300, "map", 60.0)],
+                       [(A + 300, "map", 60.0), (A + 330, "map", 61.0)],
+                       [(A + 40 * 60, "map", 75.0)]):
+            plain = self.lab(future, query=MAP_65)
+            again = label(*anchored(future), MAP_65)
+            self.assertEqual(plain, again)
+        self.assertEqual(self.lab([(A + 300, "map", 60.0)], query=MAP_65),
+                         {"status": "positive", "minutes": 300})
+
+    def test_a_single_spurious_crossing_does_not_fire(self):
+        status = self.lab([(A + 300, "map", 60.0), (A + 330, "map", 75.0),
+                           (A + 40 * 60, "map", 75.0)])
+        self.assertEqual(status, {"status": "negative", "minutes": H})
+
+    def test_two_crossings_within_60_minutes_fire_at_the_second(self):
+        status = self.lab([(A + 300, "map", 60.0), (A + 345, "map", 62.0)])
+        self.assertEqual(status, {"status": "positive", "minutes": 345})
+
+    def test_two_crossings_90_minutes_apart_do_not_fire(self):
+        status = self.lab([(A + 300, "map", 60.0), (A + 390, "map", 62.0),
+                           (A + 40 * 60, "map", 75.0)])
+        self.assertEqual(status, {"status": "negative", "minutes": H})
+
+    def test_a_normal_reading_between_breaks_the_run(self):
+        status = self.lab([(A + 300, "map", 60.0), (A + 310, "map", 70.0),
+                           (A + 320, "map", 60.0), (A + 40 * 60, "map", 75.0)])
+        self.assertEqual(status["status"], "negative")
+
+    def test_one_crossing_then_no_further_reading_is_unknown_not_negative(self):
+        # Horizon elapses: not_ascertainable (an unconfirmed crossing is not event-free).
+        self.assertEqual(self.lab([(A + 40 * 60, "map", 60.0)]),
+                         {"status": "not_ascertainable", "minutes": None})
+        # The stay ends first: censored at the stream end, as for any stay.
+        self.assertEqual(self.lab([(A + 300, "map", 60.0)], end=("home", A + 600)),
+                         {"status": "censored", "minutes": 600})
+
+    def test_the_registry_sets_it_per_cause_and_refuses_bad_specs(self):
+        import tempfile
+
+        raw = yaml.safe_load((ROOT / "configs/thresholds.yaml").read_text())
+        for entry in raw["competing_risk_cause"]:
+            if entry["concept"] in ("respiratory_rate", "sbp"):
+                entry["sustained"] = {"min_readings": 2, "within_minutes": 60}
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "t.yaml"
+            path.write_text(yaml.safe_dump(raw))
+            registry = load_thresholds(path)
+            causes = {t.concept: t.sustained for t in registry["competing_risk_cause"]}
+            self.assertEqual(causes["respiratory_rate"], (2, 60))
+            self.assertEqual(causes["sbp"], (2, 60))
+            self.assertIsNone(causes["map"])
+            for bad in ({"min_readings": 1, "within_minutes": 60}, {"min_readings": 2}):
+                broken = copy.deepcopy(raw)
+                broken["competing_risk_cause"][0]["sustained"] = bad
+                path.write_text(yaml.safe_dump(broken))
+                with self.assertRaises(ThresholdGridError):
+                    load_thresholds(path)
+        # Default registry: off everywhere.
+        self.assertTrue(all(t.sustained is None for t in load_thresholds()["competing_risk_cause"]))
+
+
 class StatusShareTest(unittest.TestCase):
     def test_shares_are_aggregate_counts_over_anchors_and_queries(self):
         positive, a1 = anchored([(A + 300, "map", 60.0)])
@@ -616,7 +691,13 @@ class StatusShareTest(unittest.TestCase):
         self.assertAlmostEqual(sum(report["threshold_queries"]["shares"].values()), 1.0)
         # Aggregate only: nothing but counts and shares, keyed by status.
         self.assertEqual(set(report), {"anchors", "threshold_queries", "cause_labels",
-                                       "competing_risk"})
+                                       "competing_risk", "competing_risk_by_cause"})
+        # Per-cause event rate over supervised anchors: the one supervised anchor's event
+        # is MAP (cause 0).
+        by_cause = report["competing_risk_by_cause"]
+        self.assertEqual(by_cause["supervised_anchors"], 1)
+        self.assertEqual(by_cause["events"], {"0": 1})
+        self.assertEqual(by_cause["rates"], {"0": 1.0})
         self.assertNotIn("opaque-stay", json.dumps(report))
 
     def test_empty_input_reports_zero_anchors(self):

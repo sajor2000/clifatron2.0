@@ -1286,6 +1286,44 @@ def build_synthetic_site(work: str | Path) -> dict:
             "split_freeze": work / "output/final_no_phi/split_freeze.json"}
 
 
+# ------------------------------------------------------------------ context length
+
+PROMPT_OVER_CONTEXT_WARN = 0.10
+
+
+def context_checks(arm: ArmData, *, episodes: Mapping[str, str | Path],
+                   cohorts: Mapping[str, str | Path], max_tokens: int = 8192) -> list[Check]:
+    """Informational, per site: share of candidate anchors and of extubation time-zero
+    prompts whose history exceeds 4,096 / 8,192 / 16,384 tokens (aggregate only,
+    `src/eval/context_length.py`). Warns when more than 10% of the prompts exceed
+    `max_tokens`: those prompts are read over their last `max_tokens` tokens."""
+    from src.eval.context_length import prompt_context_report, shard_context_report
+
+    checks = []
+    for site, directory in arm.sites.items():
+        shard = directory / GEM_EVENTS
+        name = f"context: {arm.name}/{site}"
+        if not shard.exists():
+            checks.append(Check(name, SKIP, f"no {GEM_EVENTS}"))
+            continue
+        try:
+            anchors = shard_context_report(shard)
+            detail = f"candidate anchors over {{4K, 8K, 16K}}: {anchors['candidate_anchors_share_over']}"
+            status = PASS
+            if site in cohorts and site in episodes:
+                prompts = prompt_context_report(shard, cohorts[site], episodes[site])
+                share = prompts["share_over"].get(str(max_tokens))
+                detail += f"; extubation prompts (n={prompts['n']}): {prompts['share_over']}"
+                if isinstance(share, float) and share > PROMPT_OVER_CONTEXT_WARN:
+                    status = WARN
+                    detail += (f": more than {PROMPT_OVER_CONTEXT_WARN:.0%} of prompts exceed "
+                               f"{max_tokens} tokens")
+            checks.append(Check(name, status, detail))
+        except Exception as exc:  # noqa: BLE001
+            checks.append(Check(name, WARN, f"{type(exc).__name__}: {str(exc)[:200]}"))
+    return checks
+
+
 # ------------------------------------------------------------------ main
 
 def run_preflight(*, arms: Sequence[ArmData], episodes: Mapping[str, Path],
@@ -1294,7 +1332,8 @@ def run_preflight(*, arms: Sequence[ArmData], episodes: Mapping[str, Path],
                   sample_stays: int, min_free_gb: float, smoke_timeout: float,
                   train_config: Path = TRAIN_CONFIG_PATH, keep_scratch: bool = False,
                   thresholds_path: Path = THRESHOLDS_PATH,
-                  budgets: Mapping[str, float] | None = None) -> Report:
+                  budgets: Mapping[str, float] | None = None,
+                  extubation_cohorts: Mapping[str, Path] | None = None) -> Report:
     import torch
 
     report = Report()
@@ -1358,6 +1397,8 @@ def run_preflight(*, arms: Sequence[ArmData], episodes: Mapping[str, Path],
         except Exception as exc:  # noqa: BLE001
             report.add(f"schedule: updates per budget [{target.name}]", FAIL,
                        f"{type(exc).__name__}: {str(exc)[:200]}")
+    if target is not None:
+        report.extend(context_checks(target, episodes=episodes, cohorts=extubation_cohorts or {}))
     report.extend(disk_checks(to_build, run_root, min_free_gb=min_free_gb))
     return report
 
@@ -1408,6 +1449,9 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--allow-dirty", action="store_true",
                     help="warn instead of failing on modified tracked files")
     ap.add_argument("--smoke-timeout", type=float, default=SMOKE_TIMEOUT_S)
+    ap.add_argument("--extubation-cohort", action="append", default=[], metavar="[SITE=]PATH",
+                    help="a site's extubation cohort artifact: adds the share of time-zero "
+                         "prompts over 4K/8K/16K tokens to the context check")
     ap.add_argument("--synthetic", action="store_true",
                     help="build a synthetic site in a temporary directory and check it")
     return ap
@@ -1439,7 +1483,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             memory_arm=args.memory_arm, sample_stays=args.sample_stays,
             min_free_gb=args.min_free_gb, smoke_timeout=args.smoke_timeout,
             train_config=Path(args.train_config), keep_scratch=args.keep_scratch,
-            thresholds_path=Path(args.thresholds), budgets=matrix["budgets"])
+            thresholds_path=Path(args.thresholds), budgets=matrix["budgets"],
+            extubation_cohorts=_site_paths(args.extubation_cohort, first_site)
+            if args.extubation_cohort else None)
     except PreflightError as exc:
         print(f"REFUSED: {exc}", file=sys.stderr)
         return 2

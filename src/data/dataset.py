@@ -22,6 +22,18 @@ With `TargetBuilder(mode="gem_tte")` (U3, KTD1) the same windows also carry in-s
 time-to-event labels: anchors are sampled and labelled on the whole stay, so a label
 uses events from later windows, and each window keeps the anchors that fall inside it.
 
+CONTINUATION HEADER (product authority, 2026-10-03). A stay longer than one context
+window is cut into contiguous windows, so only the FIRST window starts with the stay's
+header (`<bos>`, `ADMISSION//<type>` and the static admission tokens: age decile, sex,
+race, ethnicity, admission type). With `continuation_header` (the header's token ids,
+`header_token_ids(vocab)`) every later window of the stay is given the stay's header
+again at its start: header positions keep their own minutes (admission, 0) and are never
+targets (masked), so labels, anchors' labels and next-event targets are unchanged; anchor
+offsets shift by the header length. The header counts against `max_tokens`: a window that
+would exceed it is refused - the shard must be cut with room for it
+(`gem_window_bounds_with_header`; the tokenizer change is to call it in place of
+`gem_window_bounds`).
+
 ANCHORS. Every segment that can be supervised lists its anchors under ``"anchors"``:
 ``{"offset": position in the packed row, "cr": competing-risk label or None,
 "queries": [threshold query, ...]}`` with label times in minutes since the anchor
@@ -62,6 +74,48 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 
+def header_token_ids(vocab: Mapping[str, int]) -> frozenset[int]:
+    """Token ids that make up a stay's header: `<bos>`, every `ADMISSION//*` and every
+    static admission token (`tokenize.STATIC_TOKENS` concepts, `concept` or `concept=x`)."""
+    from src.data.tokenize import STATIC_TOKENS
+
+    static = tuple(STATIC_TOKENS)
+    ids = set()
+    for name, token in vocab.items():
+        if token is None:
+            continue
+        concept = name.split("=", 1)[0]
+        if name == "<bos>" or name.startswith("ADMISSION//") or concept in static:
+            ids.add(int(token))
+    return frozenset(ids)
+
+
+def stay_header_length(tokens: Sequence[int], header: frozenset[int]) -> int:
+    """Length of the leading run of header tokens of a stay stream."""
+    n = 0
+    for token in tokens:
+        if int(token) not in header:
+            break
+        n += 1
+    return n
+
+
+def gem_window_bounds_with_header(n: int, max_tokens: int, header_len: int) -> list[tuple[int, int]]:
+    """Contiguous `[start, end)` windows of a stay of `n` tokens whose header (the first
+    `header_len` tokens) is re-inserted before every continuation window: the first window
+    holds `max_tokens` tokens, every later one `max_tokens - header_len`, so each sample
+    is at most `max_tokens` long. The final `<eos>` is never left alone (as in
+    `tokenize.gem_window_bounds`)."""
+    if max_tokens - header_len < 2:
+        raise ValueError("max_tokens leaves no room after the header")
+    bounds = [0, min(n, max_tokens)]
+    while bounds[-1] < n:
+        bounds.append(min(n, bounds[-1] + max_tokens - header_len))
+    if len(bounds) > 2 and bounds[-1] - bounds[-2] == 1:
+        bounds[-2] -= 1
+    return list(zip(bounds[:-1], bounds[1:]))
+
+
 class ModelDataset(Dataset):
     """Deterministic map-style dataset retaining packed document boundaries."""
 
@@ -75,6 +129,8 @@ class ModelDataset(Dataset):
         episode_targets: Mapping[str, Mapping[str, Any]] | None = None,
         epoch: int = 0,
         value_channel: bool = False,
+        continuation_header: frozenset[int] | None = None,
+        max_tokens: int | None = None,
     ) -> None:
         """`value_channel` (continuous-fused arm, U6): each canonical or full-hospitalization
         sample also carries `input_value` / `input_value_mask`, the CURRENT event's value
@@ -100,6 +156,10 @@ class ModelDataset(Dataset):
         self.episode_targets = dict(episode_targets or {})
         self.epoch = int(epoch)
         self.value_channel = bool(value_channel)
+        if continuation_header is not None and representation != "gem":
+            raise ValueError("continuation_header applies to the gem representation only")
+        self.continuation_header = None if continuation_header is None else frozenset(continuation_header)
+        self.max_tokens = None if max_tokens is None else int(max_tokens)
         self._gem_built: dict[str, dict[str, Any]] = {}
         if isinstance(records, GemCorpus) and representation != "gem":
             raise TargetContractError(_GEM_ONLY)
@@ -271,10 +331,63 @@ class ModelDataset(Dataset):
                  "queries": item["queries"]}
                 for item in built["anchors"] if start <= item["anchor_idx"] < end
             ]
+        values = part.value_list(lo, hi)
+        if self.continuation_header is not None and row > first:
+            values = self._prepend_header(sample, part, base, values)
+        elif self.max_tokens is not None and length > self.max_tokens:
+            raise TargetContractError(f"GEM window of {length} tokens exceeds max_tokens {self.max_tokens}")
         if self.value_channel:
-            self._add_value_channel(sample, {"token": sample["input_ids"],
-                                             "value": part.value_list(lo, hi)})
+            self._add_value_channel(sample, {"token": sample["input_ids"], "value": values})
         return sample
+
+    def _prepend_header(self, sample: dict[str, Any], part: "_GemPart", base: int,
+                        values: list) -> list:
+        """CONTINUATION HEADER (module docstring): the stay's header before this window."""
+        head_tokens = part.token[base:base + 64].tolist()
+        h = stay_header_length(head_tokens, self.continuation_header)
+        if h == 0:
+            return values
+        total = h + len(sample["input_ids"])
+        if self.max_tokens is not None and total > self.max_tokens:
+            raise TargetContractError(
+                f"continuation window with its {h}-token header is {total} tokens, over "
+                f"max_tokens {self.max_tokens}: cut the shard with "
+                "dataset.gem_window_bounds_with_header")
+        sample["input_ids"] = part.token[base:base + h].tolist() + sample["input_ids"]
+        sample["attention_mask"] = [1] * total
+        sample["pos_min"] = part.pos_min[base:base + h].tolist() + sample["pos_min"]
+        for field in ("soft_token", "soft_weight"):
+            if sample.get(field) is not None:
+                sample[field] = part.soft_list(field, base, base + h) + sample[field]
+        for field, dtype in _TARGET_DTYPES.items():
+            pad = [False] * h if dtype is np.bool_ else ([0.0] * h if dtype is np.float64 else [0] * h)
+            sample[field] = pad + list(sample[field])
+        segment = sample["segments"][0]
+        segment["packed_end"] = total
+        segment["header_tokens"] = h
+        if segment.get("anchor_offset") is not None:
+            segment["anchor_offset"] += h
+        for anchor in segment.get("anchors", ()):
+            anchor["offset"] += h
+        return part.value_list(base, base + h) + values
+
+    def sample_lengths(self) -> list[int]:
+        """Tokens per training row, header included (for the token-budget sampler)."""
+        corpus = getattr(self, "corpus", None)
+        if corpus is None:
+            return [len(record["token"]) for record in self.records]
+        lengths = corpus.window_lengths()
+        if self.continuation_header is None:
+            return lengths
+        out = []
+        for index, length in enumerate(lengths):
+            part, row = corpus.window(index)
+            first, _ = part.stay_windows(int(part.win_stay[row]))
+            if row > first:
+                base = int(part.win_offset[first])
+                length += stay_header_length(part.token[base:base + 64].tolist(), self.continuation_header)
+            out.append(length)
+        return out
 
     def _packed_sample(self, record: dict[str, Any]) -> dict[str, Any]:
         if record.get("packed_schema_version") != PACKED_SCHEMA_VERSION:

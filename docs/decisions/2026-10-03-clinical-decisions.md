@@ -48,7 +48,7 @@ the vitals without a SOFA component are anchored to NEWS2. Direction is strict (
 
 | # | Question | Decision | Default replaced | Key references | Implemented in | Status |
 |---|---|---|---|---|---|---|
-| 1 | Respiratory-rate cause | Confirm `> 24` /min (NEWS2 score 3 at >= 25) | `> 24`, proposed | Yousefi 2024 doi:10.1186/s12873-024-01084-w | `configs/thresholds.yaml` | implemented |
+| 1 | Respiratory-rate cause | Confirm `> 24` /min for the first L40 screen; RR >= 25 (NEWS2 top band) logged as the secondary sensitivity value (`sensitivity_value: 24.9` under the strict `above` rule; identical to `> 24` for integer-charted rates). See "Sustained crossings" below. | `> 24`, proposed | Yousefi 2024 doi:10.1186/s12873-024-01084-w; Badawy 2017 doi:10.1136/bmjqs-2017-006671; Latten 2019 doi:10.1371/journal.pone.0223155 | `configs/thresholds.yaml` | implemented |
 | 2 | Creatinine cause | KDIGO AKI rule instead of a fixed value: event when creatinine rises >= 0.3 mg/dL above the lowest value in the preceding rolling 48 h, or reaches >= 1.5x the lowest value in the preceding rolling 7 days. Baseline: tier 1 of the authority's rule (outpatient creatinine 7-365 days before admission) is not in the token stream, so tier 2 (lowest in-stay value inside the window) is used; tier 3 (back-calculation from an assumed eGFR of 75) is a documented future sensitivity analysis. A measurement with no earlier creatinine in the 7-day window cannot be assessed (`not_ascertainable`, never negative). Labels are computed on the whole stay in availability order. The threshold-hazard QUERY grid for creatinine keeps its fixed decision thresholds 1.5 / 2.0 / 3.0 mg/dL. | `> 2.0` mg/dL, proposed | KDIGO 2012 AKI guideline (Khwaja 2012 doi:10.1159/000339789); criteria as quoted in PMID 33750089; pyAKI doi:10.1371/journal.pone.0315325; De Rosa 2016 doi:10.1186/s13054-016-1218-4; Cooper 2021 doi:10.1016/j.ekir.2020.12.020 | `configs/thresholds.yaml` (`rule: kdigo_aki`), `src/data/threshold_grid.py` (`RuleQuery`), `src/data/targets.py` (`kdigo_aki_flags`, `_label_rule`); tests in `tests/test_targets_gem_tte.py::KdigoCreatinineCauseTest` | implemented |
 | 3 | Bilirubin cause | Confirm `> 2.0` mg/dL (SOFA liver score 2) | same, proposed | Singer 2016 doi:10.1001/jama.2016.0287 | `configs/thresholds.yaml` | implemented |
 | 4 | Platelet cause | Confirm `< 100` x10^3/uL (SOFA coagulation score 2) | same, proposed | Singer 2016 doi:10.1001/jama.2016.0287 | `configs/thresholds.yaml` | implemented |
@@ -63,6 +63,35 @@ for the NEWS2 bands). The interim value 39.1 was superseded the same day by 39.1
 which the authority chose for the CSV edge and the token-stream readability, not for a
 score-3 equivalence. Respiratory rate (>= 25), heart rate (>= 131) and SBP (<= 90) are
 NEWS2 score-3 cut-offs.
+
+### Sustained crossings and per-cause event rates (product authority, 2026-10-03)
+
+Charted respiratory rate is a noisy spot estimate that clusters at 18 and 20 /min (Badawy
+2017, BMJ Qual Saf, doi:10.1136/bmjqs-2017-006671) and is measured with only moderate
+inter-observer agreement (Latten 2019, PLoS One, doi:10.1371/journal.pone.0223155);
+threshold duration changes what a crossing predicts in monitored patients (Aagaard 2026,
+Sensors, doi:10.3390/s26175399). All three verified on PubMed (PMIDs 28652259, 31581207,
+42740020). So, without changing the confirmed values:
+
+- **Optional sustained-crossing rule, off by default.** Any fixed-value competing-risk cause
+  in `configs/thresholds.yaml` may carry `sustained: {min_readings: k, within_minutes: w}`
+  (for example RR > 24 or SBP < 90 with k = 2, w = 60). A crossing then counts only when k
+  CONSECUTIVE readings beyond the threshold (no non-qualifying reading between them), all
+  after the anchor, span at most w minutes; the event time is the reading that completes the
+  run, which must fall inside the horizon. An isolated crossing never fires. A crossing that
+  is not confirmed (the last reading inside the horizon is beyond the threshold but no run
+  completed) is unknown, not event-free: if the stay ends first it is `competing_event` or
+  `censored` as usual; otherwise `not_ascertainable` (never `negative`). Labels are still
+  computed on the whole stay in availability order; prevalence is unchanged. With the key
+  absent the labels are the single-crossing labels, unchanged. Implemented in
+  `src/data/threshold_grid.py` (`_sustained`, `GridQuery.sustained`) and
+  `src/data/targets.py` ("SUSTAINED CROSSING", `_sustained_completion`); tests in
+  `tests/test_targets_gem_tte.py::SustainedCrossingTest`. Status: implemented, off.
+- **Per-cause event rates.** `targets.anchor_status_shares` now reports
+  `competing_risk_by_cause`: per cause index, the events and the share of supervised anchors
+  whose competing-risk event is that cause, so the real-data smoke
+  (`src/train/real_data_smoke.py`) can compare RR > 24 vs SpO2 < 88 vs lactate > 4 with and
+  without the sustained rule. Status: implemented.
 
 ## B. Off-edge control thresholds (item 8)
 
@@ -149,6 +178,46 @@ NEWS2 score-3 cut-offs.
 | 46 | Held-out NIV / HFNC arms too small | **Chosen:** a patient-level stratified split that over-samples patients with an NIV or HFNC first post-extubation device into the held-out partitions (all but `train`) until each arm holds 50% of its patients there, keeping the overall 60/15/10/15 by moving as many other patients the other way, deterministic by seed. The stratum comes only from pre-registered, outcome-blind cohort membership (`patient_id`, `eligible`, `arm_first_device`). Rush is external validation, not the sole held-out source. This changes the training-data composition and is baked into every checkpoint, so it is switched on at the split-freeze step, not before. | 60/15/10/15 unstratified | none (partitioning strategy) | `configs/train.yaml` `data_contract.held_out_stratification` (`enabled: false` until the freeze), `src/data/splits.py`, `src/data/cohort.py` (`--held-out-strata`), `src/train/preflight.py` (freeze records and checks the option), `docs/plans/l40-runbook.md` step 7; tests in `tests/test_splits.py`, `tests/test_preflight.py`, `tests/test_artifact_policy.py` | implemented (activation at the split freeze) |
 | 47 | Availability lag for charted-only tables | 30-minute lag primary, 15 and 60 minutes as sensitivity analyses | none | none (operational safeguard for hard rule 4) | `configs/data.yaml`, `src/data/tokenize.py`, `src/data/extubation_cohort.py` | implemented (parallel) |
 
+### Trial-agreement margins: FROZEN, optional, not on the critical path (2026-10-03)
+
+The project goal was re-confirmed: the trial-agreement margin rubric is **frozen as
+optional**. The registry, code and tests in the tree keep the item-42 per-trial fixed
+margins with the Roehmel-Kieser second hurdle as committed (values `proposed`); nothing
+about margins gates a training run or Paper 1's claims.
+
+**Approved method if the rubric is revived** (product authority, 2026-10-03; supersedes the
+per-trial 50% margins): (1) pool only exchangeable trials in exposure-outcome FAMILIES
+(NIV vs HFNC, reintubation <= 7 d: HIGH-WEAN [approximate] + Hernandez 2022; HFNC vs
+conventional oxygen, low risk, 72 h: Hernandez 2016 low risk; Casey 2021 kept out as a
+different intervention/population and null; Ferrer not evaluable; null and
+non-inferiority trials keep the equivalence margin and are never pooled); (2) per family,
+an inverse-variance fixed-effect pooled log RR from the published arm counts, with
+DerSimonian-Laird and I^2 as a check, registering the more conservative; margin = 50% of
+the pooled 95% bound nearest the null (FDA fixed-margin method: Mauri & D'Agostino 2017,
+doi:10.1056/NEJMra1510063; Althunian 2017, doi:10.1186/s13063-017-1859-x); (3) operative
+margin = the smaller of that and an SCID of RR 1.20 / 5 percentage points (proposed, ICU
+physician sign-off), on both scales (scale caveat: Quartagno 2020,
+doi:10.1186/s13063-020-4070-4); (4) a feasibility floor: a trial whose operative margin is
+narrower than the emulation's outcome-blind estimate resolution is an
+`uninformative_benchmark`, reported separately and never scored as an emulation failure;
+the second-hurdle direction check is unchanged. All three references verified on PubMed
+(PMIDs 28270184, 32029000; Mauri 2017 via the attachment's list). The work-in-progress
+implementation (registry families, `pool_family`, SCID cap, `estimate_resolution`, the
+uninformative classification and its tests) is saved as
+`output/patches/pooled-margins-wip.patch` and is NOT applied. Computed on the published
+counts before it was set aside: NIV vs HFNC pooled (fixed effect; I^2 = 0, so DL is
+identical) margin 1.096 / 1.4 percentage points; HFNC vs oxygen low risk 1.152 / 1.3 pp;
+Ferrer pooled 1.270, operative 1.20 / 5 pp after the SCID cap. On the synthetic fixture's
+size the HFNC-vs-oxygen and NIV-vs-HFNC trials would be classified uninformative.
+
+## Pre-training configuration decisions (2026-10-03)
+
+| Decision | Before | After | Why | Implemented in | Status |
+|---|---|---|---|---|---|
+| Admission header in continuation windows | A stay longer than one window is cut into contiguous windows; only the first starts with `<bos>`, `ADMISSION//<type>` and the static tokens (age decile, sex, race, ethnicity, admission type). Verified on the synthetic long stay: the second window has none of them. | Optional `continuation_header`: every continuation window gets the stay's header at its start (own positions, masked as targets; labels and anchors' labels unchanged, anchor offsets shift). Counted against `max_tokens`: an over-budget window is refused. | A later window otherwise has no admission context. | `src/data/dataset.py` (`header_token_ids`, `stay_header_length`, `_prepend_header`, `sample_lengths`, `gem_window_bounds_with_header`), `src/train/pretrain.py`, `configs/model.yaml` `trunk.continuation_header`; `tests/test_gem_training_path.py` | implemented, **off** until the tokenizer cuts continuation windows at `max_tokens - header_len` (call `dataset.gem_window_bounds_with_header` in place of `gem_window_bounds` in `src/data/tokenize.py::_gem_records`, then rebuild the shards and switch `continuation_header: true`) |
+| RoPE base for minute positions | `rope_base: 10000` with positions in minutes since admission: slowest wavelength 2*pi*10000^(31/32) ~ 47,000 min (~33 days), shorter than long stays (66+ days, ~100,000 min) | `rope_base: 100000`: slowest wavelength ~ 438,000 min (~305 days, ~4x the longest stay); the fastest dimension still turns 1 rad/min, so short-range resolution is unchanged; per-dimension frequency ratio 1.33 -> 1.43. 5e5 was not chosen: it puts the slowest wavelength at ~4 years, beyond any stay. | Distinct angles for every minute of the longest stay in the slowest dimension. Formula checked against the RoPE definition used by Hugging Face Transformers (`inv_freq = 1 / base^(2i/d)`, computed in float32; Context7, /huggingface/transformers). Changes the model: applies to every run trained after it. | `configs/model.yaml`; `tests/test_rope_base.py` | implemented |
+| Context-length report | none | `src/eval/context_length.py` (CLI): per shard, share of candidate anchors and ICU+24 h anchors over 4,096 / 8,192 / 16,384 tokens of history, and of the extubation time-zero prompts (aggregate; small cells suppressed). Pre-flight `context:` check per site (warns above 10% of prompts over 8,192; `--extubation-cohort`). `src.eval.threshold_eval --max-context` scores a trained model at 4K vs 8K without retraining. | Size the context decision from the data. | `src/eval/context_length.py`, `src/train/preflight.py`, `src/eval/threshold_eval.py`, runbook step 15; `tests/test_context_length.py` | implemented |
+
 ## Simulation operating characteristics after items 42-45
 
 The planted-effect simulation (`src/eval/causal/simulation.py`) on the synthetic fixture of
@@ -173,3 +242,22 @@ narrow that even the true trial effect passes only 14-17% of the time at this sa
 those trials are in practice unreproducible under the 50%-preserved fixed margin. With the
 withheld confounder no scenario passes more than 1% of the time. Both points go to the
 product authority before the values are registered.
+
+## Open items for the product authority (raised by this implementation)
+
+The margin rubric is frozen (above); these remain on record if it is revived. Margins are unchanged; these are reported for decision before the values are registered.
+
+1. **The 50% fixed margin makes two effect trials nearly unreproducible.** HIGH-WEAN 2019
+   (relative margin 1.029) and Hernandez 2022 (1.039) have benchmark intervals whose bound
+   nearest 1 is close to 1, so half of M1 is a margin of 3-4%. On the synthetic fixture the
+   rule passed the TRUE trial effect in only 14-17% of replicates. Options: a smaller
+   preserved fraction for agreement (the FDA fraction was written for non-inferiority, not
+   for agreement with a benchmark), a floor on the margin, or scoring these trials on the
+   absolute scale.
+2. **The second hurdle on null trials compares against the trial's noisy point estimate.**
+   For a null benchmark (Casey 2021, Hernandez 2016 high risk) "direction-consistent" means
+   the side of 1 on which the trial's own non-significant point estimate fell. It removes
+   reversed-effect passes (Casey 0.60 -> 0.02) but still passes a zero effect about half the
+   time, and could fail a correct emulation of a truly null effect for the same reason.
+   Options: apply the hurdle to effect trials only, or define harm for null trials as an
+   estimate beyond the equivalence region.

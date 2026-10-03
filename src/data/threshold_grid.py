@@ -89,6 +89,7 @@ class Threshold:
     paired_decision: float | None = None
     rule: str | None = None
     rule_params: tuple[tuple[str, float], ...] = ()
+    sustained: tuple[int, int] | None = None     # (min_readings, within_minutes)
 
     @property
     def params(self) -> dict[str, float]:
@@ -122,6 +123,9 @@ class GridQuery:
     value: float
     direction: str
     threshold_bin: int
+    # Optional sustained-crossing requirement of a competing-risk cause:
+    # (min_readings, within_minutes); None = a single crossing is the event.
+    sustained: tuple[int, int] | None = None
 
     @property
     def direction_id(self) -> int:
@@ -168,14 +172,22 @@ def load_thresholds(path: str | Path = THRESHOLDS_PATH) -> dict[str, Any]:
                     f"{THRESHOLD_STATUSES[kind]}, got {status!r}")
             paired = entry.get("paired_decision")
             rule = entry.get("rule")
+            sustained = _sustained(kind, entry)
             if rule is not None:
+                if sustained is not None:
+                    raise ThresholdGridError(
+                        f"{kind} {entry['concept']}: `sustained` applies to a fixed-value cause, "
+                        "not to a rule")
                 parsed.append(_rule_threshold(kind, entry, direction, status))
                 continue
+            if "sensitivity_value" in entry:
+                _finite(entry["sensitivity_value"], f"{kind} {entry['concept']} sensitivity_value")
             parsed.append(Threshold(
                 kind, entry["concept"],
                 _finite(entry.get("value"), f"{kind} {entry['concept']} value"), direction,
                 status,
                 None if paired is None else _finite(paired, f"{kind} paired_decision"),
+                sustained=sustained,
             ))
         if len({(t.concept, t.value, t.direction) for t in parsed}) != len(parsed):
             raise ThresholdGridError(f"threshold registry repeats a `{kind}` entry")
@@ -203,6 +215,26 @@ def load_thresholds(path: str | Path = THRESHOLDS_PATH) -> dict[str, Any]:
         if registry["label_rule"][key] <= 0:
             raise ThresholdGridError(f"label_rule {key} must be positive")
     return registry
+
+
+def _sustained(kind: str, entry: Mapping) -> tuple[int, int] | None:
+    """Optional `sustained: {min_readings, within_minutes}` of a competing-risk cause
+    (off when absent). min_readings >= 2 (one reading is the default rule)."""
+    raw = entry.get("sustained")
+    if raw is None:
+        return None
+    if kind != "competing_risk_cause":
+        raise ThresholdGridError(f"{kind} {entry['concept']}: only a competing-risk cause may "
+                                 "be `sustained`")
+    if not isinstance(raw, Mapping) or set(raw) != {"min_readings", "within_minutes"}:
+        raise ThresholdGridError(f"{kind} {entry['concept']}: sustained must give exactly "
+                                 "min_readings and within_minutes")
+    readings, minutes = raw["min_readings"], raw["within_minutes"]
+    if isinstance(readings, bool) or not isinstance(readings, int) or readings < 2 \
+            or isinstance(minutes, bool) or not isinstance(minutes, int) or minutes <= 0:
+        raise ThresholdGridError(f"{kind} {entry['concept']}: sustained needs integer "
+                                 "min_readings >= 2 and within_minutes > 0")
+    return readings, minutes
 
 
 def _rule_threshold(kind: str, entry: Mapping, direction: str, status: str | None) -> Threshold:
@@ -363,12 +395,20 @@ class ThresholdGrid:
         self._thresholds = thresholds
         self._registered = {
             kind: tuple(self._rule_query(t) if t.rule is not None
-                        else self.query(t.concept, t.value, t.direction)
+                        else self._with_sustained(self.query(t.concept, t.value, t.direction), t)
                         for t in thresholds[kind])
             for kind in THRESHOLD_KINDS
         }
         self.causes = {query.target_idx: query
                        for query in self._registered["competing_risk_cause"]}
+
+    @staticmethod
+    def _with_sustained(query: GridQuery, threshold: Threshold) -> GridQuery:
+        if threshold.sustained is None:
+            return query
+        from dataclasses import replace
+
+        return replace(query, sustained=threshold.sustained)
 
     def _rule_query(self, threshold: Threshold) -> RuleQuery:
         if threshold.concept not in self._index:

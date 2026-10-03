@@ -100,7 +100,16 @@ competing_risk_cause:
   - {concept: map,              value: 65.0,  direction: below, status: contract}   # cohort.yaml map_below_65_48h
   - {concept: lactate,          value: 4.0,   direction: above, status: contract}   # cohort.yaml lactate_above_4_48h
   - {concept: spo2,             value: 88.0,  direction: below, status: contract}   # cohort.yaml spo2_below_88_48h
-  - {concept: respiratory_rate, value: 24.0,  direction: above, status: confirmed}  # NEWS2 score 3: >= 25 breaths/min
+  # RR > 24 confirmed for the first L40 screen (product authority, 2026-10-03). Secondary
+  # sensitivity value: >= 25 (NEWS2 top band), registered as `sensitivity_value` (strict
+  # `above`, so 24.9; identical to > 24 for integer-charted rates). Charted RR is noisy and
+  # clusters at 18/20 (Badawy 2017, doi:10.1136/bmjqs-2017-006671; Latten 2019,
+  # doi:10.1371/journal.pone.0223155), so a cause may require a SUSTAINED crossing, off by
+  # default: add `sustained: {min_readings: 2, within_minutes: 60}` to this entry (or to
+  # sbp, or any fixed-value cause). Event time = the reading completing the run; see
+  # src/data/targets.py "SUSTAINED CROSSING" (Aagaard 2026, doi:10.3390/s26175399, on
+  # threshold duration in monitoring).
+  - {concept: respiratory_rate, value: 24.0,  direction: above, status: confirmed, sensitivity_value: 24.9}  # NEWS2 score 3: >= 25 breaths/min
   - concept: creatinine
     direction: above
     status: confirmed

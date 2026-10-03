@@ -598,6 +598,7 @@ def evaluate_run(model, streams: Sequence[Mapping], vocab_blob: Mapping,
         "bin_counts": {concept: len(segments[concept]) for concept in grid.binned},
         "status_counts": status_counts(pairs, partition=roles["evaluation"]),
         "rows": rows,
+        "context_tokens": context_tokens,
     }
     return {"scores": scores, "summary": summary}
 
@@ -717,6 +718,12 @@ def stay_streams(frame) -> list[dict]:
 
 # ---------------------------------------------------------------------------------- CLI
 
+def context_tokens(max_context: int | None, mcfg: Mapping) -> int | None:
+    """The history length each anchor is read over: `--max-context`, else the trunk's
+    `max_tokens`. Recorded in the run summary (`context_tokens`)."""
+    return int(max_context) if max_context is not None else mcfg["trunk"].get("max_tokens")
+
+
 def load_model(checkpoint, vocab_blob: Mapping, mcfg: Mapping, *, n_targets: int):
     """The run's model, sized from its checkpoint manifest (embedding rows = the
     vocabulary's max id + 1, the recorded trunk) and bound to `vocab_blob`."""
@@ -747,7 +754,13 @@ def main(argv: list[str] | None = None) -> None:
     ap.add_argument("--final-evaluation", action="store_true",
                     help="allow scoring a sealed partition (internal_test)")
     ap.add_argument("--device", default="cpu")
+    ap.add_argument("--max-context", type=int, default=None,
+                    help="read each anchor over at most this many tokens of history (default: "
+                         "the trunk's max_tokens); evaluates a trained model at e.g. 4096 vs "
+                         "8192 without retraining")
     args = ap.parse_args(argv)
+    if args.max_context is not None and args.max_context < 2:
+        raise SystemExit("--max-context must be at least 2 tokens")
 
     spec = load_run_spec(args.run_dir)
     claims = load_claims_config(args.claims)
@@ -769,7 +782,7 @@ def main(argv: list[str] | None = None) -> None:
                           objective_arm=spec["objective_arm"], site=args.site, roles=roles,
                           device=torch.device(args.device).type,
                           arm=spec["tokenization_arm"],
-                          context_tokens=mcfg["trunk"].get("max_tokens"))
+                          context_tokens=context_tokens(args.max_context, mcfg))
     if result["summary"]["vocabulary"] != spec["vocab_hash"]:
         raise SystemExit("the vocabulary does not match the run_spec.json vocab_hash")
     write_run_outputs(args.run_dir, result)

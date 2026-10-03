@@ -358,6 +358,57 @@ class GemLoaderTest(unittest.TestCase):
         total = sum(len(dataset[i]["segments"][0]["anchors"]) for i in indices)
         self.assertEqual(total, len(built["anchors"]))
 
+    def test_continuation_windows_lack_the_header_unless_it_is_reinserted(self):
+        """Product authority, 2026-10-03: the second and later windows of a long stay start
+        mid-stream (no <bos>, ADMISSION//, static tokens); `continuation_header` puts the
+        stay's header back without changing labels."""
+        from test_gem_artifact import LONG_STAY
+
+        from src.data.dataset import ModelDataset, header_token_ids, stay_header_length
+
+        base = self.loaders.train_dataset
+        header = header_token_ids(self.corpus["blob"]["vocab"])
+        key = f"site_a:{LONG_STAY}"
+        indices = [i for i, r in enumerate(base.records) if r.get("episode_key") == key]
+        first, second = base[indices[0]], base[indices[1]]
+        h = stay_header_length(first["input_ids"], header)
+        self.assertGreaterEqual(h, 2)                         # <bos>, ADMISSION//, statics
+        self.assertEqual(stay_header_length(second["input_ids"], header), 0)   # the gap
+
+        fixed = ModelDataset(base.corpus, representation="gem", target_builder=base.target_builder,
+                             expected_hashes=base.expected_hashes, continuation_header=header)
+        again_first, again_second = fixed[indices[0]], fixed[indices[1]]
+        self.assertEqual(again_first["input_ids"], first["input_ids"])          # window 1 as is
+        self.assertEqual(again_second["input_ids"][:h], first["input_ids"][:h])
+        self.assertEqual(again_second["input_ids"][h:], second["input_ids"])
+        self.assertEqual(again_second["pos_min"][:h], first["pos_min"][:h])
+        self.assertFalse(any(again_second["ntp_mask"][:h]))
+        self.assertEqual(again_second["ntp_target"][h:], second["ntp_target"])
+        seg, old = again_second["segments"][0], second["segments"][0]
+        self.assertEqual((seg["packed_start"], seg["packed_end"]), (0, h + len(second["input_ids"])))
+        self.assertEqual([a["offset"] - h for a in seg["anchors"]], [a["offset"] for a in old["anchors"]])
+        self.assertEqual([a["cr"] for a in seg["anchors"]], [a["cr"] for a in old["anchors"]])
+        self.assertEqual(fixed.sample_lengths()[indices[1]], h + len(second["input_ids"]))
+        # Deterministic.
+        self.assertEqual(fixed[indices[1]]["input_ids"], again_second["input_ids"])
+        # Counted against the budget: a full window plus its header is refused.
+        from src.data.targets import TargetContractError
+        capped = ModelDataset(base.corpus, representation="gem", target_builder=base.target_builder,
+                              expected_hashes=base.expected_hashes, continuation_header=header,
+                              max_tokens=len(second["input_ids"]))
+        with self.assertRaisesRegex(TargetContractError, "max_tokens"):
+            capped[indices[1]]
+
+    def test_header_aware_window_bounds_keep_every_sample_within_the_budget(self):
+        from src.data.dataset import gem_window_bounds_with_header
+
+        bounds = gem_window_bounds_with_header(1000, 64, 6)
+        self.assertEqual(bounds[0], (0, 64))
+        self.assertEqual(bounds[-1][1], 1000)
+        self.assertTrue(all(b - a <= 58 for a, b in bounds[1:]))
+        self.assertTrue(all(b1 == a2 for (_, b1), (a2, _) in zip(bounds, bounds[1:])))
+        self.assertGreater(bounds[-1][1] - bounds[-1][0], 1)
+
     def test_continuous_fused_value_channel_loads_on_the_full_hospitalization_shards(self):
         loaders = gem_loaders(self.corpus, value_channel=True, td=self.work)
         dataset = loaders.train_dataset

@@ -48,6 +48,19 @@ with "beyond the threshold" read as "meets the rule", and the ascertainment chec
 ASSESSABLE measurement in the window before the horizon - a stay with a single creatinine
 is `not_ascertainable`, never negative. Labels are still computed on the whole stay.
 
+SUSTAINED CROSSING (optional per competing-risk cause, off by default; product authority,
+2026-10-03). With ``sustained = (k, w)`` on a fixed-value query, a crossing counts only when
+it is sustained: ``k`` CONSECUTIVE measurements of the concept beyond the threshold (no
+measurement that is not beyond between them), all after the anchor minute, the last at
+most ``w`` minutes after the first. The event time is the reading that completes the run
+(the k-th), and it must lie inside the horizon. An isolated crossing does not fire.
+Prevalence is unchanged (the last lookback value beyond the threshold). An UNCONFIRMED run
+- the last measurement inside the horizon is beyond the threshold but no run completed and
+none could still complete inside the horizon from the readings seen - is treated as unknown,
+not as event-free: the stay then reads competing_event / censored as usual when it ends
+first, and otherwise ``not_ascertainable`` (never ``negative``). With ``sustained`` absent
+the rule above is used unchanged.
+
 Label times are MINUTES since the anchor. The bin is not computed here: each head bins
 the minutes on its own grid (`src.model.heads.time_bin`, KTD4).
 """
@@ -286,9 +299,19 @@ class TargetBuilder:
                 return "prevalent", None
         end_future = int(np.searchsorted(times, anchor_min + horizon, side="right"))
         future = observed[first_future:end_future]
-        crossings = np.flatnonzero(future < query.value if below else future > query.value)
-        if crossings.size:
-            return "positive", int(times[first_future + int(crossings[0])]) - anchor_min
+        beyond_future = future < query.value if below else future > query.value
+        sustained = getattr(query, "sustained", None)
+        unconfirmed = False
+        if sustained is None:
+            crossings = np.flatnonzero(beyond_future)
+            if crossings.size:
+                return "positive", int(times[first_future + int(crossings[0])]) - anchor_min
+        else:
+            completed = _sustained_completion(times[first_future:end_future], beyond_future,
+                                              *sustained)
+            if completed is not None:
+                return "positive", int(times[first_future + completed]) - anchor_min
+            unconfirmed = bool(beyond_future.size and beyond_future[-1])
         to_end = index["end_min"] - anchor_min
         if index["expired"] and to_end <= horizon:
             return "competing_event", to_end
@@ -296,7 +319,7 @@ class TargetBuilder:
             return "censored", to_end
         window = round(spec.required_measurement_within_hours_of_horizon * 60)
         measured_from = max(anchor_min + 1, anchor_min + horizon - window)
-        if end_future > int(np.searchsorted(times, measured_from, side="left")):
+        if not unconfirmed and end_future > int(np.searchsorted(times, measured_from, side="left")):
             return "negative", horizon
         return "not_ascertainable", None
 
@@ -566,6 +589,29 @@ class TargetBuilder:
         return None if chosen is None else dict(labels[chosen])
 
 
+def _sustained_completion(times: np.ndarray, beyond: np.ndarray, min_readings: int,
+                         within_minutes: int) -> int | None:
+    """Index of the reading that completes the first run of `min_readings` consecutive
+    beyond-threshold readings spanning at most `within_minutes`, or None."""
+    run_start = None
+    count = 0
+    for i, flag in enumerate(beyond):
+        if not flag:
+            run_start, count = None, 0
+            continue
+        if run_start is None:
+            run_start, count = i, 1
+        else:
+            count += 1
+            # Slide the run start forward until the window fits.
+            while int(times[i]) - int(times[run_start]) > within_minutes:
+                run_start += 1
+                count -= 1
+        if count >= min_readings:
+            return i
+    return None
+
+
 _NO_TIMES = np.empty(0, dtype=np.int64)
 _NO_VALUES = np.empty(0, dtype=np.float64)
 # Float tolerance for KDIGO's inclusive ">=": 1.2 - 0.9 is 0.2999... in binary.
@@ -622,16 +668,34 @@ def anchor_status_shares(builds: Iterable[Mapping[str, Any]]) -> dict[str, Any]:
         counts[group][status] = counts[group].get(status, 0) + 1
 
     anchors = 0
+    by_cause: dict[str, int] = {}
+    supervised = 0
     for built in builds:
         for anchor in built.get("anchors", ()):
             anchors += 1
             add("competing_risk",
                 "not_supervised" if anchor["cr"] is None else anchor["cr"]["status"])
+            cr = anchor["cr"]
+            if cr is not None:
+                supervised += 1
+                if cr["status"] in ("positive", "competing_event"):
+                    key = str(cr["cause"])
+                    by_cause[key] = by_cause.get(key, 0) + 1
             for status in anchor["cause_status"].values():
                 add("cause_labels", status)
             for query in anchor["queries"]:
                 add("threshold_queries", query["status"])
     report: dict[str, Any] = {"anchors": anchors}
+    # Per-cause event rate: share of SUPERVISED anchors (a competing-risk label exists)
+    # whose competing-risk event is that cause (keys: cause index as a string; the death
+    # slot is the last index). For comparing causes, e.g. RR > 24 vs SpO2 < 88 vs
+    # lactate > 4, with and without a sustained rule.
+    report["competing_risk_by_cause"] = {
+        "supervised_anchors": supervised,
+        "events": dict(sorted(by_cause.items(), key=lambda kv: int(kv[0]))),
+        "rates": {k: v / supervised for k, v in sorted(by_cause.items(), key=lambda kv: int(kv[0]))}
+        if supervised else {},
+    }
     for group, by_status in counts.items():
         n = sum(by_status.values())
         report[group] = {

@@ -303,7 +303,7 @@ Check: `PRE-FLIGHT PASSED`; the two-rank smoke runs over gloo on CPU.
 ## 15. Pre-flight on the node
 
 ```bash
-uv run python -m src.train.preflight --episodes mimic=output/intermediate_phi/episodes.parquet
+uv run python -m src.train.preflight --episodes mimic=output/intermediate_phi/episodes.parquet --extubation-cohort mimic=output/intermediate_phi/extubation_cohort.parquet
 ```
 
 With Rush: add `--episodes rush=output/intermediate_phi/episodes_rush.parquet`.
@@ -331,6 +331,11 @@ Prints one table and exits non-zero on any FAIL. It checks:
   fails on a warm-up as long as the run or a run that writes no checkpoint, warns when
   only the final checkpoint would be written;
 - disk: room for the caches still to build and for checkpoints.
+- context (informational, per site): share of candidate anchors and of extubation
+  time-zero prompts whose history exceeds 4,096 / 8,192 / 16,384 tokens
+  (`src/eval/context_length.py`, aggregate only); warns when more than 10% of the prompts
+  exceed 8,192. A trained run can then be scored at 4K vs 8K with
+  `src.eval.threshold_eval --max-context 4096`.
 
 Memory figures measured on the MIMIC verification sample (1.2M sampled events) on
 2026-10-03: 57 bytes per event of memory-mapped cache (one copy per node), 8-19 bytes per

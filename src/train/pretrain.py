@@ -42,6 +42,7 @@ from torch.utils.data import DataLoader
 from src.data.collate import collate_model_samples
 from src.data.dataset import (
     DistributedTokenBudgetBatchSampler,
+    header_token_ids,
     GemCorpus,
     LengthGroupedSampler,
     ModelDataset,
@@ -889,10 +890,7 @@ def build_loaders(
 def _window_lengths(dataset: ModelDataset) -> list[int]:
     """Events per training row: the gem corpus's window lengths (no per-window lists),
     else each record's token count."""
-    corpus = getattr(dataset, "corpus", None)
-    if corpus is not None:
-        return corpus.window_lengths()
-    return [len(record["token"]) for record in dataset.records]
+    return dataset.sample_lengths()
 
 
 def _batched_loader(dataset: ModelDataset, tcfg: dict, *, seed: int) -> DataLoader:
@@ -962,6 +960,10 @@ def _build_gem_loaders(
         vocab_size=vocab_size, value_stats=value_stats, run_seed=seed)
     rss_before = resident_set_bytes()
     datasets = {}
+    # Continuation header (src/data/dataset.py): off until the shards are cut with room
+    # for it (`dataset.gem_window_bounds_with_header`).
+    header = (header_token_ids(vocab_blob["vocab"])
+              if mcfg["trunk"].get("continuation_header", False) else None)
     for partition in ("train", "validation"):
         # Columnar, memory-mapped per site (cache beside each shard, gem_cache/); keys
         # are ``<site>:<hosp_id>`` so the same raw identifier at two sites stays two.
@@ -986,13 +988,15 @@ def _build_gem_loaders(
         datasets[partition] = ModelDataset(
             corpus, representation="gem", target_builder=target_builder,
             expected_hashes=dict(binding), value_channel=value_channel,
+            continuation_header=header,
+            max_tokens=None if header is None else int(mcfg["trunk"]["max_tokens"]),
         ) if len(corpus) else None
     memory = loader_memory(rss_before, datasets.values())
     validation = datasets["validation"]
     validation_dl = None if validation is None else DataLoader(
         validation,
         batch_sampler=TokenBudgetBatchSampler(
-            validation.corpus.window_lengths(),
+            validation.sample_lengths(),
             max_batch_tokens=int(tcfg["runtime"].get("token_budget", 0) or 0) or 2 ** 62,
             max_batch_size=tcfg["batch"]["per_gpu"], seed=seed, shuffle=False),
         collate_fn=collate_model_samples,
