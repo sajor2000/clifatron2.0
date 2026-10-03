@@ -1,0 +1,244 @@
+# Extubation study cohort contract (plan U9; R1, R2, R3, R5, R32; KTD6, KTD8).
+# Every definitional choice of the cohort, the device arms and the trial risk factors
+# is a named parameter here; src/data/extubation_cohort.py reads nothing else.
+#
+# Hard rule #1: respiratory support is a model INPUT, never a trunk prediction target.
+# This contract only READS it, to define the cohort (extubation) and the exposure
+# (device arm). Outcomes (reintubation, death) are not defined here: they are the
+# `study_endpoints` of configs/cohort.yaml, labelled by a later unit.
+
+contract_version: "1.0.0"
+clif_version: "2.1.0"
+
+# Availability (storetime) ordering is NOT redeclared here: each table's
+# `availability_col` and `availability_lag_minutes` come from this file (R2).
+data_config: "configs/data.yaml"
+train_config: "configs/train.yaml"            # partitions + split_seed (KTD6: same rule)
+artifact_policy: "configs/artifact_policy.yaml"
+episode_artifact: "output/intermediate_phi/episodes.parquet"
+
+# Row-level output is patient_level_phi: governed, git-ignored, never exported.
+outputs:
+  cohort: "output/intermediate_phi/extubation_cohort.parquet"
+  # Always the cohort file's sibling `<stem>_device_rows.parquet`.
+  device_rows: "output/intermediate_phi/extubation_cohort_device_rows.parquet"
+
+# `data_table` = key under configs/data.yaml `tables` (file + availability ordering).
+# `file` = a CLIF table with no availability column of its own.
+source_tables:
+  hospitalization: {file: "clif_hospitalization"}
+  respiratory_support: {data_table: "resp_support"}
+  labs: {data_table: "labs"}
+  vitals: {data_table: "vitals"}
+  code_status: {data_table: "code_status"}
+  adt: {data_table: "adt"}
+  hospital_diagnosis: {file: "clif_hospital_diagnosis"}
+
+# ---------------------------------------------------------------- time zero (R2)
+time_zero:
+  # The extubation timestamp = availability time of the first recognised non-invasive
+  # device row after a run of invasive-ventilation rows.
+  definition: "first_non_invasive_device_row_after_invasive_ventilation"
+  # Every covariate (labs, vitals, code status, diagnoses) uses only rows whose
+  # availability time is STRICTLY before time zero. Only value implemented.
+  covariate_boundary: "strictly_before"
+  # First extubation per patient across all hospitalizations; a later extubation never
+  # replaces an ineligible first one (the ineligible row is kept with its reason).
+  first_extubation_per: "patient"
+
+# ---------------------------------------------------------------- detection (R1)
+detection:
+  invasive_categories: ["IMV"]
+  # Rows with no device_category carry no device evidence (on MIMIC about half of them
+  # are ventilator-setting rows): they are dropped from the device sequence. Their
+  # tracheostomy flag is still read. Only value implemented.
+  null_device_rows: "ignore"
+  # Rows whose category maps to no class below (e.g. "Other": T-piece, bag-mask) are
+  # not evidence of extubation either; kept in the device-row artifact as `unmapped`.
+  unmapped_device_rows: "ignore"
+  # A return to invasive ventilation sooner than this after the candidate extubation
+  # row is a ventilator gap (charting blip, circuit change): stitched into one
+  # continuous episode, NOT an extubation. Gap = next IMV row - candidate row.
+  # (At equal timestamps an IMV row is ordered before a non-invasive row.)
+  stitch_gap_hours: 1.0
+  look_back:
+    # One IMV row cannot establish a duration.
+    min_invasive_rows: 2
+    # The last IMV row must be this recent, or the extubation time is not located
+    # (IMV rows are charted every few hours; 12 h is several missed charting cycles).
+    max_hours_since_last_invasive_row: 12.0
+  look_forward:
+    # Non-invasive rows required in [time zero, time zero + window_hours] before any
+    # return to IMV. 1 = the time-zero row itself; 2 asks for a confirming row.
+    min_non_invasive_rows: 1
+    window_hours: 24.0
+
+# Minimum invasive-ventilation duration (first IMV row of the stitched episode to time
+# zero). The sensitivity cohort reuses the SAME first extubation, so cohorts nest.
+cohorts:
+  primary:
+    min_invasive_hours: 24.0
+  sensitivity:
+    ventilation_12h:
+      min_invasive_hours: 12.0
+
+# ---------------------------------------------------------------- arms (R3, KTD8)
+grace_window:
+  # Default 3 h. Post-extubation device rows are a median 180 minutes apart on MIMIC
+  # (90th percentile 300 min; notes/extubation-evidence-review.md section 7), so 3 h is
+  # the shortest window that holds one charting step after the time-zero row (KTD8:
+  # "the grace window holds one decision step"). Shorter windows usually hold the
+  # time-zero row alone; longer ones let rescue support count as prophylaxis (median
+  # time from palliative extubation to death is 118 min, section 10).
+  hours: 3.0
+  sensitivity_hours: [1.0, 2.0, 6.0]
+  # Rows with time zero <= t <= time zero + hours are inside the window.
+  right_closed: true
+
+arms:
+  # Escalation order, lowest support first. Rescue = support ranked above the assigned
+  # arm, started after the grace window.
+  order: ["conventional_oxygen", "hfnc", "niv"]
+  device_categories:
+    niv: ["NIPPV", "CPAP"]                    # BiPAP and CPAP
+    hfnc: ["High Flow NC"]
+    # "Face Mask" may include aerosol face tents (open question in the plan); "Room Air"
+    # is no supplemental support, i.e. neither NIV nor HFNC.
+    conventional_oxygen: ["Nasal Cannula", "Face Mask", "Room Air"]
+  assignment:
+    # first_device    - the device at the actual extubation: the first arm device row
+    #                   inside the grace window (KTD8; session-settled decision).
+    # highest_support - the highest-ranked arm device inside the grace window
+    #                   (sensitivity; the feasibility counts in the evidence review).
+    rule: "first_device"
+    sensitivity_rules: ["highest_support"]
+    # NIV alternating with HFNC inside the grace window is the NIV arm (HIGH-WEAN).
+    alternating_niv_hfnc: "niv"
+
+rescue:
+  # Support ranked above the assigned arm, first started after the grace window and
+  # before any return to IMV, within this many hours of time zero. A descriptive flag:
+  # never the assigned arm, never a covariate (it is post-time-zero information).
+  look_forward_hours: 168.0
+
+device_rows:
+  # Every device row from time zero through this horizon is kept in the device-row
+  # artifact (the clone-censor-weight estimator censors clones on rows inside the grace
+  # window; keeping the longer horizon lets every sensitivity window be re-derived).
+  keep_hours: 168.0
+
+# ---------------------------------------------------------------- exclusions (R1)
+exclusions:
+  minimum_age: 18
+  tracheostomy:
+    # Excluded when the flag is set on any respiratory row at or before time zero in
+    # the index hospitalization, or when the time-zero device is a trach device.
+    flag_col: "tracheostomy"
+    device_categories: ["Trach Collar"]
+  code_status:
+    # Status in effect at time zero = latest row available strictly before it.
+    # A category outside these five lists fails closed.
+    comfort_care_categories: ["AND"]                       # terminal / comfort-care extubation
+    do_not_reintubate_categories: ["DNR/DNI", "DNAR/DNI"]  # documented do-not-(re)intubate
+    # DNR without DNI does not forbid reintubation: kept, recorded, and available as a
+    # sensitivity exclusion (most trials excluded DNR as well).
+    dnr_only_categories: ["DNR", "DNAR", "UDNR"]
+    full_code_categories: ["Full", "Presume Full"]
+    other_categories: ["Other"]                            # kept and recorded as-is
+    # Code status is missing for about 43% of MIMIC extubations and most palliative
+    # extubations are in patients admitted full code, so missing status never excludes:
+    # the patient is kept and `code_status_missing` is set.
+    missing: "keep_and_flag"
+
+# ---------------------------------------------------------------- risk factors (R5)
+# Each trial risk factor has a documented proxy; coverage is reported in the waterfall.
+risk_factors:
+  age_over_65:
+    source: "hospitalization.age_at_admission"
+    threshold: 65                 # strictly greater (Hernandez 2016b, HIGH-WEAN)
+    proxy: "age at hospital admission, not at extubation"
+  hypercapnia:
+    lab_category: "pco2_arterial"
+    threshold_mmhg: 45.0          # strictly greater
+    units: ["mmHg", "mm Hg"]      # any other unit fails closed
+    lookback_hours: 24.0          # "at end of SBT or on extubation day"
+    value: "latest_before_time_zero"
+    proxy: "latest arterial PaCO2 resulted before time zero; no SBT-end anchor in CLIF"
+  bmi:
+    weight_category: "weight_kg"
+    height_category: "height_cm"
+    weight_scope: "index_hospitalization"   # latest weight before time zero
+    height_scope: "patient_history"         # latest height before time zero, any stay
+    plausible_weight_kg: [25.0, 400.0]
+    plausible_height_cm: [120.0, 230.0]
+    plausible_bmi: [10.0, 100.0]
+    threshold: 30.0               # strictly greater (Hernandez 2016b)
+    proxy: "latest charted weight and height before time zero"
+  prolonged_ventilation:
+    min_invasive_hours: 168.0     # >= 7 days (Hernandez 2022)
+    proxy: "duration of the stitched IMV episode ending at time zero"
+  comorbidities:
+    # MIMIC diagnosis codes have no present-on-admission flag and are recorded after
+    # discharge, so index-stay codes LEAK post-extubation information. The default
+    # uses only sources that are safe before time zero; the comorbidity is NULL (not
+    # false) for a patient with no usable history.
+    sources: ["prior_hospitalization_codes", "index_stay_poa_codes"]
+    allow_leaky_sources: false
+    available_sources:
+      prior_hospitalization_codes:
+        leaks_post_time_zero: false
+        rule: "codes of the patient's hospitalizations discharged before the index admission"
+      index_stay_poa_codes:
+        leaks_post_time_zero: false
+        rule: "index-stay codes with poa_present == 1 (all null on MIMIC: contributes nothing)"
+      index_stay_codes:
+        leaks_post_time_zero: true
+        rule: "all index-stay codes; leakage sensitivity analysis only"
+    # ICD prefixes, dots removed. Heart failure and chronic pulmonary disease follow the
+    # Quan 2005 Elixhauser/Charlson coding algorithms; clinical review is required
+    # before the protocol is registered.
+    definitions:
+      copd:
+        icd10cm: ["J41", "J42", "J43", "J44"]
+        icd9cm: ["491", "492", "496"]
+      chronic_respiratory_disease:
+        icd10cm: ["I278", "I279", "J40", "J41", "J42", "J43", "J44", "J45", "J46", "J47",
+                  "J60", "J61", "J62", "J63", "J64", "J65", "J66", "J67", "J684", "J701",
+                  "J703", "E662"]
+        icd9cm: ["4168", "4169", "490", "491", "492", "493", "494", "495", "496", "500",
+                 "501", "502", "503", "504", "505", "5064", "5081", "5088", "27803"]
+      heart_failure:
+        icd10cm: ["I099", "I110", "I130", "I132", "I255", "I420", "I425", "I426", "I427",
+                  "I428", "I429", "I43", "I50", "P290"]
+        icd9cm: ["39891", "40201", "40211", "40291", "40401", "40403", "40411", "40413",
+                 "40491", "40493", "4254", "4255", "4257", "4258", "4259", "428"]
+      chronic_cardiac_disease:      # heart failure, ischaemic heart disease, atrial fibrillation
+        icd10cm: ["I099", "I110", "I130", "I132", "I255", "I420", "I425", "I426", "I427",
+                  "I428", "I429", "I43", "I50", "P290", "I20", "I21", "I22", "I23", "I24",
+                  "I25", "I48"]
+        icd9cm: ["39891", "40201", "40211", "40291", "40401", "40403", "40411", "40413",
+                 "40491", "40493", "4254", "4255", "4257", "4258", "4259", "428", "410",
+                 "411", "412", "413", "414", "42731"]
+  # Trial risk factors with no CLIF proxy built by this unit.
+  not_built:
+    apache_ii: "severity score is not derived in this repo"
+    inadequate_secretions: "suctioning frequency is not charted in CLIF 2.1"
+    weak_cough: "not charted in CLIF 2.1"
+    airway_patency: "not charted in CLIF 2.1"
+    difficult_weaning: "failed-SBT count is deferred (SBT documented for about 55% of MIMIC extubations)"
+
+# ---------------------------------------------------------------- per-site sources
+# calendar_period_source: where a site's calendar period comes from. A period is NEVER
+# derived from event timestamps (MIMIC dates are shifted per patient). A site with no
+# declared source, or whose declared table is not staged, has a NULL period.
+sites:
+  mimic:
+    calendar_period_source:
+      kind: "patient_table"           # joined on patient
+      file: "mimic_anchor_year_group" # parquet beside the CLIF tables (MIMIC-IV `patients`)
+      patient_id_col: "patient_id"    # MIMIC-IV subject_id as a string
+      period_col: "anchor_year_group" # 3-year band, e.g. "2014 - 2016"
+  rush:
+    calendar_period_source: null      # declare before the adoption-era contrast (R40)
+  uchicago:
+    calendar_period_source: null
