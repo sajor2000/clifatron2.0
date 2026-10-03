@@ -598,6 +598,113 @@ class AblationArmsEndToEndTest(unittest.TestCase):
         self.assertTrue(all(p.requires_grad for p in run.model.th.parameters()))
         self.assertTrue(run.model.enc.lm_head.projection.weight.requires_grad)
 
+    def test_seed_sets_initial_weights_batch_order_and_target_sampling(self):
+        from src.train.run_tokenization_ablation import setup_arm
+
+        arm = self.arm_cfgs["clinical_soft"]
+        tcfg = _tiny_tcfg(Path(self._td.name) / "ckpt_seed")
+
+        def state(seed):
+            run = setup_arm(arm, mcfg=TINY_MCFG, tcfg=tcfg, n_targets=2, device=self.cpu,
+                            seed=seed)
+            weights = {k: v.clone() for k, v in run.model.state_dict().items()}
+            order = list(iter(run.loaders.train.sampler))
+            return weights, order, run.loaders.train_dataset.target_builder.run_seed
+
+        (w1, o1, r1), (w1b, o1b, r1b), (w2, o2, r2) = state(1), state(1), state(2)
+        self.assertTrue(all(torch.equal(w1[k], w1b[k]) for k in w1))
+        self.assertEqual(o1, o1b)
+        self.assertEqual((r1, r1b, r2), (1, 1, 2))
+        self.assertFalse(all(torch.equal(w1[k], w2[k]) for k in w1))
+        self.assertNotEqual(o1, o2)
+
+    def test_embedding_rows_are_the_vocabulary_max_id_plus_one(self):
+        run = self.runs["clinical_soft"]
+        rows = max(run.vocab_blob["vocab"].values()) + 1
+        self.assertEqual(run.vocab_size, rows)
+        self.assertEqual(run.model.enc.tok_emb.num_embeddings, rows)
+
+    # ------------------------------------- consumers of a fresh training checkpoint
+
+    def _fresh_checkpoint(self):
+        """A checkpoint written by `engine.train` (the pretrain loop): max id + 1
+        embedding rows, `config.vocab_size` and `config.trunk` in its manifest."""
+        if getattr(type(self), "_fresh", None) is None:
+            from src.train.run_tokenization_ablation import setup_arm, train_arm
+
+            work = Path(self._td.name)
+            tcfg = _tiny_tcfg(work / "ckpt_fresh")
+            tcfg["runtime"]["ckpt_every"] = 1
+            arm = self.arm_cfgs["clinical_soft"]
+            run = setup_arm(arm, mcfg=TINY_MCFG, tcfg=tcfg, n_targets=2, device=self.cpu,
+                            seed=3)
+            train_arm(run, tcfg=tcfg, mcfg=TINY_MCFG, device=self.cpu, total_steps=1,
+                      lr=1e-3)
+            path = max((work / "ckpt_fresh").glob("ckpt_*.pt"))
+            type(self)._fresh = (path, run.vocab_blob)
+        return type(self)._fresh
+
+    def _other_size_mcfg(self):
+        """A model config whose trunk differs from the checkpoint's: consumers must
+        rebuild the trunk the manifest records, and its embedding rows."""
+        mcfg = copy.deepcopy(TINY_MCFG)
+        mcfg["trunk"].update({"d_model": 32, "target_vocab": 10000})
+        return mcfg
+
+    def test_fresh_checkpoint_records_its_vocabulary_size_and_trunk(self):
+        from src.train.checkpoint import load_checkpoint
+
+        path, blob = self._fresh_checkpoint()
+        config = load_checkpoint(path)["manifest"]["config"]
+        self.assertEqual(config["vocab_size"], max(blob["vocab"].values()) + 1)
+        self.assertEqual(config["trunk"]["d_model"], TINY_MCFG["trunk"]["d_model"])
+
+    def test_fresh_checkpoint_loads_in_threshold_eval(self):
+        from src.eval.threshold_eval import load_model
+
+        path, blob = self._fresh_checkpoint()
+        model = load_model(path, blob, self._other_size_mcfg(), n_targets=2)
+        self.assertEqual(model.enc.tok_emb.num_embeddings, max(blob["vocab"].values()) + 1)
+
+    def test_fresh_checkpoint_loads_in_generate(self):
+        import yaml
+
+        from src.model.generate import load_generation_model
+
+        path, blob = self._fresh_checkpoint()
+        work = Path(self._td.name)
+        mpath, dpath = work / "gen_model.yaml", work / "gen_data.yaml"
+        mpath.write_text(yaml.safe_dump(self._other_size_mcfg()))
+        dpath.write_text(yaml.safe_dump({"target_concepts": [{"name": "map"},
+                                                             {"name": "lactate"}]}))
+        enc = load_generation_model(path, mpath, dpath, blob)
+        self.assertEqual(enc.tok_emb.num_embeddings, max(blob["vocab"].values()) + 1)
+        self.assertEqual(enc.d_model, TINY_MCFG["trunk"]["d_model"])
+
+    def test_fresh_checkpoint_loads_in_checkpoint_sweep(self):
+        from src.eval.checkpoint_sweep import build_model
+
+        path, blob = self._fresh_checkpoint()
+        model = build_model(path, blob, self._other_size_mcfg(), n_targets=2)
+        self.assertEqual(model.enc.tok_emb.num_embeddings, max(blob["vocab"].values()) + 1)
+
+    def test_fresh_checkpoint_loads_in_run_arm(self):
+        from src.train.checkpoint import load_checkpoint
+        from src.train.run_arm import build_from_scratch
+
+        path, blob = self._fresh_checkpoint()
+        model = build_from_scratch(blob, TINY_MCFG, n_targets=2)
+        model.load_state_dict(load_checkpoint(path)["model"])
+
+    def test_fresh_checkpoint_initialises_a_tokenization_arm(self):
+        from src.train.run_tokenization_ablation import setup_arm
+
+        path, _ = self._fresh_checkpoint()
+        tcfg = _tiny_tcfg(Path(self._td.name) / "ckpt_init")
+        run = setup_arm(self.arm_cfgs["clinical_soft"], mcfg=TINY_MCFG, tcfg=tcfg,
+                        n_targets=2, device=self.cpu, init_checkpoint=path)
+        self.assertIsNotNone(run.model)
+
     def test_value_regression_weight_changes_value_loss_contribution(self):
         from src.train.run_tokenization_ablation import TokenizationAblationModel
 

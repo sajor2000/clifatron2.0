@@ -196,6 +196,19 @@ class EvaluationSetTest(unittest.TestCase):
         n_thresholds = len(registry()["decision"]) + len(registry()["control"])
         self.assertEqual(len(a["pairs"]), len(a["anchors"]) * n_thresholds * 2)
 
+    def test_batched_labels_equal_one_label_anchor_call_per_pair(self):
+        streams = encode(self.stays, clinical_segments())
+        built = te.evaluation_set(streams, self.clinical, registry(),
+                                  horizons_hours=[24, 48], anchors_per_stay=2, seed=11)
+        rule = registry()["label_rule"]
+        builders = {h: te._builder(self.clinical, h, rule) for h in (24.0, 48.0)}
+        for pair in built["pairs"]:
+            anchor = built["anchors"][pair["anchor"]]
+            label = builders[pair["horizon_hours"]].label_anchor(
+                streams[anchor["stay"]], anchor["anchor_idx"], pair["query"])
+            self.assertEqual((pair["status"], pair["minutes"]),
+                             (label["status"], label["minutes"]))
+
     def test_non_scorable_states_are_counted_and_never_scored_as_negative(self):
         built = self.build(self.clinical, clinical_segments())
         counts = te.status_counts(built["pairs"], partition="internal_test")

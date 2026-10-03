@@ -61,13 +61,26 @@ from src.train.engine import (
     ALLOW_CPU_DDP_FLAG,
     TrainConfig,
     is_distributed,
+    resolve_total_steps,
     select_device,
     setup_ddp,
     train,
     wrap_ddp,
 )
 from src.train.curriculum import apply_objective_arm, resolve_objective_arm
-from src.train.pretrain import Loaders, Model, build_loaders, build_optimizer, build_scheduler
+from src.train.pretrain import (
+    DEFAULT_SEED,
+    TRUNK_OVERRIDES,
+    Loaders,
+    Model,
+    apply_trunk_overrides,
+    build_loaders,
+    build_optimizer,
+    build_scheduler,
+    embedding_vocab_size,
+    parse_trunk_overrides,
+    seed_everything,
+)
 
 TOKENIZERS = ("fused", CONTINUOUS_FUSED, "textcode")
 SCHEMES = ("clinical_segment", "decile_ablation")   # configs/data.yaml value_binning.scheme
@@ -104,6 +117,8 @@ class ArmRun:
     vocab_blob: dict
     binding: dict[str, str]
     n_value_bins: int
+    seed: int = DEFAULT_SEED
+    vocab_size: int = 0
 
 
 def resolve_arm(abl: dict, name: str, *, events=None, vocab=None, value_stats=None,
@@ -131,6 +146,15 @@ def resolve_arm(abl: dict, name: str, *, events=None, vocab=None, value_stats=No
             raise SystemExit(f"arm {name} needs its own {key} path "
                              f"(arms.{name}.{key} or --{key.replace('_', '-')})")
     return arm
+
+
+def arm_data_config(cfg: dict, arm: dict) -> dict:
+    """The data config an arm's vocabulary is built with: `cfg` with the arm's
+    ``binning`` overrides applied to ``value_binning`` (KTD11: the decile arms' scheme,
+    matched granularity and whether the decision thresholds are forced edges)."""
+    out = copy.deepcopy(cfg)
+    out["value_binning"].update(copy.deepcopy(arm.get("binning") or {}))
+    return out
 
 
 def check_arm_vocab(arm: dict, blob: dict) -> int:
@@ -188,16 +212,21 @@ def apply_freeze_trunk(model: Model, freeze: bool, init_checkpoint) -> bool:
 
 def setup_arm(arm: dict, *, mcfg: dict, tcfg: dict, n_targets: int, device,
               text_encoder: TextEncoder | None = None, init_checkpoint=None,
-              dry_run: bool = False, is_main: bool = True, seed: int = 42) -> ArmRun:
-    """Model + loaders for one resolved arm (see `resolve_arm`)."""
-    torch.manual_seed(seed)
+              dry_run: bool = False, is_main: bool = True, seed: int = DEFAULT_SEED,
+              sites: dict | None = None, dcfg: dict | None = None,
+              thresholds: dict | None = None) -> ArmRun:
+    """Model + loaders for one resolved arm (see `resolve_arm`).
+
+    `seed` seeds the model initialisation, the batch order and the anchor and threshold
+    sampling. `sites` (``{site: gem_events.parquet}``, with `dcfg`, the data config)
+    selects the full-hospitalization path (in-stream labels, U5); otherwise the arm's
+    24-hour `events` shard is read. The embedding has the vocabulary's max id + 1 rows
+    (`embedding_vocab_size`)."""
+    seed_everything(seed)
     blob = load_vocab_blob(arm["vocab"])
     binding = artifact_binding(blob)  # refuses a pre-v2 vocabulary
     value_bins = check_arm_vocab(arm, blob)
-    vocab_size = int(mcfg["trunk"].get("target_vocab", 10000))
-    if max(blob["vocab"].values()) >= vocab_size:
-        raise SystemExit(f"arm {arm['name']}: vocabulary ids exceed the model's "
-                         f"target_vocab {vocab_size}")
+    vocab_size = embedding_vocab_size(blob, mcfg)
     text_table = None
     if arm["tokenizer"] == "textcode":
         text_table = textcode_table(
@@ -213,7 +242,7 @@ def setup_arm(arm: dict, *, mcfg: dict, tcfg: dict, n_targets: int, device,
     apply_freeze_trunk(model, bool(arm.get("freeze_trunk", False)), init)
     model.to(device)
     loaders = build_loaders(
-        arm["events"],
+        dict(sites) if sites else arm["events"],
         binding=binding,
         vocab_blob=blob,
         tcfg=tcfg,
@@ -224,15 +253,26 @@ def setup_arm(arm: dict, *, mcfg: dict, tcfg: dict, n_targets: int, device,
         is_main=is_main,
         soft=bool(arm.get("soft_discretization", False)),
         value_channel=arm["tokenizer"] == CONTINUOUS_FUSED,
+        representation="gem" if sites else "decile",
+        dcfg=dcfg,
+        thresholds=thresholds,
+        seed=seed,
     )
-    return ArmRun(arm["name"], arm, model, loaders, blob, binding, value_bins)
+    return ArmRun(arm["name"], arm, model, loaders, blob, binding, value_bins, seed,
+                  vocab_size)
 
 
 def train_arm(run: ArmRun, *, tcfg: dict, mcfg: dict, device, total_steps=None, lr=None,
               out_dir=None, local: int = 0):
     """`engine.train` over the arm's loaders: AdamW on the trainable parameters, the
     pretrain warmup+cosine schedule, checkpoints bound to the arm's vocabulary."""
-    total_steps = int(total_steps if total_steps is not None else run.arm["total_steps"])
+    if total_steps is None:
+        # A run sized in passes (`schedule.passes`, the matrix budgets) wins over the
+        # arm's fixed step count.
+        total_steps = (resolve_total_steps(tcfg, len(run.loaders.train))
+                       if tcfg["schedule"].get("passes") is not None
+                       else run.arm["total_steps"])
+    total_steps = int(total_steps)
     lr = float(lr if lr is not None else run.arm["lr"])
     tcfg = copy.deepcopy(tcfg)
     if out_dir is not None:
@@ -249,8 +289,12 @@ def train_arm(run: ArmRun, *, tcfg: dict, mcfg: dict, device, total_steps=None, 
     warmup = min(int(tcfg["schedule"].get("warmup_steps", 2000)), total_steps)
     scheduler = build_scheduler(opt, total_steps, warmup)
     train_cfg = TrainConfig({}, tcfg, mcfg, total_steps)
+    # Recorded in every checkpoint manifest: what a consumer needs to rebuild the model.
+    train_cfg.vocab_size = run.vocab_size
+    train_cfg.trunk = dict(mcfg["trunk"])
+    train_cfg.tokenization_arm = run.name
     return train(model, run.loaders.train, run.loaders.validation, opt, scheduler,
-                 train_cfg, device, seed=42, vocab_binding=run.binding)
+                 train_cfg, device, seed=run.seed, vocab_binding=run.binding)
 
 
 def masked_target_counts(batch: dict) -> dict[str, int]:
@@ -262,7 +306,7 @@ def masked_target_counts(batch: dict) -> dict[str, int]:
             "cr": count("cr_mask"), "th": count("th_mask")}
 
 
-def main():
+def main(argv: list[str] | None = None):
     ap = argparse.ArgumentParser()
     ap.add_argument("--arm", required=True)
     ap.add_argument("--events", default=None, help="override the arm's events shard")
@@ -281,28 +325,59 @@ def main():
     ap.add_argument("--total-steps", type=int, default=None)
     ap.add_argument("--objective-arm", default=None,
                     help="objective variant from configs/objective_arms.yaml")
+    ap.add_argument("--seed", type=int, default=DEFAULT_SEED,
+                    help="model initialisation, batch order, anchor and threshold sampling")
+    ap.add_argument("--trajectory", choices=("icu_24h", "hospitalization"),
+                    default="icu_24h",
+                    help="hospitalization: the arm's gem_events.parquet in each --data "
+                         "directory, with in-stream time-to-event labels (U5)")
+    ap.add_argument("--data", nargs="+", default=None,
+                    help="hospitalization: the arm's shard directory per site")
+    ap.add_argument("--site", nargs="+", default=None,
+                    help="hospitalization: site name per --data directory")
+    ap.add_argument("--trunk", action="append", default=[], metavar="KEY=VALUE",
+                    help=f"trunk override, repeatable ({', '.join(TRUNK_OVERRIDES)})")
+    ap.add_argument("--passes", type=float, default=None,
+                    help="run length in passes over the training data (the matrix budget)")
+    ap.add_argument("--device", default=None,
+                    help="single-process device override (e.g. cpu); default: automatic")
     ap.add_argument("--out", default="results/tokenization_ablation")
+    ap.add_argument("--run-dir", default=None,
+                    help="write checkpoints and run.json here (default: <out>/<arm>)")
     ap.add_argument("--dry-run", action="store_true",
                     help="build the arm's model and loaders, print shapes, and exit")
     ap.add_argument(ALLOW_CPU_DDP_FLAG, action="store_true",
                     help="let a distributed (torchrun) launch run on CPU over gloo when "
                          "CUDA is unavailable; without it such a launch is refused")
-    args = ap.parse_args()
+    args = ap.parse_args(argv)
 
     local, is_main = setup_ddp(allow_cpu=args.allow_cpu_ddp)
-    dev = select_device(local)
+    dev = torch.device(args.device) if args.device and not is_distributed() \
+        else select_device(local)
 
     abl = yaml.safe_load(Path(args.ablation_config).read_text())
     mcfg = yaml.safe_load(Path(args.model_config).read_text())
     if args.objective_arm is not None:
         mcfg = apply_objective_arm(mcfg, resolve_objective_arm(args.objective_arm))
+    mcfg = apply_trunk_overrides(mcfg, parse_trunk_overrides(args.trunk))
     tcfg = yaml.safe_load(Path(args.train_config).read_text())
-    n_targets = len(yaml.safe_load(Path(args.data_config).read_text())["target_concepts"])
-    arm = resolve_arm(abl, args.arm, events=args.events, vocab=args.vocab,
+    if args.passes is not None:
+        tcfg["schedule"]["passes"] = args.passes
+    dcfg = yaml.safe_load(Path(args.data_config).read_text())
+    n_targets = len(dcfg["target_concepts"])
+    sites = None
+    if args.trajectory == "hospitalization":
+        if not args.data or len(args.site or ()) != len(args.data):
+            raise SystemExit("--trajectory hospitalization needs --data DIR... and one "
+                             "--site per directory")
+        sites = {site: Path(d) / "gem_events.parquet" for site, d in zip(args.site, args.data)}
+    arm = resolve_arm(abl, args.arm, events=args.events,
+                      vocab=args.vocab or (Path(args.data[0]) / "vocab.json" if sites else None),
                       value_stats=args.value_stats, init_checkpoint=args.init_checkpoint,
                       primary_vocab=args.primary_vocab)
     run = setup_arm(arm, mcfg=mcfg, tcfg=tcfg, n_targets=n_targets, device=dev,
-                    dry_run=args.dry_run, is_main=is_main)
+                    dry_run=args.dry_run, is_main=is_main, seed=args.seed, sites=sites,
+                    dcfg=dcfg)
 
     if is_main:
         total = count_params(run.model)
@@ -323,14 +398,16 @@ def main():
             dist.destroy_process_group()
         return
 
-    out_dir = Path(args.out) / args.arm
+    out_dir = Path(args.run_dir) if args.run_dir else Path(args.out) / args.arm
     _, manifest = train_arm(run, tcfg=tcfg, mcfg=mcfg, device=dev,
                             total_steps=args.total_steps, out_dir=out_dir, local=local)
     if is_main:
         # Aggregate-only run record (no row-level data).
         out_dir.mkdir(parents=True, exist_ok=True)
         (out_dir / "run.json").write_text(json.dumps({
-            "arm": args.arm, "run_id": manifest.run_id, "ledger": manifest.ledger,
+            "arm": args.arm, "run_id": manifest.run_id, "seed": args.seed,
+            "objective_arm": args.objective_arm, "trajectory": args.trajectory,
+            "parameters": manifest.parameters, "ledger": manifest.ledger,
             "validation": manifest.validation, "vocab_binding": run.binding,
             "n_value_bins": run.n_value_bins,
         }, indent=2))

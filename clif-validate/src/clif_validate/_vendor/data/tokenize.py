@@ -1132,6 +1132,48 @@ def _quantile_edges(vals: pl.Series, n_bins: int, forced: list[float],
     return concept_edges
 
 
+def _matched_quantile_edges(vals: np.ndarray, n_edges: int, forced: list[float],
+                            concept: str) -> list[float]:
+    """KTD11: `n_edges` interior quantile edges, filling edges lost to ties.
+
+    Starts from `_quantile_edges` at ``n_edges + 1`` bins (forced edges pinned, each
+    replacing its nearest quantile edge). Where tied values leave fewer distinct edges,
+    each lost (duplicate) quantile is replaced by the next unused distinct observed value
+    above it (else the nearest below); a shortfall left after that is filled with the
+    unused distinct value farthest from every edge. Candidates exclude the minimum, so
+    every bin holds at least one fitting value. With too few distinct values the result
+    keeps the smaller count (the caller reports it)."""
+    pinned = sorted({float(e) for e in forced if np.isfinite(float(e))})
+    series = pl.Series(vals)
+    edges = _quantile_edges(series, max(n_edges, len(pinned)) + 1, pinned, concept)
+    if len(edges) >= n_edges:
+        return edges
+    used = set(edges)
+    candidates = [float(v) for v in np.unique(vals)[1:]]
+    raw = sorted(float(series.quantile(q))
+                 for q in np.linspace(0, 1, n_edges + 2)[1:-1])
+    seen: set[float] = set()
+    for r in raw:
+        if len(used) >= n_edges:
+            break
+        if r not in seen:
+            seen.add(r)
+            continue
+        pick = next((c for c in candidates if c > r and c not in used), None)
+        if pick is None:
+            pick = next((c for c in reversed(candidates) if c < r and c not in used), None)
+        if pick is None:
+            break
+        used.add(pick)
+    while len(used) < n_edges:
+        free = [c for c in candidates if c not in used]
+        if not free:
+            break
+        used.add(max(free, key=lambda c: (min((abs(c - e) for e in used), default=0.0),
+                                          -c)))
+    return sorted(used)
+
+
 def build_clinical_segment_bins(
     csv_path: str | Path,
     target_concepts: list[str],
@@ -1214,6 +1256,7 @@ def build_segments(bin_cfg: dict, fit_events: pl.DataFrame,
                    directions: dict[str, str] | None = None,
                    *, tables: dict | None = None,
                    quantile_concepts: set[str] | None = None,
+                   granularity: dict | None = None,
                    ) -> tuple[dict[str, list[dict]], dict[str, str]]:
     """Segments for every numeric concept + its binning source (R4; KTD3).
 
@@ -1235,6 +1278,16 @@ def build_segments(bin_cfg: dict, fit_events: pl.DataFrame,
     keep their segments even when absent from the fit partition (threshold queries).
     `quantile_concepts` skip the ordinal rule (the static `age_decile` token is deciles
     of age even when a small fit set happens to be integer-valued with few distinct ages).
+
+    MATCHED GRANULARITY (KTD11; decile scheme with `matched_granularity: true`): each
+    quantile concept requests the segment count the clinical_segment scheme gives it on
+    the same fit events (`segment_source` required), and tied quantiles are filled from
+    unused distinct observed values (`_matched_quantile_edges`).
+    `decile_forced_edges` (default true) pins `forced_edges` in the decile scheme; the
+    plain population-decile arm sets it false. `granularity`, when given, is filled with
+    the aggregate record: ``reference_scheme``, ``forced_edges``, ``matched`` (concepts
+    at the clinical count) and ``exceptions`` ({concept: requested, built,
+    distinct_values}) for every concept that keeps a smaller count.
 
     Returns ``({concept: segments}, {concept: source})``.
     """
@@ -1259,6 +1312,8 @@ def build_segments(bin_cfg: dict, fit_events: pl.DataFrame,
         if not bin_cfg.get("n_bins"):
             raise ValueError(f"value_binning.scheme={scheme} requires n_bins")
         n_quantile_bins = int(bin_cfg["n_bins"])
+        if not bin_cfg.get("decile_forced_edges", True):
+            forced = {}
     else:
         raise ValueError(f"unknown value_binning.scheme: {scheme!r}")
     if n_quantile_bins < 2:
@@ -1281,6 +1336,20 @@ def build_segments(bin_cfg: dict, fit_events: pl.DataFrame,
                                     forced, directions)
         if csv_source else {}
     )
+
+    reference = None
+    if csv_source is None and bin_cfg.get("matched_granularity"):
+        if not bin_cfg.get("segment_source"):
+            raise ValueError("matched_granularity needs value_binning.segment_source: the "
+                             "decile arm requests each concept's clinical-arm bin count")
+        reference, _ = build_segments(
+            {**bin_cfg, "scheme": "clinical_segment", "matched_granularity": False},
+            fit_events, target_concepts, directions, tables=tables,
+            quantile_concepts=quantile_concepts)
+        if granularity is not None:
+            granularity.update({"reference_scheme": "clinical_segment",
+                                "forced_edges": bool(forced), "matched": 0,
+                                "exceptions": {}})
 
     segments: dict[str, list[dict]] = {}
     sources: dict[str, str] = {}
@@ -1306,11 +1375,28 @@ def build_segments(bin_cfg: dict, fit_events: pl.DataFrame,
             # Policy step 8: a dose's stop bin, with no gap to its first positive point.
             segments[concept] = with_zero_point(points) if is_dose else points
             sources[concept] = "ordinal"
+        elif reference is not None and concept in reference:
+            requested = len(reference[concept])
+            edges = _matched_quantile_edges(fit_vals, requested - 1 - int(is_dose),
+                                            list(concept_forced), concept)
+            segments[concept] = to_segments(edges, concept_forced, direction)
+            sources[concept] = "quantile"
         else:
             edges = _quantile_edges(pl.Series(fit_vals), n_quantile_bins,
                                     list(concept_forced), concept)
             segments[concept] = to_segments(edges, concept_forced, direction)
             sources[concept] = "quantile"
+        if reference is not None and granularity is not None and concept in reference:
+            requested, built = len(reference[concept]), len(segments[concept])
+            if built == requested:
+                granularity["matched"] += 1
+            else:
+                granularity["exceptions"][concept] = {
+                    "requested": requested, "built": built,
+                    "distinct_values": len(np.unique(fit_vals))}
+    if reference is not None and granularity is not None:
+        # Clinical-arm concepts with no fitting value (CSV targets absent from the fit).
+        granularity["not_fit"] = sorted(set(reference) - set(segments))
     return segments, sources
 
 
@@ -1444,6 +1530,7 @@ def _extend_for_gem(gem_cfg: dict, gem_fit: pl.DataFrame, fit_events: pl.DataFra
                     bin_cfg: dict, cfg: dict, directions: dict, target_units: dict,
                     treatment_sources: set[str], quantile_concepts: set[str],
                     min_category_stays: int = MIN_CATEGORY_STAYS,
+                    granularity: dict | None = None,
                     ) -> tuple[dict, dict, dict, dict, dict]:
     """U8: extend the 24 h-fit vocabulary so the GEM artifact shares it.
 
@@ -1461,9 +1548,13 @@ def _extend_for_gem(gem_cfg: dict, gem_fit: pl.DataFrame, fit_events: pl.DataFra
                                & ~pl.col("concept").is_in(sorted(known)))
     extra_edges: dict = {}
     if not extra_fit.is_empty():
+        extra_granularity: dict = {}
         built, built_sources = build_segments(
             bin_cfg, extra_fit, [], directions, tables=cfg["tables"],
-            quantile_concepts=quantile_concepts)
+            quantile_concepts=quantile_concepts, granularity=extra_granularity)
+        if granularity and extra_granularity:
+            granularity["matched"] += extra_granularity["matched"]
+            granularity["exceptions"].update(extra_granularity["exceptions"])
         extra_edges = {c: segs for c, segs in built.items() if c not in edges}
         if extra_edges:
             extra_units = reference_units(extra_fit, extra_edges, cfg, target_units)
@@ -2142,9 +2233,10 @@ def tokenize_site(cfg: dict, site: str, base: Path, out: Path,
         }
         quantile_concepts = {c for c, (_, _, numeric) in STATIC_TOKENS.items()
                              if numeric and c in static_tokens}
+        granularity: dict = {}
         edges, binning_sources = build_segments(
             bin_cfg, fit_events, target_concepts, directions, tables=cfg["tables"],
-            quantile_concepts=quantile_concepts,
+            quantile_concepts=quantile_concepts, granularity=granularity,
         )
         vocab = build_vocab(fit_events, edges, min_category_stays=min_cell)
         units = reference_units(fit_events, edges, cfg, target_units)
@@ -2159,7 +2251,7 @@ def tokenize_site(cfg: dict, site: str, base: Path, out: Path,
                 gem_cfg, gem_fit, fit_events, vocab, edges, binning_sources, units,
                 bin_cfg=bin_cfg, cfg=cfg, directions=directions, target_units=target_units,
                 treatment_sources=treatment_sources, quantile_concepts=quantile_concepts,
-                min_category_stays=min_cell,
+                min_category_stays=min_cell, granularity=granularity,
             )
             del gem_fit
         raw_events = None   # last pre-window use was the GEM fit above
@@ -2208,6 +2300,9 @@ def tokenize_site(cfg: dict, site: str, base: Path, out: Path,
                 "sample_size": None if keep_ids is None else len(keep_ids),
             },
         }
+        if granularity:
+            # KTD11: decile arm at the clinical arm's bin counts; aggregate counts only.
+            vocab_manifest["provenance"]["matched_granularity"] = granularity
         by_source = {
             src: sum(1 for v in binning_sources.values() if v == src) for src in BINNING_SOURCES
         }
@@ -2308,6 +2403,7 @@ def _write_run_report(path: Path, trajectory: str, events: pl.DataFrame,
         run_sample_size=None if keep_ids is None else len(keep_ids),
         context=context, unit_key=_normalized_unit, gem=gem, min_cell=min_cell,
         missing_columns=missing_columns,
+        matched_granularity=provenance.get("matched_granularity"),
     )
     identifiers = {
         str(v) for column in ("hospitalization_id", "patient_id", "hospitalization_joined_id")

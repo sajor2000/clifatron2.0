@@ -389,7 +389,8 @@ def build_report(*, trajectory: str, events: pl.DataFrame, records: pl.DataFrame
                  run_sample_size: int | None, context: int,
                  unit_key: Callable[[str], str] = lambda u: u.strip().lower(),
                  gem: Mapping | None = None, min_cell: int = MIN_CELL,
-                 missing_columns: Mapping[str, list[str]] | None = None) -> dict:
+                 missing_columns: Mapping[str, list[str]] | None = None,
+                 matched_granularity: Mapping | None = None) -> dict:
     """Aggregate-only report (unsuppressed; `write_report` applies disclosure control at
     `min_cell`, recorded under ``suppression``). `missing_columns`: configured wide-table
     columns a site's parquet lacks (skipped, never a binder error), per table.
@@ -403,6 +404,8 @@ def build_report(*, trajectory: str, events: pl.DataFrame, records: pl.DataFrame
     for concept in binned:
         source = binning_sources.get(concept, "unknown")
         sources_count[source] = sources_count.get(source, 0) + 1
+    # `matched_granularity`: a decile-arm vocabulary's KTD11 record (concepts at the
+    # clinical arm's bin count, and every exception), listed under ``vocab``.
     fit_mask = (pl.col("partition") == fit_partition) if fit_partition is not None \
         else pl.lit(False)
     report: dict[str, Any] = {
@@ -438,6 +441,15 @@ def build_report(*, trajectory: str, events: pl.DataFrame, records: pl.DataFrame
         "unk": {**_unk(records, fit_partition, min_cell),
                 "by_concept": {c: int(n) for c, n in sorted(unk_by_concept.items())}},
     }
+    if matched_granularity:
+        report["vocab"]["matched_granularity"] = {
+            "reference_scheme": matched_granularity.get("reference_scheme"),
+            "forced_edges": bool(matched_granularity.get("forced_edges")),
+            "matched": int(matched_granularity.get("matched", 0)),
+            "exceptions": {c: dict(row) for c, row in sorted(
+                (matched_granularity.get("exceptions") or {}).items())},
+            "not_fit": sorted(matched_granularity.get("not_fit") or ()),
+        }
     if trajectory == "hospitalization":
         per_stay = (records.group_by("hosp_id")
                     .agg(pl.col("n_events").sum().alias("tokens"), pl.len().alias("windows")))

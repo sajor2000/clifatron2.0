@@ -250,6 +250,15 @@ value_binning:
   ordinal_max_distinct: 25
   min_count: 20
   quantile_n_bins: 10
+  # KTD11 (decile scheme only; the clinical arm ignores both): `matched_granularity` makes
+  # each decile concept request the segment count the clinical scheme gives it on the same
+  # fit events, filling quantiles lost to ties from the next unused distinct observed
+  # values (a concept with too few distinct values keeps the smaller count and is listed
+  # in vocab.json provenance.matched_granularity and the tokenization report).
+  # `decile_forced_edges` pins `forced_edges` in the decile scheme: false = plain
+  # population deciles (global_deciles), true = the forced-edge decile arm.
+  matched_granularity: true
+  decile_forced_edges: false
   # Dose concepts (any concept charted by these tables, or a table flagged `dose: true`)
   # get a [0,0] stop bin; their quantiles are fit on strictly positive doses only.
   dose_sources: [meds, meds_intermittent]

@@ -52,6 +52,7 @@ from src.train.pretrain import (
     build_loaders,
     build_optimizer,
     build_scheduler,
+    embedding_vocab_size,
     objective_weights,
 )
 
@@ -104,6 +105,14 @@ class AdapterModel(ObjectiveSchedule, torch.nn.Module):
 
 
 # -------------------------------------------------------------------- driver
+def build_from_scratch(vocab_blob: dict, mcfg: dict, *, n_targets: int) -> FromScratchModel:
+    """The from-scratch arm's model: embedding rows = the vocabulary's max id + 1
+    (`embedding_vocab_size`, as `pretrain` sizes it), so its checkpoints and pretrain's
+    load into each other and into every checkpoint consumer."""
+    return FromScratchModel(embedding_vocab_size(vocab_blob, mcfg), n_targets, mcfg,
+                            n_value_bins=n_value_bins(vocab_blob))
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--arm", required=True)
@@ -142,18 +151,17 @@ def main():
     n_targets = len(
         yaml.safe_load(Path("configs/data.yaml").read_text())["target_concepts"]
     )
-    vocab_size = mcfg["trunk"].get("target_vocab", 10000)
     total_steps = arm_cfg["total_steps"]
     # The threshold head's value-bin count comes from the vocabulary (never a default).
     vocab_blob = load_vocab_blob(
         Path(args.vocab or Path(args.data) / "vocab.json"),
         required_for="n_value_bins is derived from the frozen vocabulary's segments")
     value_bins = n_value_bins(vocab_blob)
+    vocab_size = embedding_vocab_size(vocab_blob, mcfg)
 
     # --------------- build model
     if arm_cfg["trunk"] in ("clif_encoder",):
-        model = FromScratchModel(vocab_size, n_targets, mcfg,
-                                 n_value_bins=value_bins).to(dev)
+        model = build_from_scratch(vocab_blob, mcfg, n_targets=n_targets).to(dev)
         if is_main:
             print(f"[{args.arm}] CLIFEncoder from scratch, {count_params(model)/1e6:.1f}M params")
     else:
@@ -226,10 +234,12 @@ def main():
             f"  Output: {out_dir}\n"
             f"{'='*60}"
         )
+    train_cfg = TrainConfig({}, tcfg, mcfg, total_steps)
+    train_cfg.vocab_size = vocab_size   # recorded in every checkpoint manifest
+    train_cfg.trunk = dict(mcfg["trunk"])
     _, manifest = train(
         model, loaders.train, loaders.validation, opt, scheduler,
-        TrainConfig({}, tcfg, mcfg, total_steps), dev,
-        seed=42, vocab_binding=binding,
+        train_cfg, dev, seed=42, vocab_binding=binding,
     )
     if is_main:
         (out_dir / "run.json").write_text(json.dumps({

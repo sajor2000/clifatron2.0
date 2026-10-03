@@ -17,6 +17,9 @@ are the primary shard's:
 - **Current-value channel.** The event's own value, normalized with frozen per-token
   stats fit on the arm's train partition (`normalize_value`, applied by
   `ModelDataset(value_channel=True)`); NaN/categorical/missing values are masked to 0.
+- **Full hospitalization.** The same derivation applies to the primary
+  ``gem_events.parquet`` (pass it as ``--primary-events``): the arm's in-stream labels read
+  the edgeless target-concept tokens and their values (`ContinuousThresholdGrid`).
 - **Primary threshold bins.** The threshold head still queries VALUE bins: the arm's
   vocab artifact carries the primary clinical segments (``primary_segments``, hashed
   into the manifest), its ``n_value_bins`` comes from them, and the joined outcomes'
@@ -49,6 +52,7 @@ from src.data.segments import (
     segments_hash,
     vocab_segments,
 )
+from src.data.threshold_grid import ThresholdGrid
 # The TargetBuilder.max_abs_value_z default: a finite sentinel (e.g. a 999999 pH) is
 # masked as an input exactly as it is dropped as a value-head target.
 from src.data.targets import MAX_ABS_Z
@@ -170,6 +174,25 @@ def primary_n_value_bins(blob: Mapping) -> int:
     """`ThresholdHazardHead` value-bin count of a continuous-fused arm: the primary
     clinical segments' (`segments.n_value_bins_of`)."""
     return n_value_bins_of(primary_segments(blob))
+
+
+class ContinuousThresholdGrid(ThresholdGrid):
+    """`ThresholdGrid` of a continuous-fused vocabulary (full-hospitalization arm).
+
+    Thresholds map to bins of the PRIMARY clinical segments (`primary_segments`, as the
+    24 h arm's joined outcomes do), and the events a label reads are the edgeless
+    ``concept`` tokens of the target concepts (their value is the event's own). The
+    binding is the continuous-fused artifact's, so shard rows and checkpoints bound to
+    it are accepted and nothing else."""
+
+    def __init__(self, vocab_blob: Mapping, target_concepts, thresholds: Mapping, *,
+                 tau_sampling: str = "empirical_bins"):
+        view = {**vocab_blob, "segments": dict(primary_segments(vocab_blob))}
+        super().__init__(view, target_concepts, thresholds, tau_sampling=tau_sampling)
+        self.binding = artifact_binding(vocab_blob)
+        vocab = vocab_blob["vocab"]
+        self.token_target = {int(vocab[name]): self._index[name]
+                             for name in self._segments if vocab.get(name) is not None}
 
 
 def derive_continuous_fused_shard(primary_events, primary_blob: Mapping,

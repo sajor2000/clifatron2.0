@@ -196,3 +196,133 @@ class TokenizeBinsTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# ---- KTD11: matched granularity for the decile arms -----------------------------------
+
+def _data_binning(**overrides) -> dict:
+    import yaml
+
+    cfg = yaml.safe_load((ROOT / "configs/data.yaml").read_text())
+    return {**cfg["value_binning"], **overrides}
+
+
+def _directions() -> dict:
+    import yaml
+
+    cfg = yaml.safe_load((ROOT / "configs/data.yaml").read_text())
+    return {t["name"]: t["direction"] for t in cfg["target_concepts"]}
+
+
+def _matched_fixture() -> pl.DataFrame:
+    """Fit events: a continuous CSV concept (lactate), a heavily tied integer CSV
+    concept shaped like SpO2 (most values 95-100), a continuous non-CSV concept, an
+    integer ordinal scale, and a CSV concept with only three distinct values."""
+    import numpy as np
+
+    rng = np.random.default_rng(7)
+    spo2 = np.concatenate([np.full(400, 100.0), np.full(300, 99.0), np.full(250, 98.0),
+                           np.full(200, 97.0), np.full(150, 96.0), np.full(100, 95.0),
+                           rng.integers(70, 95, size=120).astype(float)])
+    lactate = np.round(rng.lognormal(0.3, 0.6, size=800), 2)
+    synth = rng.normal(50.0, 10.0, size=500)
+    gcs = rng.integers(3, 16, size=300).astype(float)
+    sparse = np.repeat([1.0, 2.0, 3.0], 30)    # creatinine: 3 distinct values only
+    concepts, values = [], []
+    for name, vals in (("spo2", spo2), ("lactate", lactate), ("synth_lab", synth),
+                       ("gcs_total", gcs), ("creatinine", sparse)):
+        concepts += [name] * len(vals)
+        values += [float(v) for v in vals]
+    return pl.DataFrame({"concept": concepts, "value": values,
+                         "source": ["labs"] * len(values)})
+
+
+TARGETS = ["map", "lactate", "spo2", "respiratory_rate", "creatinine", "bilirubin_total",
+           "platelet_count", "heart_rate", "sbp", "temp_c"]
+
+
+class MatchedGranularityTest(unittest.TestCase):
+    """The decile arms request each concept's bin count from the clinical arm (KTD11)."""
+
+    @classmethod
+    def setUpClass(cls):
+        from src.data.tokenize import build_segments
+
+        cls.fit = _matched_fixture()
+        cls.clinical, cls.clinical_sources = build_segments(
+            _data_binning(), cls.fit, TARGETS, _directions())
+        cls.reports = {}
+        cls.arms = {}
+        for name, forced in (("plain", False), ("forced", True)):
+            report: dict = {}
+            cls.arms[name] = build_segments(
+                _data_binning(scheme="decile_ablation", matched_granularity=True,
+                              decile_forced_edges=forced),
+                cls.fit, TARGETS, _directions(), granularity=report)
+            cls.reports[name] = report
+
+    def test_every_concept_with_enough_values_has_the_clinical_bin_count(self):
+        for name, (segments, sources) in self.arms.items():
+            exceptions = self.reports[name]["exceptions"]
+            for concept, segs in segments.items():
+                if concept in exceptions:
+                    continue
+                with self.subTest(arm=name, concept=concept):
+                    self.assertEqual(len(segs), len(self.clinical[concept]))
+                    self.assertEqual(sources[concept], "quantile")
+
+    def test_every_exception_is_reported_with_both_counts(self):
+        for name, report in self.reports.items():
+            with self.subTest(arm=name):
+                self.assertEqual(report["reference_scheme"], "clinical_segment")
+                self.assertIn("creatinine", report["exceptions"])
+                row = report["exceptions"]["creatinine"]
+                self.assertEqual(row["requested"], len(self.clinical["creatinine"]))
+                self.assertEqual(row["built"], len(self.arms[name][0]["creatinine"]))
+                self.assertLess(row["built"], row["requested"])
+                self.assertEqual(row["distinct_values"], 3)
+                # Every concept short of its clinical count is listed, and only those.
+                short = {c for c, segs in self.arms[name][0].items()
+                         if len(segs) != len(self.clinical[c])}
+                self.assertEqual(short, set(report["exceptions"]))
+
+    def test_heavily_tied_spo2_reaches_the_clinical_count_through_the_fill_rule(self):
+        from src.data.tokenize import _quantile_edges
+
+        requested = len(self.clinical["spo2"])
+        vals = self.fit.filter(pl.col("concept") == "spo2")["value"]
+        plain_quantiles = _quantile_edges(vals, requested, [], "spo2")
+        self.assertLess(len(plain_quantiles) + 1, requested)   # ties lose edges
+        for name, (segments, _) in self.arms.items():
+            with self.subTest(arm=name):
+                self.assertEqual(len(segments["spo2"]), requested)
+                self.assertNotIn("spo2", self.reports[name]["exceptions"])
+
+    def test_forced_edge_arm_contains_every_registered_decision_threshold(self):
+        from src.data.threshold_grid import load_thresholds
+
+        segments = self.arms["forced"][0]
+        for threshold in load_thresholds()["decision"]:
+            if threshold.concept not in segments:
+                continue
+            with self.subTest(threshold=threshold):
+                self.assertTrue(_is_boundary(segments[threshold.concept], threshold.value))
+
+    def test_plain_decile_arm_does_not_pin_the_decision_thresholds(self):
+        self.assertFalse(_is_boundary(self.arms["plain"][0]["lactate"], 2.0)
+                         and _is_boundary(self.arms["plain"][0]["lactate"], 4.0))
+
+    def test_ordinal_scale_matches_its_point_count(self):
+        self.assertEqual(self.clinical_sources["gcs_total"], "ordinal")
+        for segments, _ in self.arms.values():
+            self.assertEqual(len(segments["gcs_total"]), len(self.clinical["gcs_total"]))
+
+    def test_unmatched_decile_and_clinical_builds_are_unchanged(self):
+        from src.data.tokenize import build_segments
+
+        again, _ = build_segments(_data_binning(), self.fit, TARGETS, _directions())
+        self.assertEqual(again, self.clinical)
+        legacy, _ = build_segments(_data_binning(scheme="decile_ablation",
+                                                 matched_granularity=False), self.fit,
+                                   TARGETS, _directions())
+        self.assertEqual(len(legacy["synth_lab"]), 10)   # n_bins, not the clinical count

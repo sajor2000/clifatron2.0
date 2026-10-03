@@ -28,7 +28,7 @@ terminal token's minute, drawn with `random.random()` from a generator seeded by
 tokenization arm of the same stays gets the same anchors, the same pairs and, because
 labels are computed at the exact threshold value, the same labels. Every registered
 `decision` and `control` threshold is queried at every horizon in
-`claims.yaml evaluation.horizons_hours`, each labelled by `TargetBuilder.label_anchor`
+`claims.yaml evaluation.horizons_hours`, each labelled by `TargetBuilder.label_anchors`
 with that horizon (the label rule's lookback and ascertainment window are unchanged).
 Only `positive` (label 1) and `negative` (label 0) are scored; `prevalent`, `censored`,
 `competing_event` and `not_ascertainable` are counted (`status_counts`) and never scored,
@@ -249,16 +249,24 @@ def evaluation_set(streams: Sequence[Mapping], grid: ThresholdGrid,
             pick = slot + int(rng.random() * (len(minutes) - slot))
             minutes[slot], minutes[pick] = minutes[pick], minutes[slot]
         cluster_id = _digest(f"stay:{key}").hex()[:16]
-        for minute in sorted(minutes[:take]):
+        chosen = sorted(minutes[:take])
+        # One stream index per (stay, horizon): every (anchor, query) labelled against it.
+        labels = {horizon: iter(builder.label_anchors(
+                      stream, [(last_of_minute[minute], query) for minute in chosen
+                               for _, query in queries]))
+                  for horizon, builder in builders.items()}
+        for minute in chosen:
             anchor_idx = last_of_minute[minute]
             anchor = len(anchors)
             pair_id = _digest(f"{key}:{minute}").hex()[:16]
             anchors.append({"stay": stay, "anchor_idx": anchor_idx, "anchor_min": minute,
                             "partition": stream.get("partition"), "pair_id": pair_id,
                             "cluster_id": cluster_id})
-            for kind, query in queries:
-                for horizon, builder in builders.items():
-                    label = builder.label_anchor(stream, anchor_idx, query)
+            per_query = {horizon: [next(labels[horizon]) for _ in queries]
+                         for horizon in builders}
+            for q, (kind, query) in enumerate(queries):
+                for horizon in builders:
+                    label = per_query[horizon][q]
                     status = label["status"]
                     pairs.append({
                         "anchor": anchor, "pair_id": pair_id, "cluster_id": cluster_id,
@@ -709,14 +717,20 @@ def stay_streams(frame) -> list[dict]:
 
 # ---------------------------------------------------------------------------------- CLI
 
+def load_model(checkpoint, vocab_blob: Mapping, mcfg: Mapping, *, n_targets: int):
+    """The run's model, sized from its checkpoint manifest (embedding rows = the
+    vocabulary's max id + 1, the recorded trunk) and bound to `vocab_blob`."""
+    from src.train.pretrain import load_model_from_checkpoint
+
+    return load_model_from_checkpoint(checkpoint, mcfg, n_targets, vocab_blob)
+
+
 def main(argv: list[str] | None = None) -> None:
     import polars as pl
     import torch
 
-    from src.data.segments import load_vocab_blob, n_value_bins
+    from src.data.segments import load_vocab_blob
     from src.eval.claims_report import load_run_spec
-    from src.train.checkpoint import load_checkpoint, verify_checkpoint_binding
-    from src.train.pretrain import Model
 
     ap = argparse.ArgumentParser(
         description="Zero-shot threshold evaluation of one finished run (aggregate output)")
@@ -748,11 +762,7 @@ def main(argv: list[str] | None = None) -> None:
     mcfg = yaml.safe_load(Path(args.model_config).read_text())
     dcfg = yaml.safe_load(Path(args.data_config).read_text())
     vblob = load_vocab_blob(args.vocab, required_for="threshold evaluation")
-    blob = load_checkpoint(args.checkpoint)
-    verify_checkpoint_binding(blob, vblob)
-    model = Model(mcfg["trunk"].get("target_vocab", 10000), len(dcfg["target_concepts"]),
-                  mcfg, n_value_bins=n_value_bins(vblob))
-    model.load_state_dict(blob.get("model", blob))
+    model = load_model(args.checkpoint, vblob, mcfg, n_targets=len(dcfg["target_concepts"]))
     streams = stay_streams(pl.read_parquet(args.shards))
     result = evaluate_run(model, streams, vblob, thresholds, claims,
                           target_concepts=dcfg["target_concepts"],

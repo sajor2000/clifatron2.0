@@ -300,6 +300,23 @@ class TargetBuilder:
         status, minutes = self._label(index, int(anchor_idx), query)
         return {"status": status, "minutes": minutes}
 
+    def label_anchors(self, episode: Mapping[str, Any],
+                      pairs: Iterable[tuple[int, Any]]) -> list[dict[str, Any]]:
+        """`label_anchor` for many ``(anchor_idx, query)`` pairs of ONE stay, against one
+        stream index built once (evaluation labels every registered threshold at several
+        anchors and horizons). Same output, pair by pair; every anchor is checked."""
+        if self.mode != "gem_tte":
+            raise TargetContractError("in-stream labels require mode 'gem_tte'")
+        index = self._stream_index([int(tok) for tok in episode["token"]],
+                                   [int(pos) for pos in episode["pos_min"]],
+                                   list(episode.get("value", [None] * len(episode["token"]))))
+        out = []
+        for anchor_idx, query in pairs:
+            self._check_anchor(index, int(anchor_idx))
+            status, minutes = self._label(index, int(anchor_idx), query)
+            out.append({"status": status, "minutes": minutes})
+        return out
+
     def _competing_risk(self, causes: Mapping[int, tuple[str, int | None]]) -> dict | None:
         """The anchor's competing-risk label from its per-concept cause labels, by the
         rule the 24 h path uses (`outcome_anchor`): the earliest crossing is the event;

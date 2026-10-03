@@ -32,28 +32,21 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
+import polars as pl
 import torch
 import torch.distributed as dist
-import polars as pl
 import yaml
-from torch.utils.data import DataLoader
 from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
+from torch.utils.data import DataLoader
 
-from src.model.encoder import CLIFEncoder, count_params
-from src.model.heads import (
-    CompetingRiskHead,
-    ThresholdHazardHead,
-    ValueRegressionHead,
-    next_event_loss,
-    time_bin,
-)
+from src.data.collate import collate_model_samples
 from src.data.dataset import (
     DistributedTokenBudgetBatchSampler,
+    GemCorpus,
     LengthGroupedSampler,
     ModelDataset,
     TokenBudgetBatchSampler,
 )
-from src.data.collate import collate_model_samples
 from src.data.segments import (
     SAMPLE_VOCAB_REFUSAL,
     artifact_binding,
@@ -64,6 +57,20 @@ from src.data.segments import (
 )
 from src.data.targets import InStreamTargets, TargetBuilder
 from src.data.threshold_grid import ThresholdGrid, load_thresholds
+from src.data.tokenize_continuous import (
+    REPRESENTATION as CONTINUOUS_FUSED,
+)
+from src.data.tokenize_continuous import (
+    ContinuousThresholdGrid,
+)
+from src.model.encoder import CLIFEncoder, count_params
+from src.model.heads import (
+    CompetingRiskHead,
+    ThresholdHazardHead,
+    ValueRegressionHead,
+    next_event_loss,
+    time_bin,
+)
 from src.train.curriculum import (
     HEADS,
     apply_objective_arm,
@@ -84,6 +91,8 @@ from src.train.engine import (
 )
 
 logger = logging.getLogger(__name__)
+# The seed of a run that passes none (`--seed`).
+DEFAULT_SEED = 42
 
 
 def _load_decile_records(
@@ -203,7 +212,7 @@ def in_stream_target_builder(
     thresholds: Mapping,
     vocab_size: int,
     value_stats: Mapping[int, tuple[float, float]],
-    run_seed: int = 42,
+    run_seed: int = DEFAULT_SEED,
 ) -> TargetBuilder:
     """The `gem_tte` TargetBuilder for one vocabulary (KTD1, KTD3).
 
@@ -214,10 +223,14 @@ def in_stream_target_builder(
     `mcfg["in_stream"]` how many anchors and queries each window gets. No time grid is
     read here: the heads bin label minutes themselves (KTD4)."""
     rule = thresholds["label_rule"]
-    grid = ThresholdGrid(
-        vocab_blob, dcfg["target_concepts"], thresholds,
-        tau_sampling=mcfg["heads"]["threshold_hazard"].get("tau_sampling"),
-    )
+    tau = mcfg["heads"]["threshold_hazard"].get("tau_sampling")
+    if vocab_blob.get("representation") == CONTINUOUS_FUSED:
+        # Edgeless concept tokens; thresholds on the primary clinical segments.
+        grid = ContinuousThresholdGrid(vocab_blob, dcfg["target_concepts"], thresholds,
+                                       tau_sampling=tau)
+    else:
+        grid = ThresholdGrid(vocab_blob, dcfg["target_concepts"], thresholds,
+                             tau_sampling=tau)
     return TargetBuilder(
         vocab_size=vocab_size,
         n_time_bins=mcfg["heads"]["threshold_hazard"]["n_time_bins"],
@@ -325,17 +338,50 @@ class ObjectiveSchedule:
                                  arm=self.objective_arm)
 
 
+# `trunk.rope_position` (configs/model.yaml): what the rotary positions count.
+# admission_minutes = minutes since admission (primary); token_index = event order only
+# (the R36 order-only ablation arm).
+ROPE_POSITIONS = ("admission_minutes", "token_index")
+
+
+class OrderOnlyEncoder(CLIFEncoder):
+    """`CLIFEncoder` whose rotary positions are the token index, not admission minutes
+    (R36: event order only). Same parameters, so checkpoints are interchangeable; only
+    the position ids differ. RoPE is relative, so a window's offset does not matter."""
+
+    order_only = True
+
+    def forward(self, token, pos_min, token_weight=None) -> torch.Tensor:
+        index = torch.arange(pos_min.size(-1), device=pos_min.device)
+        return super().forward(token, index.expand_as(pos_min), token_weight)
+
+
+def rope_position(mcfg: Mapping) -> str:
+    position = mcfg["trunk"].get("rope_position", "admission_minutes")
+    if position not in ROPE_POSITIONS:
+        raise ValueError(f"unknown trunk.rope_position {position!r}; expected one of "
+                         f"{ROPE_POSITIONS}")
+    return position
+
+
 class Model(ObjectiveSchedule, torch.nn.Module):
     def __init__(self, vocab_size, n_targets, mcfg, *, n_value_bins: int,
                  encoder: torch.nn.Module | None = None):
         """`n_value_bins` comes from the frozen vocabulary (`segments.n_value_bins`).
 
-        `encoder` (default: a fresh `CLIFEncoder`) lets the tokenization ablation swap
-        the input representation (continuous-fused value channel, TextCode embedding
-        table) while keeping this objective, its masks and its config weights (KTD8)."""
+        `encoder` (default: a fresh `CLIFEncoder`, or `OrderOnlyEncoder` under
+        `trunk.rope_position: token_index`) lets the tokenization ablation swap the input
+        representation (continuous-fused value channel, TextCode embedding table) while
+        keeping this objective, its masks and its config weights (KTD8)."""
         super().__init__()
         n_causes = n_targets + 1  # +1 for global death competing-cause slot
-        self.enc = encoder if encoder is not None else CLIFEncoder(vocab_size, mcfg)
+        order_only = rope_position(mcfg) == "token_index"
+        if encoder is None:
+            encoder = (OrderOnlyEncoder if order_only else CLIFEncoder)(vocab_size, mcfg)
+        elif order_only:
+            raise ValueError("trunk.rope_position token_index (order-only) is implemented "
+                             "for the fused encoder only")
+        self.enc = encoder
         d = self.enc.d_model
         h = mcfg["heads"]
         self.cr = CompetingRiskHead(d, n_causes, h["competing_risk"]["n_time_bins"])
@@ -490,6 +536,99 @@ def embedding_vocab_size(vocab_blob: Mapping, mcfg: Mapping) -> int:
     return size
 
 
+# Trunk keys a run may override (`--trunk KEY=VALUE`; the size sweep and the order-only
+# arm, R36/R37). Anything else in `trunk` is part of the locked design.
+TRUNK_OVERRIDES = {"d_model": int, "n_layers": int, "n_heads": int, "ffn_mult": int,
+                   "rope_position": str}
+
+
+def seed_everything(seed: int) -> None:
+    """Seed model initialisation and every other draw from torch's default generators
+    (CPU and every accelerator: `torch.manual_seed`). Batch order and anchor/threshold
+    sampling take the seed explicitly (`build_loaders(seed=...)`)."""
+    torch.manual_seed(int(seed))
+
+
+def parse_trunk_overrides(items: list[str] | None) -> dict:
+    """``["d_model=192", "n_layers=4"]`` -> ``{"d_model": 192, "n_layers": 4}``; an
+    unknown key or a malformed item is refused."""
+    out: dict = {}
+    for item in items or ():
+        key, sep, raw = str(item).partition("=")
+        if not sep or key not in TRUNK_OVERRIDES:
+            raise SystemExit(f"--trunk takes KEY=VALUE with KEY one of "
+                             f"{sorted(TRUNK_OVERRIDES)}; got {item!r}")
+        try:
+            out[key] = TRUNK_OVERRIDES[key](raw)
+        except ValueError as exc:
+            raise SystemExit(f"--trunk {item!r}: {exc}") from exc
+    return out
+
+
+def apply_trunk_overrides(mcfg: Mapping, overrides: Mapping) -> dict:
+    """A copy of the model config with `overrides` applied to `trunk` (refuses a size
+    whose heads do not divide the width, and an unknown rope_position)."""
+    import copy
+
+    out = copy.deepcopy(dict(mcfg))
+    out["trunk"] = {**out["trunk"], **dict(overrides)}
+    if int(out["trunk"]["d_model"]) % int(out["trunk"]["n_heads"]):
+        raise SystemExit(f"trunk d_model {out['trunk']['d_model']} is not divisible by "
+                         f"n_heads {out['trunk']['n_heads']}")
+    rope_position(out)
+    return out
+
+
+def checkpoint_model_config(ckpt: Mapping, mcfg: Mapping,
+                            vocab_blob: Mapping | None = None) -> tuple[int, dict]:
+    """``(embedding rows, model config)`` to rebuild a checkpoint's model.
+
+    The rows come from the checkpoint manifest (`config.vocab_size`, recorded by every
+    training runner); without one, from the saved token embedding, else
+    `embedding_vocab_size(vocab_blob)`. The trunk recorded in the manifest (`config.trunk`,
+    size-sweep and order-only overrides) replaces the given config's trunk."""
+    config = ((ckpt.get("manifest") or {}).get("config") or {}) if isinstance(ckpt, Mapping) else {}
+    trunk = config.get("trunk")
+    out = apply_trunk_overrides(mcfg, trunk) if isinstance(trunk, Mapping) else dict(mcfg)
+    size = config.get("vocab_size")
+    if size is None:
+        state = ckpt.get("model", ckpt) if isinstance(ckpt, Mapping) else {}
+        weight = state.get("enc.tok_emb.weight") if isinstance(state, Mapping) else None
+        if weight is not None:
+            size = int(weight.shape[0])
+        elif vocab_blob is not None:
+            size = embedding_vocab_size(vocab_blob, out)
+        else:
+            size = int(out["trunk"].get("target_vocab", 10000))
+    return int(size), out
+
+
+def load_model_from_checkpoint(checkpoint, mcfg: Mapping, n_targets: int,
+                               vocab_blob: Mapping, *, verify: bool = True) -> "Model":
+    """The `Model` of a training checkpoint (path or loaded dict), sized from its
+    manifest (`checkpoint_model_config`), refused unless bound to `vocab_blob`, with its
+    weights loaded. `n_value_bins` comes from the vocabulary (the primary segments' for a
+    continuous-fused one)."""
+    from src.train.checkpoint import load_checkpoint, verify_checkpoint_binding
+
+    ckpt = load_checkpoint(checkpoint) if not isinstance(checkpoint, Mapping) else checkpoint
+    if verify:
+        verify_checkpoint_binding(ckpt, vocab_blob)
+    vocab_size, cfg = checkpoint_model_config(ckpt, mcfg, vocab_blob)
+    model = Model(vocab_size, n_targets, cfg, n_value_bins=vocab_value_bins(vocab_blob))
+    model.load_state_dict(ckpt.get("model", ckpt))
+    return model
+
+
+def vocab_value_bins(vocab_blob: Mapping) -> int:
+    """The threshold head's value-bin count of any arm's vocabulary."""
+    if vocab_blob.get("representation") == CONTINUOUS_FUSED:
+        from src.data.tokenize_continuous import primary_n_value_bins
+
+        return primary_n_value_bins(vocab_blob)
+    return n_value_bins(vocab_blob)
+
+
 def resident_set_bytes() -> int:
     """This process's current resident set size in bytes (Linux /proc, else `ps`)."""
     statm = Path("/proc/self/statm")
@@ -502,11 +641,11 @@ def resident_set_bytes() -> int:
 
 def loader_memory(before: int, datasets) -> dict:
     """Resident memory the loaded windows added (bytes, and bytes per event) — rough: it
-    is a process RSS delta, so allocator reuse can hide or inflate a little. Each DDP rank
-    holds its own copy (no sharing between ranks)."""
+    is a process RSS delta (`before` is measured before the load), so allocator reuse can
+    hide or inflate a little."""
     gc.collect()
     after = resident_set_bytes()
-    events = sum(len(r["token"]) for ds in datasets if ds is not None for r in ds.records)
+    events = sum(ds.corpus.events for ds in datasets if ds is not None)
     return {"rss_before_bytes": before, "rss_after_bytes": after, "events": events,
             "bytes_per_event": (after - before) / max(events, 1)}
 
@@ -544,6 +683,7 @@ def build_loaders(
     representation: str = "decile",
     dcfg: Mapping | None = None,
     thresholds: Mapping | None = None,
+    seed: int = 42,
 ) -> Loaders:
     """Shard records -> TargetBuilder -> ModelDataset -> samplers -> DataLoaders.
 
@@ -562,6 +702,10 @@ def build_loaders(
     `vocab_blob` is that vocab.json itself: it must match `binding`, and a vocabulary
     fit on a verification sample (`provenance.sample: true`, KTD9) is refused unless
     `dry_run` — a sample vocabulary is smoke-only.
+
+    `seed` (the run's `--seed`) drives the batch order (every sampler) and the anchor
+    and threshold sampling (`TargetBuilder.run_seed`); model initialisation is seeded
+    by the caller (`seed_everything`).
     """
     if representation not in ("decile", "gem"):
         raise ValueError(f"representation must be 'decile' or 'gem', got {representation!r}")
@@ -577,7 +721,7 @@ def build_loaders(
             events_path, binding=binding, vocab_blob=vocab_blob, tcfg=tcfg, mcfg=mcfg,
             dcfg=dcfg, thresholds=load_thresholds() if thresholds is None else thresholds,
             vocab_size=vocab_size, value_stats_path=value_stats_path, dry_run=dry_run,
-            soft=soft, value_channel=value_channel)
+            soft=soft, value_channel=value_channel, seed=seed)
     # Bind value-stats to the data's vocabulary AND segments so a stale /
     # cross-vocabulary / cross-bin stats file is rejected rather than silently applying
     # unrelated centers/scales.
@@ -637,7 +781,7 @@ def build_loaders(
         n_time_bins=mcfg["heads"]["competing_risk"]["n_time_bins"],
         horizon_hours=mcfg["heads"]["competing_risk"].get("horizon_hours", 48),
         value_stats=value_stats,
-        run_seed=42,
+        run_seed=seed,
     )
     # Every shard row must be bound to this vocabulary and these segments.
     expected_hashes = dict(binding)
@@ -667,7 +811,7 @@ def build_loaders(
 
     token_budget = int(tcfg["runtime"].get("token_budget", 0) or 0)
     if is_distributed():
-        dl = _batched_loader(dataset, tcfg)
+        dl = _batched_loader(dataset, tcfg, seed=seed)
     elif token_budget > 0:
         # Token-budget batches: B x max_len <= budget — long stays batch alone,
         # short stays pack tight. Bounds MPS math-path attention transients (three
@@ -676,7 +820,7 @@ def build_loaders(
             [len(r["token"]) for r in records],
             max_batch_tokens=token_budget,
             max_batch_size=tcfg["batch"]["per_gpu"],
-            seed=42,
+            seed=seed,
         )
         dl = DataLoader(
             dataset,
@@ -691,7 +835,7 @@ def build_loaders(
         sampler = LengthGroupedSampler(
             [len(r["token"]) for r in records],
             tcfg["batch"]["per_gpu"],
-            seed=42,
+            seed=seed,
         )
         dl = DataLoader(
             dataset,
@@ -709,7 +853,7 @@ def build_loaders(
             [len(r["token"]) for r in validation_records],
             max_batch_tokens=token_budget,
             max_batch_size=tcfg["batch"]["per_gpu"],
-            seed=42,
+            seed=seed,
             shuffle=False,
         )
         validation_dl = DataLoader(
@@ -739,12 +883,21 @@ def build_loaders(
     )
 
 
-def _batched_loader(dataset: ModelDataset, tcfg: dict, *, seed: int = 42) -> DataLoader:
+def _window_lengths(dataset: ModelDataset) -> list[int]:
+    """Events per training row: the gem corpus's window lengths (no per-window lists),
+    else each record's token count."""
+    corpus = getattr(dataset, "corpus", None)
+    if corpus is not None:
+        return corpus.window_lengths()
+    return [len(record["token"]) for record in dataset.records]
+
+
+def _batched_loader(dataset: ModelDataset, tcfg: dict, *, seed: int) -> DataLoader:
     """Training loader over `DistributedTokenBudgetBatchSampler`: batches formed globally
     under `runtime.token_budget` (rows only when it is 0) and `batch.per_gpu`, dealt to
     the ranks of the process group (one rank outside DDP), every rank the same count."""
     sampler = DistributedTokenBudgetBatchSampler(
-        [len(record["token"]) for record in dataset.records],
+        _window_lengths(dataset),
         max_batch_tokens=int(tcfg["runtime"].get("token_budget", 0) or 0) or None,
         max_batch_size=tcfg["batch"]["per_gpu"],
         seed=seed,
@@ -756,21 +909,6 @@ def _batched_loader(dataset: ModelDataset, tcfg: dict, *, seed: int = 42) -> Dat
         num_workers=tcfg["runtime"].get("num_workers", 0),
         pin_memory=torch.cuda.is_available(),
     )
-
-
-def _load_gem_records(
-    path: Path, site: str, *, partition: str, drop_values: bool,
-) -> list[dict]:
-    """One site's GEM window rows of `partition`, keyed ``<site>:<hosp_id>`` so the same
-    raw identifier at two sites stays two stays. Only that partition is materialized."""
-    frame = pl.scan_parquet(path).filter(pl.col("partition") == partition).collect()
-    records = []
-    for row in frame.iter_rows(named=True):
-        row["episode_key"] = f"{site}:{row.pop('hosp_id')}"
-        if drop_values:
-            row["value"] = [None] * len(row["token"])
-        records.append(row)
-    return records
 
 
 def _build_gem_loaders(
@@ -787,14 +925,16 @@ def _build_gem_loaders(
     dry_run: bool,
     soft: bool | None,
     value_channel: bool,
+    seed: int,
 ) -> Loaders:
     """The full-hospitalization path (U5, KTD1): one or more sites' `gem_events.parquet`,
     each beside a vocab.json that must be the training vocabulary (same binding; a sample
     vocabulary is refused unless `dry_run`), read side by side into ONE dataset — sites
-    are never pooled on disk; both development sites live on the node that trains. Every
-    window of every stay stays in memory: the `gem_tte` labels of a window read events
-    from later windows, so whole stays are assembled before labelling. Each shard row is
-    checked against the binding by `ModelDataset`."""
+    are never pooled on disk; both development sites live on the node that trains. Each
+    partition is one columnar `GemCorpus` (memory-mapped cache in ``gem_cache/`` beside
+    each shard, shared page cache across ranks): the `gem_tte` labels of a window read
+    events from later windows, so whole stays are assembled from the columns before
+    labelling. Each shard's bindings are checked by `ModelDataset`."""
     names = list(sites)
     if not names or len(set(names)) != len(names) or any(
             not name or ":" in str(name) for name in names):
@@ -816,38 +956,48 @@ def _build_gem_loaders(
     )
     target_builder = in_stream_target_builder(
         vocab_blob=vocab_blob, mcfg=mcfg, dcfg=dcfg, thresholds=thresholds,
-        vocab_size=vocab_size, value_stats=value_stats)
+        vocab_size=vocab_size, value_stats=value_stats, run_seed=seed)
     rss_before = resident_set_bytes()
     datasets = {}
     for partition in ("train", "validation"):
-        records = [record for name, path in sites.items()
-                   for record in _load_gem_records(Path(path), name, partition=partition,
-                                                   drop_values=dry_run and not value_stats)]
+        # Columnar, memory-mapped per site (cache beside each shard, gem_cache/); keys
+        # are ``<site>:<hosp_id>`` so the same raw identifier at two sites stays two.
+        corpus = GemCorpus.concat([
+            GemCorpus.from_parquet(path, site=name, partition=partition, cache=True)
+            for name, path in sites.items()])
         if partition == "train":
-            if not records:
+            if len(corpus) == 0:
                 raise ValueError("no train-partition windows in the given sites")
-            if not dry_run and not value_stats and _has_numeric_values(records):
+            if not dry_run and not value_stats and corpus.has_numeric_values():
                 raise SystemExit("value-head normalization is required before real "
                                  "training; pass --value-stats")
-        _apply_soft_policy(records, soft)
+        if dry_run and not value_stats:
+            corpus.drop_values()
+        if soft is False:
+            corpus.drop_soft()
+        elif soft and len(corpus) and (corpus.soft_width() or 0) < 2:
+            raise SystemExit(
+                "this arm uses soft discretization but the shard carries no soft bins; "
+                "tokenize it with value_binning.soft_discretization: true"
+            )
         datasets[partition] = ModelDataset(
-            records, representation="gem", target_builder=target_builder,
+            corpus, representation="gem", target_builder=target_builder,
             expected_hashes=dict(binding), value_channel=value_channel,
-        ) if records else None
+        ) if len(corpus) else None
     memory = loader_memory(rss_before, datasets.values())
     validation = datasets["validation"]
     validation_dl = None if validation is None else DataLoader(
         validation,
         batch_sampler=TokenBudgetBatchSampler(
-            [len(record["token"]) for record in validation.records],
+            validation.corpus.window_lengths(),
             max_batch_tokens=int(tcfg["runtime"].get("token_budget", 0) or 0) or 2 ** 62,
-            max_batch_size=tcfg["batch"]["per_gpu"], seed=42, shuffle=False),
+            max_batch_size=tcfg["batch"]["per_gpu"], seed=seed, shuffle=False),
         collate_fn=collate_model_samples,
         num_workers=tcfg["runtime"].get("num_workers", 0),
         pin_memory=torch.cuda.is_available(),
     )
     return Loaders(
-        train=_batched_loader(datasets["train"], tcfg),
+        train=_batched_loader(datasets["train"], tcfg, seed=seed),
         validation=validation_dl,
         train_dataset=datasets["train"],
         validation_dataset=validation,
@@ -933,6 +1083,14 @@ def main():
                     help="objective variant from configs/objective_arms.yaml (full, "
                          "next_token_only, minus_value, minus_competing_risk, "
                          "minus_threshold, no_curriculum); default: model config as is")
+    ap.add_argument("--seed", type=int, default=DEFAULT_SEED,
+                    help="the run's seed: model initialisation, batch order, anchor and "
+                         "threshold sampling (recorded in the manifest)")
+    ap.add_argument("--trunk", action="append", default=[], metavar="KEY=VALUE",
+                    help=f"trunk override, repeatable ({', '.join(TRUNK_OVERRIDES)}): the "
+                         "size sweep and the order-only arm (recorded in the manifest)")
+    ap.add_argument("--passes", type=float, default=None,
+                    help="run length in passes over the training data (schedule.passes)")
     ap.add_argument(ALLOW_CPU_DDP_FLAG, action="store_true",
                     help="let a distributed (torchrun) launch run on CPU over gloo when "
                          "CUDA is unavailable; without it such a launch is refused")
@@ -946,6 +1104,9 @@ def main():
     mcfg = yaml.safe_load(Path(args.model_config).read_text())
     if args.objective_arm is not None:
         mcfg = apply_objective_arm(mcfg, resolve_objective_arm(args.objective_arm))
+    mcfg = apply_trunk_overrides(mcfg, parse_trunk_overrides(args.trunk))
+    if args.passes is not None:
+        tcfg["schedule"]["passes"] = args.passes
     curriculum_enabled(mcfg)  # refuse an unknown loss_balancing / curriculum before work
     dcfg = yaml.safe_load(Path(args.data_config).read_text())
     n_targets = len(dcfg["target_concepts"])
@@ -961,6 +1122,7 @@ def main():
     binding = artifact_binding(vblob)  # refuses a pre-v2 vocabulary (re-tokenize)
     vocab_size = embedding_vocab_size(vblob, mcfg)
 
+    seed_everything(args.seed)
     model = Model(vocab_size, n_targets, mcfg, n_value_bins=n_value_bins(vblob)).to(dev)
     if is_main:
         print(f"params: {count_params(model)/1e6:.2f}M (embedding rows {vocab_size})")
@@ -978,6 +1140,7 @@ def main():
         is_main=is_main,
         representation="gem" if gem else "decile",
         dcfg=dcfg,
+        seed=args.seed,
     )
     dataset, dl, validation_dl = loaders.train_dataset, loaders.train, loaders.validation
     if is_main and loaders.memory is not None:
@@ -1021,10 +1184,11 @@ def main():
     train_cfg.trajectory = args.trajectory
     train_cfg.sites = list(args.site)
     train_cfg.loader_memory = loaders.memory
+    train_cfg.trunk = dict(mcfg["trunk"])
 
     model, manifest = train(
         model, dl, validation_dl, opt, scheduler, train_cfg, dev,
-        resume_ckpt=args.resume, seed=42, fresh_schedule=args.fresh_schedule,
+        resume_ckpt=args.resume, seed=args.seed, fresh_schedule=args.fresh_schedule,
         vocab_binding=binding,
     )
 

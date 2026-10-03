@@ -1068,5 +1068,35 @@ class SyntheticSiteTrainingTest(unittest.TestCase):
         self.assertGreaterEqual(total, len(rows))
 
 
+class BatchedLabelTest(unittest.TestCase):
+    """`label_anchors` labels many (anchor, query) pairs of one stay against ONE stream
+    index, with exactly `label_anchor`'s output, pair by pair."""
+
+    def test_batched_labels_equal_per_call_labels(self):
+        events = [(minute, "map", 80.0 - (minute // 97) % 30) for minute in range(5, 4000, 37)]
+        events += [(minute, "lactate", 1.0 + (minute // 211) % 5)
+                   for minute in range(9, 4000, 211)]
+        events.sort(key=lambda e: e[0])
+        for end in (("home", 4100), ("expired", 3000), None):
+            s = stream(events, end=end)
+            pos = s["pos_min"]
+            stop = next((i for i, t in enumerate(s["token"]) if t in GRID.terminal_tokens),
+                        len(s["token"]))
+            anchors = [i for i in range(stop) if i + 1 == len(pos) or pos[i + 1] > pos[i]]
+            pairs = [(i, q) for i in anchors[::3]
+                     for q in (MAP_65, LACTATE_4, GRID.query("map", 63.0))]
+            for horizon in (12, 48):
+                b = builder(horizon_hours=horizon)
+                with self.subTest(end=end, horizon=horizon):
+                    self.assertEqual(b.label_anchors(s, pairs),
+                                     [b.label_anchor(s, i, q) for i, q in pairs])
+
+    def test_a_bad_anchor_in_the_batch_is_refused(self):
+        s, index = anchored([])
+        terminal = next(i for i, t in enumerate(s["token"]) if t in GRID.terminal_tokens)
+        with self.assertRaises(TargetContractError):
+            builder().label_anchors(s, [(index, MAP_65), (terminal, MAP_65)])
+
+
 if __name__ == "__main__":
     unittest.main()

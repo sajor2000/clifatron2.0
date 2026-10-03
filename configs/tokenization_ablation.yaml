@@ -13,12 +13,16 @@
 #   scheme      configs/data.yaml value_binning.scheme the arm's vocabulary was built with
 #               (clinical_segment | decile_ablation); checked against the vocab's binning sources.
 #   tokenizer   fused | continuous_fused | textcode (the input representation).
+#   binning     configs/data.yaml value_binning overrides the arm's vocabulary is built with
+#               (`run_tokenization_ablation.arm_data_config`). The decile arms request each
+#               concept's clinical-arm bin count (matched_granularity, KTD11); only the
+#               forced-edge decile arm pins the decision thresholds (decile_forced_edges).
 #   soft_discretization  true -> soft [T,K] bins (the shard must be tokenized with soft on);
 #               false -> hard ids. Hard and soft arms of one scheme share one shard.
 #   events / vocab / value_stats  per-arm artifacts (override with --events/--vocab/--value-stats).
 #     clinical:   python -m src.data.tokenize ... (scheme clinical_segment, soft on)
 #                 + outcome_join + value_stats
-#     deciles:    the same with scheme decile_ablation
+#     deciles:    the same with the arm's `binning` (two tokenizations: plain, forced edges)
 #     continuous: python -m src.data.tokenize_continuous --primary-vocab <clinical>/vocab.json
 #                 --primary-events <clinical>/events_with_outcomes.parquet --out <continuous dir>
 #                 (edgeless concept ids; threshold bins + n_value_bins from the primary segments)
@@ -82,6 +86,7 @@ arms:
   global_deciles:
     description: "Per-concept population deciles, frozen from reference site"
     scheme: decile_ablation
+    binning: {scheme: decile_ablation, matched_granularity: true, decile_forced_edges: false}
     tokenizer: fused
     soft_discretization: false
     events: output/intermediate_phi/mimic_decile/events_with_outcomes.parquet
@@ -91,7 +96,8 @@ arms:
     total_steps: 20000
     tags: [tokenization, decile, lee-2026]
 
-  # (4) Deciles + soft discretization. Same shard as (3).
+  # (4) Deciles + soft discretization + the forced decision-threshold edges, at the clinical
+  # arm's bin counts (KTD11). Its own tokenization (the edges differ from (3)).
   # Lee 2026: ahead on selected tail outcomes (severe hypokalemia / hypernatremia / hypotension /
   # CRRT / K-extremes) as a point estimate, from unfused arms only — not a tested result for
   # fused tokens. (Corrected 2026-10-03 from "Lee's best encoder on dangerous tails. Wins on ...";
@@ -99,11 +105,12 @@ arms:
   deciles_plus_soft:
     description: "Deciles with soft discretization (kernel=1) + forced clinical edges"
     scheme: decile_ablation
+    binning: {scheme: decile_ablation, matched_granularity: true, decile_forced_edges: true}
     tokenizer: fused
     soft_discretization: true
-    events: output/intermediate_phi/mimic_decile/events_with_outcomes.parquet
-    vocab: output/intermediate_phi/mimic_decile/vocab.json
-    value_stats: output/intermediate_phi/mimic_decile/value_stats.json
+    events: output/intermediate_phi/mimic_decile_forced/events_with_outcomes.parquet
+    vocab: output/intermediate_phi/mimic_decile_forced/vocab.json
+    value_stats: output/intermediate_phi/mimic_decile_forced/value_stats.json
     lr: 1.0e-3
     total_steps: 20000
     tags: [tokenization, decile, soft-discretization, lee-2026]
