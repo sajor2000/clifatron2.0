@@ -12,7 +12,10 @@ What is proven:
   - accumulation runs non-boundary microsteps under `no_sync` and yields the gradient a
     single process computes over the same samples;
   - an epoch whose microbatch count is not a multiple of the accumulation factor, and a
-    stop at the update limit, leave both ranks with identical parameters.
+    stop at the update limit, leave both ranks with identical parameters;
+  - U4 (KTD5): under the next-token warm-up of the curriculum both ranks apply the same
+    weights on the same update, complete their updates, and leave every head bit-identical
+    to its initialisation until the transition starts.
 
 All data is synthetic. Each launch picks a free port, is killed at a deadline instead of
 hanging, and never leaves a child process behind.
@@ -38,8 +41,9 @@ LAUNCH_TIMEOUT_S = 180
 CPU = torch.device("cpu")
 
 
-def tiny_mcfg(**weights: float) -> dict:
-    """A one-layer d16 `pretrain.Model` config; `weights` overrides `heads.<name>.weight`."""
+def tiny_mcfg(*, curriculum: str | None = None, **weights: float) -> dict:
+    """A one-layer d16 `pretrain.Model` config; `weights` overrides `heads.<name>.weight`,
+    `curriculum` sets the model config's `curriculum` (absent: no curriculum)."""
     heads = {
         "next_event": {"enabled": True, "weight": 0.2},
         "competing_risk": {"enabled": True, "weight": 1.0, "n_time_bins": N_TIME_BINS},
@@ -49,11 +53,14 @@ def tiny_mcfg(**weights: float) -> dict:
     }
     for name, weight in weights.items():
         heads[name]["weight"] = weight
-    return {
+    mcfg = {
         "trunk": {"d_model": 16, "n_layers": 1, "n_heads": 2, "ffn_mult": 2, "dropout": 0.0,
                   "rope_base": 10000.0, "tied_embeddings": False},
         "heads": heads,
     }
+    if curriculum is not None:
+        mcfg["curriculum"] = curriculum
+    return mcfg
 
 
 def tiny_tcfg(ckpt_dir, *, grad_accum: int = 1, ckpt_every: int = 1000, val_every: int = 1000,
@@ -132,6 +139,25 @@ def build_model(mcfg: dict, seed: int = 0):
     return Model(VOCAB, N_TARGETS, mcfg, n_value_bins=N_VALUE_BINS)
 
 
+def record_weights(model) -> list[tuple[float, ...]]:
+    """(next-event, competing-risk, threshold, value) weights a bare `pretrain.Model`
+    applied on each training forward."""
+    from src.train.curriculum import HEADS
+
+    used: list[tuple[float, ...]] = []
+    model.register_forward_hook(
+        lambda module, *_: used.append(tuple(module.loss_weights[head] for head in HEADS)))
+    return used
+
+
+HEAD_PREFIXES = ("cr.", "th.", "vr.")
+
+
+def head_state(state: dict, prefixes: tuple[str, ...] = HEAD_PREFIXES) -> dict:
+    """The time-to-event and value heads' entries of a `pretrain.Model` state dict."""
+    return {name: value for name, value in state.items() if name.startswith(prefixes)}
+
+
 def accumulated_gradient(model, loader, *, grad_accum: int, rank: int = 0) -> dict:
     """The gradient `_train_one_epoch` applies in its (single) update: plain SGD at lr 1
     with no clipping moves each parameter by exactly minus that gradient."""
@@ -175,20 +201,22 @@ def _train_pretrain_model(local: int, out_dir: Path, mcfg: dict, batches: list[d
                           ckpt_every: int = 1000) -> dict:
     """`engine.train` over the DDP-wrapped `pretrain.Model` with the pretrain optimizer."""
     from src.train.engine import TrainConfig, train
-    from src.train.pretrain import build_scheduler
+    from src.train.pretrain import build_optimizer, build_scheduler
 
-    model = _wrap(build_model(mcfg), local)
+    bare = build_model(mcfg)
+    weights = record_weights(bare)
+    model = _wrap(bare, local)
     flags = _record_sync(model)
     tcfg = tiny_tcfg(out_dir / "ckpt", grad_accum=grad_accum, ckpt_every=ckpt_every)
-    opt = torch.optim.AdamW(model.parameters(), lr=tcfg["optimizer"]["lr"],
-                            weight_decay=tcfg["optimizer"]["weight_decay"],
-                            betas=tcfg["optimizer"]["betas"])
+    opt = build_optimizer(model, lr=tcfg["optimizer"]["lr"],
+                          weight_decay=tcfg["optimizer"]["weight_decay"],
+                          betas=tcfg["optimizer"]["betas"])
     scheduler = build_scheduler(opt, total_steps, 1)
     _, manifest = train(model, microbatch_loader(batches, distributed=True), None, opt,
                         scheduler, TrainConfig({}, tcfg, mcfg, total_steps), CPU,
                         vocab_binding=BINDING)
     return {"updates": manifest.ledger["optimizer_updates"], "state": _state(model),
-            "sync": flags}
+            "sync": flags, "weights": weights}
 
 
 def scenario_tte_weights_zero(local: int, out_dir: Path) -> dict:
@@ -225,6 +253,74 @@ def scenario_partial_epoch(local: int, out_dir: Path) -> dict:
     batches = [synthetic_batch(200 + i, supervised=i % 4 != 1) for i in range(10)]
     return _train_pretrain_model(local, out_dir, tiny_mcfg(), batches, total_steps=5,
                                  grad_accum=2)
+
+
+CURRICULUM_STEPS = 20      # warm-up: updates 0..2; transition: update 3; configured from 4
+CURRICULUM_ACCUM = 2
+
+
+def scenario_curriculum_warmup(local: int, out_dir: Path) -> dict:
+    """The curriculum under DDP at accumulation 2, a checkpoint after every update. Rank 1
+    never sees a supervised anchor, so its heads are skipped for the whole run."""
+    batches = [synthetic_batch(400 + i, supervised=i % 2 == 0) for i in range(8)]
+    return _train_pretrain_model(local, out_dir, tiny_mcfg(curriculum="ntp_then_tte"),
+                                 batches, total_steps=CURRICULUM_STEPS,
+                                 grad_accum=CURRICULUM_ACCUM, ckpt_every=1)
+
+
+def adapter_batch(seed: int, *, supervised: bool = True) -> dict:
+    """`synthetic_batch` in the per-anchor minutes contract the adapter reads: one anchor
+    per row, label times in minutes since the anchor (no pre-binned keys)."""
+    batch = synthetic_batch(seed, supervised=supervised)
+    for key in ("cr_bin", "th_crossed", "th_observed_bin"):
+        del batch[key]
+    g = torch.Generator().manual_seed(seed + 10_000)
+    n = batch["input_ids"].size(0)
+    batch["anchor_batch_idx"] = torch.arange(n)
+    batch["cr_time_min"] = torch.randint(0, 48 * 60, (n,), generator=g)
+    batch["th_anchor"] = torch.arange(n)
+    batch["th_event"] = torch.rand(n, generator=g) > 0.5
+    batch["th_time_min"] = torch.randint(0, 48 * 60, (n,), generator=g)
+    return batch
+
+
+def tiny_adapter_model(*, freeze: bool, curriculum: str = "none", seed: int = 0):
+    """`run_arm.AdapterModel` on a two-layer GPT2 backbone (the CLIFATRON wedge path)."""
+    from transformers import GPT2Config, GPT2LMHeadModel
+
+    from src.train.run_arm import AdapterModel
+
+    torch.manual_seed(seed)
+    backbone = GPT2LMHeadModel(GPT2Config(vocab_size=VOCAB, n_positions=64, n_embd=16,
+                                          n_layer=2, n_head=2, bos_token_id=0,
+                                          eos_token_id=0))
+    backbone.config._attn_implementation = "eager"
+    mcfg = tiny_mcfg(curriculum=curriculum)
+    return AdapterModel(backbone, N_TARGETS, freeze, mcfg, n_value_bins=N_VALUE_BINS)
+
+
+def scenario_adapter_arms(local: int, out_dir: Path) -> dict:
+    """The wedge model under DDP: frozen probe and joint fine-tune (with the curriculum),
+    rank 1 never seeing a supervised anchor."""
+    from src.train.engine import TrainConfig, train
+    from src.train.pretrain import build_optimizer, build_scheduler
+
+    batches = [adapter_batch(600 + i, supervised=i % 2 == 0) for i in range(8)]
+    result = {}
+    for name, freeze, curriculum in (("frozen", True, "none"),
+                                     ("joint", False, "ntp_then_tte")):
+        bare = tiny_adapter_model(freeze=freeze, curriculum=curriculum)
+        model = _wrap(bare, local)
+        tcfg = tiny_tcfg(out_dir / name)
+        opt = build_optimizer(model, lr=1e-2, weight_decay=0.1, betas=(0.9, 0.95),
+                              trunk_prefixes=("adapter.backbone.",))
+        _, manifest = train(model, microbatch_loader(batches, distributed=True), None, opt,
+                            build_scheduler(opt, 8, 1),
+                            TrainConfig({}, tcfg, {"compile": False}, 8), CPU,
+                            vocab_binding=BINDING)
+        result[name] = {"updates": manifest.ledger["optimizer_updates"],
+                        "state": _state(model)}
+    return result
 
 
 ABLATION_TOKENIZERS = ("fused", "continuous_fused", "textcode")
@@ -267,6 +363,8 @@ SCENARIOS = {
     "rank_without_anchor": scenario_rank_without_anchor,
     "accumulation_gradient": scenario_accumulation_gradient,
     "partial_epoch": scenario_partial_epoch,
+    "curriculum_warmup": scenario_curriculum_warmup,
+    "adapter_arms": scenario_adapter_arms,
     "ablation_runner": scenario_ablation_runner,
 }
 
@@ -352,7 +450,7 @@ def _launch_once(scenario: str, out_dir: Path, timeout: float):
 @unittest.skipUnless(dist.is_available() and dist.is_gloo_available(),
                      "torch.distributed gloo backend is not built on this platform")
 class TwoRankTrainingTest(unittest.TestCase):
-    def _launch(self, scenario: str) -> list[dict]:
+    def _launch(self, scenario: str, *, keep_all_checkpoints: bool = False) -> list[dict]:
         """Both ranks' results; fails with each rank's log tail when the launch did not
         finish cleanly."""
         with tempfile.TemporaryDirectory() as td:
@@ -369,6 +467,10 @@ class TwoRankTrainingTest(unittest.TestCase):
             if self.checkpoints:
                 self.checkpoint = torch.load(out_dir / "ckpt" / self.checkpoints[-1],
                                              weights_only=False)
+            self.checkpoint_by_step = {
+                int(p.stem.rsplit("step", 1)[1]): torch.load(p, weights_only=False)
+                for p in (out_dir / "ckpt").glob("*.pt")
+            } if keep_all_checkpoints else {}
         return results
 
     def assertSameState(self, a: dict, b: dict, what: str):
@@ -431,6 +533,48 @@ class TwoRankTrainingTest(unittest.TestCase):
         self.assertEqual(r1["sync"], expected)
         self.assertSameState(r0["state"], r1["state"], "partial accumulation")
 
+    def test_curriculum_warm_up_is_ddp_safe_and_ranks_apply_the_same_weights(self):
+        from src.train.curriculum import curriculum_weights
+
+        r0, r1 = self._launch("curriculum_warmup", keep_all_checkpoints=True)
+        self.assertEqual((r0["updates"], r1["updates"]), (CURRICULUM_STEPS, CURRICULUM_STEPS))
+        self.assertSameState(r0["state"], r1["state"], "curriculum")
+        # Same weights on the same update on both ranks, one schedule step per optimizer
+        # update (two microbatches each), from the engine's update counter.
+        expected = [tuple(curriculum_weights(update, CURRICULUM_STEPS)[:4])
+                    for update in range(CURRICULUM_STEPS) for _ in range(CURRICULUM_ACCUM)]
+        self.assertEqual(r0["weights"], expected)
+        self.assertEqual(r1["weights"], expected)
+        self.assertEqual(expected[:6], [(1.0, 0.0, 0.0, 0.0)] * 6)      # next-token only
+        self.assertEqual(expected[-1], (0.2, 1.0, 1.0, 0.5))
+        # Warm-up (updates 0..2) and the first transition update (blend at 0) leave every
+        # head exactly as initialised: zero gradient through the touch term, no weight
+        # decay. The trunk trains from the first update.
+        initial = build_model(tiny_mcfg(curriculum="ntp_then_tte")).state_dict()
+        self.assertEqual(sorted(self.checkpoint_by_step), list(range(1, CURRICULUM_STEPS + 1)))
+        for step in (1, 2, 3, 4):
+            saved = self.checkpoint_by_step[step]["model"]
+            for name, value in head_state(saved).items():
+                self.assertTrue(torch.equal(value, initial[name]), f"step {step}: {name} moved")
+            self.assertFalse(torch.equal(saved["enc.blocks.0.qkv.weight"],
+                                         initial["enc.blocks.0.qkv.weight"]))
+        # The heads train once their weight is positive (rank 0 supervises them).
+        for name in ("cr.fc.weight", "th.mlp.0.weight", "vr.mlp.0.weight"):
+            self.assertFalse(torch.equal(r1["state"][name], initial[name]), name)
+
+    def test_adapter_arms_complete_updates_with_skipped_heads(self):
+        r0, r1 = self._launch("adapter_arms")
+        for name in ("frozen", "joint"):
+            with self.subTest(arm=name):
+                self.assertEqual((r0[name]["updates"], r1[name]["updates"]), (8, 8))
+                self.assertSameState(r0[name]["state"], r1[name]["state"], name)
+        frozen = tiny_adapter_model(freeze=True).state_dict()
+        for pname, value in r0["frozen"]["state"].items():
+            if pname.startswith(("adapter.backbone.", "adapter.next_event.")):
+                self.assertTrue(torch.equal(value, frozen[pname]), pname)
+        self.assertFalse(torch.equal(r0["frozen"]["state"]["adapter.cr.fc.weight"],
+                                     frozen["adapter.cr.fc.weight"]))
+
     def test_ablation_runner_trains_every_representation(self):
         r0, r1 = self._launch("ablation_runner")
         self.assertEqual(set(r0), set(ABLATION_TOKENIZERS))
@@ -441,6 +585,58 @@ class TwoRankTrainingTest(unittest.TestCase):
                 # Epoch-boundary validation runs on rank 0 only; rank 1 waits at the barrier.
                 self.assertEqual((r0[tokenizer]["validations"], r1[tokenizer]["validations"]),
                                  (1, 0))
+
+
+class AdapterObjectiveTest(unittest.TestCase):
+    """`CLIFATRONHeads.loss` on the minutes contract (KTD4) with DDP-safe skips (KTD2)."""
+
+    def _prepared(self, batch):
+        from src.train.engine import _prepare_batch
+
+        return _prepare_batch(batch, CPU)
+
+    def test_heads_bin_minutes_on_their_own_grids(self):
+        from src.model.heads import time_bin
+
+        model = tiny_adapter_model(freeze=True).adapter
+        batch = self._prepared(adapter_batch(3))
+        # Two anchors: an event at 61 min, and a censoring at 59 min of the 180-min
+        # competing-risk bins (48 h / N_TIME_BINS): no full bin observed, so masked out.
+        batch["cr_type"] = torch.tensor([0, -1])
+        batch["cr_time_min"] = torch.tensor([61, 59])
+        batch["cr_mask"] = torch.tensor([True, True])
+        out = model.loss(batch)
+        H = model.hidden_states(batch["input_ids"], batch["attention_mask"])
+        h = H[batch["anchor_batch_idx"], batch["anchor_idx"]]
+        expected = model.cr.loss(h[:1], torch.tensor([0]),
+                                 time_bin(torch.tensor([61]), N_TIME_BINS, 48))
+        self.assertTrue(torch.allclose(out["cr"], expected))
+        # An observed-bin count passed as `cr_bin` is no longer read.
+        batch["cr_bin"] = torch.tensor([3, 3])
+        self.assertTrue(torch.equal(model.loss(batch)["cr"], out["cr"]))
+
+    def test_every_trainable_parameter_gets_a_gradient_whatever_is_skipped(self):
+        for freeze in (True, False):
+            for supervised in (True, False):
+                model = tiny_adapter_model(freeze=freeze)
+                batch = self._prepared(adapter_batch(5, supervised=supervised))
+                weights = {} if supervised else {"w_cr": 0.0}
+                model.adapter.loss(batch, **weights)["total"].backward()
+                with self.subTest(freeze=freeze, supervised=supervised):
+                    trainable = [(n, p) for n, p in model.named_parameters()
+                                 if p.requires_grad]
+                    self.assertTrue(trainable)
+                    for pname, param in trainable:
+                        self.assertIsNotNone(param.grad, pname)
+                    # A frozen probe trains only its heads.
+                    if freeze:
+                        self.assertFalse(any(n.startswith(("adapter.backbone.",
+                                                           "adapter.next_event."))
+                                             for n, _ in trainable))
+
+    def test_frozen_adapter_refuses_the_curriculum(self):
+        with self.assertRaisesRegex(ValueError, "frozen-trunk arm cannot run"):
+            tiny_adapter_model(freeze=True, curriculum="ntp_then_tte")
 
 
 if __name__ == "__main__":

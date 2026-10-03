@@ -63,10 +63,15 @@ in_stream:
   anchors_per_window: 8      # each carries one competing-risk label
   queries_per_anchor: 4      # threshold-hazard queries per anchor (tau_sampling above)
 
-# Multi-task loss balancing (RESEARCH.md §3): uncertainty (Kendall 1/2σ²) + grad-norm,
-# so dense mortality signal doesn't starve sparse auxiliaries. Fallback: fixed weights above.
-loss_balancing: "uncertainty"       # uncertainty | fixed
-curriculum: "ntp_then_tte"          # warm up on next-event, then phase in TTE heads
+# Loss balancing is FIXED weights: the objective is the sum of the heads' losses times the
+# heads.*.weight above. `fixed` is the only value; anything else is refused at config load
+# (an `uncertainty` option sat here for months and was never implemented).
+loss_balancing: "fixed"
+# ntp_then_tte | none. ntp_then_tte (src/train/curriculum.py): the first 15% of the planned
+# optimizer updates train next-event only, the next 5% blend linearly to the weights above,
+# the rest use them. `none` uses them from the first update. configs/objective_arms.yaml
+# names the objective variants; `pretrain --objective-arm <name>` selects one.
+curriculum: "ntp_then_tte"
 
 precision: "bf16"
 compile: true

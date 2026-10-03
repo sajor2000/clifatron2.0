@@ -54,7 +54,7 @@ Label-free federated validation is a separate question. A frozen probe trains ta
 **local labels**, so it is the in-domain wedge, not the federation model. The **zero-shot**
 threshold / competing-risk heads that a new site runs without training come from a model
 pretrained *with* our TTE heads: the joint fine-tune of CLIFATRON or, on the primary path, the
-from-scratch model ([Objectives & Training](./objectives-training.md#two-training-entry-points)).
+from-scratch model ([Objectives & Training](./objectives-training.md#training-entry-points)).
 "Label-free" describes the model only; each site still auto-derives evaluation labels locally.
 :::
 

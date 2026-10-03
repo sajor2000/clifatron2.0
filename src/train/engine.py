@@ -3,6 +3,11 @@
 Builds DataLoader(s), runs optimizer-update-based accumulation with bf16 autocast,
 clips once per update, validates periodically, saves epoch-boundary checkpoints,
 and records a provenance manifest.
+
+Before each optimizer update the engine hands its update counter (restored from the
+checkpoint on resume) to a model that sets its loss weights per update
+(`pretrain.ObjectiveSchedule`, KTD5), and switches each head's weight decay off while
+that head's weight is zero.
 """
 from __future__ import annotations
 
@@ -163,6 +168,50 @@ def _restore_rng_states(rng_states) -> None:
             torch.cuda.set_rng_state(torch.tensor(value, dtype=torch.uint8), local)
 
 
+def _objective_model(model):
+    """The model under any DDP / torch.compile wrapper, when it schedules its own loss
+    weights (`set_training_step`); else None."""
+    module = model.module if isinstance(model, DistributedDataParallel) else model
+    module = getattr(module, "_orig_mod", module)
+    return module if hasattr(module, "set_training_step") else None
+
+
+def _apply_objective_step(model, opt, step: int, total_steps: int) -> dict | None:
+    """Loss weights for optimizer update `step`, and each head group's weight decay: off
+    while the head's weight is 0 (AdamW decays a parameter whatever its gradient), the
+    configured value once it trains. Every rank runs this with the same counter."""
+    module = _objective_model(model)
+    if module is None:
+        return None
+    weights = module.set_training_step(step, total_steps)
+    for group in opt.param_groups:
+        head = group.get("head")
+        if head is not None:
+            group["weight_decay"] = group["head_weight_decay"] if weights[head] > 0 else 0.0
+    return weights
+
+
+def _check_head_decay_groups(model, opt) -> None:
+    """Fail closed when a head that can sit at zero weight shares a decaying parameter
+    group: it would shrink while it is not trained. `pretrain.build_optimizer` builds
+    the per-head groups."""
+    module = _objective_model(model)
+    if module is None or not hasattr(module, "head_parameters"):
+        return
+    group_of = {id(p): group for group in opt.param_groups for p in group["params"]}
+    for head, params in module.head_parameters().items():
+        if not module.head_weight_can_be_zero(head):
+            continue
+        for param in params:
+            group = group_of.get(id(param))
+            if group is not None and group.get("head") != head and group.get("weight_decay"):
+                raise ValueError(
+                    f"the {head} head can train at zero weight (curriculum or objective "
+                    "arm) but its parameters share a weight-decayed optimizer group, so "
+                    "AdamW would shrink them untrained; build the optimizer with "
+                    "pretrain.build_optimizer (one group per head)")
+
+
 def _scale_grads(model, denom: int) -> None:
     if denom <= 1:
         return
@@ -173,8 +222,11 @@ def _scale_grads(model, denom: int) -> None:
 
 def _train_one_epoch(
     model, dl, opt, scheduler, epoch, tcfg: TrainConfig, dev, *, rank,
-    max_updates: int | None = None, boundary_cb=None,
+    max_updates: int | None = None, boundary_cb=None, step_offset: int = 0,
 ):
+    """One pass over `dl`. `step_offset` is the number of optimizer updates applied
+    before this epoch (the run's update counter): update `step_offset + updates` sets
+    the loss weights of every microbatch it accumulates (KTD5)."""
     model.train()
     ml = MetricsLog()
     opt.zero_grad(set_to_none=True)
@@ -191,8 +243,13 @@ def _train_one_epoch(
     ddp = model if isinstance(model, DistributedDataParallel) else None
     last_batch_idx = len(dl) - 1 if ddp is not None else None
 
+    weights = None
     for batch_idx, batch in enumerate(dl):
         batch = _prepare_batch(batch, dev)
+        if micro % tcfg.grad_accum == 0:
+            # First microbatch of an update: the schedule advances once per update.
+            weights = _apply_objective_step(model, opt, step_offset + updates,
+                                            tcfg.total_steps)
 
         synchronized = (
             ddp is None
@@ -243,7 +300,9 @@ def _train_one_epoch(
                     f"cr={_as_float(losses.get('cr', 0)):.4f} "
                     f"th={_as_float(losses.get('th', 0)):.4f} "
                     f"val={_as_float(losses.get('val', 0)):.4f} "
-                    f"lr={scheduler.get_last_lr()[0]:.3e} "
+                    + ("" if weights is None else
+                       "w=" + "/".join(f"{w:.3g}" for w in weights.values()) + " ")
+                    + f"lr={scheduler.get_last_lr()[0]:.3e} "
                     f"updates_per_min={updates / elapsed * 60:.2f}",
                     flush=True,
                 )
@@ -286,10 +345,17 @@ def train(model, train_dl, val_dl, opt, scheduler, tcfg: TrainConfig, dev, *,
     note = precision_note(dev)
     if is_main and note:
         print(note, flush=True)
+    _check_head_decay_groups(model, opt)
+    objective = _objective_model(model)
+    config = dict(tcfg.__dict__)
+    if objective is not None:
+        config["objective"] = objective.objective_record()
+        if is_main:
+            print(objective.describe_schedule(tcfg.total_steps), flush=True)
 
     manifest = Manifest(
         model_name="clifatron2",
-        config=tcfg.__dict__,
+        config=config,
         seed=seed,
         ckpt_dir=str(tcfg.ckpt_dir),
     )
@@ -430,6 +496,7 @@ def train(model, train_dl, val_dl, opt, scheduler, tcfg: TrainConfig, dev, *,
         ml, sm, tok, ntp, updates = _train_one_epoch(
             model, train_dl, opt, scheduler, epoch, tcfg, dev, rank=local_rank,
             max_updates=tcfg.total_steps - global_step, boundary_cb=_boundary,
+            step_offset=global_step,
         )
         total_sm += sm
         total_tok += tok

@@ -66,7 +66,8 @@ from src.train.engine import (
     train,
     wrap_ddp,
 )
-from src.train.pretrain import Loaders, Model, build_loaders, build_scheduler
+from src.train.curriculum import apply_objective_arm, resolve_objective_arm
+from src.train.pretrain import Loaders, Model, build_loaders, build_optimizer, build_scheduler
 
 TOKENIZERS = ("fused", CONTINUOUS_FUSED, "textcode")
 SCHEMES = ("clinical_segment", "decile_ablation")   # configs/data.yaml value_binning.scheme
@@ -241,8 +242,8 @@ def train_arm(run: ArmRun, *, tcfg: dict, mcfg: dict, device, total_steps=None, 
         model = torch.compile(model, dynamic=True)
     if is_distributed():
         model = wrap_ddp(model, torch.device(device), local)
-    opt = torch.optim.AdamW(
-        [p for p in model.parameters() if p.requires_grad], lr=lr,
+    opt = build_optimizer(  # one group per head: no decay while a head's weight is 0
+        model, lr=lr,
         weight_decay=tcfg["optimizer"]["weight_decay"], betas=tcfg["optimizer"]["betas"],
     )
     warmup = min(int(tcfg["schedule"].get("warmup_steps", 2000)), total_steps)
@@ -278,6 +279,8 @@ def main():
     ap.add_argument("--train-config", default="configs/train.yaml")
     ap.add_argument("--data-config", default="configs/data.yaml")
     ap.add_argument("--total-steps", type=int, default=None)
+    ap.add_argument("--objective-arm", default=None,
+                    help="objective variant from configs/objective_arms.yaml")
     ap.add_argument("--out", default="results/tokenization_ablation")
     ap.add_argument("--dry-run", action="store_true",
                     help="build the arm's model and loaders, print shapes, and exit")
@@ -291,6 +294,8 @@ def main():
 
     abl = yaml.safe_load(Path(args.ablation_config).read_text())
     mcfg = yaml.safe_load(Path(args.model_config).read_text())
+    if args.objective_arm is not None:
+        mcfg = apply_objective_arm(mcfg, resolve_objective_arm(args.objective_arm))
     tcfg = yaml.safe_load(Path(args.train_config).read_text())
     n_targets = len(yaml.safe_load(Path(args.data_config).read_text())["target_concepts"])
     arm = resolve_arm(abl, args.arm, events=args.events, vocab=args.vocab,

@@ -54,7 +54,7 @@ flowchart TB
         A["CLIF 2.1 parquet<br/>Site 1 · Site 2 · Site 3"] --> B["Tokenization<br/>fused code=bin · clinical segments<br/>soft discretization · minute RoPE"]
         B --> C["Backbone<br/>from-scratch Qwen2-arch ~30M (primary)<br/>· CLIFATRON Qwen2 0.5B wedge<br/>8192 ctx · untied emb"]
         C --> D["Our heads<br/>threshold-hazard · competing-risk<br/>value-regression · next-event"]
-        D --> E["Joint pretrain<br/>NTP → TTE curriculum<br/>uncertainty + grad-norm balancing"]
+        D --> E["Pretrain<br/>NTP → TTE curriculum<br/>fixed loss weights"]
     end
 
     E --> F["Method 3 wedge<br/>anchor state → probe vs XGBoost<br/>3×3 transportability matrix"]

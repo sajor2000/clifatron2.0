@@ -46,6 +46,14 @@ from src.data.segments import (
 )
 from src.data.targets import InStreamTargets, TargetBuilder
 from src.data.threshold_grid import ThresholdGrid
+from src.train.curriculum import (
+    HEADS,
+    apply_objective_arm,
+    curriculum_enabled,
+    curriculum_weights,
+    describe_schedule,
+    resolve_objective_arm,
+)
 from src.train.engine import (
     ALLOW_CPU_DDP_FLAG,
     TrainConfig,
@@ -222,7 +230,83 @@ def zero_touch(head: torch.nn.Module | None, like: torch.Tensor) -> torch.Tensor
     return (sum(p.sum() for p in params) * 0.0).to(like.dtype)
 
 
-class Model(torch.nn.Module):
+class ObjectiveSchedule:
+    """The loss weights a model applies on each optimizer update (KTD5).
+
+    `w` holds the configured weights (`heads.*.weight`, or an objective arm's). Without
+    the curriculum they apply from the first update; with it, `set_training_step` — called
+    by the engine with its optimizer-update counter before each update — returns the
+    `curriculum_weights` blend from next-token only to `w`. Every rank calls it with the
+    same counter, so every rank applies the same weights on the same update.
+
+    `_active` (a head is in the loss) drives the skip branches and changes only at the
+    warm-up boundary; the weight values live in the `_loss_mix` buffer, so a compiled
+    model does not recompile on every transition update. A head whose weight is zero
+    still touches its parameters (`zero_touch`): DDP sees the same gradient set on every
+    rank whatever the schedule."""
+
+    HEAD_ATTRS = {"competing_risk": "cr", "threshold_hazard": "th",
+                  "value_regression": "vr"}
+
+    def _init_objective(self, weights: Mapping[str, float], mcfg: Mapping) -> None:
+        self.w = {head: float(weights[head]) for head in HEADS}
+        self.curriculum = curriculum_enabled(mcfg)
+        self.objective_arm = mcfg.get("objective_arm")
+        self.register_buffer("_loss_mix", torch.zeros(len(HEADS)), persistent=False)
+        self._set_loss_weights(self.w)
+
+    def _set_loss_weights(self, weights: Mapping[str, float]) -> None:
+        self.loss_weights = {head: float(weights[head]) for head in HEADS}
+        self._active = {head: weight > 0.0 for head, weight in self.loss_weights.items()}
+        with torch.no_grad():
+            self._loss_mix.copy_(torch.tensor([self.loss_weights[h] for h in HEADS]))
+
+    def set_training_step(self, step: int, total_steps: int) -> dict[str, float]:
+        """The weights for optimizer update `step` (0-based) of `total_steps` planned."""
+        if self.curriculum:
+            mix = curriculum_weights(step, total_steps,
+                                     target=tuple(self.w[h] for h in HEADS))
+            self._set_loss_weights(dict(zip(HEADS, mix[:4])))
+        else:
+            self._set_loss_weights(self.w)
+        return dict(self.loss_weights)
+
+    def _weight(self, head: str) -> torch.Tensor:
+        return self._loss_mix[HEADS.index(head)]
+
+    def _head_module(self, head: str):
+        return getattr(self, self.HEAD_ATTRS[head], None)
+
+    def head_parameters(self) -> dict[str, list[torch.nn.Parameter]]:
+        """The parameters of each time-to-event / value head (by `HEADS` name). The engine
+        switches their weight decay off while their weight is zero (`build_optimizer`)."""
+        heads = {}
+        for head in self.HEAD_ATTRS:
+            module = self._head_module(head)
+            if module is not None:
+                heads[head] = list(module.parameters())
+        return heads
+
+    def head_weight_can_be_zero(self, head: str) -> bool:
+        return self.w[head] == 0.0 or self.curriculum
+
+    def objective_record(self) -> dict:
+        """What this run optimizes, recorded in the manifest of every checkpoint. A head
+        an arm removes is never listed as trained."""
+        return {
+            "objective_arm": self.objective_arm,
+            "loss_balancing": "fixed",
+            "curriculum": "ntp_then_tte" if self.curriculum else "none",
+            "weights": dict(self.w),
+            "trained_heads": [head for head in HEADS if self.w[head] > 0.0],
+        }
+
+    def describe_schedule(self, total_steps: int) -> str:
+        return describe_schedule(total_steps, self.w, self.curriculum,
+                                 arm=self.objective_arm)
+
+
+class Model(ObjectiveSchedule, torch.nn.Module):
     def __init__(self, vocab_size, n_targets, mcfg, *, n_value_bins: int,
                  encoder: torch.nn.Module | None = None):
         """`n_value_bins` comes from the frozen vocabulary (`segments.n_value_bins`).
@@ -235,7 +319,6 @@ class Model(torch.nn.Module):
         self.enc = encoder if encoder is not None else CLIFEncoder(vocab_size, mcfg)
         d = self.enc.d_model
         h = mcfg["heads"]
-        self.w = objective_weights(mcfg)
         self.cr = CompetingRiskHead(d, n_causes, h["competing_risk"]["n_time_bins"])
         # Each head's own horizon: label minutes are binned per head (KTD4).
         self.cr_horizon_hours = float(h["competing_risk"].get("horizon_hours", 48))
@@ -245,6 +328,7 @@ class Model(torch.nn.Module):
             n_value_bins=n_value_bins, thr_dim=h["threshold_hazard"]["threshold_embed_dim"],
         )
         self.vr = ValueRegressionHead(d, vocab_size) if h["value_regression"]["enabled"] else None
+        self._init_objective(objective_weights(mcfg), mcfg)
 
     def forward(self, batch):
         if "document_ids" in batch:
@@ -280,8 +364,9 @@ class Model(torch.nn.Module):
         cr = self._cr_loss(batch, h_last, H)
         th = self._th_loss(batch, h_last, H)
         val = self._val_loss(batch, H)
-        w = self.w
-        total = w["next_event"] * ntp + w["competing_risk"] * cr + w["threshold_hazard"] * th + w["value_regression"] * val
+        w = self._weight
+        total = (w("next_event") * ntp + w("competing_risk") * cr
+                 + w("threshold_hazard") * th + w("value_regression") * val)
         return {"ntp": ntp, "cr": cr, "th": th, "val": val, "total": total}
 
     @staticmethod
@@ -296,7 +381,7 @@ class Model(torch.nn.Module):
         """CR loss; 0 when the head is disabled/unweighted or the batch carries no CR
         targets (pure-NTP batches from shards without an outcome join)."""
         timed = "cr_time_min" in batch
-        if self.w["competing_risk"] == 0.0 or "cr_type" not in batch or not (
+        if not self._active["competing_risk"] or "cr_type" not in batch or not (
                 timed or "cr_bin" in batch):
             return zero_touch(self.cr, H)
         cr_type = batch["cr_type"]
@@ -318,7 +403,7 @@ class Model(torch.nn.Module):
 
     def _th_loss(self, batch, h_last, H):
         """Threshold-hazard loss with the same fail-to-zero guard as _cr_loss."""
-        if self.w["threshold_hazard"] == 0.0 or "th_target" not in batch:
+        if not self._active["threshold_hazard"] or "th_target" not in batch:
             return zero_touch(self.th, H)
         th_mask = batch.get("th_mask")
         if "th_time_min" in batch:
@@ -343,7 +428,7 @@ class Model(torch.nn.Module):
 
     def _val_loss(self, batch, H):
         """Value-regression (ORA mark) loss; 0 when disabled or no values present."""
-        if self.vr is None or self.w["value_regression"] == 0.0:
+        if self.vr is None or not self._active["value_regression"]:
             return zero_touch(self.vr, H)
         if "value" not in batch or "val_mask" not in batch:
             return zero_touch(self.vr, H)
@@ -584,6 +669,48 @@ def build_loaders(
     )
 
 
+def build_optimizer(model, *, lr: float, weight_decay: float, betas, head_lr: float | None = None,
+                    trunk_prefixes: tuple[str, ...] | None = None) -> torch.optim.AdamW:
+    """AdamW with one parameter group per time-to-event / value head (KTD5).
+
+    AdamW's decoupled decay shrinks a parameter even when its gradient is exactly zero,
+    so a head held at zero weight by the curriculum (or removed by an objective arm)
+    would drift toward zero. Each head group carries `head` and `head_weight_decay`;
+    the engine sets its `weight_decay` to 0 while that head's weight is 0 and back to
+    `head_weight_decay` once it trains. With zero gradient, zero moments and no decay,
+    AdamW leaves the parameter bit-identical.
+
+    The remaining trainable parameters (trunk, next-event projection) form the first
+    group at `lr`; with `trunk_prefixes`, only names starting with one of them do, and
+    the other non-head parameters train at `head_lr` with the heads (default `lr`).
+    Frozen parameters (`requires_grad=False`) are left out."""
+    module = model.module if hasattr(model, "module") else model
+    module = getattr(module, "_orig_mod", module)
+    head_lr = lr if head_lr is None else head_lr
+    owner = {}
+    if hasattr(module, "head_parameters"):
+        for head, params in module.head_parameters().items():
+            owner.update({id(p): head for p in params})
+    trunk, other, heads = [], [], {}
+    for name, param in module.named_parameters():
+        if not param.requires_grad:
+            continue
+        if id(param) in owner:
+            heads.setdefault(owner[id(param)], []).append(param)
+        elif trunk_prefixes is None or name.startswith(trunk_prefixes):
+            trunk.append(param)
+        else:
+            other.append(param)
+    groups = [{"params": trunk, "lr": lr}] if trunk else []
+    if other:
+        groups.append({"params": other, "lr": head_lr})
+    for head in HEADS:
+        if heads.get(head):
+            groups.append({"params": heads[head], "lr": head_lr, "head": head,
+                           "head_weight_decay": weight_decay})
+    return torch.optim.AdamW(groups, lr=lr, weight_decay=weight_decay, betas=betas)
+
+
 def build_scheduler(opt, total_steps: int, warmup_steps: int):
     """Linear warmup then cosine decay (the pretrain schedule)."""
     sched1 = LinearLR(opt, start_factor=0.01, end_factor=1.0, total_iters=warmup_steps)
@@ -604,6 +731,10 @@ def main():
                          "schedule would pin LR at its tail value)")
     ap.add_argument("--dry-run", action="store_true", help="print model + loader info and exit")
     ap.add_argument("--value-stats", default=None, help="JSON token_id -> [center, scale] for value-head normalization")
+    ap.add_argument("--objective-arm", default=None,
+                    help="objective variant from configs/objective_arms.yaml (full, "
+                         "next_token_only, minus_value, minus_competing_risk, "
+                         "minus_threshold, no_curriculum); default: model config as is")
     ap.add_argument(ALLOW_CPU_DDP_FLAG, action="store_true",
                     help="let a distributed (torchrun) launch run on CPU over gloo when "
                          "CUDA is unavailable; without it such a launch is refused")
@@ -615,6 +746,9 @@ def main():
         print("device: mps (Mac smoke-test path)")
     tcfg = yaml.safe_load(Path(args.config).read_text())
     mcfg = yaml.safe_load(Path(args.model_config).read_text())
+    if args.objective_arm is not None:
+        mcfg = apply_objective_arm(mcfg, resolve_objective_arm(args.objective_arm))
+    curriculum_enabled(mcfg)  # refuse an unknown loss_balancing / curriculum before work
     dcfg = yaml.safe_load(Path("configs/data.yaml").read_text())
     n_targets = len(dcfg["target_concepts"])
     vocab_size = mcfg["trunk"].get("target_vocab", 10000)
@@ -658,8 +792,8 @@ def main():
     if is_distributed():
         model = wrap_ddp(model, dev, local)
 
-    opt = torch.optim.AdamW(
-        model.parameters(), lr=tcfg["optimizer"]["lr"],
+    opt = build_optimizer(
+        model, lr=tcfg["optimizer"]["lr"],
         weight_decay=tcfg["optimizer"]["weight_decay"], betas=tcfg["optimizer"]["betas"],
     )
 

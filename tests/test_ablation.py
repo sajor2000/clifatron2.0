@@ -99,6 +99,43 @@ class AblationTest(unittest.TestCase):
             self.assertIn("total_steps", abl["arms"][arm])
             self.assertIn("tags", abl["arms"][arm])
 
+    def test_ablation_config_has_no_treatment_initiation_outcome(self):
+        """Hard rule #1: treatments are model inputs, never trunk prediction targets."""
+        try:
+            from test_data_config import FORBIDDEN_TRUNK_TASKS
+        except ImportError:  # pragma: no cover - run from the repo root as a package
+            from tests.test_data_config import FORBIDDEN_TRUNK_TASKS
+
+        shared = yaml.safe_load(Path("configs/ablation.yaml").read_text())["shared"]
+        named = set(shared["outcomes"]) | set(shared.get("zero_shot_outcomes") or ())
+        self.assertFalse(named & set(FORBIDDEN_TRUNK_TASKS), sorted(named))
+        self.assertIn("new_imv_24h", FORBIDDEN_TRUNK_TASKS)   # the helper still lists them
+
+    def test_every_arm_names_a_curriculum_the_engine_runs(self):
+        from src.train.curriculum import curriculum_enabled
+
+        abl = yaml.safe_load(Path("configs/ablation.yaml").read_text())
+        for name, arm in abl["arms"].items():
+            with self.subTest(arm=name):
+                enabled = curriculum_enabled({"curriculum": arm.get("curriculum", "none")})
+                # A frozen CLIFATRON probe has no next-token objective to warm up.
+                if arm.get("freeze_trunk") and arm["trunk"] == "clifatron_checkpoint":
+                    self.assertFalse(enabled)
+
+    def test_run_arm_refuses_a_cpu_distributed_launch_without_the_flag(self):
+        import os
+        import subprocess
+        import sys
+
+        env = dict(os.environ, CUDA_VISIBLE_DEVICES="", RANK="0", LOCAL_RANK="0",
+                   WORLD_SIZE="2", MASTER_ADDR="127.0.0.1", MASTER_PORT="29599")
+        done = subprocess.run(
+            [sys.executable, "-m", "src.train.run_arm", "--arm", "from_scratch",
+             "--data", "/nonexistent"], env=env, capture_output=True, text=True, timeout=180)
+        self.assertNotEqual(done.returncode, 0)
+        self.assertIn("CUDA is unavailable", done.stderr)
+        self.assertIn("--allow-cpu-ddp", done.stderr)
+
     def test_dry_run_arm_loads(self):
         import subprocess
 

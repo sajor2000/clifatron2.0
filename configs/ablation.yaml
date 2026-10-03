@@ -6,14 +6,17 @@
 # Hypothesis: frozen-backbone head-training > joint fine-tune > from-scratch >
 # no-pretrain for in-domain tasks; from-scratch may close gap for transfer.
 
+# Each arm's `curriculum` (ntp_then_tte | none) is applied per optimizer update by the
+# training engine (src/train/run_arm.py, KTD5).
+
 # ------------------------------------------------------------------- shared
 shared:
   # Outcomes derived from standard CLIF 2.1 fields (no manual annotation).
+  # Never a treatment-initiation outcome (new_imv_24h, new_vasopressor_24h): treatments
+  # are model inputs, never trunk targets (hard rule #1; tests/test_ablation.py).
   outcomes:
     - in_hospital_mortality
     - aki_kdigo_48h
-    - new_imv_24h
-    - new_vasopressor_24h
     - resp_failure_48h
   # Held-out — zero-shot via threshold_hazard head only.
   zero_shot_outcomes:
@@ -34,7 +37,9 @@ arms:
     trunk: clifatron_checkpoint
     freeze_trunk: true
     tie_weights: false
-    curriculum: ntp_then_tte
+    # A frozen probe has no next-token objective, so the NTP warm-up would train nothing;
+    # run_arm refuses a curriculum on a frozen trunk.
+    curriculum: none
     lr: 1e-3              # 3× trunk LR (heads train fast)
     total_steps: 20000
     per_gpu_batch: 128

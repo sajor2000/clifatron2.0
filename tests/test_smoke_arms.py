@@ -249,7 +249,8 @@ def _make_batch(shards: list, vocab_size: int):
         vocab_size=vocab_size,
         n_time_bins=48,
         horizon_hours=48,
-        value_stats={},
+        # Smoke only: neutral (center 0, scale 1) stats; real runs use value_stats.json.
+        value_stats={token: (0.0, 1.0) for token in range(vocab_size)},
         run_seed=42,
     )
 
@@ -266,12 +267,17 @@ def _make_batch(shards: list, vocab_size: int):
     value_target = torch.zeros((len(shards), max_len))
     value_mask_t = torch.zeros((len(shards), max_len), dtype=torch.bool)
 
+    # Per-anchor label contract (src/data/collate.py): one anchor per stay here, label
+    # times in MINUTES since the anchor; each head bins them on its own grid (KTD4).
     th_target = torch.zeros(len(shards), dtype=torch.long)
     th_tau = torch.zeros(len(shards), dtype=torch.long)
     th_dir = torch.zeros(len(shards), dtype=torch.long)
-    th_crossed = torch.zeros(len(shards), dtype=torch.long)
-    cr_type = torch.zeros(len(shards), dtype=torch.long)
-    cr_bin = torch.zeros(len(shards), dtype=torch.long)
+    th_event = torch.zeros(len(shards), dtype=torch.bool)
+    th_time_min = torch.zeros(len(shards), dtype=torch.long)
+    th_mask = torch.zeros(len(shards), dtype=torch.bool)
+    cr_type = torch.full((len(shards),), -1, dtype=torch.long)
+    cr_time_min = torch.zeros(len(shards), dtype=torch.long)
+    cr_mask = torch.zeros(len(shards), dtype=torch.bool)
     last_idx = torch.zeros(len(shards), dtype=torch.long)
 
     for i, s in enumerate(shards):
@@ -294,7 +300,7 @@ def _make_batch(shards: list, vocab_size: int):
             "value": _val.tolist(),
             "target_eligible": [True] * n,
             "anchor_idx": n - 1,
-            "anchor_min": n,
+            "anchor_min": int(s["pos_min"][n - 1]),   # the anchor's minute, not a count
             "outcomes": [
                 {
                     "target_idx": 0,
@@ -310,25 +316,19 @@ def _make_batch(shards: list, vocab_size: int):
         ntp_mask[i, :n] = torch.tensor(built["ntp_mask"], dtype=torch.bool)
         value_target[i, :n] = torch.tensor(built["value_target"])
         value_mask_t[i, :n] = torch.tensor(built["value_mask"], dtype=torch.bool)
-        for label in built["outcome_labels"]:
-            if label["tte_mask"]:
-                cr_type[i] = label["event_cause"]
-                cr_bin[i] = (
-                    label["observed_bins"] if label.get("censored", False)
-                    else label["event_bin"]
-                )
-                break
-        query = built["threshold_query"]
-        if query is not None:
+        anchor = builder.outcome_anchor(episode, built)
+        if anchor["cr"] is not None:
+            cr_type[i] = anchor["cr"]["cause"]
+            cr_time_min[i] = anchor["cr"]["minutes"]
+            cr_mask[i] = True
+        if anchor["queries"]:
+            query = anchor["queries"][0]
             th_target[i] = query["target_idx"]
             th_tau[i] = query["threshold_bin"]
             th_dir[i] = query["direction"]
-            th_crossed[i] = query["threshold_crossed_bin"]
-        else:
-            th_target[i] = 0
-            th_tau[i] = 2
-            th_dir[i] = 0
-            th_crossed[i] = -1
+            th_event[i] = query["status"] == "positive"
+            th_time_min[i] = query["minutes"] or 0
+            th_mask[i] = query["minutes"] is not None
         last_idx[i] = n - 1
 
     batch = {
@@ -344,11 +344,14 @@ def _make_batch(shards: list, vocab_size: int):
         "value_mask": value_mask_t,
         "last_idx": last_idx,
         "cr_type": cr_type,
-        "cr_bin": cr_bin,
+        "cr_time_min": cr_time_min,
+        "cr_mask": cr_mask,
         "th_target": th_target,
         "th_tau": th_tau,
         "th_dir": th_dir,
-        "th_crossed": th_crossed,
+        "th_event": th_event,
+        "th_time_min": th_time_min,
+        "th_mask": th_mask,
     }
     return batch
 

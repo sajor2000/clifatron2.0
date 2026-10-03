@@ -8,9 +8,9 @@
 # base stays self-supervised. NTP-only also matches how the vendored HF checkpoints
 # were trained, keeping pre/post-RL comparisons apples-to-apples.
 #
-# NOTE: `loss_balancing: uncertainty` and `curriculum: ntp_then_tte` are read by
-# run_arm/joint paths, NOT pretrain.py — inert here; pretrain uses fixed weights
-# from heads.*.weight (objective_weights()).
+# `loss_balancing` accepts only `fixed` (heads.*.weight); `curriculum: none` trains with
+# these weights from the first optimizer update (src/train/curriculum.py). Equivalent to
+# `pretrain --objective-arm next_token_only` (configs/objective_arms.yaml).
 
 trunk:
   d_model: 512
