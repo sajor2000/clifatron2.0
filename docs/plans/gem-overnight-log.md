@@ -709,3 +709,19 @@ another session on this Mac — not by this loop; no data left `output/` (all
 git-ignored). Suites green on this pass: tests/ 430 passed 4 skipped,
 clif-validate/ 32. origin/main in sync at `ff3fbad`; viewer alive, all
 sources. Loop work remains gated on user infrastructure (18:00).
+
+### 2026-10-02 19:00 — New branch `t3code/tokenizer-fixes` (16 commits); r2 sample arms
+
+Fetch revealed new remote branch `t3code/tokenizer-fixes`, 16 commits ahead of
+main, 91 files (+16,829/−1,839): the tokenizer-v2 program (U1–U9) — bins for
+every numeric concept, vocab v2 contract with single bin_index, six-arm
+tokenization ablation, full-hospitalization GEM artifact with
+ADMISSION/DISCHARGE terminal framing, disposition/censoring/mortality rollout
+eval, suppression-safe aggregate reports. **Not merged** — inspected
+read-only; flagged to the user (merge is a user decision, like PR #15).
+Corresponding regenerated sample arms appeared in `output/intermediate_phi/`
+(18:41–18:42, other session): `mimic_v2_sample_r2` (117M), `_r2_continuous`
+(6.8M), `_r2_decile` (38M) — all git-ignored. Suites green on main:
+tests/ 430 passed 4 skipped, clif-validate/ 32. origin/main in sync at
+`8ec3866` after this entry's push; viewer alive, all five sources. Loop work
+remains gated on user infrastructure (19:00).
