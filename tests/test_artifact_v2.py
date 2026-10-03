@@ -305,9 +305,6 @@ class ArtifactV2Test(unittest.TestCase):
                   vocab_binding=artifact_binding(_shift_segments(self.blob)))
 
 
-if __name__ == "__main__":
-    unittest.main()
-
 
 class UnitSpellingEquivalenceTest(unittest.TestCase):
     """Re-importing the reference site's own vocab must not fail on unit spellings
@@ -331,3 +328,7 @@ class UnitSpellingEquivalenceTest(unittest.TestCase):
         ref = {"concepts": {"glucose_serum": "mg/dL"}}
         with self.assertRaises(ValueError):
             validate_units(self._events("glucose_serum", "mmol/L"), cfg, ref)
+
+
+if __name__ == "__main__":
+    unittest.main()

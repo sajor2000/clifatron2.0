@@ -25,7 +25,8 @@ class _Tiny(torch.nn.Module):
 
 
 def _save(path, **over):
-    model = over.pop("model", None) or _Tiny()
+    model = over.pop("model", None)
+    model = _Tiny() if model is None else model  # a compiled module has no truth value
     opt = over.pop("opt", None) or torch.optim.SGD(_Tiny().parameters(), lr=0.01)
     sched = over.pop("sched", None) or torch.optim.lr_scheduler.StepLR(opt, 1000)
     save_checkpoint(path, model=model, optimizer=opt, scheduler=sched,
@@ -45,6 +46,15 @@ class CheckpointAtomicityTest(unittest.TestCase):
             loaded = load_checkpoint(path)
             for key in ("model", "optimizer", "scheduler", "epoch", "step", "manifest"):
                 self.assertIn(key, loaded)
+
+    def test_a_compiled_model_saves_raw_state_dict_keys(self):
+        """`torch.compile` prefixes keys with `_orig_mod.`; a raw model must load them."""
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "ckpt.pt"
+            _save(path, model=torch.compile(_Tiny()))
+            loaded = load_checkpoint(path)
+            self.assertEqual(set(loaded["model"]), {"fc.weight", "fc.bias"})
+            _Tiny().load_state_dict(loaded["model"])
 
     def test_a_failed_save_does_not_replace_an_existing_good_checkpoint(self):
         """tmp-then-rename: a save that dies before the move leaves the old file intact."""

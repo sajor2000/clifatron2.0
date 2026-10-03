@@ -338,6 +338,13 @@ class RealDataGateTest(unittest.TestCase):
         self.assertTrue({"unk_rate_non_fit", "small_cells_suppressed"}
                         <= self._failed(report))
 
+    def test_a_suppressed_unk_count_on_a_large_base_gates_on_its_upper_bound(self):
+        report = _good_report()
+        report["unk"]["non_fit"] = {"tokens": 2_000_000, "unk": "<10", "rate": None}
+        self.assertNotIn("unk_rate_non_fit", self._failed(report))
+        report["unk"]["non_fit"] = {"tokens": 500, "unk": "<10", "rate": None}
+        self.assertIn("unk_rate_non_fit", self._failed(report))  # bound 9/500 > 0.01
+
     def test_gate_cli_exits_nonzero_on_failure(self):
         import yaml
 

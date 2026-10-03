@@ -16,7 +16,7 @@ import torch
 import torch.distributed as dist
 
 from src.data.segments import compare_binding
-from src.train.checkpoint import save_checkpoint, load_checkpoint
+from src.train.checkpoint import load_checkpoint, save_checkpoint, unwrap_compiled
 from src.train.manifest import Manifest
 
 
@@ -274,7 +274,7 @@ def train(model, train_dl, val_dl, opt, scheduler, tcfg: TrainConfig, dev, *,
         loaded = load_checkpoint(resume_ckpt, dev)
         compare_binding(loaded.get("vocab_binding"), vocab_binding, what="resume checkpoint")
         target_model = model.module if is_distributed() and hasattr(model, "module") else model
-        target_model.load_state_dict(loaded["model"])
+        unwrap_compiled(target_model).load_state_dict(loaded["model"])
         # fresh_schedule: keep the model + optimizer (Adam moments) but NOT the
         # saved LR schedule — for continuation runs with a NEW config schedule
         # (e.g. extending a finished cosine; a loaded decayed schedule would pin

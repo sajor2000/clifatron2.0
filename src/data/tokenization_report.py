@@ -512,11 +512,23 @@ def gate_report(report: Mapping, cfg: Mapping, *,
                              "0 numeric concepts bare in the fit partition" if not bare
                              else f"{len(bare)} numeric concept(s) bare: {', '.join(bare)}"))
 
-    rate = ((report.get("unk") or {}).get("non_fit") or {}).get("rate")
-    checks.append(_check(
-        "unk_rate_non_fit", rate is not None and rate < max_unk_rate,
-        f"<unk> rate on non-fit partitions = {rate} (limit {max_unk_rate})"
-        if rate is not None else "non-fit <unk> rate not measurable (base under 10)"))
+    non_fit = (report.get("unk") or {}).get("non_fit") or {}
+    rate, nf_tokens = non_fit.get("rate"), non_fit.get("tokens")
+    if rate is not None:
+        passed = rate < max_unk_rate
+        detail = f"<unk> rate on non-fit partitions = {rate} (limit {max_unk_rate})"
+    elif (_is_count(nf_tokens) and nf_tokens >= min_cell
+          and non_fit.get("unk") == f"<{min_cell}"):
+        # The rate is withheld because the <unk> count is a small cell; the published
+        # values still bound it by (min_cell - 1) / tokens.
+        bound = (min_cell - 1) / nf_tokens
+        passed = bound < max_unk_rate
+        detail = (f"<unk> rate on non-fit partitions < {round(bound, 6)} "
+                  f"(count under {min_cell}; limit {max_unk_rate})")
+    else:
+        passed = False
+        detail = f"non-fit <unk> rate not measurable (base under {min_cell} or withheld)"
+    checks.append(_check("unk_rate_non_fit", passed, detail))
 
     if report.get("trajectory") == "hospitalization":
         gem = report.get("gem") or {}

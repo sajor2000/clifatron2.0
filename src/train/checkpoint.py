@@ -8,6 +8,12 @@ import torch
 from src.data.segments import check_binding
 
 
+def unwrap_compiled(model):
+    """The module `torch.compile` wrapped, else `model`: an `OptimizedModule` prefixes
+    every state-dict key with ``_orig_mod.``, which a raw model cannot load."""
+    return getattr(model, "_orig_mod", model)
+
+
 def save_checkpoint(path, *, model, optimizer, scheduler, epoch, step=0, rng_states=None,
                     manifest=None, vocab_binding=None):
     """Atomically write a training checkpoint.
@@ -22,7 +28,7 @@ def save_checkpoint(path, *, model, optimizer, scheduler, epoch, step=0, rng_sta
     try:
         ckpt = {
             "schema_version": 2,
-            "model": model.state_dict(),
+            "model": unwrap_compiled(model).state_dict(),
             "optimizer": optimizer.state_dict(),
             "scheduler": scheduler.state_dict(),
             "epoch": epoch,

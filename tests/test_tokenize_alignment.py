@@ -9,6 +9,7 @@ asserts every per-stay array is the same length.
 """
 
 import json
+import math
 import os
 import tempfile
 import unittest
@@ -361,6 +362,12 @@ class FusedCategoricalAndCoverageTest(unittest.TestCase):
         self.assertEqual(
             sum(t.startswith("braden_mobility=") for t in tokens), len(self.HOURS)
         )
+        # The validation-only numeric concept's finite values are dropped with its
+        # identity: no frozen stats exist to normalize an <unk> input or target.
+        row = self.events.filter(self.events["hosp_id"] == self.VALIDATION[0]).row(0, named=True)
+        unk_values = [v for t, v in zip(tokens, row["value"]) if t == "<unk>"]
+        self.assertTrue(unk_values)
+        self.assertTrue(all(v is None or math.isnan(v) for v in unk_values))
 
     def test_binning_sources_cover_every_binned_concept_and_are_hashed(self):
         from src.data.tokenize import json_sha256

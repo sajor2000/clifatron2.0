@@ -1773,7 +1773,9 @@ def _encode_events(events: pl.DataFrame, vocab: dict, edges: dict, bin_cfg: dict
             soft_weight.append(weights)
             pos_min.append(positions[j])
             target_eligible.append(eligibles[j])
-            valnum.append(float(v) if v is not None else nan)  # ORA value-regression target
+            # ORA value-regression target. An <unk> (a concept the fit partition never
+            # saw) has no frozen stats to normalize against, so it carries no value.
+            valnum.append(nan if v is None or hard == unk_id else float(v))
             if gem_mode:
                 n_le_anchor += bool(le_anchors[j])
         columns["hosp_id"].append(hosp_ids[lo])
