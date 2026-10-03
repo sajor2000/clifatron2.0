@@ -57,6 +57,19 @@ class ArtifactMismatch(RuntimeError):
     """
 
 
+def check_manifest_binding(manifest: dict, vocab_blob: dict) -> None:
+    """The bundle's heads were trained against exactly one tokenizer-v2 vocabulary and
+    set of segments (KTD7). The manifest records that binding; it must equal the bundled
+    vocab.json's, and a bundle recording none (built by the previous tokenizer) is
+    refused with a re-tokenize message."""
+    from src.data.segments import ArtifactBindingError, check_binding
+
+    try:
+        check_binding(manifest.get("vocab_binding"), vocab_blob, what="bundle checkpoint")
+    except ArtifactBindingError as exc:
+        raise ArtifactMismatch(str(exc)) from exc
+
+
 def load_checkpoint(path: str):
     """Load frozen CLIFATRON checkpoint with our heads attached. Fails closed (U5 D2).
 
@@ -76,8 +89,14 @@ def load_checkpoint(path: str):
     nothing whatsoever enforcing that -- no caller, no CLI flag, no coupling to outcome
     status. An unenforced exemption inside a fail-closed control is worse than none: it
     reads as a considered safety valve while behaving as an open door.
+
+    The heads' value-bin count is derived from the bundled vocab.json
+    (`segments.n_value_bins`), never a default, and the manifest's vocabulary binding
+    must match that vocab.json (`check_manifest_binding`), so the strict load proves the
+    heads were trained against these exact segments.
     """
     import torch
+    from src.data.segments import ArtifactBindingError, n_value_bins
     from src.model.head_adapter import CLIFATRONHeads, load_backbone
 
     ckpt = Path(path)
@@ -88,13 +107,27 @@ def load_checkpoint(path: str):
             "validator would score an untrained model and emit a benchmark-shaped "
             "report; refusing rather than degrading."
         )
+    for required in ("vocab.json", "bundle_manifest.json"):
+        if not (ckpt / required).exists():
+            raise ArtifactMismatch(
+                f"{required} is absent from the bundle; the heads' vocabulary binding "
+                "cannot be checked, so refusing to load them."
+            )
+    vocab_blob = json.loads((ckpt / "vocab.json").read_text())
+    check_manifest_binding(json.loads((ckpt / "bundle_manifest.json").read_text()),
+                           vocab_blob)
+    try:
+        value_bins = n_value_bins(vocab_blob)
+    except ArtifactBindingError as exc:
+        raise ArtifactMismatch(str(exc)) from exc
 
     backbone = load_backbone(path)
     device = "cuda" if torch.cuda.is_available() else "cpu"
     backbone = backbone.to(device).eval()
 
     n_targets = 10
-    model = CLIFATRONHeads(backbone, n_targets, freeze_backbone=True)
+    model = CLIFATRONHeads(backbone, n_targets, freeze_backbone=True,
+                           n_value_bins=value_bins)
 
     state = torch.load(head_path, map_location=device, weights_only=True)
     try:
@@ -769,7 +802,7 @@ def main():
     _attest.record_access(args.access_log, model_version=provenance["model_version"],
                           actor_role="site_operator", artifact_id=Path(args.out).name,
                           action="export")
-    out = write_export(payload, args.out, args.ledger)
+    write_export(payload, args.out, args.ledger)
 
     # Reports what actually happened, not an unconditional reassurance. The previous
     # version printed "No raw data ... have left the node." on every run, including runs

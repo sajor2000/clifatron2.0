@@ -7,7 +7,6 @@ and (c) failing closed on a missing or corrupt file rather than silently startin
 fresh. This proves each claim data-free on CPU.
 """
 
-import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -26,7 +25,8 @@ class _Tiny(torch.nn.Module):
 
 
 def _save(path, **over):
-    model = over.pop("model", None) or _Tiny()
+    model = over.pop("model", None)
+    model = _Tiny() if model is None else model  # a compiled module has no truth value
     opt = over.pop("opt", None) or torch.optim.SGD(_Tiny().parameters(), lr=0.01)
     sched = over.pop("sched", None) or torch.optim.lr_scheduler.StepLR(opt, 1000)
     save_checkpoint(path, model=model, optimizer=opt, scheduler=sched,
@@ -46,6 +46,15 @@ class CheckpointAtomicityTest(unittest.TestCase):
             loaded = load_checkpoint(path)
             for key in ("model", "optimizer", "scheduler", "epoch", "step", "manifest"):
                 self.assertIn(key, loaded)
+
+    def test_a_compiled_model_saves_raw_state_dict_keys(self):
+        """`torch.compile` prefixes keys with `_orig_mod.`; a raw model must load them."""
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "ckpt.pt"
+            _save(path, model=torch.compile(_Tiny()))
+            loaded = load_checkpoint(path)
+            self.assertEqual(set(loaded["model"]), {"fc.weight", "fc.bias"})
+            _Tiny().load_state_dict(loaded["model"])
 
     def test_a_failed_save_does_not_replace_an_existing_good_checkpoint(self):
         """tmp-then-rename: a save that dies before the move leaves the old file intact."""
@@ -111,6 +120,56 @@ class FailClosedLoadTest(unittest.TestCase):
             torch.save({"schema_version": 0, "model": {}}, path)
             with self.assertRaisesRegex(ValueError, "schema version"):
                 load_checkpoint(path)
+
+
+VOCAB_V2 = {
+    "vocab": {"<pad>": 0, "map=0": 1, "map=1": 2},
+    "segments": {"map": [
+        {"lo": None, "hi": 65.0, "lo_closed": False, "hi_closed": False},
+        {"lo": 65.0, "hi": None, "lo_closed": True, "hi_closed": False},
+    ]},
+    "manifest": {"tokenizer_version": 2},
+}
+
+
+class VocabBindingTest(unittest.TestCase):
+    """U5 (KTD7): a checkpoint records the vocabulary and segments it was trained on,
+    and a consumer with a different vocabulary or segments is refused."""
+
+    def test_the_binding_is_recorded_and_verified(self):
+        from src.data.segments import artifact_binding
+        from src.train.checkpoint import verify_checkpoint_binding
+
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "ckpt.pt"
+            _save(path, vocab_binding=artifact_binding(VOCAB_V2))
+            loaded = load_checkpoint(path)
+        self.assertEqual(loaded["vocab_binding"], {
+            "tokenizer_version": "2",
+            "vocabulary": artifact_binding(VOCAB_V2)["vocabulary"],
+            "numeric_edges": artifact_binding(VOCAB_V2)["numeric_edges"],
+        })
+        verify_checkpoint_binding(loaded, VOCAB_V2)
+
+        moved = {**VOCAB_V2, "segments": {"map": [
+            {"lo": None, "hi": 66.0, "lo_closed": False, "hi_closed": False},
+            {"lo": 66.0, "hi": None, "lo_closed": True, "hi_closed": False},
+        ]}}
+        with self.assertRaisesRegex(ValueError, "numeric_edges"):
+            verify_checkpoint_binding(loaded, moved)
+        renamed = {**VOCAB_V2, "vocab": {"<pad>": 0, "map=0": 2, "map=1": 1}}
+        with self.assertRaisesRegex(ValueError, "vocabulary"):
+            verify_checkpoint_binding(loaded, renamed)
+
+    def test_an_unbound_checkpoint_is_refused_with_a_retokenize_message(self):
+        from src.train.checkpoint import verify_checkpoint_binding
+
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "ckpt.pt"
+            _save(path)
+            loaded = load_checkpoint(path)
+        with self.assertRaisesRegex(ValueError, "re-tokeni[sz]e"):
+            verify_checkpoint_binding(loaded, VOCAB_V2)
 
 
 if __name__ == "__main__":

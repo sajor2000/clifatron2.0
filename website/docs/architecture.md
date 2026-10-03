@@ -27,7 +27,7 @@ We attach the same four heads to either backbone's per-token hidden states. A Qw
 (adds QK-Norm) is a **measured ablation row** ([Ablations](./ablations.md)), so "Qwen2 vs Qwen3" is
 a quantified finding, not an assertion.
 
-:::info Objective, not backbone, is the lever
+:::info[Objective, not backbone, is the lever]
 ORA (arXiv:2602.00541) shows the gains are backbone-agnostic — so the backbone is a footnote and the
 *objective* is where the novelty lives. The from-scratch Qwen2-arch model is the primary contribution; the
 CLIFATRON-Qwen2 attach is the cheap wedge that de-risks it first. See `MEMORY.md` §B.
@@ -152,8 +152,8 @@ flowchart LR
 ```
 
 Resolution: **untied + ~10k vocab** (≈8–12M emb + ~25M trunk ≈ 33–37M, still the "~30M
-neighborhood"). Documented in `notes/NEXT_STEPS.md §2.3`. The current frozen v2 vocab is only a
-few hundred ids ([vocabulary](./data-tokenization.md#4--fused-vocabulary-and-the-frozen-manifest)),
+neighborhood"). Documented in `notes/NEXT_STEPS.md §2.3`. The tokenizer-v2 vocab is about 2k ids
+on the Site 1 verification sample ([vocabulary](./data-tokenization.md#4--fused-vocabulary-and-the-frozen-manifest)),
 so ~10k is headroom, not today's size.
 
 ---
@@ -176,7 +176,7 @@ sequenceDiagram
     H-->>B: prediction (hazard / CIF / value / logit)
 ```
 
-:::warning Transformers v5 caveat
+:::warning[Transformers v5 caveat]
 The installed `transformers` is v5, where `output_hidden_states` moved to a
 `_can_record_outputs` mechanism and the *final* hidden state may differ from the last
 hidden-states entry due to extra normalization. Verify `anchor_state` against a real CLIFATRON

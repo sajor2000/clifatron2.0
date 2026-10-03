@@ -32,15 +32,12 @@ import json
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-# The one outcome the synthetic bundle evaluates, and the zero-shot query the
-# fixture manifest declares for it. Per ThresholdHazardHead: `tau_bin` is the
-# queried threshold's VALUE-bin index (0..n_value_bins), not a time bin, and
-# `direction` is 0=below, 1=above. MAP < 65 mmHg → the forced 65.0 edge's bin,
-# direction below.
+# The one outcome the synthetic bundle evaluates. Its zero-shot query is NOT hand-coded:
+# `synthetic_outcome_queries` derives it from the built vocabulary's segments with the
+# tokenizer's own binning function (per ThresholdHazardHead: `tau_bin` is the queried
+# threshold's VALUE-bin index — for MAP < 65 the bin of a value just under the forced
+# 65.0 edge — and `direction` is 0=below, 1=above).
 SYNTHETIC_OUTCOME = "map_below_65_48h"
-SYNTHETIC_OUTCOME_QUERIES = {
-    SYNTHETIC_OUTCOME: {"target_index": 0, "tau_bin": 1, "direction": 0},
-}
 SYNTHETIC_SITE = "SYNTH-A"
 SYNTHETIC_KEY_ID = "synthetic-releaser"
 TRUST_ROLES_FILENAME = "trust_roles.yaml"      # written beside the bundle (out of band)
@@ -95,7 +92,8 @@ FIXTURE_POLICY = {
     "compatibility_manifests": {
         "experimental_representation": {
             "required_hashes": [
-                "training_split", "vocabulary", "numeric_edges",
+                "training_split", "vocabulary", "numeric_edges", "binning_sources",
+                "reference_units", "concept_sources",
                 "target_map", "outcome_spec", "clif_version",
             ],
             "vocabulary_origin": "reference_training_partition",
@@ -114,6 +112,7 @@ FIXTURE_DATA_CONFIG = {
         "vitals": {
             "file": "clif_vitals",
             "availability_col": "recorded_dttm",
+            "availability": "missing_storetime",   # R12: declared on every table
             "concept_col": "vital_category",
             "value_col": "vital_value",
             "unit_col": "vital_unit",
@@ -123,8 +122,10 @@ FIXTURE_DATA_CONFIG = {
         {"name": "map", "source": "vitals", "direction": "below", "unit": "mmHg"},
     ],
     "value_binning": {
+        # Quantile target well above the old hard-coded n_value_bins=10, so `map` gets
+        # >= 12 segments and every consumer must derive n_value_bins from the vocab.
         "scheme": "decile",
-        "n_bins": 4,
+        "n_bins": 16,
         "build_from_site": SYNTHETIC_SITE,
         "fit_partition": "train",
         "soft_discretization": True,
@@ -242,6 +243,7 @@ def build_synthetic_bundle(bundle_dir: str | Path, site_dir: str | Path,
     import yaml
     from transformers import GPT2Config, GPT2LMHeadModel
 
+    from src.data.segments import n_value_bins
     from src.data.tokenize import tokenize_site
     from src.eval.bundle import write_bundle_manifest
     from src.model.head_adapter import CLIFATRONHeads, load_backbone
@@ -266,7 +268,7 @@ def build_synthetic_bundle(bundle_dir: str | Path, site_dir: str | Path,
 
     episodes = pl.read_parquet(episode_path)
     vocab_out = Path("output/intermediate_phi/synthetic_vocab_build")
-    tokenize_site(cfg, SYNTHETIC_SITE, Path(site_dir), vocab_out, None, None,
+    tokenize_site(cfg, SYNTHETIC_SITE, Path(site_dir), vocab_out, None,
                   episodes=episodes, artifact_policy=FIXTURE_POLICY)
     blob = json.loads((vocab_out / "vocab.json").read_text())
     (root / "vocab.json").write_text(json.dumps(blob))
@@ -281,9 +283,11 @@ def build_synthetic_bundle(bundle_dir: str | Path, site_dir: str | Path,
     GPT2LMHeadModel(backbone_cfg).save_pretrained(root)
 
     # head_weights.pt holds the FULL CLIFATRONHeads state dict (backbone included):
-    # load_checkpoint loads it with strict=True over the whole module.
+    # load_checkpoint loads it with strict=True over the whole module, with the
+    # value-bin count derived from this vocabulary exactly as here.
     torch.manual_seed(seed)
-    model = CLIFATRONHeads(load_backbone(str(root)), 10, freeze_backbone=True)
+    model = CLIFATRONHeads(load_backbone(str(root)), 10, freeze_backbone=True,
+                           n_value_bins=n_value_bins(blob))
     torch.save(model.state_dict(), root / "head_weights.pt")
 
     # Sign the fixture like a real release (U11): generate a throwaway Ed25519 keypair,
@@ -304,13 +308,22 @@ def build_synthetic_bundle(bundle_dir: str | Path, site_dir: str | Path,
         vocab_hash=hashes["vocabulary"],
         outcome_spec_hash=hashes["outcome_spec"],
         clif_version="2.1",
-        outcome_queries=SYNTHETIC_OUTCOME_QUERIES,
+        outcome_queries=synthetic_outcome_queries(blob),
         signing_key=priv_bytes,
         key_id=SYNTHETIC_KEY_ID,
     )
     write_synthetic_trust_root(root.parent / TRUST_ROLES_FILENAME, pub_hex)
     (root.parent / RELEASER_KEY_FILENAME).write_text(priv_bytes.hex())
     return root
+
+
+def synthetic_outcome_queries(vocab_blob: dict) -> dict[str, dict]:
+    """The fixture's zero-shot queries, derived from the built vocabulary's segments
+    via `segments.threshold_bin` (the same check `load_bundle` applies)."""
+    from src.eval.bundle import expected_outcome_queries
+
+    return expected_outcome_queries(FIXTURE_DATA_CONFIG, FIXTURE_COHORT,
+                                    vocab_blob["segments"])
 
 
 def write_synthetic_trust_root(path: str | Path, public_key_hex: str) -> Path:
@@ -335,10 +348,10 @@ __all__ = [
     "RELEASER_KEY_FILENAME",
     "SYNTHETIC_KEY_ID",
     "SYNTHETIC_OUTCOME",
-    "SYNTHETIC_OUTCOME_QUERIES",
     "SYNTHETIC_SITE",
     "TRUST_ROLES_FILENAME",
     "build_synthetic_bundle",
     "build_synthetic_site",
+    "synthetic_outcome_queries",
     "write_synthetic_trust_root",
 ]

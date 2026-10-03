@@ -20,13 +20,13 @@ dangerous tails we most care about.
 
 from __future__ import annotations
 
-import hashlib
 import json
 import math
 from pathlib import Path
 
 import numpy as np
 
+from src.data.segments import json_sha256, segments_hash, vocab_segments
 from src.data.splits import fit_partition
 
 # 1.349 = IQR of a standard normal (Φ⁻¹(0.75) − Φ⁻¹(0.25)); makes robust scale
@@ -121,13 +121,12 @@ def compute_value_stats_from_events(
 
 
 def vocab_hash(vocab: dict) -> str:
-    """SHA-256 of the fused vocab (matches tokenize._json_sha256 canonicalization).
+    """SHA-256 of the fused vocab (`segments.json_sha256`, the manifest's hashing rule).
 
     Binds a value-stats artifact to the exact vocabulary whose token ids give it
     meaning, so a stale or cross-vocabulary file is rejected instead of silently
     applying unrelated centers/scales."""
-    payload = json.dumps(vocab, sort_keys=True, separators=(",", ":"))
-    return hashlib.sha256(payload.encode()).hexdigest()
+    return json_sha256(vocab)
 
 
 def write_value_stats(
@@ -136,22 +135,30 @@ def write_value_stats(
     *,
     vocab: dict | None = None,
     vocab_sha: str | None = None,
+    segments: dict | None = None,
+    segments_sha: str | None = None,
     fit_partition_name: str | None = None,
     min_count: int = _MIN_COUNT,
     robust: bool = True,
 ) -> Path:
     """Write frozen stats as a self-describing artifact bound to its vocabulary.
 
-    Format: `{"schema": 2, "vocab_hash": <sha256|null>, "min_count", "robust",
-    "stats": {token_id: [center, scale]}}`. Pass `vocab` (the fused vocab dict) or a
-    precomputed `vocab_sha` to bind the artifact; the loader verifies it."""
+    Format: `{"schema": 2, "vocab_hash": <sha256|null>, "segments_hash": <sha256|null>,
+    "min_count", "robust", "stats": {token_id: [center, scale]}}`. Pass `vocab` (the
+    fused vocab dict) or a precomputed `vocab_sha`, and the tokenizer-v2 `segments` (or
+    `segments_sha`), to bind the artifact; the loader verifies both. The same vocabulary
+    with different segments gives the same token ids different value ranges, so the
+    segments hash is part of the identity (KTD7)."""
     if vocab is not None and vocab_sha is None:
         vocab_sha = vocab_hash(vocab)
+    if segments is not None and segments_sha is None:
+        segments_sha = segments_hash(segments)
     out = Path(out_path)
     out.parent.mkdir(parents=True, exist_ok=True)
     blob = {
         "schema": 2,
         "vocab_hash": vocab_sha,
+        "segments_hash": segments_sha,
         "fit_partition": fit_partition_name,
         "min_count": int(min_count),
         "robust": bool(robust),
@@ -165,6 +172,7 @@ def load_value_stats(
     path: str | Path,
     *,
     expected_vocab_hash: str | None = None,
+    expected_segments_hash: str | None = None,
     expected_fit_partition: str | None = None,
 ) -> dict[int, tuple[float, float]]:
     """Load a value-stats artifact, verifying vocabulary identity when available.
@@ -172,8 +180,17 @@ def load_value_stats(
     Accepts both the schema-2 self-describing format and the legacy bare
     `{token_id: [center, scale]}` map. If `expected_vocab_hash` is given, the
     artifact must be schema-2 and carry a matching `vocab_hash`; otherwise token
-    ids could be interpreted against an unrelated vocabulary."""
+    ids could be interpreted against an unrelated vocabulary. If
+    `expected_segments_hash` is given, it must also carry a matching `segments_hash`
+    (stats written before tokenizer v2 carry none and are refused)."""
     blob = json.loads(Path(path).read_text())
+    if expected_segments_hash is not None and not (
+        isinstance(blob, dict) and "stats" in blob and blob.get("segments_hash")
+    ):
+        raise ValueError(
+            "value-stats artifact is not bound to tokenizer-v2 segments (no segments_hash); "
+            "recompute it from the re-tokenized reference shard"
+        )
     if isinstance(blob, dict) and "stats" in blob:  # schema-2 self-describing
         stored = blob.get("vocab_hash")
         if expected_vocab_hash is not None:
@@ -184,6 +201,11 @@ def load_value_stats(
                     f"value-stats vocabulary hash mismatch: artifact {stored[:12]}… != "
                     f"expected {expected_vocab_hash[:12]}… (stale or cross-vocabulary stats)"
                 )
+        if expected_segments_hash is not None and blob["segments_hash"] != expected_segments_hash:
+            raise ValueError(
+                f"value-stats segments hash mismatch: artifact {blob['segments_hash'][:12]}… "
+                f"!= expected {expected_segments_hash[:12]}… (stats fit under different bins)"
+            )
         if expected_fit_partition is not None:
             stored_partition = blob.get("fit_partition")
             if stored_partition != expected_fit_partition:
@@ -226,24 +248,24 @@ def _main() -> None:
 
     # Bind to the fused vocabulary so a stale/cross-vocab artifact is detectable.
     vocab_path = Path(args.vocab) if args.vocab else Path(args.events).with_name("vocab.json")
-    vsha = None
-    if vocab_path.exists():
-        blob = json.loads(vocab_path.read_text())
-        vocab = blob.get("vocab", blob)  # tolerate {"vocab":..} or a bare map
-        vsha = vocab_hash(vocab)
-    else:
-        print(f"warning: no vocab.json at {vocab_path} — artifact will be UNBOUND (no identity check)")
+    if not vocab_path.exists():
+        raise SystemExit(f"no vocab.json at {vocab_path}: value stats must be bound to the "
+                         "tokenizer-v2 vocabulary and segments they were fit under")
+    blob = json.loads(vocab_path.read_text())
+    vsha = vocab_hash(blob["vocab"]) if isinstance(blob.get("vocab"), dict) else None
+    ssha = segments_hash(vocab_segments(blob))  # refuses a pre-v2 vocabulary
 
     path = write_value_stats(
         stats,
         args.out,
         vocab_sha=vsha,
+        segments_sha=ssha,
         fit_partition_name=args.partition,
         min_count=args.min_count,
         robust=robust,
     )
-    print(f"wrote {len(stats):,} per-token value stats -> {path}"
-          + (f" (vocab {vsha[:12]}…)" if vsha else " (unbound)"))
+    print(f"wrote {len(stats):,} per-token value stats -> {path} "
+          f"(vocab {str(vsha)[:12]}…, segments {ssha[:12]}…)")
 
 
 if __name__ == "__main__":

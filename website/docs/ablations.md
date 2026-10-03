@@ -45,7 +45,7 @@ flowchart TB
 | From scratch | random-init CLIFEncoder, Qwen2-arch ~30M (our primary model) | full (~35M) | TOO-BERT (from-scratch can win specific tasks) |
 | No-pretrain | random encoder (frozen) | head only | negative control (floor) |
 
-:::tip Why frozen-probe is the expected winner
+:::tip[Why frozen-probe is the expected winner]
 On data-constrained single-site data (utility saturates ~28M on Site 1, arXiv:2505.22964),
 unfreezing a 0.5B backbone risks catastrophic forgetting, and the task-aligned survival objective
 *is* the supervision.
@@ -105,15 +105,20 @@ QK-Norm helps is a **measured row**, not an assumption
 
 ## Tokenization ablation (summary)
 
-Five representation arms on one frozen trunk: physician **clinical segments** (primary), population
-deciles (`decile_ablation`), deciles + soft discretization, continuous-fused, and TextCode. The
-full arm table and the work needed before any claim live in
-**[Tokenization ablation](./data-tokenization.md#9--tokenization-ablation-designed-not-yet-runnable)**.
+Six representation arms on the same trunk and objective: physician **clinical segments** with
+soft discretization (primary), clinical segments with hard ids, population deciles
+(`decile_ablation`, same concept coverage), deciles + soft discretization, continuous-fused, and
+TextCode. Each arm loads its own shard and frozen vocabulary through the shared
+`pretrain.build_loaders` path and trains with masked losses and the configured objective weights.
+The full arm table lives in
+**[Tokenization ablation](./data-tokenization.md#9--tokenization-ablation)**.
 
-:::caution Not yet runnable
-`src/train/run_tokenization_ablation.py` builds each arm's model and then exits at
-`TODO: wire DataLoader`; the continuous-fused and TextCode arms are stubs. Only `--dry-run` model
-construction is tested. No tokenization result exists.
+:::info[Runnable; no result yet]
+All six arms run end to end: two optimizer steps on a synthetic shard in CI
+(`tests/test_tokenization_ablation.py`), and two steps each on a 5,000-episode Site 1 verification
+sample ([verified on real data](./data-tokenization.md#verified-on-real-data)). No tokenization
+result exists yet: the sample vocabulary is smoke-only, and results need the production
+vocabulary fit on the full train partition plus the full training run.
 :::
 
 ---
@@ -138,9 +143,10 @@ Run:
 # finetune-vs-scratch
 torchrun --nproc_per_node=2 -m src.train.run_arm --arm frozen_backbone_head_only --checkpoint <ckpt> --data <narratives>
 
-# tokenization ablation (NOT yet runnable: exits at TODO: wire DataLoader; use --dry-run)
-for arm in clifatron_clinical_bins global_deciles deciles_plus_soft continuous_fused textcode; do
-    torchrun --nproc_per_node=2 -m src.train.run_tokenization_ablation --arm $arm --data <events.parquet>
+# tokenization ablation (per-arm events/vocab/value_stats paths come from the config;
+# override with --events / --vocab / --value-stats)
+for arm in clinical_soft clinical_hard global_deciles deciles_plus_soft continuous_fused textcode; do
+    torchrun --nproc_per_node=2 -m src.train.run_tokenization_ablation --arm $arm
 done
 
 # compare

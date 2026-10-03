@@ -14,8 +14,10 @@ from torch.utils.data import DataLoader
 
 from src.data.collate import collate_model_samples
 from src.data.dataset import ModelDataset
+from src.data.segments import artifact_binding, load_vocab_blob, n_value_bins
 from src.data.targets import TargetBuilder
-from src.data.value_stats import load_value_stats, vocab_hash
+from src.data.value_stats import load_value_stats
+from src.train.checkpoint import verify_checkpoint_binding
 from src.train.engine import _prepare_batch
 from src.train.pretrain import Model, _load_decile_records
 
@@ -42,8 +44,12 @@ def evaluate_checkpoint(
     model: Model,
     loader: DataLoader,
     device: torch.device,
+    vocab_blob: dict,
 ) -> dict[str, Any]:
+    """Validation losses of one checkpoint, refused unless it is bound to `vocab_blob`
+    (the vocab.json the validation shard was encoded with)."""
     blob = torch.load(checkpoint, map_location="cpu", weights_only=False)
+    verify_checkpoint_binding(blob, vocab_blob)
     state = blob.get("model")
     if not isinstance(state, dict):
         raise ValueError(f"{checkpoint} does not contain a model state dictionary")
@@ -103,11 +109,12 @@ def main() -> None:
     data_dir = Path(args.data)
     model_config = yaml.safe_load(Path(args.model_config).read_text())
     data_config = yaml.safe_load(Path(args.data_config).read_text())
-    vocab_blob = json.loads((data_dir / "vocab.json").read_text())
-    expected_vocab_hash = vocab_hash(vocab_blob.get("vocab", vocab_blob))
+    vocab_blob = load_vocab_blob(data_dir / "vocab.json")
+    binding = artifact_binding(vocab_blob)  # refuses a pre-v2 vocabulary
     value_stats = load_value_stats(
         args.value_stats,
-        expected_vocab_hash=expected_vocab_hash,
+        expected_vocab_hash=binding["vocabulary"],
+        expected_segments_hash=binding["numeric_edges"],
         expected_fit_partition="train",
     )
 
@@ -124,7 +131,7 @@ def main() -> None:
         records,
         representation="decile",
         target_builder=target_builder,
-        expected_hashes={},
+        expected_hashes=binding,
         epoch=0,
     )
     loader = DataLoader(
@@ -138,7 +145,7 @@ def main() -> None:
 
     n_targets = len(data_config["target_concepts"])
     vocab_size = model_config["trunk"].get("target_vocab", 10000)
-    model = Model(vocab_size, n_targets, model_config)
+    model = Model(vocab_size, n_targets, model_config, n_value_bins=n_value_bins(vocab_blob))
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     results = []
     for checkpoint in args.checkpoints:
@@ -147,6 +154,7 @@ def main() -> None:
             model=model,
             loader=loader,
             device=device,
+            vocab_blob=vocab_blob,
         )
         results.append(result)
         losses = result["losses"]

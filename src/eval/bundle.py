@@ -2,10 +2,13 @@
 
 A bundle is a directory holding everything inference needs and nothing else:
 
-    bundle_manifest.json   identity + per-file SHA-256 + zero-shot outcome queries
+    bundle_manifest.json   identity + per-file SHA-256 + zero-shot outcome queries +
+                           the heads' vocabulary binding (tokenizer version, vocabulary
+                           and segments hashes)
     head_weights.pt        trained head parameters (loaded strict=True)
     config.json, model.*   the HF backbone checkpoint
-    vocab.json             {"vocab", "edges", "manifest"} — the frozen vocabulary
+    vocab.json             the frozen tokenizer-v2 vocabulary artifact (vocab, segments,
+                           binning sources, reference units, manifest)
     data_config.yaml       resolved data config (tables, binning, versions)
     cohort.yaml            the frozen outcome contract the vocabulary was hashed against
     artifact_policy.yaml   disclosure policy pinned to THIS bundle
@@ -28,8 +31,12 @@ Three rules govern this module:
 
 3. **Verify before parse.** File hashes are checked before any bundled file's content
    is interpreted; the vocabulary then re-verifies its own compatibility hashes via
-   `validate_vocabulary_artifact`; and the manifest's identity fields are cross-checked
-   against the vocabulary manifest so one bundle cannot carry two identities.
+   `validate_vocabulary_artifact` (a vocabulary fit on a `--sample-episodes`
+   verification sample is refused); and the manifest's identity fields are cross-checked
+   against the vocabulary manifest so one bundle cannot carry two identities. Each
+   outcome query's target_index/tau_bin/direction is re-derived from the bundled
+   cohort contract and segments (`segments.threshold_bin`, the tokenizer's own binning
+   function) and must match what the manifest declares.
 """
 
 from __future__ import annotations
@@ -44,7 +51,11 @@ from pathlib import Path
 import yaml
 
 from src.eval import schema as _schema
-from src.eval.clif_validate import ArtifactMismatch, verify_bundle_compatibility
+from src.eval.clif_validate import (
+    ArtifactMismatch,
+    check_manifest_binding,
+    verify_bundle_compatibility,
+)
 
 BUNDLE_MANIFEST = "bundle_manifest.json"
 # The detached Ed25519 signature over the manifest (U11). Kept in sync with
@@ -142,7 +153,8 @@ def _validated_outcome_queries(manifest: dict) -> dict[str, dict]:
 
     These are the model-facing integers, not the human-readable strings in
     `cohort.yaml`: per ThresholdHazardHead, `tau_bin` is the queried threshold's
-    VALUE-bin index (0..n_value_bins) and `direction` is 0=below / 1=above.
+    VALUE-bin index (0..n_value_bins) and `direction` is 0=below / 1=above. Shape only;
+    `check_outcome_queries` checks the values against the bundle's own segments.
     """
     queries = manifest.get("outcome_queries")
     if not isinstance(queries, dict) or not queries:
@@ -174,6 +186,51 @@ def _validated_outcome_queries(manifest: dict) -> dict[str, dict]:
     return queries
 
 
+DIRECTION_CODES = {"below": 0, "above": 1}
+
+
+def expected_outcome_queries(data_cfg: dict, cohort_cfg: dict, segments: dict) -> dict[str, dict]:
+    """The zero-shot query each cohort outcome implies under these segments:
+    `target_index` = the outcome concept's position in `target_concepts`, `direction` =
+    0 below / 1 above, `tau_bin` = `segments.threshold_bin` — the token bin of a value
+    just on the event side of the threshold, i.e. exactly how the tokenizer bins it."""
+    from src.data.segments import threshold_bin
+
+    targets = [t["name"] for t in data_cfg.get("target_concepts", [])]
+    out: dict[str, dict] = {}
+    for name, spec in (cohort_cfg.get("outcomes") or {}).items():
+        concept, direction = spec.get("concept"), spec.get("direction")
+        if concept not in targets or direction not in DIRECTION_CODES or concept not in segments:
+            continue
+        out[name] = {
+            "target_index": targets.index(concept),
+            "tau_bin": threshold_bin(float(spec["threshold"]), segments[concept], direction),
+            "direction": DIRECTION_CODES[direction],
+        }
+    return out
+
+
+def check_outcome_queries(queries: dict, data_cfg: dict, cohort_cfg: dict,
+                          segments: dict) -> None:
+    """Every declared query must be the one the bundle's cohort contract and segments
+    imply; an inconsistent target_index/tau_bin/direction would score a different
+    question than the release attests to."""
+    expected = expected_outcome_queries(data_cfg, cohort_cfg, segments)
+    for name, query in queries.items():
+        want = expected.get(name)
+        if want is None:
+            raise ArtifactMismatch(
+                f"outcome query {name!r} has no binned target concept and threshold in the "
+                "bundled cohort contract and segments; its tau_bin cannot be verified"
+            )
+        for field in ("target_index", "direction", "tau_bin"):
+            if query[field] != want[field]:
+                raise ArtifactMismatch(
+                    f"outcome query {name!r} declares {field}={query[field]}, but the "
+                    f"bundle's cohort contract and segments give {field}={want[field]}"
+                )
+
+
 # A SQL column identifier: a letter/underscore start, then word chars. No spaces,
 # quotes, parens, or punctuation that could break out of an identifier position.
 _SQL_IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
@@ -182,9 +239,75 @@ _SQL_IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _TABLE_FILE_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 
 # The table-spec fields tokenize._read_table interpolates into a DuckDB query string.
-# `value_col`/`unit_col` are optional; the rest are required when a table is declared.
-_REQUIRED_SPEC_IDENTIFIERS = ("concept_col", "availability_col")
-_OPTIONAL_SPEC_IDENTIFIERS = ("value_col", "unit_col")
+# `availability_col` is required; every other column field is optional, but a table must
+# name its concepts somehow (concept_col, a literal concept, or melted columns).
+_REQUIRED_SPEC_IDENTIFIERS = ("availability_col",)
+_OPTIONAL_SPEC_IDENTIFIERS = (
+    "concept_col", "value_col", "unit_col", "categorical_value_col",
+    # U4 (KTD5): MCS group qualifier, a single-concept table's literal concept (inlined
+    # as a SQL string literal), and the patient-keyed join columns (code status).
+    "concept_qualifier_col", "concept", "patient_id_col", "admission_col", "discharge_col",
+)
+# Lists of column identifiers melted into one event per column (wide tables).
+_LIST_SPEC_IDENTIFIERS = ("value_cols", "categorical_value_cols")
+# Additional parquet basenames a table spec reads (the patient -> stay join).
+_OPTIONAL_SPEC_FILES = ("hospitalization_file",)
+_CONCEPT_SOURCES = ("concept_col", "concept", "value_cols", "categorical_value_cols")
+
+
+def _refuse_identifier(where: str, field: str, value: object) -> None:
+    raise ArtifactMismatch(
+        f"bundle {where} field {field!r}={value!r} is not a valid "
+        "SQL identifier; refusing to interpolate it into a query"
+    )
+
+
+def _check_identifier(where: str, field: str, value: object) -> None:
+    if not isinstance(value, str) or not _SQL_IDENT_RE.match(value):
+        _refuse_identifier(where, field, value)
+
+
+def _check_file(where: str, field: str, value: object) -> None:
+    if not isinstance(value, str) or not _TABLE_FILE_RE.match(value):
+        raise ArtifactMismatch(
+            f"bundle {where} declares an unsafe {field} {value!r}; "
+            "must be a bare parquet basename (no path separators or '..')"
+        )
+
+
+def _check_enum(where: str, field: str, value: object, allowed: tuple) -> None:
+    if value not in allowed:
+        raise ArtifactMismatch(
+            f"bundle {where} field {field!r}={value!r} is invalid; "
+            f"expected one of {', '.join(map(str, allowed))}"
+        )
+
+
+def _validate_dose_block(where: str, dose: object, tables: dict,
+                         dose_kinds: tuple[str, ...]) -> None:
+    if not isinstance(dose, dict):
+        raise ArtifactMismatch(f"bundle {where} dose block is not a mapping")
+    _check_enum(where, "dose.kind", dose.get("kind"), dose_kinds)
+    if dose.get("action_col") is not None:
+        _check_identifier(where, "dose.action_col", dose["action_col"])
+    stops = dose.get("stop_actions")
+    if stops is not None:
+        # Bound as query parameters, but held to the identifier shape anyway.
+        if not isinstance(stops, list):
+            _refuse_identifier(where, "dose.stop_actions", stops)
+        for stop in stops:
+            _check_identifier(where, "dose.stop_actions", stop)
+    weight = dose.get("weight_source")
+    if weight is not None:
+        if not isinstance(weight, dict) or weight.get("table") not in tables:
+            raise ArtifactMismatch(
+                f"bundle {where} dose.weight_source must name a declared table, got {weight!r}"
+            )
+        _check_identifier(where, "dose.weight_source.concept", weight.get("concept"))
+        wspec = tables[weight["table"]]
+        for field in ("concept_col", "value_col"):
+            _check_identifier(f"table {weight['table']!r}", field,
+                              wspec.get(field) if isinstance(wspec, dict) else None)
 
 
 def _validate_data_config_identifiers(data_cfg: dict) -> None:
@@ -197,13 +320,21 @@ def _validate_data_config_identifiers(data_cfg: dict) -> None:
     engine that can read local files (review finding). Full releaser-signature trust is
     U11; this is the cheap, in-scope defense that does not wait on it: every bundle
     identifier must look like an identifier before it reaches a query string.
+
+    U4 (KTD5) widened the interpolated surface: melted column lists, the MCS qualifier,
+    literal concepts, the patient-keyed join (columns + hospitalization file), the dose
+    block and the static-token entity files. Every one is validated here, and the
+    spec enums (`dose.kind`, `emit`, `key`, `static_tokens`) must be known values.
     """
+    from src.data.tokenize import DOSE_KINDS, EMIT_MODES, STATIC_TOKENS, TABLE_KEYS
+
     tables = data_cfg.get("tables")
     if not isinstance(tables, dict) or not tables:
         raise ArtifactMismatch("bundle data config declares no tables")
     for name, spec in tables.items():
         if not isinstance(spec, dict):
             raise ArtifactMismatch(f"bundle table spec {name!r} is not a mapping")
+        where = f"table {name!r}"
         file_stem = spec.get("file")
         if not isinstance(file_stem, str) or not _TABLE_FILE_RE.match(file_stem):
             raise ArtifactMismatch(
@@ -211,20 +342,41 @@ def _validate_data_config_identifiers(data_cfg: dict) -> None:
                 "must be a bare parquet basename (no path separators or '..')"
             )
         for field in _REQUIRED_SPEC_IDENTIFIERS:
-            value = spec.get(field)
-            if not isinstance(value, str) or not _SQL_IDENT_RE.match(value):
-                raise ArtifactMismatch(
-                    f"bundle table {name!r} field {field!r}={value!r} is not a valid "
-                    "SQL identifier; refusing to interpolate it into a query"
-                )
+            _check_identifier(where, field, spec.get(field))
         for field in _OPTIONAL_SPEC_IDENTIFIERS:
-            value = spec.get(field)
-            if value is not None and (not isinstance(value, str)
-                                      or not _SQL_IDENT_RE.match(value)):
-                raise ArtifactMismatch(
-                    f"bundle table {name!r} field {field!r}={value!r} is not a valid "
-                    "SQL identifier; refusing to interpolate it into a query"
-                )
+            if spec.get(field) is not None:
+                _check_identifier(where, field, spec[field])
+        for field in _LIST_SPEC_IDENTIFIERS:
+            cols = spec.get(field)
+            if cols is None:
+                continue
+            if not isinstance(cols, list) or not cols:
+                _refuse_identifier(where, field, cols)
+            for col in cols:
+                _check_identifier(where, field, col)
+        for field in _OPTIONAL_SPEC_FILES:
+            if spec.get(field) is not None:
+                _check_file(where, field, spec[field])
+        if not any(spec.get(field) for field in _CONCEPT_SOURCES):
+            _refuse_identifier(where, "concept_col", spec.get("concept_col"))
+        if spec.get("emit") is not None:
+            _check_enum(where, "emit", spec["emit"], EMIT_MODES)
+        if spec.get("key") is not None:
+            _check_enum(where, "key", spec["key"], TABLE_KEYS)
+        if spec.get("dose") is not None:
+            _validate_dose_block(where, spec["dose"], tables, DOSE_KINDS)
+    static = data_cfg.get("static_tokens")
+    if static is not None:
+        if not isinstance(static, list):
+            raise ArtifactMismatch(f"bundle static_tokens must be a list, got {static!r}")
+        for token in static:
+            _check_enum("static_tokens", "static_tokens", token, tuple(STATIC_TOKENS))
+    source = data_cfg.get("static_source")
+    if source is not None:
+        if not isinstance(source, dict):
+            raise ArtifactMismatch("bundle static_source is not a mapping")
+        for field, value in source.items():
+            _check_file("static_source", field, value)
 
 
 def pin_bundle_policy(policy_path: str | Path) -> None:
@@ -247,8 +399,9 @@ class Bundle:
     provenance: dict            # the identity block verify_bundle_compatibility returns
     outcome_queries: dict       # {outcome_name: {target_index, tau_bin, direction}}
     vocab: dict
-    edges: dict
+    segments: dict
     vocab_manifest: dict
+    vocab_artifact: dict        # the whole validated vocab.json (tokenize_site input)
     data_cfg: dict              # config-path fields rewritten to bundled absolutes
     policy: dict
     policy_path: Path
@@ -335,7 +488,15 @@ def load_bundle(path: str | Path, *, pin_policy: bool = True,
     blob = json.loads((root / "vocab.json").read_text())
     from src.data.tokenize import validate_vocabulary_artifact
 
-    vocab, edges, vocab_manifest = validate_vocabulary_artifact(blob, data_cfg, policy)
+    vocab, segments, vocab_manifest = validate_vocabulary_artifact(blob, data_cfg, policy)
+    # KTD9: a vocabulary fit on a verification sample is smoke/dry-run only; training
+    # refuses it, and so does every site.
+    from src.data.segments import SAMPLE_VOCAB_REFUSAL, is_sample_vocab
+
+    if is_sample_vocab(blob):
+        raise ArtifactMismatch(f"bundle vocabulary {SAMPLE_VOCAB_REFUSAL}")
+    check_outcome_queries(outcome_queries, data_cfg,
+                          yaml.safe_load(cohort_path.read_text()), segments)
 
     # One bundle, one identity: the manifest's headline hashes must be the ones the
     # vocabulary actually carries, or the provenance block would attest to a
@@ -351,6 +512,8 @@ def load_bundle(path: str | Path, *, pin_policy: bool = True,
             "bundle manifest outcome_spec_hash does not match the bundled cohort "
             "contract's hash — the manifest attests to different outcomes than it ships."
         )
+    # The heads were trained against one vocabulary and one set of segments (KTD7).
+    check_manifest_binding(manifest, blob)
     # The manifest carries the major.minor CLIF version verify_bundle_compatibility
     # gates on ("2.1"); the data config carries the full schema_version ("2.1.0").
     if data_cfg["schema_version"].split(".")[:2] != provenance["clif_version"].split(".")[:2]:
@@ -389,8 +552,9 @@ def load_bundle(path: str | Path, *, pin_policy: bool = True,
         provenance=provenance,
         outcome_queries=outcome_queries,
         vocab=vocab,
-        edges=edges,
+        segments=segments,
         vocab_manifest=vocab_manifest,
+        vocab_artifact=blob,
         data_cfg=data_cfg,
         policy=policy,
         policy_path=policy_path,
@@ -417,6 +581,8 @@ def write_bundle_manifest(bundle_dir: str | Path, *, model_bundle_id: str,
     is written to `bundle_manifest.sig`. `load_bundle(..., verify_signature=True)` then
     anchors trust in that signature rather than the self-hash alone.
     """
+    from src.data.segments import artifact_binding
+
     root = Path(bundle_dir)
     manifest = {
         "model_bundle_id": model_bundle_id,
@@ -425,6 +591,8 @@ def write_bundle_manifest(bundle_dir: str | Path, *, model_bundle_id: str,
         "outcome_spec_hash": outcome_spec_hash,
         "clif_version": clif_version,
         "outcome_queries": outcome_queries,
+        # KTD7: the heads' vocabulary binding, computed from the bundled vocab.json.
+        "vocab_binding": artifact_binding(json.loads((root / "vocab.json").read_text())),
         "files": hash_bundle_files(root),
     }
     if (signing_key is None) != (key_id is None):
@@ -452,6 +620,8 @@ __all__ = [
     "BUNDLE_MANIFEST",
     "REQUIRED_BUNDLE_FILES",
     "Bundle",
+    "check_outcome_queries",
+    "expected_outcome_queries",
     "hash_bundle_files",
     "load_bundle",
     "pin_bundle_policy",

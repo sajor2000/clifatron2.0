@@ -12,7 +12,7 @@ Where the project stands and exactly what is left to finish it. Synced to `main`
 `docs/plans/2026-08-27-001-feat-evidence-ready-model-experiments-plan.md`; this page is the
 finish-line synopsis.
 
-:::tip The headline
+:::tip[The headline]
 **Every data-free, unblocked unit has landed.** The codebase is a complete, tested, CI-enforced,
 reproducible methods artifact. What remains is **not code-blocked** — it is gated on **real data,
 GPU hardware, and one governance decision.**
@@ -118,7 +118,7 @@ flowchart LR
 | **G4 — GPU qualification** | 2× L40 report: FA2 packed attention, DDP scaling, memory, matrix cost. **`nvidia-smi` driver mismatch — reboot first.** | Reboot; run U13-FA2 + U14. |
 | **G5 — transfer approval** | Written approval to reuse PHI-derived weights for transport across sites. | Obtain + record, else U6/U7 run same-site only. |
 
-:::warning The one thing to do first
+:::warning[The one thing to do first]
 The **pre-selection governance decision (G1)** is the longest-lead, still-unasked item, and a "no"
 reshapes the whole sequence. Ask it before anything else — it gates U12, which gates the method arms.
 :::

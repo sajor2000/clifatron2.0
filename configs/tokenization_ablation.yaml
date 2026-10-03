@@ -1,98 +1,141 @@
-# Tokenization ablation design (NEXT_STEPS.md §4).
-# STATUS 2026-10-02: DESIGN ONLY — src/train/run_tokenization_ablation.py builds models and exits at
-# "TODO: wire DataLoader"; continuous_fused + textcode inputs are stubs. Primary scheme is physician
-# clinical segments (MEMORY.md §E1a, revised 2026-09-02); see website/docs/data-tokenization.md §9.
+# Tokenization ablation design (NEXT_STEPS.md §4) — run by src/train/run_tokenization_ablation.py.
+# STATUS 2026-10-02 (U6): RUNNABLE. Each arm loads its OWN events shard + frozen vocab.json through
+# pretrain.build_loaders and trains through pretrain.Model / engine.train with masked losses and the
+# configs/model.yaml heads.*.weight objective weights. Only the input representation varies.
+# Primary scheme is physician clinical segments + soft discretization (MEMORY.md §E1a, revised
+# 2026-09-02); see website/docs/data-tokenization.md §9.
 # Evidence: Lee 2026 (arxiv:2604.16775) — deciles+soft wins tails; McCann 2026
 # (medRxiv 2026.08.04) — continuous-fused better numeric, worse calibration;
 # Al Attrach 2025 (arxiv:2512.05217) — frozen text encoders beat trainable.
+#
+# Arm keys:
+#   scheme      configs/data.yaml value_binning.scheme the arm's vocabulary was built with
+#               (clinical_segment | decile_ablation); checked against the vocab's binning sources.
+#   tokenizer   fused | continuous_fused | textcode (the input representation).
+#   soft_discretization  true -> soft [T,K] bins (the shard must be tokenized with soft on);
+#               false -> hard ids. Hard and soft arms of one scheme share one shard.
+#   events / vocab / value_stats  per-arm artifacts (override with --events/--vocab/--value-stats).
+#     clinical:   python -m src.data.tokenize ... (scheme clinical_segment, soft on)
+#                 + outcome_join + value_stats
+#     deciles:    the same with scheme decile_ablation
+#     continuous: python -m src.data.tokenize_continuous --primary-vocab <clinical>/vocab.json
+#                 --primary-events <clinical>/events_with_outcomes.parquet --out <continuous dir>
+#                 (edgeless concept ids; threshold bins + n_value_bins from the primary segments)
+#                 + value_stats on the derived shard
+# Batch size, grad accumulation, warmup and runtime come from configs/train.yaml (shared by
+# every arm, so only tokenization varies).
 
 # ------------------------------------------------------------------- shared
 shared:
+  # Outcomes from configs/cohort.yaml (the frozen contract); nothing outside it.
   outcomes:
-    - in_hospital_mortality
-    - aki_kdigo_48h
-    - new_imv_24h
-    - new_vasopressor_24h
-    - resp_failure_48h
-  zero_shot_outcomes:
-    - delirium
+    - map_below_65_48h
+    - lactate_above_4_48h
+    - spo2_below_88_48h
+  zero_shot_outcomes: []
   n_folds: 5
   seed_base: 42
   metrics: [auroc, auprc, ece, brier, calib_slope, calib_intercept, ici]
   calibration: temperature_scaling
-  # All arms use the SAME frozen CLIFEncoder trunk — only tokenization varies.
-  # Keeps total params comparable and isolates the tokenizer effect.
+  # Same CLIFEncoder trunk architecture for every arm — only tokenization varies.
   trunk: clif_encoder
-  freeze_trunk: true
+  # freeze_trunk freezes the transformer blocks ONLY with an init_checkpoint bound to the arm's
+  # vocabulary (--init-checkpoint); without one the runner warns and keeps the trunk trainable
+  # (a frozen random trunk trains the heads on noise). Arms train from scratch by default.
+  freeze_trunk: false
+  init_checkpoint: null
   curriculum: ntp_then_tte
 
 # --------------------------------------------------------------------- arms
 arms:
-  # (1) Physician clinical-segment bins — the PRIMARY scheme (data.yaml scheme: clinical_segment).
-  # Fixed min/max segments from the CLIF consortium CSV, built by src/data/tokenize.py (NOT vendored
-  # tokenETL). NOTE: soft_discretization is false here but true in data.yaml — the primary config
-  # (clinical + soft) has no arm of its own yet.
+  # (1) PRIMARY — physician clinical-segment bins + soft discretization (configs/data.yaml default).
   # Bins from external/clifatron/tokenETL/config/critical_illness_tokenization_final_with_intervals.csv
-  clifatron_clinical_bins:
-    description: "CLIFATRON clinical-segment bins (baseline)"
-    tokenizer: clifatron_clinical
-    soft_discretization: false
-    lr: 1e-3
+  clinical_soft:
+    description: "Physician clinical-segment bins + soft discretization (primary)"
+    primary: true
+    scheme: clinical_segment
+    tokenizer: fused
+    soft_discretization: true
+    events: output/intermediate_phi/mimic/events_with_outcomes.parquet
+    vocab: output/intermediate_phi/mimic/vocab.json
+    value_stats: output/intermediate_phi/mimic/value_stats.json
+    lr: 1.0e-3
     total_steps: 20000
-    per_gpu_batch: 128
+    tags: [tokenization, primary, clinical-bins, soft-discretization]
+
+  # (2) Clinical-segment bins, hard ids (the CLIFATRON baseline). Same shard as the primary arm.
+  clinical_hard:
+    description: "Physician clinical-segment bins, hard tokens (CLIFATRON baseline)"
+    scheme: clinical_segment
+    tokenizer: fused
+    soft_discretization: false
+    events: output/intermediate_phi/mimic/events_with_outcomes.parquet
+    vocab: output/intermediate_phi/mimic/vocab.json
+    value_stats: output/intermediate_phi/mimic/value_stats.json
+    lr: 1.0e-3
+    total_steps: 20000
     tags: [tokenization, baseline, clinical-bins]
 
-  # (2) Global deciles only — Lee's simplest winner.
-  # Per-concept population deciles, frozen from reference site.
-  # No soft discretization, no clinical-threshold edges.
+  # (3) Global deciles only — Lee's simplest winner. Per-concept population deciles, frozen from
+  # the reference site (data.yaml scheme: decile_ablation), hard ids.
   global_deciles:
     description: "Per-concept population deciles, frozen from reference site"
-    tokenizer: decile
+    scheme: decile_ablation
+    tokenizer: fused
     soft_discretization: false
-    lr: 1e-3
+    events: output/intermediate_phi/mimic_decile/events_with_outcomes.parquet
+    vocab: output/intermediate_phi/mimic_decile/vocab.json
+    value_stats: output/intermediate_phi/mimic_decile/value_stats.json
+    lr: 1.0e-3
     total_steps: 20000
-    per_gpu_batch: 128
     tags: [tokenization, decile, lee-2026]
 
-  # (3) Deciles + soft discretization — Lee's best encoder on dangerous tails.
-  # Was the default 2026-08-27 → 2026-09-02; now an ablation arm (data.yaml scheme: decile_ablation).
+  # (4) Deciles + soft discretization — Lee's best encoder on dangerous tails. Same shard as (3).
   # Wins on severe hypokalemia / hypernatremia / hypotension / CRRT / K-extremes.
   deciles_plus_soft:
     description: "Deciles with soft discretization (kernel=1) + forced clinical edges"
-    tokenizer: decile
+    scheme: decile_ablation
+    tokenizer: fused
     soft_discretization: true
-    soft_kernel_bins: 1
-    forced_edges: true
-    lr: 1e-3
+    events: output/intermediate_phi/mimic_decile/events_with_outcomes.parquet
+    vocab: output/intermediate_phi/mimic_decile/vocab.json
+    value_stats: output/intermediate_phi/mimic_decile/value_stats.json
+    lr: 1.0e-3
     total_steps: 20000
-    per_gpu_batch: 128
     tags: [tokenization, decile, soft-discretization, lee-2026]
 
-  # (4) Continuous-fused — McCann 2026.
-  # Value channel as a continuous embedding + numeric head + Monte Carlo.
+  # (5) Continuous-fused — McCann 2026. Edgeless concept ids + normalized current-value channel,
+  # derived from the primary clinical shard; threshold bins / n_value_bins from the primary segments.
   #   +30% numeric accuracy, −34% seq length, worse calibration.
   # Hypothesis: loses on calibration metrics, wins on regression outcomes.
   continuous_fused:
     description: "Continuous-fused value channel (McCann 2026) — ablation"
+    scheme: clinical_segment
     tokenizer: continuous_fused
     soft_discretization: false
-    lr: 1e-3
+    events: output/intermediate_phi/mimic_continuous/events_with_outcomes.parquet
+    vocab: output/intermediate_phi/mimic_continuous/vocab.json
+    value_stats: output/intermediate_phi/mimic_continuous/value_stats.json
+    primary_vocab: output/intermediate_phi/mimic/vocab.json
+    lr: 1.0e-3
     total_steps: 20000
-    per_gpu_batch: 128
     tags: [tokenization, continuous-fused, mccann-2026, ablation]
 
-  # (5) TextCode — frozen BioClinical-ModernBERT descriptions.
-  # Each CLIF code mapped to natural language description → frozen BERT embedding.
-  # Al Attrach 2025: frozen > trainable, 10+ AUROC gap, 15× fewer trainable params.
+  # (6) TextCode — frozen BioClinical-ModernBERT embeddings of a generated description of every
+  # fused id (concept, source table, bin interval, unit) + a trainable projection. Primary shard,
+  # hard ids. Al Attrach 2025: frozen > trainable, 10+ AUROC gap, 15× fewer trainable params.
   # Hypothesis: competitive on all tasks but worse than fused on rare concepts.
   textcode:
-    description: "Frozen BioClinical-ModernBERT code embeddings (TextCode)"
+    description: "Frozen BioClinical-ModernBERT code-description embeddings (TextCode)"
+    scheme: clinical_segment
     tokenizer: textcode
-    textcode_encoder: "thomas-sounack/BioClinical-ModernBERT-large"
+    textcode_encoder: "thomas-sounack/BioClinical-ModernBERT-base"   # = data.yaml notes.encoder
     soft_discretization: false
-    lr: 1e-3
+    events: output/intermediate_phi/mimic/events_with_outcomes.parquet
+    vocab: output/intermediate_phi/mimic/vocab.json
+    value_stats: output/intermediate_phi/mimic/value_stats.json
+    lr: 1.0e-3
     total_steps: 20000
-    per_gpu_batch: 128
     tags: [tokenization, textcode, frozen-encoder, al-attrach-2025]
 
 # ---------------------------------------------------------------- reporting
@@ -102,18 +145,19 @@ report:
   primary_table:
     orientation: outcome_by_arm
   headroom_figure:
-    # clifatron clinical bins as baseline
+    # the primary arm (clinical + soft) as baseline
     x_axis: outcome
-    y_axis: "AUROC gain over CLIFATRON clinical bins"
-    series: [global_deciles, deciles_plus_soft, continuous_fused, textcode]
+    y_axis: "AUROC gain over clinical-segment + soft bins (primary)"
+    series: [clinical_hard, global_deciles, deciles_plus_soft, continuous_fused, textcode]
   calibration_detail:
     note: "Compare ECE, Brier, slope, ICI across arms. McCann predicts continuous-fused loses here."
     metrics: [ece, brier, calib_slope, ici]
   tail_sensitivity:
-    note: "Lee predicts deciles+soft wins. Test: severe hypokalemia, CRRT, K-extremes."
-    outcomes: [aki_kdigo_48h, resp_failure_48h]
+    note: "Lee predicts deciles+soft wins dangerous tails (severe hypotension, hyperlactatemia, hypoxemia)."
+    outcomes: [map_below_65_48h, lactate_above_4_48h, spo2_below_88_48h]
   evidence_table:
-    clifatron_clinical_bins: "CLIFATRON vendor — clinical-segment-anchored quantiles"
+    clinical_soft: "Physician clinical segments + soft discretization (primary; MEMORY.md §E1a)"
+    clinical_hard: "CLIFATRON vendor — physician clinical-segment bins, hard"
     global_deciles: "Lee 2026 arxiv:2604.16775 — deciles ≈ clinical at matched granularity"
     deciles_plus_soft: "Lee 2026 — soft discretization wins dangerous tails"
     continuous_fused: "McCann 2026 medRxiv 2026.08.04 — +30% numeric, worse calibration"

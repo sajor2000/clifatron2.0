@@ -192,11 +192,26 @@ These resolve every open design question as of this date. Change only with new e
   decision (2026-08-27) — reversed on clinical-relevance grounds; the ablation keeps it honest.*
   Clinical decision thresholds (lactate 2/4, MAP 65, SpO₂ 88/90, creatinine 1.5/2/3 ≈ KDIGO) are
   guaranteed bin edges under either scheme; P/F Berlin is deferred until P/F is in `target_concepts`.
-- **E1b. Tokenizer as built (audited 2026-10-02) — full spec `website/docs/data-tokenization.md`.**
-  Only the 10 `target_concepts` get clinical-segment bins (185 numeric tokens); all other numeric labs/vitals
-  are bare concept tokens (value kept for the mark head only). Bins are `[a,b)` vs the CSV's `(a,b]`. No med
-  doses / vent settings yet. Same-timestamp tie order is unstable. The tokenization-ablation runner is not
-  wired. These are tracked as T1–T7 on that page — resolve before any ablation or paper claim.
+- **E1b. Tokenizer v2 — RESOLVED 2026-10-02** (audit T1–T7; plan
+  `docs/plans/2026-10-02-1450-fix-tokenizer-bins-for-everything-plan.md`; spec
+  `website/docs/data-tokenization.md`). Every numeric concept is binned (CSV segments → ordinal → frozen
+  quantile, `single` when sparse; zero bin for every dose); CSV interval flags honored under precedence
+  policy v2 (v1 + step 8: an open `(0, first positive)` running-dose bin, so no running dose bins as
+  stopped; v1 vocabs refused) with outcome-direction closure at forced edges; one `segments.bin_index` for every consumer;
+  fused `concept=value` categoricals; doses (weight ASOF), intermittent meds, 17 vent settings, assessments,
+  CRRT, ECMO/MCS by group, code status, position, static admission tokens; deterministic post-join order +
+  per-table availability declarations; vocab v2 contract (stale artifacts refused, `n_value_bins` derived);
+  GEM full-hospitalization artifact (ADMISSION/DISCHARGE framing, rollout mortality, censoring); runnable
+  six-arm ablation; aggregate-only `tokenization_report.json` + gate (min cell from the artifact
+  policy, rates withheld for sub-10 numerators, complementary suppression); categorical value tokens
+  only when seen in >= `minimum_cell_size` (10) distinct fit stays (vocab.json ships to sites; rarer ->
+  `<unk>`); `--workers` parallel encode in fixed event-budget chunks (`--encode-chunk-events`,
+  byte-identical for any workers/budget). Verified on a 5,000-episode Site 1 sample (gate PASS; all 6 arms + GEM smoke pass).
+  **RETRAIN NOTE:** every v1 artifact and checkpoint (incl. the 6k-step MPS GEM checkpoint) is rejected —
+  re-tokenize and retrain. The production vocab must be fit on the FULL Site 1 train partition (L40
+  re-tokenization); a `--sample-episodes` vocab is `provenance.sample: true` and training refuses it.
+  Residuals (time-to-terminal, two suspect CSV exact rows, clinician review of data-driven bins, NEE/SOFA/
+  comorbidities, norepinephrine salt-vs-base audit, post-discharge deaths) are listed on the spec page.
 - E2. **TextCode / language-grounded arm ELEVATED from future-work to a real transfer-robustness arm.**
   PORTER (arXiv:2606.24102, 2026): frozen-vocab models drop ~69% of events on cross-site transfer;
   language-grounded recovers 97.1% AUROC without vocab mapping. Frozen mCIDE stays PRIMARY (turnkey, matches

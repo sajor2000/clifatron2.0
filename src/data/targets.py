@@ -1,4 +1,16 @@
-"""Deterministic token and time-to-event targets for canonical ICU episodes."""
+"""Deterministic token and time-to-event targets for canonical ICU episodes.
+
+Two modes (U8, KTD10):
+
+- ``icu_24h`` (default): the 24 h prediction artifact. Every feature must be at or
+  before the anchor (a later position is leakage and is refused), and TTE outcome
+  labels / threshold queries are built at the anchor.
+- ``gem``: the full-hospitalization GEM artifact. Next-event targets run over the whole
+  stay (pre-ICU to discharge), so the post-anchor check is disabled for this mode ONLY;
+  there are no TTE labels (an episode carrying outcomes is refused). Target eligibility
+  is still the tokenizer's: the `DISCHARGE//*` terminal token is a target, while
+  `<bos>`, `ADMISSION//*`, static and treatment tokens are never targets (Rule 1).
+"""
 
 from __future__ import annotations
 
@@ -20,6 +32,12 @@ OUTCOME_STATUSES = {
 }
 
 
+TARGET_MODES = ("icu_24h", "gem")
+# Plausibility bound on a normalized value: a finite sentinel (e.g. a 999999 pH) beyond
+# it is dropped as a value-head target (and masked as a continuous-fused input).
+MAX_ABS_Z = 20.0
+
+
 class TargetContractError(ValueError):
     """An episode cannot safely produce the declared target contract."""
 
@@ -31,9 +49,14 @@ class TargetBuilder:
     horizon_hours: float
     value_stats: Mapping[int, tuple[float, float]]
     run_seed: int = 0
-    max_abs_value_z: float = 20.0
+    max_abs_value_z: float = MAX_ABS_Z
+    mode: str = "icu_24h"
 
     def __post_init__(self) -> None:
+        if self.mode not in TARGET_MODES:
+            raise TargetContractError(
+                f"target mode must be one of {', '.join(TARGET_MODES)}, got {self.mode!r}"
+            )
         if self.vocab_size <= 0 or self.n_time_bins <= 0 or self.horizon_hours <= 0:
             raise TargetContractError("vocabulary, time-bin count, and horizon must be positive")
         if not math.isfinite(self.max_abs_value_z) or self.max_abs_value_z <= 0:
@@ -55,12 +78,20 @@ class TargetBuilder:
             raise TargetContractError("token fields must be non-empty and have equal lengths")
         if any(value < 0 or value >= self.vocab_size for value in token):
             raise TargetContractError("token id is outside the frozen vocabulary")
-        anchor_idx = int(episode["anchor_idx"])
-        if anchor_idx < 0 or anchor_idx >= len(token):
+        gem = self.mode == "gem"
+        raw_anchor = episode.get("anchor_idx")
+        anchor_idx = None if gem and raw_anchor is None else int(raw_anchor)
+        if anchor_idx is not None and (anchor_idx < 0 or anchor_idx >= len(token)):
             raise TargetContractError("anchor_idx is outside the episode sequence")
-        anchor_min = int(episode.get("anchor_min", pos_min[anchor_idx]))
-        if any(value > anchor_min for value in pos_min):
-            raise TargetContractError("post-anchor feature encountered")
+        if gem:
+            # The GEM stream deliberately runs past the anchor (whole hospitalization);
+            # the anchor index is kept only for representation evaluation.
+            if episode.get("outcomes"):
+                raise TargetContractError("gem mode carries no TTE outcome labels")
+        else:
+            anchor_min = int(episode.get("anchor_min", pos_min[anchor_idx]))
+            if any(value > anchor_min for value in pos_min):
+                raise TargetContractError("post-anchor feature encountered")
 
         ntp_target = [0] * len(token)
         ntp_mask = [False] * len(token)

@@ -114,7 +114,8 @@ class BundleContractTest(_BundleFixtureCase):
         self.assertEqual(b.provenance["model_bundle_id"], "synthetic-fixture")
         self.assertEqual(b.provenance["clif_version"], "2.1")
         self.assertIn(SYNTHETIC_OUTCOME, b.outcome_queries)
-        self.assertIn("map", b.edges)
+        self.assertIn("map", b.segments)
+        self.assertEqual(b.segments, b.vocab_artifact["segments"])
         # config paths were rewritten to bundled absolutes — nothing repo-relative left
         self.assertTrue(Path(b.data_cfg["cohort_contract"]).is_absolute())
         self.assertTrue(Path(b.data_cfg["cohort_contract"]).exists())
@@ -238,6 +239,71 @@ class BundleContractTest(_BundleFixtureCase):
         with self.assertRaisesRegex(ArtifactMismatch, "direction must be 0"):
             load_bundle(broken)
 
+    def test_the_fixture_tau_bin_is_the_bin_index_of_the_threshold(self):
+        """U5: the declared tau_bin is derived with bin_index, not hand-coded."""
+        from src.data.segments import bin_index
+
+        b = load_bundle(self.bundle_dir, trust_roles_path=self.trust_roles)
+        query = b.outcome_queries[SYNTHETIC_OUTCOME]
+        # MAP < 65 (below): the event-side bin is the one holding values just under 65.
+        self.assertEqual(query["tau_bin"], bin_index(64.999, b.segments["map"]))
+        self.assertNotEqual(query["tau_bin"], bin_index(65.0, b.segments["map"]))
+
+    def test_an_inconsistent_tau_bin_fails_at_load(self):
+        """A query whose tau_bin disagrees with the bundle's own segments scores a
+        different threshold than the release attests to: refuse it at load."""
+        broken = self._mutable_copy("bundle_taubin")
+        manifest = json.loads((broken / BUNDLE_MANIFEST).read_text())
+        manifest["outcome_queries"][SYNTHETIC_OUTCOME]["tau_bin"] += 1
+        write_bundle_manifest(
+            broken, model_bundle_id=manifest["model_bundle_id"],
+            model_version=manifest["model_version"], vocab_hash=manifest["vocab_hash"],
+            outcome_spec_hash=manifest["outcome_spec_hash"],
+            clif_version=manifest["clif_version"],
+            outcome_queries=manifest["outcome_queries"],
+            signing_key=self.releaser_key, key_id=SYNTHETIC_KEY_ID,
+        )
+        with self.assertRaisesRegex(ArtifactMismatch, "tau_bin"):
+            load_bundle(broken, trust_roles_path=self.trust_roles)
+
+    def test_a_query_with_the_wrong_target_index_or_direction_fails_at_load(self):
+        for field, value in (("target_index", 3), ("direction", 1)):
+            broken = self._mutable_copy(f"bundle_query_{field}")
+            manifest = json.loads((broken / BUNDLE_MANIFEST).read_text())
+            manifest["outcome_queries"][SYNTHETIC_OUTCOME][field] = value
+            write_bundle_manifest(
+                broken, model_bundle_id=manifest["model_bundle_id"],
+                model_version=manifest["model_version"],
+                vocab_hash=manifest["vocab_hash"],
+                outcome_spec_hash=manifest["outcome_spec_hash"],
+                clif_version=manifest["clif_version"],
+                outcome_queries=manifest["outcome_queries"],
+                signing_key=self.releaser_key, key_id=SYNTHETIC_KEY_ID,
+            )
+            with self.assertRaisesRegex(ArtifactMismatch, field):
+                load_bundle(broken, trust_roles_path=self.trust_roles)
+
+    def test_a_manifest_bound_to_other_segments_is_refused(self):
+        broken = self._mutable_copy("bundle_binding")
+        manifest = json.loads((broken / BUNDLE_MANIFEST).read_text())
+        manifest["vocab_binding"]["numeric_edges"] = "0" * 64
+        (broken / BUNDLE_MANIFEST).write_text(json.dumps(manifest))
+        with self.assertRaisesRegex(ArtifactMismatch, "numeric_edges"):
+            load_bundle(broken, verify_signature=False)
+
+    def test_a_vocabulary_fit_on_a_verification_sample_is_refused(self):
+        """A `--sample-episodes` vocabulary is smoke-only (KTD9): a bundle built around
+        one must not load at a site, even when every hash and the manifest agree."""
+        broken = self._mutable_copy("bundle_sample_vocab")
+        vocab_path = broken / "vocab.json"
+        blob = json.loads(vocab_path.read_text())
+        blob["manifest"]["provenance"]["sample"] = True
+        blob["manifest"]["provenance"]["sample_size"] = 12
+        vocab_path.write_text(json.dumps(blob))
+        self._reseal(broken)          # file hashes + vocab binding now consistent
+        with self.assertRaisesRegex(ArtifactMismatch, "verification sample"):
+            load_bundle(broken, verify_signature=False)
+
     def test_a_sql_unsafe_column_name_is_refused(self):
         """An untrusted table spec column that could break out of DuckDB SQL fails closed."""
         import yaml
@@ -245,6 +311,18 @@ class BundleContractTest(_BundleFixtureCase):
         broken = self._mutable_copy("bundle_sqlcol")
         dc = yaml.safe_load((broken / "data_config.yaml").read_text())
         dc["tables"]["vitals"]["concept_col"] = "x FROM read_text('/etc/passwd') --"
+        (broken / "data_config.yaml").write_text(yaml.safe_dump(dc))
+        self._reseal(broken)
+        with self.assertRaisesRegex(ArtifactMismatch, "SQL identifier"):
+            load_bundle(broken)
+
+    def test_a_sql_unsafe_categorical_value_column_is_refused(self):
+        """`categorical_value_col` is interpolated into SQL too (U2), so it is validated."""
+        import yaml
+
+        broken = self._mutable_copy("bundle_sqlcatcol")
+        dc = yaml.safe_load((broken / "data_config.yaml").read_text())
+        dc["tables"]["vitals"]["categorical_value_col"] = "x) FROM read_text('/etc/passwd') --"
         (broken / "data_config.yaml").write_text(yaml.safe_dump(dc))
         self._reseal(broken)
         with self.assertRaisesRegex(ArtifactMismatch, "SQL identifier"):
@@ -326,6 +404,37 @@ class BundleInferenceTest(_BundleFixtureCase):
             episode_artifact=self.episodes, outcome_cfgs=outcome_cfgs,
             shard_dir=Path("output/intermediate_phi") / shard, site_id="SYNTH-A",
         )
+
+    def test_site_loader_derives_n_value_bins_from_the_bundle_vocab(self):
+        """U5: `map` has more than the old default 10 segments, so a hard-coded
+        n_value_bins=10 could not load these heads strictly."""
+        from src.data.segments import n_value_bins
+
+        blob = json.loads((self.bundle_dir / "vocab.json").read_text())
+        self.assertGreaterEqual(len(blob["segments"]["map"]), 12)
+        derived = n_value_bins(blob)
+        self.assertGreater(derived, 11)
+        self.assertEqual(self.model.th.thr_emb.num_embeddings, derived + 1)
+
+    def test_site_loader_refuses_a_checkpoint_bound_to_other_segments(self):
+        from src.eval.clif_validate import load_checkpoint
+
+        broken = self._mutable_copy("bundle_ckpt_binding")
+        manifest = json.loads((broken / BUNDLE_MANIFEST).read_text())
+        manifest["vocab_binding"]["numeric_edges"] = "0" * 64
+        (broken / BUNDLE_MANIFEST).write_text(json.dumps(manifest))
+        with self.assertRaisesRegex(ArtifactMismatch, "numeric_edges"):
+            load_checkpoint(str(broken))
+
+    def test_site_loader_refuses_a_v1_bundle_without_a_binding(self):
+        from src.eval.clif_validate import load_checkpoint
+
+        broken = self._mutable_copy("bundle_ckpt_v1")
+        manifest = json.loads((broken / BUNDLE_MANIFEST).read_text())
+        manifest.pop("vocab_binding")
+        (broken / BUNDLE_MANIFEST).write_text(json.dumps(manifest))
+        with self.assertRaisesRegex(ArtifactMismatch, "re-tokeni[sz]e"):
+            load_checkpoint(str(broken))
 
     def test_an_undeclared_outcome_refuses_to_improvise_a_query(self):
         with self.assertRaisesRegex(ArtifactMismatch, "no zero-shot query"):

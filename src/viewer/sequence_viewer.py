@@ -29,6 +29,7 @@ import polars as pl
 import pyarrow as pa
 import pyarrow.parquet as pq
 
+from src.data.segments import interval_label, vocab_segments
 from src.eval.clinical_plausibility import assess_sequence, split_sequence
 
 _ROW_IDX_COL = "__row_idx"
@@ -109,30 +110,21 @@ def load_vocab_lock(path: Path) -> set[str]:
     return set(vocab.keys())
 
 
-def load_vocab_edges(path: Path) -> dict[str, list[float]]:
-    """Load frozen numeric-bin edges from a tokenizer vocab artifact."""
-    blob = json.loads(path.read_text())
-    edges = blob.get("edges", {})
-    if not isinstance(edges, dict):
-        return {}
-    return {
-        str(concept): [float(edge) for edge in values]
-        for concept, values in edges.items()
-        if isinstance(values, list)
-    }
+def load_vocab_segments(path: Path, *, checkpoint: str | Path | None = None
+                        ) -> dict[str, list[dict]]:
+    """Frozen per-concept segments from a tokenizer-v2 vocab artifact (KTD1).
 
+    A pre-v2 artifact (edge lists, no tokenizer version) is refused with a re-tokenize
+    message. With `checkpoint`, the checkpoint's recorded vocabulary/segments binding
+    must match this artifact (KTD7), so rollouts are never decoded against bins the
+    model was not trained on."""
+    blob = json.loads(Path(path).read_text())
+    segments = vocab_segments(blob)
+    if checkpoint is not None:
+        from src.train.checkpoint import load_checkpoint, verify_checkpoint_binding
 
-def load_vocab_edges(path: Path) -> dict[str, list[float]]:
-    """Load frozen numeric-bin edges from a tokenizer vocab artifact."""
-    blob = json.loads(path.read_text())
-    edges = blob.get("edges", {})
-    if not isinstance(edges, dict):
-        return {}
-    return {
-        str(concept): [float(edge) for edge in values]
-        for concept, values in edges.items()
-        if isinstance(values, list)
-    }
+        verify_checkpoint_binding(load_checkpoint(checkpoint), blob)
+    return {str(concept): list(segs) for concept, segs in segments.items()}
 
 
 def load_id_to_token(path: Path) -> dict[int, str]:
@@ -144,8 +136,11 @@ def load_id_to_token(path: Path) -> dict[int, str]:
     return {int(i): t for t, i in vocab.items()}
 
 
-def parse_token(token: str, *, edges: dict[str, list[float]] | None = None) -> dict[str, Any]:
-    """Best-effort parse of a fused clinical token."""
+def parse_token(token: str, *, segments: dict[str, list[dict]] | None = None
+                ) -> dict[str, Any]:
+    """Best-effort parse of a fused clinical token. A ``concept=k`` token decodes to the
+    k-th frozen segment: ``low``/``high`` bounds (None when unbounded) and an
+    ``interval`` label whose brackets follow the segment's closure."""
     raw = token
     if (
         (raw.startswith("[") and raw.endswith("]"))
@@ -161,6 +156,7 @@ def parse_token(token: str, *, edges: dict[str, list[float]] | None = None) -> d
             "bin": None,
             "low": None,
             "high": None,
+            "interval": None,
             "value": None,
             "highlight": False,
         }
@@ -169,7 +165,9 @@ def parse_token(token: str, *, edges: dict[str, list[float]] | None = None) -> d
     if m is not None:
         concept = m.group("concept")
         bin_index = int(m.group("bin"))
-        boundaries = (edges or {}).get(concept, [])
+        concept_segments = (segments or {}).get(concept, [])
+        seg = (concept_segments[bin_index]
+               if 0 <= bin_index < len(concept_segments) else None)
         return {
             "raw": raw,
             "group": concept.split("_", 1)[0],
@@ -177,8 +175,9 @@ def parse_token(token: str, *, edges: dict[str, list[float]] | None = None) -> d
             "concept": concept,
             "category": None,
             "bin": bin_index,
-            "low": boundaries[bin_index - 1] if 0 < bin_index <= len(boundaries) else None,
-            "high": boundaries[bin_index] if bin_index < len(boundaries) else None,
+            "low": seg["lo"] if seg else None,
+            "high": seg["hi"] if seg else None,
+            "interval": interval_label(seg) if seg else None,
             "value": None,
             "highlight": bool(_DEFAULT_HIGHLIGHT_RE.search(raw)),
         }
@@ -193,6 +192,7 @@ def parse_token(token: str, *, edges: dict[str, list[float]] | None = None) -> d
             "bin": None,
             "low": None,
             "high": None,
+            "interval": None,
             "value": None,
             "highlight": bool(_DEFAULT_HIGHLIGHT_RE.search(raw)),
         }
@@ -212,6 +212,7 @@ def parse_token(token: str, *, edges: dict[str, list[float]] | None = None) -> d
             "bin": None,
             "low": float(m.group("low")),
             "high": float(m.group("high")),
+            "interval": None,
             "value": None,
             "highlight": bool(_DEFAULT_HIGHLIGHT_RE.search(raw)),
         }
@@ -228,6 +229,7 @@ def parse_token(token: str, *, edges: dict[str, list[float]] | None = None) -> d
             "bin": None,
             "low": None,
             "high": None,
+            "interval": None,
             "value": float(m.group("value")),
             "highlight": bool(_DEFAULT_HIGHLIGHT_RE.search(raw)),
         }
@@ -248,6 +250,7 @@ def parse_token(token: str, *, edges: dict[str, list[float]] | None = None) -> d
         "bin": None,
         "low": None,
         "high": None,
+        "interval": None,
         "value": None,
         "highlight": bool(_DEFAULT_HIGHLIGHT_RE.search(raw)),
     }
@@ -257,10 +260,10 @@ def summarize_sequence(
     tokens: list[str],
     *,
     vocab: set[str] | None = None,
-    edges: dict[str, list[float]] | None = None,
+    segments: dict[str, list[dict]] | None = None,
     prompt_tokens: list[str] | None = None,
 ) -> dict[str, Any]:
-    parsed = [parse_token(t, edges=edges) for t in tokens]
+    parsed = [parse_token(t, segments=segments) for t in tokens]
 
     group_counts: dict[str, int] = {}
     concept_counts: dict[str, int] = {}
@@ -294,7 +297,7 @@ def summarize_sequence(
         "plausibility": assess_sequence(
             tokens,
             vocab=vocab,
-            edges=edges,
+            segments=segments,
             prompt_tokens=prompt_tokens,
         ),
     }
@@ -497,7 +500,7 @@ class TextSource(SequenceSource):
 class ViewerState:
     sources: dict[str, SequenceSource]
     vocab: set[str] | None = None
-    edges: dict[str, list[float]] | None = None
+    segments: dict[str, list[dict]] | None = None
 
 
 _INDEX_HTML = r"""<!doctype html>
@@ -698,8 +701,7 @@ _INDEX_HTML = r"""<!doctype html>
           `concept=${t.concept}`,
           t.category ? `category=${t.category}` : null,
           t.bin != null ? `bin=${t.bin}` : null,
-          t.low != null ? `low=${t.low}` : null,
-          t.high != null ? `high=${t.high}` : null,
+          t.interval != null ? `interval=${t.interval}` : null,
           t.value != null ? `value=${t.value}` : null,
         ].filter(Boolean).join('\n');
         span.title = tip;
@@ -979,7 +981,7 @@ def _make_handler(state: ViewerState):
                     summary = summarize_sequence(
                         tokens,
                         vocab=state.vocab,
-                        edges=state.edges,
+                        segments=state.segments,
                         prompt_tokens=prompt_tokens,
                     )
                     meta = {k: v for k, v in row.items() if k not in {getattr(src, "seq_col", "generated_sequence"), "generated_sequence", "sequence", "filtered_clif_text"}}
@@ -1032,13 +1034,13 @@ def _make_handler(state: ViewerState):
                         "generated": summarize_sequence(
                             generated_tokens,
                             vocab=state.vocab,
-                            edges=state.edges,
+                            segments=state.segments,
                             prompt_tokens=str(prompt).split(),
                         ),
                         "observed": summarize_sequence(
                             observed_tokens,
                             vocab=state.vocab,
-                            edges=state.edges,
+                            segments=state.segments,
                         ),
                     })
                     return
@@ -1057,7 +1059,11 @@ def main(argv: list[str] | None = None) -> None:
     ap = argparse.ArgumentParser(description="Local web app to inspect token sequences")
     ap.add_argument("--parquet", action="append", default=[], help="Parquet file with token sequences")
     ap.add_argument("--txt", action="append", default=[], help="Text file (one sequence per line)")
-    ap.add_argument("--vocab-lock", default=None, help="Optional vocab_lock.json to compute OOV rate")
+    ap.add_argument("--vocab-lock", default=None,
+                    help="Optional tokenizer-v2 vocab.json (OOV rate, bin intervals)")
+    ap.add_argument("--checkpoint", default=None,
+                    help="Optional checkpoint the sequences came from; refused unless it "
+                         "is bound to --vocab-lock's vocabulary and segments")
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=8042)
     ap.add_argument("--no-open", action="store_true", help="Do not auto-open the browser")
@@ -1096,8 +1102,11 @@ def main(argv: list[str] | None = None) -> None:
     if not sources:
         ap.error("Provide at least one --parquet or --txt input")
 
-    edges = load_vocab_edges(vocab_path) if vocab_path else None
-    state = ViewerState(sources=sources, vocab=vocab, edges=edges)
+    if args.checkpoint and not vocab_path:
+        ap.error("--checkpoint requires --vocab-lock (the binding is checked against it)")
+    segments = (load_vocab_segments(vocab_path, checkpoint=args.checkpoint)
+                if vocab_path else None)
+    state = ViewerState(sources=sources, vocab=vocab, segments=segments)
 
     handler = _make_handler(state)
     server = ThreadingHTTPServer((args.host, args.port), handler)

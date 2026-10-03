@@ -15,6 +15,15 @@ Evidence anchors (docs/plans/2026-09-25-001-feat-icu-gem-generative-model-plan.m
   - Positions: the trunk's RoPE contract is admission-relative MINUTES, so generated
     tokens advance `pos_step_min` per step (default 60 — an hourly event clock, à la
     EHR2Path's hourly state aggregation) until a learned time model lands (G4).
+  - Generate until disposition (U9, R19; KTD10): every `DISCHARGE//*` terminal token
+    plus `<eos>` is a stop id. `rollout_to_disposition` runs N seeded rollouts from a
+    GEM prefix truncated at the anchor and labels each one `terminal` (with its
+    disposition), `eos` (ended without a disposition) or `censored` (hit the token cap)
+    — a censored rollout is never survival. ETHOS (PMID 39300208) and BBJ CLIF GEM
+    frame mortality as the death frequency over such rollouts.
+    Time-to-terminal: the fixed `pos_step_min` clock is IMPOSED, not predicted, so
+    `elapsed_min` stays None and only the step count is reported until a learned
+    time model (G4) supplies per-step deltas.
 
 CLI (smoke/demo path — uniform prompt positions):
     uv run --frozen --group dev python -m src.model.generate \
@@ -27,13 +36,13 @@ CLI (smoke/demo path — uniform prompt positions):
 from __future__ import annotations
 
 import argparse
-import json
 from pathlib import Path
 from collections.abc import Mapping, Sequence
 
 import torch
 import torch.nn.functional as F
 
+from src.data.segments import DISCHARGE_PREFIX, load_vocab_blob, n_value_bins, vocab_segments
 from src.model.encoder import CLIFEncoder, apply_rope, build_rope_cache
 from src.eval.clinical_plausibility import assess_sequence, split_sequence
 
@@ -87,7 +96,7 @@ def _cached_forward(enc: CLIFEncoder, token_ids: torch.Tensor, pos_min: torch.Te
         raise ValueError(
             "chunked decoding after prefill supports exactly one new token per step"
         )
-    x = enc.tok_emb(token_ids)
+    x = enc.embed_tokens(token_ids)   # the TextCode arm replaces tok_emb (hook)
     cos, sin = build_rope_cache(pos_min, enc.head_dim, enc.rope_base)
     for layer_idx, blk in enumerate(enc.blocks):
         prefill = cache.k[layer_idx] is None
@@ -119,9 +128,9 @@ def sample_logits(logits: torch.Tensor, *, temperature: float = 1.0, top_k: int 
     # Forbidden ids are masked in BOTH branches — greedy must respect
     # min_new_tokens stop-suppression, not just the sampling branch.
     if min_token_ids:
-        for tid in min_token_ids:
-            logits = logits.index_fill(-1, torch.tensor([tid], device=logits.device),
-                                       float("-inf"))
+        logits = logits.index_fill(
+            -1, torch.tensor(list(min_token_ids), dtype=torch.long, device=logits.device),
+            float("-inf"))
     if allowed_token_ids is not None:
         keep = torch.zeros(logits.size(-1), dtype=torch.bool, device=logits.device)
         keep.index_fill_(
@@ -288,7 +297,7 @@ def generate(model: CLIFEncoder, input_ids: torch.Tensor, pos_min: torch.Tensor,
     lengths = torch.zeros(B, dtype=torch.long, device=device)
     stopped = torch.zeros(B, dtype=torch.bool, device=device)
     last_pos = pos_min[:, -1]
-    previous_ids = input_ids[:, -1]
+    previous_ids = input_ids[:, -1].tolist()
     history = [
         input_ids[row, max(0, T - 8):].tolist()
         for row in range(B)
@@ -304,7 +313,7 @@ def generate(model: CLIFEncoder, input_ids: torch.Tensor, pos_min: torch.Tensor,
                 else tuple(range(logits.size(-1)))
             )
             transition_allowed = []
-            for token_id in previous_ids.tolist():
+            for token_id in previous_ids:
                 candidate = transition_allowed_token_ids.get(
                     int(token_id), fallback_allowed
                 )
@@ -322,11 +331,12 @@ def generate(model: CLIFEncoder, input_ids: torch.Tensor, pos_min: torch.Tensor,
         active = ~stopped
         out[active, step] = next_id[active]
         lengths[active] += 1
-        for row in range(B):
-            if bool(active[row]):
-                history[row].append(int(next_id[row]))
+        next_list = next_id.tolist()   # one device transfer per step
+        for row, is_active in enumerate(active.tolist()):
+            if is_active:
+                history[row].append(int(next_list[row]))
                 history[row] = history[row][-8:]
-        previous_ids = next_id
+        previous_ids = next_list
         if stop_t is not None:
             hit = torch.isin(next_id, stop_t)
             stopped = stopped | (hit & active)
@@ -343,13 +353,181 @@ def generate(model: CLIFEncoder, input_ids: torch.Tensor, pos_min: torch.Tensor,
     return {"tokens": out, "lengths": lengths, "stopped": stopped}
 
 
+# -------------------------------------------- generate until disposition (U9, R19)
+
+STOP_TERMINAL, STOP_EOS, STOP_CENSORED = "terminal", "eos", "censored"
+STOP_REASONS = (STOP_TERMINAL, STOP_EOS, STOP_CENSORED)
+TIME_UNAVAILABLE_REASON = (
+    "the sampler advances a fixed pos_step_min clock (no learned time model), so "
+    "generated elapsed minutes are not a model estimate; only steps are reported"
+)
+
+
+class TerminalVocabularyError(ValueError):
+    """The vocabulary cannot frame a disposition: it lacks the DISCHARGE// allowlist."""
+
+
+def _terminal_ids(vocab: Mapping[str, int]) -> dict[int, str]:
+    """id -> disposition for every `DISCHARGE//*` token in `vocab` (possibly empty)."""
+    return {int(i): token[len(DISCHARGE_PREFIX):] for token, i in vocab.items()
+            if token.startswith(DISCHARGE_PREFIX)}
+
+
+def terminal_token_ids(vocab: Mapping[str, int],
+                       dispositions: Sequence[str] | None = None) -> dict[int, str]:
+    """id -> disposition for every `DISCHARGE//*` token in `vocab`.
+
+    Refuses a vocabulary with no terminal token (a pre-GEM vocabulary: rollouts could
+    never terminate, so every one would be censored) and, when `dispositions` (the
+    `configs/data.yaml` `gem.dispositions` allowlist) is given, one missing any of
+    them — a missing disposition could never be generated, biasing mortality."""
+    ids = _terminal_ids(vocab)
+    if not ids:
+        raise TerminalVocabularyError(
+            f"vocabulary has no {DISCHARGE_PREFIX}* terminal tokens; generate-until-"
+            "disposition needs the GEM allowlist (re-tokenize with the gem config block)"
+        )
+    missing = sorted(set(dispositions or ()) - set(ids.values()))
+    if missing:
+        raise TerminalVocabularyError(
+            "vocabulary lacks allowlisted terminal tokens: "
+            + ", ".join(f"{DISCHARGE_PREFIX}{d}" for d in missing)
+        )
+    return ids
+
+
+def stop_token_ids_for(vocab: Mapping[str, int]) -> tuple[int, ...]:
+    """Every `DISCHARGE//*` id plus `<eos>` (sorted), the R19 stop set. A vocabulary
+    without terminal tokens stops on `<eos>` only."""
+    ids = set(_terminal_ids(vocab))
+    if "<eos>" in vocab:
+        ids.add(int(vocab["<eos>"]))
+    return tuple(sorted(ids))
+
+
+def classify_rollouts(result: Mapping[str, torch.Tensor], *,
+                      terminal_ids: Mapping[int, str],
+                      end_ids: Sequence[int]) -> list[dict]:
+    """Per-row stop records for a `generate` result.
+
+    `stop_reason`: `terminal` (stopped on a `DISCHARGE//*` id; `terminal_type` = its
+    disposition), `eos` (stopped on one of `end_ids` — ended without a disposition), or
+    `censored` (never stopped: hit `max_new_tokens`). `step` is the 1-based index of
+    the stop token, or the number of tokens generated when censored. `elapsed_min` is
+    None (see TIME_UNAVAILABLE_REASON)."""
+    end = {int(i) for i in end_ids}
+    # One host transfer per tensor.
+    tokens = result["tokens"].cpu().tolist()
+    lengths = result["lengths"].cpu().tolist()
+    stopped = result["stopped"].cpu().tolist()
+    records = []
+    for row in range(len(tokens)):
+        length = int(lengths[row])
+        token_ids = tokens[row][:length]
+        last = token_ids[-1] if token_ids else None
+        if bool(stopped[row]) and last in terminal_ids:
+            reason, kind = STOP_TERMINAL, terminal_ids[last]
+        elif bool(stopped[row]) and last in end:
+            reason, kind = STOP_EOS, None
+        elif bool(stopped[row]):
+            raise ValueError(f"row {row} stopped on {last}, which is not a stop id")
+        else:
+            reason, kind = STOP_CENSORED, None
+        records.append({"stop_reason": reason, "terminal_type": kind, "step": length,
+                        "elapsed_min": None, "token_ids": token_ids})
+    return records
+
+
+def stay_stream(windows: Sequence[Mapping]) -> dict:
+    """Re-join a stay's GEM windows (gem_events.parquet rows) into the stay stream:
+    `token` / `pos_min` concatenated in `continuation_index` order, plus `anchor_idx`.
+    Windows must be contiguous (each `source_start` = the tokens before it)."""
+    ordered = sorted(windows, key=lambda w: int(w["continuation_index"]))
+    if not ordered:
+        raise ValueError("a stay needs at least one GEM window")
+    tokens: list[int] = []
+    pos: list[int] = []
+    for window in ordered:
+        if int(window.get("source_start", len(tokens))) != len(tokens):
+            raise ValueError("GEM windows are not contiguous (missing a continuation)")
+        tokens += [int(t) for t in window["token"]]
+        pos += [int(p) for p in window["pos_min"]]
+    return {"token": tokens, "pos_min": pos, "anchor_idx": int(ordered[0]["anchor_idx"])}
+
+
+def gem_anchor_prompt(windows: Sequence[Mapping], *,
+                      terminal_ids: Mapping[int, str] | None = None
+                      ) -> tuple[list[int], list[int]]:
+    """The rollout prompt for a stay: its GEM stream truncated at `anchor_idx`
+    (inclusive — the last token at or before ICU admit + 24 h). A prefix that already
+    holds a terminal token is refused: the outcome would be in the input."""
+    stream = stay_stream(windows)
+    cut = stream["anchor_idx"] + 1
+    tokens, pos = stream["token"][:cut], stream["pos_min"][:cut]
+    if terminal_ids and any(t in terminal_ids for t in tokens):
+        raise ValueError("anchor prefix contains a terminal (DISCHARGE//) token")
+    return tokens, pos
+
+
+def rollout_to_disposition(model: CLIFEncoder, prompt_ids: Sequence[int],
+                           prompt_pos_min: Sequence[int], *, vocab: Mapping[str, int],
+                           n_rollouts: int, seed: int, max_new_tokens: int,
+                           dispositions: Sequence[str] | None = None,
+                           batch_size: int | None = None, temperature: float = 1.0,
+                           top_k: int | None = None, top_p: float | None = 1.0,
+                           min_new_tokens: int = 0, pos_step_min: int = 60,
+                           allowed_token_ids: tuple[int, ...] | None = None,
+                           transition_allowed_token_ids: Mapping[int, tuple[int, ...]]
+                           | None = None,
+                           repetition_penalty: float = 1.0,
+                           device: torch.device | str | None = None) -> list[dict]:
+    """N rollouts of one prompt until a disposition (R19). Deterministic under `seed`
+    (one generator drives every chunk, in order). Returns one `classify_rollouts`
+    record per rollout, with its 0-based `rollout` index.
+
+    Refuses, before any generation, a vocabulary without the terminal allowlist (the
+    checkpoint's own vocabulary binding is enforced at load by
+    `load_generation_model`), and a prompt that already contains a terminal or `<eos>`
+    token."""
+    terminal_ids = terminal_token_ids(vocab, dispositions)
+    if "<eos>" not in vocab:
+        raise TerminalVocabularyError("vocabulary has no <eos> token")
+    eos_id = int(vocab["<eos>"])
+    stop_ids = stop_token_ids_for(vocab)
+    if any(int(t) in terminal_ids or int(t) == eos_id for t in prompt_ids):
+        raise ValueError("prompt contains a terminal or <eos> token (outcome leakage)")
+    if n_rollouts < 1:
+        raise ValueError("n_rollouts must be >= 1")
+    device = torch.device(device) if device is not None else next(model.parameters()).device
+    generator = torch.Generator(device=device)
+    generator.manual_seed(int(seed))
+    chunk = int(batch_size or n_rollouts)
+    records: list[dict] = []
+    while len(records) < n_rollouts:
+        n = min(chunk, n_rollouts - len(records))
+        ids = torch.tensor([list(prompt_ids)] * n, dtype=torch.long, device=device)
+        pos = torch.tensor([list(prompt_pos_min)] * n, dtype=torch.long, device=device)
+        result = generate(
+            model, ids, pos, max_new_tokens=max_new_tokens, temperature=temperature,
+            top_k=top_k, top_p=top_p, stop_token_ids=stop_ids,
+            min_new_tokens=min_new_tokens, pos_step_min=pos_step_min,
+            pad_token_id=int(vocab.get("<pad>", 0)), allowed_token_ids=allowed_token_ids,
+            transition_allowed_token_ids=transition_allowed_token_ids,
+            repetition_penalty=repetition_penalty, generator=generator,
+        )
+        for record in classify_rollouts(result, terminal_ids=terminal_ids,
+                                        end_ids=(eos_id,)):
+            records.append({"rollout": len(records), **record})
+    return records
+
+
 # ------------------------------------------------------------- vocab + parquet
 
 
 def load_vocab(path: str | Path) -> dict[str, int]:
     """token -> id map from a tokenizer `vocab.json` (accepts the `{"vocab": {...}}`
     wrapper or a flat {token: id} map)."""
-    blob = json.loads(Path(path).read_text())
+    blob = load_vocab_blob(path)
     vocab = blob.get("vocab", blob)
     if not isinstance(vocab, dict):
         raise ValueError(f"vocab.json has no token->id mapping: {path}")
@@ -357,10 +535,10 @@ def load_vocab(path: str | Path) -> dict[str, int]:
 
 
 def load_vocab_artifact(path: str | Path) -> dict:
-    """Load the full frozen vocab artifact, including numeric bin edges."""
-    blob = json.loads(Path(path).read_text())
-    if "vocab" not in blob:
-        blob = {"vocab": blob}
+    """Load the full frozen tokenizer-v2 vocab artifact (vocab + segments + manifest).
+    A pre-v2 artifact (edge lists, no tokenizer version) is refused: re-tokenize."""
+    blob = load_vocab_blob(path)
+    vocab_segments(blob)
     return blob
 
 
@@ -449,12 +627,18 @@ class SimulationWriter:
 
 
 def load_generation_model(checkpoint_path: str | Path, model_config: str | Path,
-                           data_config: str | Path) -> CLIFEncoder:
+                          data_config: str | Path, vocab_artifact: dict) -> CLIFEncoder:
     """Load a pretrain-style checkpoint (schema_version 2; state under 'model') for
-    generation. Falls back to a bare `enc.`-prefixed (or bare-encoder) state dict."""
+    generation. Falls back to a bare `enc.`-prefixed (or bare-encoder) state dict.
+
+    The checkpoint must be bound to `vocab_artifact` (KTD7): a checkpoint trained on a
+    different vocabulary or different segments — or on the previous tokenizer, which
+    recorded no binding — is refused, since its token ids and bins would be decoded
+    against the wrong artifact. The threshold head's value-bin count is derived from
+    the artifact's segments."""
     import yaml
 
-    from src.train.checkpoint import load_checkpoint
+    from src.train.checkpoint import load_checkpoint, verify_checkpoint_binding
     from src.train.pretrain import Model
 
     mcfg = yaml.safe_load(Path(model_config).read_text())
@@ -462,9 +646,11 @@ def load_generation_model(checkpoint_path: str | Path, model_config: str | Path,
     n_targets = len(dcfg["target_concepts"])
     vocab_size = mcfg["trunk"].get("target_vocab", 10000)
     blob = load_checkpoint(checkpoint_path)
+    verify_checkpoint_binding(blob, vocab_artifact)
     state = blob.get("model", blob)
     try:
-        model = Model(vocab_size, n_targets, mcfg)
+        model = Model(vocab_size, n_targets, mcfg,
+                      n_value_bins=n_value_bins(vocab_artifact))
         model.load_state_dict(state)
         return model.enc
     except (RuntimeError, KeyError):
@@ -480,7 +666,9 @@ def main(argv: list[str] | None = None) -> None:
     ap.add_argument("--checkpoint", required=True)
     ap.add_argument("--model-config", default="configs/model.yaml")
     ap.add_argument("--data-config", default="configs/data.yaml")
-    ap.add_argument("--vocab", default=None, help="vocab.json (decode prompts + outputs)")
+    ap.add_argument("--vocab", required=True,
+                    help="the checkpoint's tokenizer-v2 vocab.json (binding check, decode "
+                         "prompts + outputs)")
     ap.add_argument("--prompts", default=None,
                     help="text file, one space-joined token sequence per line "
                          "(default: a single <bos>-only prompt)")
@@ -497,21 +685,20 @@ def main(argv: list[str] | None = None) -> None:
     ap.add_argument("--pos-step-min", type=int, default=60,
                     help="minutes assigned per generated token (hourly clock)")
     ap.add_argument("--stop-token-ids", type=int, nargs="*", default=None,
-                    help="default: <eos> from --vocab, else id 2")
+                    help="default: every DISCHARGE//* terminal id plus <eos> from --vocab "
+                         "(R19); extra ids are recorded as stop_reason=eos")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--output", required=True, help="output simulations parquet")
     ap.add_argument("--device", default="cpu")
     args = ap.parse_args(argv)
 
     device = torch.device(args.device)
-    vocab = load_vocab(args.vocab) if args.vocab else None
-    vocab_artifact = load_vocab_artifact(args.vocab) if args.vocab else {}
-    tok2id = vocab or {}
+    vocab_artifact = load_vocab_artifact(args.vocab)
+    vocab = vocab_artifact["vocab"]
+    tok2id = vocab
     bos = tok2id.get("<bos>", 1)
 
     if args.prompts:
-        if vocab is None:
-            ap.error("--prompts requires --vocab (prompt lines are token strings)")
         unk = tok2id.get("<unk>", 3)
         lines = [ln for ln in Path(args.prompts).read_text().splitlines() if ln.strip()]
         prompt_tokens = [
@@ -526,11 +713,14 @@ def main(argv: list[str] | None = None) -> None:
     else:
         prompt_ids, hosp_ids = [[bos]], ["prompt-1"]
 
-    stop_ids = (tuple(args.stop_token_ids) if args.stop_token_ids is not None
-               else ((vocab or {}).get("<eos>", 2),))
+    terminal_ids = _terminal_ids(vocab)
+    stop_ids = (tuple(sorted({*args.stop_token_ids, *stop_token_ids_for(vocab)}))
+                if args.stop_token_ids is not None else stop_token_ids_for(vocab))
+    end_ids = tuple(i for i in stop_ids if i not in terminal_ids)
 
-    enc = load_generation_model(args.checkpoint, args.model_config, args.data_config).to(device)
-    decoder = make_decoder(vocab) if vocab else (lambda ids: [str(i) for i in ids])
+    enc = load_generation_model(args.checkpoint, args.model_config, args.data_config,
+                                vocab_artifact).to(device)
+    decoder = make_decoder(vocab)
     generator = torch.Generator(device=device)
     generator.manual_seed(args.seed)
     transitions = (
@@ -540,7 +730,7 @@ def main(argv: list[str] | None = None) -> None:
     )
 
     writer = SimulationWriter(dataset="gem")
-    allowed = tuple(sorted(vocab.values())) if vocab else None
+    allowed = tuple(sorted(vocab.values()))
     for hosp, pids in zip(hosp_ids, prompt_ids):
         n = args.n_simulations
         prompt_tokens = decoder(list(pids))
@@ -560,6 +750,7 @@ def main(argv: list[str] | None = None) -> None:
             repetition_penalty=args.repetition_penalty,
             generator=generator,
         )
+        stops = classify_rollouts(result, terminal_ids=terminal_ids, end_ids=end_ids)
         for sim in range(n):
             length = int(result["lengths"][sim])
             tokens = decoder(result["tokens"][sim, :length].tolist())
@@ -568,8 +759,8 @@ def main(argv: list[str] | None = None) -> None:
             # without positional conventions (used by src/eval/generative.py).
             review = assess_sequence(
                 tokens,
-                vocab=set(tok2id) if tok2id else None,
-                edges=vocab_artifact.get("edges"),
+                vocab=set(tok2id),
+                segments=vocab_artifact["segments"],
                 prompt_tokens=prompt_text.split(),
             )
             writer.add(
@@ -581,6 +772,9 @@ def main(argv: list[str] | None = None) -> None:
                 plausibility_score=review["score"],
                 plausibility_status=review["status"],
                 plausibility_warning_count=review["warning_count"],
+                stop_reason=stops[sim]["stop_reason"],
+                terminal_type=stops[sim]["terminal_type"],
+                stop_step=stops[sim]["step"],
             )
     n_rows = writer.write(args.output)
     print(f"Wrote {n_rows} simulations to {args.output} (viewer-compatible schema)")

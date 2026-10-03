@@ -16,7 +16,10 @@ classes:
     directory: output/intermediate_phi
     formats: [parquet]
     export_allowed: false
-    includes: [episode_shards, split_assignments, labels, predictions, caches, access_logs]
+    # gem_shards = gem_events.parquet (U8 full-hospitalization GEM windows), validated
+    # against this class exactly like the 24 h events.parquet episode shards.
+    includes: [episode_shards, gem_shards, split_assignments, labels, predictions, caches,
+               access_logs]
     backup: prohibited_unless_site_approved
     retention: delete_after_approved_project_window
     deletion: secure_delete
@@ -57,5 +60,9 @@ compatibility_manifests:
     required_hashes: [checkpoint, tokenizer, vocabulary, packed_schema, outcome_spec, clif_version]
     vocabulary_origin: checkpoint_pinned
   experimental_representation:
-    required_hashes: [training_split, vocabulary, numeric_edges, target_map, outcome_spec, clif_version]
+    # numeric_edges = the tokenizer-v2 segments hash; binning_sources, reference_units
+    # (incl. dose target units) and concept_sources are hashed vocab.json v2 fields.
+    required_hashes: [training_split, vocabulary, numeric_edges, binning_sources,
+                      reference_units, concept_sources, target_map, outcome_spec,
+                      clif_version]
     vocabulary_origin: reference_training_partition

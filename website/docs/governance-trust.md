@@ -11,7 +11,7 @@ half of the project a clinical/methods venue judges as hard as the science. All 
 and is CI-enforced. It is why the federation can run *model-to-data* without a coordinating center
 ever seeing raw data.
 
-:::info Why this exists
+:::info[Why this exists]
 "No raw data leaves a node" is a claim that has to be *enforced*, not promised. Every artifact is
 classified, every release is signed, every disclosure is ledgered, and every gate **fails closed** —
 an unverified or under-populated result is rejected, never silently passed.
@@ -172,7 +172,7 @@ flowchart LR
 - **Model card** — `MODEL_CARD.md` states plainly what is *proven* (synthetic, CPU, data-free) vs
   *pending* (real-data training, GPU qualification, real-site federation, governance).
 
-:::note Honest scope
+:::note[Honest scope]
 Every "proven" claim maps to a landed, tested unit. Real-data training, GPU qualification, and
 real-site federation are pending — see [Project Status & Roadmap](./project-status.md).
 :::

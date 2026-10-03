@@ -8,7 +8,9 @@ from src.data.dataset import PACKED_SCHEMA_VERSION, ModelDataset, make_dataloade
 from src.data.targets import TargetBuilder, TargetContractError
 
 
-HASHES = {"vocabulary": "v1", "outcome_spec": "o1"}
+# Tokenizer-v2 shard binding (KTD7) plus an extra identity hash.
+HASHES = {"vocabulary": "v1", "numeric_edges": "s1", "tokenizer_version": "2",
+          "outcome_spec": "o1"}
 
 
 def target(key, tokens, *, anchor_idx):

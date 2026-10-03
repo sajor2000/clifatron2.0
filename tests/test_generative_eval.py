@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from collections import Counter
 
 import polars as pl
@@ -9,6 +10,10 @@ import pytest
 
 from src.eval.generative import (
     concept_groups,
+    evaluate_rollout_mortality,
+    observed_gem_outcome,
+    rollout_mortality,
+    wilson_interval,
     distinct_n,
     distance_to_observed,
     evaluate,
@@ -170,3 +175,295 @@ def test_evaluate_uses_prompt_column_pairing(tmp_path):
     # prompt-2 -> h2 continuation [icu]; rollout [icu] hits it
     assert per["h2"]["unigram_recall"] == 1.0
     assert ker["mean_unigram_recall"] == pytest.approx(0.75)
+
+
+# ------------------------------------------------- U5: groups from the vocab artifact
+
+VOCAB_ARTIFACT = {
+    "segments": {"map": [], "lactate": [], "norepinephrine_mcg_kg_min": [], "sodium": []},
+    "binning_sources": {"map": "csv", "lactate": "csv",
+                        "norepinephrine_mcg_kg_min": "csv", "sodium": "quantile"},
+    "concept_sources": {
+        "tables": {
+            "map": ["vitals"], "lactate": ["labs"], "sodium": ["labs"],
+            "norepinephrine_mcg_kg_min": ["meds"], "device_category": ["resp_support"],
+            "cam_total": ["assessments"], "sex": ["static"],
+        },
+        "treatment_sources": ["meds", "resp_support", "static"],
+    },
+}
+ARTIFACT_GROUPS = concept_groups({"target_concepts": [
+    {"name": "map", "source": "vitals"}, {"name": "lactate", "source": "labs"},
+]}, VOCAB_ARTIFACT)
+
+
+def test_treatment_and_device_fused_tokens_land_in_the_treatment_group():
+    """`device_category=imv` and a med dose token contain `=`, but they are treatments
+    and devices, not measurements — grouping follows the token's source table."""
+    from src.eval.generative import _group_of
+
+    assert _group_of("device_category=imv", ARTIFACT_GROUPS) == "treatments"
+    assert _group_of("norepinephrine_mcg_kg_min=3", ARTIFACT_GROUPS) == "treatments"
+    assert _group_of("sex=female", ARTIFACT_GROUPS) == "treatments"
+    assert _group_of("map=4", ARTIFACT_GROUPS) == "vitals"
+    assert _group_of("lactate=2", ARTIFACT_GROUPS) == "labs"
+    assert _group_of("sodium=2", ARTIFACT_GROUPS) == "measurements"
+    assert _group_of("cam_total=positive", ARTIFACT_GROUPS) == "categoricals"
+    assert _group_of("<eos>", ARTIFACT_GROUPS) == "specials"
+
+
+def test_calibration_reports_the_treatment_group_and_recall_counts_it_as_key():
+    real = ["map=4", "device_category=imv", "norepinephrine_mcg_kg_min=3", "sodium=2"]
+    gen = ["map=4", "norepinephrine_mcg_kg_min=1", "sodium=2", "sodium=2"]
+    cal = event_rate_calibration(real, gen, ARTIFACT_GROUPS)
+    assert cal["group_rates"]["treatments"] == {"real": 0.5, "gen": 0.25}
+    assert cal["group_rates"]["measurements"] == {"real": 0.25, "gen": 0.5}
+    ker = key_event_recall(real, gen, ARTIFACT_GROUPS)
+    # key events: device_category + norepinephrine (treatments); gen hits the infusion
+    assert ker["n_real_categorical"] == 2
+    assert ker["categorical_recall"] == pytest.approx(0.5)
+
+
+# ------------------------------------------- U9: rollout mortality evaluation (R20)
+
+DISPOSITIONS = ("home", "facility", "hospice", "expired", "ama", "other", "unknown")
+
+
+def rec(reason, kind=None, step=5, elapsed=None):
+    return {"stop_reason": reason, "terminal_type": kind, "step": step, "elapsed_min": elapsed}
+
+
+def rollouts(**counts):
+    """terminal rollouts by disposition, plus `censored=` / `eos=` non-terminal ones."""
+    out = []
+    for kind, n in counts.items():
+        if kind in ("censored", "eos"):
+            out += [rec(kind) for _ in range(n)]
+        else:
+            out += [rec("terminal", kind) for _ in range(n)]
+    return out
+
+
+def test_wilson_interval_matches_the_closed_form():
+    lo, hi = wilson_interval(3, 8)
+    assert lo == pytest.approx(0.13684, abs=1e-4)
+    assert hi == pytest.approx(0.69426, abs=1e-4)
+    assert wilson_interval(0, 0) == (None, None)
+    lo, hi = wilson_interval(0, 5)
+    assert lo == 0.0 and 0.0 < hi < 1.0
+
+
+def test_rollout_mortality_divides_by_terminated_rollouts_only():
+    result = rollout_mortality(rollouts(expired=3, home=5, censored=2))
+    assert result["n_rollouts"] == 10
+    assert result["n_expired"] == 3
+    assert result["n_terminated"] == 8
+    assert result["n_censored"] == 2
+    assert result["mortality"] == pytest.approx(3 / 8)
+    assert result["ci_low"] == pytest.approx(0.13684, abs=1e-4)
+    assert result["ci_high"] == pytest.approx(0.69426, abs=1e-4)
+    assert result["nontermination_rate"] == pytest.approx(0.2)
+    assert result["terminal_distribution"] == {"expired": 3, "home": 5}
+    assert result["modal_terminal"] == "home"
+
+
+def test_censored_rollouts_are_never_counted_as_survival():
+    result = rollout_mortality(rollouts(expired=1, censored=5))
+    assert result["mortality"] == 1.0  # 1/1, not 1/6
+    all_censored = rollout_mortality(rollouts(censored=4))
+    assert all_censored["mortality"] is None
+    assert all_censored["ci_low"] is None and all_censored["modal_terminal"] is None
+
+
+def test_eos_and_unknown_disposition_are_excluded_from_the_denominator():
+    """`<eos>` without a disposition and DISCHARGE//unknown are end of observation, not
+    survival (R18): reported separately, excluded like censoring."""
+    result = rollout_mortality(rollouts(expired=1, home=1, unknown=2, eos=3))
+    assert result["n_terminated"] == 2
+    assert result["n_unknown"] == 2 and result["n_eos"] == 3
+    assert result["mortality"] == pytest.approx(0.5)
+    assert result["terminal_distribution"] == {"expired": 1, "home": 1, "unknown": 2}
+
+
+def four_stays():
+    return [
+        {"key": "s1", "observed": "expired", "rollouts": rollouts(expired=3, home=1)},
+        {"key": "s2", "observed": "expired", "rollouts": rollouts(expired=2, home=1, facility=1)},
+        {"key": "s3", "observed": "home", "rollouts": rollouts(expired=1, home=3, censored=2)},
+        {"key": "s4", "observed": "facility", "rollouts": rollouts(expired=3, facility=2)},
+    ]
+
+
+def test_evaluation_on_four_stays_gives_expected_auroc_and_confusion():
+    report = evaluate_rollout_mortality(four_stays(), dispositions=DISPOSITIONS)
+    summary = report["summary"]
+    # p = .75, .5 (expired) vs .25, .6 (survived): 3 of 4 pairs ordered
+    assert summary["n_evaluable"] == 4
+    assert summary["auroc"] == pytest.approx(0.75)
+    assert summary["auprc"] == pytest.approx(5 / 6)
+    assert summary["observed_mortality"] == pytest.approx(0.5)
+    assert isinstance(summary["calibration_slope"], float)
+    assert isinstance(summary["calibration_intercept"], float)
+    confusion = summary["terminal_confusion"]["counts"]
+    assert confusion["expired"]["expired"] == 2
+    assert confusion["home"]["home"] == 1
+    assert confusion["facility"]["expired"] == 1
+    assert sum(sum(row.values()) for row in confusion.values()) == 4
+    # 2 censored of 4 + 4 + 6 + 5 = 19 rollouts
+    assert summary["n_rollouts"] == 19 and summary["n_censored"] == 2
+    assert summary["nontermination_rate"] == pytest.approx(2 / 19)
+    per = {row["key"]: row for row in report["per_stay"]}
+    assert per["s3"]["mortality"] == pytest.approx(0.25) and per["s3"]["n_censored"] == 2
+
+
+def test_evaluation_excludes_unknown_outcomes_and_stays_without_terminations():
+    stays = [*four_stays(),
+             {"key": "s5", "observed": "unknown", "rollouts": rollouts(expired=4)},
+             {"key": "s6", "observed": "expired", "rollouts": rollouts(censored=3)}]
+    summary = evaluate_rollout_mortality(stays, dispositions=DISPOSITIONS)["summary"]
+    assert summary["n_stays"] == 6 and summary["n_evaluable"] == 4
+    assert summary["n_excluded_unknown_observed"] == 1
+    assert summary["n_excluded_no_termination"] == 1
+    assert summary["auroc"] == pytest.approx(0.75)
+    # the all-censored stay's modal terminal is "none", never a disposition
+    assert summary["terminal_confusion"]["counts"]["expired"]["none"] == 1
+
+
+def test_summary_is_aggregate_only():
+    report = evaluate_rollout_mortality(four_stays(), dispositions=DISPOSITIONS)
+    assert "s1" not in json.dumps(report["summary"])
+
+
+def test_time_to_terminal_mae_is_marked_unavailable_without_elapsed_minutes():
+    stays = [dict(stay, observed_minutes=600.0) for stay in four_stays()]
+    ttt = evaluate_rollout_mortality(stays, dispositions=DISPOSITIONS)["summary"][
+        "time_to_terminal"]
+    assert ttt["available"] is False and ttt["mae_min"] is None
+    assert "reason" in ttt
+
+
+def test_time_to_terminal_mae_uses_the_median_terminal_elapsed_minutes():
+    stays = [
+        {"key": "a", "observed": "home", "observed_minutes": 100.0,
+         "rollouts": [rec("terminal", "home", elapsed=e) for e in (80.0, 120.0, 400.0)]
+         + [rec("censored", elapsed=999.0)]},
+        {"key": "b", "observed": "expired", "observed_minutes": 50.0,
+         "rollouts": [rec("terminal", "expired", elapsed=110.0)]},
+    ]
+    ttt = evaluate_rollout_mortality(stays, dispositions=DISPOSITIONS)["summary"][
+        "time_to_terminal"]
+    # |120 - 100| = 20 and |110 - 50| = 60; censored minutes never enter the median
+    assert ttt["available"] is True and ttt["n"] == 2
+    assert ttt["mae_min"] == pytest.approx(40.0)
+
+
+def test_observed_gem_outcome_reads_the_terminal_after_the_anchor():
+    vocab = {"<bos>": 1, "<eos>": 2, "hr=1": 4, "ADMISSION//ed": 6,
+             **{f"DISCHARGE//{d}": 10 + i for i, d in enumerate(DISPOSITIONS)}}
+    windows = [
+        {"continuation_index": 0, "source_start": 0, "token": [1, 6, 4, 4],
+         "pos_min": [0, 0, 30, 90], "anchor_idx": 3},
+        {"continuation_index": 1, "source_start": 4, "token": [4, 13, 2],
+         "pos_min": [200, 400, 400], "anchor_idx": 3},
+    ]
+    assert observed_gem_outcome(windows, vocab) == {"disposition": "expired",
+                                                    "minutes_after_anchor": 310}
+
+
+# ------------------------------------------------------------------ terminal-leakage guards
+
+def _gem_vocab():
+    return {"<bos>": 1, "<eos>": 2, "hr=1": 4, "ADMISSION//ed": 6,
+            **{f"DISCHARGE//{d}": 10 + i for i, d in enumerate(DISPOSITIONS)}}
+
+
+@pytest.mark.parametrize("windows, message", [
+    # no terminal token at all
+    ([{"continuation_index": 0, "source_start": 0, "token": [1, 6, 4, 2],
+       "pos_min": [0, 0, 30, 90], "anchor_idx": 2}], "found 0"),
+    # two terminal tokens (expired, then home)
+    ([{"continuation_index": 0, "source_start": 0, "token": [1, 6, 4, 13, 10, 2],
+       "pos_min": [0, 0, 30, 90, 95, 95], "anchor_idx": 2}], "found 2"),
+    # the terminal token sits AT the anchor (the outcome would be in the input)
+    ([{"continuation_index": 0, "source_start": 0, "token": [1, 6, 13, 2],
+       "pos_min": [0, 0, 30, 30], "anchor_idx": 2}], "at or before the anchor"),
+    # ... or before it
+    ([{"continuation_index": 0, "source_start": 0, "token": [1, 13, 4, 2],
+       "pos_min": [0, 10, 30, 30], "anchor_idx": 2}], "at or before the anchor"),
+])
+def test_observed_gem_outcome_refuses_a_leaky_or_ambiguous_terminal(windows, message):
+    with pytest.raises(ValueError, match=message):
+        observed_gem_outcome(windows, _gem_vocab())
+
+
+def test_stay_stream_refuses_missing_or_non_contiguous_windows():
+    from src.model.generate import stay_stream
+
+    with pytest.raises(ValueError, match="at least one"):
+        stay_stream([])
+    gap = [{"continuation_index": 0, "source_start": 0, "token": [1, 6], "pos_min": [0, 0],
+            "anchor_idx": 1},
+           {"continuation_index": 1, "source_start": 3, "token": [4, 2], "pos_min": [5, 9],
+            "anchor_idx": 1}]
+    with pytest.raises(ValueError, match="not contiguous"):
+        stay_stream(gap)
+
+
+# ------------------------------------------------------------------ --events binding (F5)
+
+def _v2_vocab_blob():
+    from src.data.segments import TOKENIZER_VERSION
+
+    return {"vocab": {"<pad>": 0, "<bos>": 1, "<eos>": 2, "<unk>": 3, "spo2=0": 10,
+                      "spo2=1": 11},
+            "segments": {"spo2": [
+                {"lo": None, "hi": 88.0, "lo_closed": False, "hi_closed": False},
+                {"lo": 88.0, "hi": None, "lo_closed": True, "hi_closed": False}]},
+            "manifest": {"tokenizer_version": TOKENIZER_VERSION}}
+
+
+def _write_eval_inputs(tmp_path, hashes):
+    from src.data.segments import binding_expr
+
+    blob = _v2_vocab_blob()
+    (tmp_path / "vocab.json").write_text(json.dumps(blob))
+    events = pl.DataFrame({"hosp_id": ["h1", "h2"], "token": [[1, 10, 11], [1, 11]]})
+    if hashes is not None:
+        events = events.with_columns(binding_expr(hashes))
+    events.write_parquet(tmp_path / "events.parquet")
+    pl.DataFrame([{"hospitalization_id": "prompt-1", "simulation_number": 1,
+                   "generated_sequence": "spo2=0 spo2=1"}]).write_parquet(
+        tmp_path / "sims.parquet")
+    cfg = tmp_path / "data.yaml"
+    cfg.write_text("target_concepts:\n  - {name: spo2, source: vitals}\n")
+    return ["--sims", str(tmp_path / "sims.parquet"), "--events",
+            str(tmp_path / "events.parquet"), "--vocab", str(tmp_path / "vocab.json"),
+            "--data-config", str(cfg)]
+
+
+def test_main_refuses_an_events_shard_bound_to_another_vocabulary(tmp_path):
+    from src.data.segments import ArtifactBindingError, artifact_binding
+    from src.eval import generative as genmod
+
+    other = dict(artifact_binding(_v2_vocab_blob()), vocabulary="0" * 64)
+    argv = _write_eval_inputs(tmp_path, other)
+    with pytest.raises(ArtifactBindingError, match="vocabulary mismatch"):
+        genmod.main(argv)
+
+
+def test_main_refuses_an_events_shard_with_no_binding(tmp_path):
+    from src.data.segments import ArtifactBindingError
+    from src.eval import generative as genmod
+
+    with pytest.raises(ArtifactBindingError, match="no tokenizer-v2"):
+        genmod.main(_write_eval_inputs(tmp_path, None))
+
+
+def test_main_scores_an_events_shard_bound_to_the_supplied_vocabulary(tmp_path):
+    from src.data.segments import artifact_binding
+    from src.eval import generative as genmod
+
+    argv = _write_eval_inputs(tmp_path, artifact_binding(_v2_vocab_blob()))
+    genmod.main([*argv, "--out", str(tmp_path / "report.json")])
+    report = json.loads((tmp_path / "report.json").read_text())
+    assert report["event_rate_calibration"]["n_gen_tokens"] == 2

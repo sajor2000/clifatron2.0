@@ -9,10 +9,12 @@ import duckdb
 import polars as pl
 import yaml
 
+from src.data.segments import POLICY_VERSION
 from src.data.splits import content_manifest
 from src.data.tokenize import (
     _read_table,
     restrict_to_observation_window,
+    validate_table_availability,
     validate_units,
     validate_vocabulary_artifact,
 )
@@ -58,6 +60,34 @@ class DataConfigTest(unittest.TestCase):
         self.assertTrue(data["tables"]["meds"]["input_only"])
         self.assertTrue(data["tables"]["resp_support"]["input_only"])
         self.assertTrue(data["tables"]["adt"]["input_only"])
+
+    def test_every_configured_table_declares_availability_semantics(self):
+        """R12: availability is required per table; a missing or unknown one fails."""
+        from src.data.cohort import QualificationError
+
+        root = Path(__file__).parents[1]
+        tables = yaml.safe_load((root / "configs/data.yaml").read_text())["tables"]
+        declared = validate_table_availability(tables)
+        self.assertEqual(set(declared), set(tables))
+        self.assertEqual(declared["vitals"]["availability"], "missing_storetime")
+        self.assertEqual(declared["resp_support"]["availability"], "missing_storetime")
+        self.assertEqual(declared["labs"]["availability"], "result")
+        self.assertEqual(declared["meds"]["availability"], "recorded")
+        self.assertEqual(declared["adt"]["availability"], "recorded")
+        self.assertTrue(all(d["lag_minutes"] == 0 for d in declared.values()))
+
+        missing = {**tables, "labs": {k: v for k, v in tables["labs"].items()
+                                      if k != "availability"}}
+        with self.assertRaisesRegex(QualificationError, "'labs'.*availability"):
+            validate_table_availability(missing)
+        unknown = {**tables, "labs": {**tables["labs"], "availability": "charttime"}}
+        with self.assertRaisesRegex(QualificationError, "'labs'.*availability"):
+            validate_table_availability(unknown)
+        for bad_lag in (-5, 2.5, True, "10"):
+            negative = {**tables, "labs": {**tables["labs"],
+                                           "availability_lag_minutes": bad_lag}}
+            with self.assertRaisesRegex(QualificationError, "availability_lag_minutes"):
+                validate_table_availability(negative)
 
     def test_observation_positions_are_icu_admission_relative_and_include_anchor(self):
         utc = "UTC"
@@ -118,8 +148,14 @@ class DataConfigTest(unittest.TestCase):
         cfg = yaml.safe_load((root / "configs/data.yaml").read_text())
         policy = yaml.safe_load((root / "configs/artifact_policy.yaml").read_text())
         cohort_cfg = yaml.safe_load((root / cfg["cohort_contract"]).read_text())
-        vocab = {"<pad>": 0, "map=0": 1}
-        edges = {"map": [65.0]}
+        vocab = {"<pad>": 0, "map=0": 1, "map=1": 2}
+        segments = {"map": [
+            {"lo": None, "hi": 65.0, "lo_closed": False, "hi_closed": False},
+            {"lo": 65.0, "hi": None, "lo_closed": True, "hi_closed": False},
+        ]}
+        binning_sources = {"map": "csv"}
+        reference_units = {"concepts": {"map": "mmHg"}, "dose_targets": {}}
+        concept_sources = {"tables": {"map": ["vitals"]}, "treatment_sources": []}
 
         def digest(value):
             payload = json.dumps(value, sort_keys=True, separators=(",", ":"))
@@ -127,12 +163,16 @@ class DataConfigTest(unittest.TestCase):
 
         manifest = {
             "artifact_family": "experimental_representation",
+            "tokenizer_version": 2,
             "clif_version": cfg["schema_version"],
             "mcide_version": cfg["mcide_version"],
             "hashes": {
                 "training_split": "1" * 64,
                 "vocabulary": digest(vocab),
-                "numeric_edges": digest(edges),
+                "numeric_edges": digest(segments),
+                "binning_sources": digest(binning_sources),
+                "reference_units": digest(reference_units),
+                "concept_sources": digest(concept_sources),
                 "target_map": digest(cfg["target_concepts"]),
                 "outcome_spec": digest(cohort_cfg["outcomes"]),
                 "clif_version": digest(cfg["schema_version"]),
@@ -140,28 +180,67 @@ class DataConfigTest(unittest.TestCase):
             "provenance": {
                 "source_site": "synthetic-reference",
                 "fit_partition": "train",
+                "precedence_policy": POLICY_VERSION,
                 "immutable": True,
             },
         }
-        loaded_vocab, loaded_edges, loaded_manifest = validate_vocabulary_artifact(
-            {"vocab": vocab, "edges": edges, "manifest": manifest}, cfg, policy
+
+        def artifact(**over):
+            blob = {"vocab": vocab, "segments": segments, "manifest": manifest,
+                    "binning_sources": binning_sources, "reference_units": reference_units,
+                    "concept_sources": concept_sources, "precedence_policy": POLICY_VERSION}
+            blob.update(over)
+            return blob
+
+        loaded_vocab, loaded_segments, loaded_manifest = validate_vocabulary_artifact(
+            artifact(), cfg, policy
         )
         self.assertEqual(loaded_vocab, vocab)
-        self.assertEqual(loaded_edges, edges)
+        self.assertEqual(loaded_segments, segments)
         self.assertEqual(loaded_manifest, manifest)
 
-        tampered = {"vocab": {**vocab, "new": 2}, "edges": edges, "manifest": manifest}
         with self.assertRaisesRegex(ValueError, "hash mismatch"):
-            validate_vocabulary_artifact(tampered, cfg, policy)
+            validate_vocabulary_artifact(artifact(vocab={**vocab, "new": 3}), cfg, policy)
 
-        wrong_family = {"vocab": vocab, "edges": edges, "manifest": {**manifest, "artifact_family": "clifatron_checkpoint"}}
+        moved = json.loads(json.dumps(segments))
+        moved["map"][0]["hi"] = moved["map"][1]["lo"] = 66.0
+        with self.assertRaisesRegex(ValueError, "numeric-edge hash mismatch"):
+            validate_vocabulary_artifact(artifact(segments=moved), cfg, policy)
+
+        with self.assertRaisesRegex(ValueError, "binning sources"):
+            validate_vocabulary_artifact(artifact(binning_sources={}), cfg, policy)
+
+        wrong_family = artifact(manifest={**manifest, "artifact_family": "clifatron_checkpoint"})
         with self.assertRaisesRegex(ValueError, "family"):
             validate_vocabulary_artifact(wrong_family, cfg, policy)
 
         bad_target = json.loads(json.dumps(manifest))
         bad_target["hashes"]["target_map"] = "2" * 64
         with self.assertRaisesRegex(ValueError, "target-map"):
-            validate_vocabulary_artifact({"vocab": vocab, "edges": edges, "manifest": bad_target}, cfg, policy)
+            validate_vocabulary_artifact(artifact(manifest=bad_target), cfg, policy)
+
+        missing = json.loads(json.dumps(manifest))
+        missing["hashes"].pop("reference_units")
+        with self.assertRaisesRegex(ValueError, "missing hashes: reference_units"):
+            validate_vocabulary_artifact(artifact(manifest=missing), cfg, policy)
+
+    def test_unit_mismatch_on_a_non_target_binned_concept_is_an_error(self):
+        """U5: validate_units covers every binned concept via the vocab's reference
+        units, not only the configured target concepts."""
+        cfg = {"unit_normalization": {"on_mismatch": "error", "concepts": {"map": "mmHg"}}}
+        reference_units = {"concepts": {"map": "mmHg", "sodium": "mmol/L",
+                                        "ecmo_flow": None},
+                           "dose_targets": {}}
+        ok = pl.DataFrame({"concept": ["sodium", "map", "ecmo_flow"],
+                           "unit": ["mmol/L", "mmHg", "L/min"], "value": [140.0, 70.0, 4.0]})
+        validate_units(ok, cfg, reference_units)
+        bad = pl.DataFrame({"concept": ["sodium"], "unit": ["mg/dL"], "value": [140.0]})
+        with self.assertRaisesRegex(ValueError, "Non-canonical CLIF units: sodium"):
+            validate_units(bad, cfg, reference_units)
+        # Without the vocab's reference units the non-target concept was never checked.
+        validate_units(bad, cfg)
+        warn = {"unit_normalization": {"on_mismatch": "warn", "concepts": {}}}
+        validate_units(bad, warn, reference_units)
 
     def test_reads_availability_column_and_validates_canonical_unit(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -239,6 +318,129 @@ class DataConfigTest(unittest.TestCase):
                     }
                 },
             )
+
+
+
+NEW_TABLE_FILES = {
+    "meds_intermittent": "clif_medication_admin_intermittent",
+    "assessments": "clif_patient_assessments",
+    "crrt": "clif_crrt_therapy",
+    "ecmo": "clif_ecmo_mcs",
+    "code_status": "clif_code_status",
+    "position": "clif_position",
+}
+
+
+class NewSourceConfigTest(unittest.TestCase):
+    """U4 (KTD5, KTD11): the new sources are config-declared."""
+
+    @classmethod
+    def setUpClass(cls):
+        root = Path(__file__).parents[1]
+        cls.cfg = yaml.safe_load((root / "configs/data.yaml").read_text())
+        cls.tables = cls.cfg["tables"]
+
+    def test_new_tables_are_declared_with_availability_and_zero_lag(self):
+        for name, file in NEW_TABLE_FILES.items():
+            self.assertEqual(self.tables[name]["file"], file, name)
+            self.assertEqual(self.tables[name]["availability_lag_minutes"], 0, name)
+        semantics = {name: self.tables[name]["availability"] for name in NEW_TABLE_FILES}
+        self.assertEqual(semantics, {
+            "meds_intermittent": "recorded", "assessments": "missing_storetime",
+            "crrt": "missing_storetime", "ecmo": "missing_storetime",
+            "code_status": "recorded", "position": "missing_storetime",
+        })
+        self.assertEqual(self.tables["resp_support"]["availability"], "missing_storetime")
+
+    def test_treatments_and_context_are_input_only_assessments_are_targets(self):
+        for name in ("meds", "meds_intermittent", "resp_support", "crrt", "ecmo",
+                     "code_status", "position", "adt"):
+            self.assertTrue(self.tables[name].get("input_only"), name)
+        for name in ("assessments", "labs", "vitals"):
+            self.assertFalse(self.tables[name].get("input_only", False), name)
+
+    def test_resp_melts_the_seventeen_csv_settings(self):
+        import csv
+
+        csv_path = Path(__file__).parents[1] / self.cfg["value_binning"]["segment_source"]
+        with open(csv_path, newline="") as fh:
+            resp = {r["measurement"] for r in csv.DictReader(fh)
+                    if r["category"] == "respiratory_support"}
+        spec = self.tables["resp_support"]
+        self.assertEqual(len(spec["value_cols"]), 17)
+        self.assertEqual(set(spec["value_cols"]), resp)
+        self.assertEqual(spec["categorical_value_cols"],
+                         ["device_category", "mode_category", "tracheostomy"])
+
+    def test_dose_blocks_and_static_tokens(self):
+        meds = self.tables["meds"]["dose"]
+        self.assertEqual(meds["kind"], "continuous")
+        self.assertEqual(meds["weight_source"], {"table": "vitals", "concept": "weight_kg"})
+        self.assertEqual(self.tables["meds_intermittent"]["dose"]["kind"], "intermittent")
+        self.assertEqual(self.tables["ecmo"]["concept_qualifier_col"], "mcs_group")
+        self.assertEqual(self.tables["code_status"]["key"], "patient")
+        self.assertEqual(self.tables["position"]["emit"], "transitions")
+        self.assertEqual(self.cfg["static_tokens"],
+                         ["age_decile", "sex", "race", "ethnicity", "admission_type"])
+
+    def test_repo_config_passes_the_bundle_identifier_validator(self):
+        from src.eval.bundle import _validate_data_config_identifiers
+
+        _validate_data_config_identifiers(self.cfg)
+
+
+class BundleIdentifierValidatorTest(unittest.TestCase):
+    """Every new SQL-interpolated config field is validated (KTD5)."""
+
+    def _cfg(self):
+        import copy
+
+        root = Path(__file__).parents[1]
+        return copy.deepcopy(yaml.safe_load((root / "configs/data.yaml").read_text()))
+
+    def test_unsafe_new_fields_are_rejected(self):
+        from src.eval.bundle import _validate_data_config_identifiers
+        from src.eval.clif_validate import ArtifactMismatch
+
+        bad = "x;DROP"
+        mutations = {
+            "value_cols entry": lambda c: c["tables"]["resp_support"]["value_cols"].append(bad),
+            "value_cols not a list": lambda c: c["tables"]["crrt"].__setitem__("value_cols", bad),
+            "categorical_value_cols": lambda c: c["tables"]["resp_support"][
+                "categorical_value_cols"].append(bad),
+            "concept_qualifier_col": lambda c: c["tables"]["ecmo"].__setitem__(
+                "concept_qualifier_col", bad),
+            "literal concept": lambda c: c["tables"]["position"].__setitem__("concept", bad),
+            "patient_id_col": lambda c: c["tables"]["code_status"].__setitem__(
+                "patient_id_col", bad),
+            "admission_col": lambda c: c["tables"]["code_status"].__setitem__(
+                "admission_col", bad),
+            "discharge_col": lambda c: c["tables"]["code_status"].__setitem__(
+                "discharge_col", bad),
+            "hospitalization_file": lambda c: c["tables"]["code_status"].__setitem__(
+                "hospitalization_file", "../../etc/passwd"),
+            "dose action_col": lambda c: c["tables"]["meds"]["dose"].__setitem__(
+                "action_col", bad),
+            "dose kind": lambda c: c["tables"]["meds"]["dose"].__setitem__("kind", bad),
+            "weight table": lambda c: c["tables"]["meds"]["dose"]["weight_source"].__setitem__(
+                "table", "nope"),
+            "weight concept": lambda c: c["tables"]["meds"]["dose"][
+                "weight_source"].__setitem__("concept", bad),
+            "stop_actions": lambda c: c["tables"]["meds"]["dose"].__setitem__(
+                "stop_actions", [bad]),
+            "emit": lambda c: c["tables"]["position"].__setitem__("emit", bad),
+            "key": lambda c: c["tables"]["code_status"].__setitem__("key", bad),
+            "static token": lambda c: c["static_tokens"].append(bad),
+            "static patient file": lambda c: c["static_source"].__setitem__(
+                "patient_file", "../x"),
+            "static hospitalization file": lambda c: c["static_source"].__setitem__(
+                "hospitalization_file", "a/b"),
+        }
+        for label, mutate in mutations.items():
+            cfg = self._cfg()
+            mutate(cfg)
+            with self.assertRaises(ArtifactMismatch, msg=label):
+                _validate_data_config_identifiers(cfg)
 
 
 if __name__ == "__main__":

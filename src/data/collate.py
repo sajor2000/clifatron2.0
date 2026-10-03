@@ -53,6 +53,11 @@ def collate_model_samples(
         batch["soft_token"] = _pad_3d(samples, "soft_token", max_length, 0, torch.long)
     if all(sample.get("soft_weight") is not None for sample in samples):
         batch["soft_weight"] = _pad_3d(samples, "soft_weight", max_length, 0.0, torch.float32)
+    if all(sample.get("input_value") is not None for sample in samples):
+        # Continuous-fused arm: normalized current value + mask (padding is masked).
+        batch["input_value"] = _pad_2d(samples, "input_value", max_length, 0.0, torch.float32)
+        batch["input_value_mask"] = _pad_2d(samples, "input_value_mask", max_length, False,
+                                            torch.bool)
 
     document_ids = torch.full((len(samples), max_length), -1, dtype=torch.long)
     flat_tokens: list[int] = []

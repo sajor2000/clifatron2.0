@@ -65,7 +65,7 @@ class VarlenIsolationTest(unittest.TestCase):
         flat = document_hidden_states(
             backbone, torch.tensor(doc), cu, force_fallback=True)
 
-        model = CLIFATRONHeads(backbone, n_targets=4, freeze_backbone=True)
+        model = CLIFATRONHeads(backbone, n_targets=4, freeze_backbone=True, n_value_bins=12)
         dense = model.hidden_states(
             torch.tensor(doc).unsqueeze(0),
             torch.ones(1, len(doc), dtype=torch.long))[0]
@@ -169,7 +169,7 @@ class VarlenIsolationTest(unittest.TestCase):
         from src.model.head_adapter import CLIFATRONHeads
 
         backbone = _tiny_backbone()
-        model = CLIFATRONHeads(backbone, n_targets=4, freeze_backbone=True)
+        model = CLIFATRONHeads(backbone, n_targets=4, freeze_backbone=True, n_value_bins=12)
         batch = {
             "flash_input_ids": torch.tensor([3, 4, 5, 6, 7, 8, 9]),
             "cu_seqlens": torch.tensor([0, 4, 7], dtype=torch.int32),

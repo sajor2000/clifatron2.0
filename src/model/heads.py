@@ -168,12 +168,17 @@ class CompetingRiskHead(nn.Module):
 class ThresholdHazardHead(nn.Module):
     """ICareFM head. Input: patient state H_t, a queried threshold τ (as its value-bin
     index) and a direction (0=below,1=above) for target concept k. Output: discrete
-    hazard over `n_time_bins` hours -> cumulative failure prob F_k(h|H_t,τ)."""
+    hazard over `n_time_bins` hours -> cumulative failure prob F_k(h|H_t,τ).
+
+    `n_value_bins` comes from the frozen vocabulary (`segments.n_value_bins`: the largest
+    segment count over every binned concept, plus one), never a default: a concept with
+    more bins than the embedding would otherwise index past it."""
 
     def __init__(self, d: int, n_targets: int, n_time_bins: int,
                  n_value_bins: int, thr_dim: int = 32):
         super().__init__()
         self.n_targets, self.n_bins = n_targets, n_time_bins
+        self.n_value_bins = int(n_value_bins)
         self.thr_emb = nn.Embedding(n_value_bins + 1, thr_dim)   # learned threshold embedding
         self.dir_emb = nn.Embedding(2, thr_dim)                  # learned direction embedding
         self.target_emb = nn.Embedding(n_targets, thr_dim)
@@ -182,6 +187,14 @@ class ThresholdHazardHead(nn.Module):
         )
 
     def _logits(self, h_last, target_idx, tau_bin, direction) -> torch.Tensor:
+        if tau_bin.numel():
+            lo, hi = torch.stack(torch.aminmax(tau_bin)).tolist()   # one host sync
+            if int(lo) < 0 or int(hi) >= self.thr_emb.num_embeddings:
+                raise ValueError(
+                    f"threshold value bin out of range [0, {self.thr_emb.num_embeddings}): "
+                    f"got {int(lo)}..{int(hi)}; n_value_bins must be derived from the "
+                    "vocabulary the query's tau_bin was computed against"
+                )
         q = torch.cat(
             [h_last, self.target_emb(target_idx), self.thr_emb(tau_bin), self.dir_emb(direction)], dim=-1
         )
@@ -248,7 +261,6 @@ class ThresholdHazardHead(nn.Module):
 
 def composite_or(*failure_probs: torch.Tensor) -> torch.Tensor:
     """Disjunction under conditional independence: P(any) = 1 - prod(1 - F_i)."""
-    out = torch.zeros_like(failure_probs[0])
     keep = torch.ones_like(failure_probs[0])
     for f in failure_probs:
         keep = keep * (1 - f)

@@ -10,10 +10,10 @@ Run:
 from __future__ import annotations
 
 import argparse
-import json
 import logging
 import math
-import os
+from collections.abc import Mapping
+from dataclasses import dataclass
 from pathlib import Path
 
 import torch
@@ -33,6 +33,14 @@ from src.model.heads import (
 )
 from src.data.dataset import LengthGroupedSampler, ModelDataset, TokenBudgetBatchSampler
 from src.data.collate import collate_model_samples
+from src.data.segments import (
+    SAMPLE_VOCAB_REFUSAL,
+    artifact_binding,
+    compare_binding,
+    is_sample_vocab,
+    load_vocab_blob,
+    n_value_bins,
+)
 from src.data.targets import TargetBuilder
 from src.train.engine import setup_ddp, is_distributed, TrainConfig, train
 
@@ -92,6 +100,7 @@ def _load_value_stats(
     path: str | None,
     *,
     expected_vocab_hash: str | None = None,
+    expected_segments_hash: str | None = None,
     expected_fit_partition: str | None = None,
 ) -> dict[int, tuple[float, float]]:
     if path is None:
@@ -100,6 +109,7 @@ def _load_value_stats(
     return load_value_stats(
         path,
         expected_vocab_hash=expected_vocab_hash,
+        expected_segments_hash=expected_segments_hash,
         expected_fit_partition=expected_fit_partition,
     )
 
@@ -147,17 +157,23 @@ def objective_weights(mcfg: dict) -> dict[str, float]:
 
 
 class Model(torch.nn.Module):
-    def __init__(self, vocab_size, n_targets, mcfg):
+    def __init__(self, vocab_size, n_targets, mcfg, *, n_value_bins: int,
+                 encoder: torch.nn.Module | None = None):
+        """`n_value_bins` comes from the frozen vocabulary (`segments.n_value_bins`).
+
+        `encoder` (default: a fresh `CLIFEncoder`) lets the tokenization ablation swap
+        the input representation (continuous-fused value channel, TextCode embedding
+        table) while keeping this objective, its masks and its config weights (KTD8)."""
         super().__init__()
         n_causes = n_targets + 1  # +1 for global death competing-cause slot
-        self.enc = CLIFEncoder(vocab_size, mcfg)
+        self.enc = encoder if encoder is not None else CLIFEncoder(vocab_size, mcfg)
         d = self.enc.d_model
         h = mcfg["heads"]
         self.w = objective_weights(mcfg)
         self.cr = CompetingRiskHead(d, n_causes, h["competing_risk"]["n_time_bins"])
         self.th = ThresholdHazardHead(
             d, n_targets, h["threshold_hazard"]["n_time_bins"],
-            n_value_bins=10, thr_dim=h["threshold_hazard"]["threshold_embed_dim"],
+            n_value_bins=n_value_bins, thr_dim=h["threshold_hazard"]["threshold_embed_dim"],
         )
         self.vr = ValueRegressionHead(d, vocab_size) if h["value_regression"]["enabled"] else None
 
@@ -169,8 +185,19 @@ class Model(torch.nn.Module):
                     raise RuntimeError(
                         "CLIFEncoder dense causal path cannot train multi-document packed rows without block-diagonal attention"
                     )
-        encoder_token = batch.get("soft_token", batch["token"])
-        H = self.enc(encoder_token, batch["pos_min"], batch.get("soft_weight"))
+        if getattr(self.enc, "uses_value_channel", False):
+            # Continuous-fused arm: edgeless concept ids + the normalized current value.
+            if "input_value" not in batch or "input_value_mask" not in batch:
+                raise ValueError(
+                    "the continuous-fused encoder needs the input_value channel "
+                    "(ModelDataset(value_channel=True))"
+                )
+            H = self.enc(batch["token"], batch["pos_min"],
+                         continuous_value=batch["input_value"],
+                         continuous_value_mask=batch["input_value_mask"])
+        else:
+            encoder_token = batch.get("soft_token", batch["token"])
+            H = self.enc(encoder_token, batch["pos_min"], batch.get("soft_weight"))
         if "anchor_batch_idx" in batch:
             if len(batch["anchor_batch_idx"]):
                 h_last = H[batch["anchor_batch_idx"], batch["last_idx"]]
@@ -230,66 +257,86 @@ class Model(torch.nn.Module):
         )
 
 
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--config", default="configs/train.yaml")
-    ap.add_argument("--model-config", default="configs/model.yaml")
-    ap.add_argument("--data", required=True)
-    ap.add_argument("--site", required=True)
-    ap.add_argument("--resume", default=None, help="path to checkpoint to resume")
-    ap.add_argument("--fresh-schedule", action="store_true",
-                    help="with --resume: load model+optimizer but keep THIS run's "
-                         "config LR schedule (continuation runs; the saved decayed "
-                         "schedule would pin LR at its tail value)")
-    ap.add_argument("--dry-run", action="store_true", help="print model + loader info and exit")
-    ap.add_argument("--value-stats", default=None, help="JSON token_id -> [center, scale] for value-head normalization")
-    args = ap.parse_args()
+@dataclass
+class Loaders:
+    """What `build_loaders` returns: the train/validation loaders and what built them."""
 
-    local, is_main = setup_ddp()
-    # CUDA for the L40 box; MPS for Mac smoke tests (AGENTS.md dev workflow); CPU last.
-    if torch.cuda.is_available():
-        dev = torch.device(f"cuda:{local}")
-    elif torch.backends.mps.is_available():
-        dev = torch.device("mps")
-        if is_main:
-            print("device: mps (Mac smoke-test path)")
-    else:
-        dev = torch.device("cpu")
-    tcfg = yaml.safe_load(Path(args.config).read_text())
-    mcfg = yaml.safe_load(Path(args.model_config).read_text())
-    dcfg = yaml.safe_load(Path("configs/data.yaml").read_text())
-    n_targets = len(dcfg["target_concepts"])
-    n_causes = n_targets + 1  # +1 for the global death competing-cause slot
-    vocab_size = mcfg["trunk"].get("target_vocab", 10000)
+    train: DataLoader
+    validation: DataLoader
+    train_dataset: ModelDataset
+    validation_dataset: ModelDataset
+    records: list[dict]
+    data_path: Path
+    value_stats: dict[int, tuple[float, float]]
 
-    model = Model(vocab_size, n_targets, mcfg).to(dev)
-    if is_main:
-        print(f"params: {count_params(model)/1e6:.1f}M")
 
-    # Bind value-stats to the data's vocabulary so a stale / cross-vocabulary stats
-    # file is rejected rather than silently applying unrelated centers/scales.
-    expected_vocab_hash = None
-    vocab_path = Path(args.data) / "vocab.json"
-    if vocab_path.exists():
-        from src.data.value_stats import vocab_hash
-        vblob = json.loads(vocab_path.read_text())
-        expected_vocab_hash = vocab_hash(vblob.get("vocab", vblob))
+def _apply_soft_policy(records: list[dict], soft: bool | None) -> None:
+    """`soft=None` keeps the shard's soft fields; `False` drops them (hard-token arm);
+    `True` requires a shard tokenized with soft discretization (width > 1), so a soft arm
+    can never silently train on hard bins."""
+    if soft is None:
+        return
+    for record in records:
+        if not soft:
+            record["soft_token"] = None
+            record["soft_weight"] = None
+        elif not record.get("soft_token") or len(record["soft_token"][0]) < 2:
+            raise SystemExit(
+                "this arm uses soft discretization but the shard carries no soft bins; "
+                "tokenize it with value_binning.soft_discretization: true"
+            )
+
+
+def build_loaders(
+    events_path: str | Path,
+    *,
+    binding: dict[str, str],
+    vocab_blob: Mapping,
+    tcfg: dict,
+    mcfg: dict,
+    vocab_size: int,
+    value_stats_path: str | Path | None = None,
+    dry_run: bool = False,
+    is_main: bool = True,
+    soft: bool | None = None,
+    value_channel: bool = False,
+) -> Loaders:
+    """Shard records -> TargetBuilder -> ModelDataset -> samplers -> DataLoaders.
+
+    The one data path shared by `pretrain.py` and the tokenization ablation (KTD8).
+    `binding` (`segments.artifact_binding` of the vocab.json the shard was encoded with)
+    binds the value stats and every shard row. When `events_path` carries no supervised
+    outcomes, its sibling `events_with_outcomes.parquet` is used (refused when stale).
+    `soft` selects hard vs soft encoder inputs (see `_apply_soft_policy`);
+    `value_channel` adds the normalized current-value field (continuous-fused arm).
+
+    `vocab_blob` is that vocab.json itself: it must match `binding`, and a vocabulary
+    fit on a verification sample (`provenance.sample: true`, KTD9) is refused unless
+    `dry_run` — a sample vocabulary is smoke-only.
+    """
+    compare_binding(binding, artifact_binding(vocab_blob), what="training binding")
+    if is_sample_vocab(vocab_blob) and not dry_run:
+        raise SystemExit(f"refusing to train: the vocabulary {SAMPLE_VOCAB_REFUSAL}")
+    # Bind value-stats to the data's vocabulary AND segments so a stale /
+    # cross-vocabulary / cross-bin stats file is rejected rather than silently applying
+    # unrelated centers/scales.
     value_stats = _load_value_stats(
-        args.value_stats,
-        expected_vocab_hash=expected_vocab_hash,
+        None if value_stats_path is None else str(value_stats_path),
+        expected_vocab_hash=binding["vocabulary"],
+        expected_segments_hash=binding["numeric_edges"],
         expected_fit_partition="train",
     )
-    data_dir = Path(args.data)
-    data_path = data_dir / "events.parquet"
+    data_path = Path(events_path)
+    data_dir = data_path.parent
     model_data_path = data_path
     records = _load_decile_records(
         data_path,
         partition="train",
-        drop_values_without_stats=args.dry_run and not value_stats,
+        drop_values_without_stats=dry_run and not value_stats,
     )
     if not _has_supervised_outcomes(records):
         augmented_path = data_dir / "events_with_outcomes.parquet"
-        if augmented_path.exists():
+        if augmented_path.exists() and augmented_path != data_path:
             data_mtime = data_path.stat().st_mtime if data_path.exists() else 0
             augmented_mtime = augmented_path.stat().st_mtime
             if augmented_mtime < data_mtime:
@@ -304,7 +351,7 @@ def main():
             records = _load_decile_records(
                 augmented_path,
                 partition="train",
-                drop_values_without_stats=args.dry_run and not value_stats,
+                drop_values_without_stats=dry_run and not value_stats,
             )
             model_data_path = augmented_path
             logger.info("using augmented events: %s", augmented_path)
@@ -316,13 +363,13 @@ def main():
                 "events_with_outcomes.parquet does not exist. "
                 "Dry-run will proceed without TTE supervision; real training will fail."
             )
-    if not args.dry_run and not value_stats and _has_numeric_values(records):
+    if not dry_run and not value_stats and _has_numeric_values(records):
         raise SystemExit(
             "value-head normalization is required before real training; pass --value-stats. "
             "Generate it from the reference site: "
             "`python -m src.data.value_stats --events <ref_events.parquet> --out value_stats.json`"
         )
-    if not args.dry_run and not _has_supervised_outcomes(records):
+    if not dry_run and not _has_supervised_outcomes(records):
         raise SystemExit("TTE supervision is required before real pretraining; join cohort outcome artifacts first")
     target_builder = TargetBuilder(
         vocab_size=vocab_size,
@@ -331,25 +378,30 @@ def main():
         value_stats=value_stats,
         run_seed=42,
     )
-    expected_hashes = {}
+    # Every shard row must be bound to this vocabulary and these segments.
+    expected_hashes = dict(binding)
+    _apply_soft_policy(records, soft)
     dataset = ModelDataset(
         records,
         representation="decile",
         target_builder=target_builder,
         expected_hashes=expected_hashes,
         epoch=0,
+        value_channel=value_channel,
     )
     validation_records = _load_decile_records(
         model_data_path,
         partition="validation",
-        drop_values_without_stats=args.dry_run and not value_stats,
+        drop_values_without_stats=dry_run and not value_stats,
     )
+    _apply_soft_policy(validation_records, soft)
     validation_dataset = ModelDataset(
         validation_records,
         representation="decile",
         target_builder=target_builder,
         expected_hashes=expected_hashes,
         epoch=0,
+        value_channel=value_channel,
     )
 
     token_budget = int(tcfg["runtime"].get("token_budget", 0) or 0)
@@ -423,6 +475,77 @@ def main():
             num_workers=tcfg["runtime"].get("num_workers", 0),
             pin_memory=torch.cuda.is_available(),
         )
+    return Loaders(
+        train=dl,
+        validation=validation_dl,
+        train_dataset=dataset,
+        validation_dataset=validation_dataset,
+        records=records,
+        data_path=model_data_path,
+        value_stats=value_stats,
+    )
+
+
+def build_scheduler(opt, total_steps: int, warmup_steps: int):
+    """Linear warmup then cosine decay (the pretrain schedule)."""
+    sched1 = LinearLR(opt, start_factor=0.01, end_factor=1.0, total_iters=warmup_steps)
+    sched2 = CosineAnnealingLR(opt, T_max=max(1, total_steps - warmup_steps))
+    return SequentialLR(opt, schedulers=[sched1, sched2], milestones=[warmup_steps])
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--config", default="configs/train.yaml")
+    ap.add_argument("--model-config", default="configs/model.yaml")
+    ap.add_argument("--data", required=True)
+    ap.add_argument("--site", required=True)
+    ap.add_argument("--resume", default=None, help="path to checkpoint to resume")
+    ap.add_argument("--fresh-schedule", action="store_true",
+                    help="with --resume: load model+optimizer but keep THIS run's "
+                         "config LR schedule (continuation runs; the saved decayed "
+                         "schedule would pin LR at its tail value)")
+    ap.add_argument("--dry-run", action="store_true", help="print model + loader info and exit")
+    ap.add_argument("--value-stats", default=None, help="JSON token_id -> [center, scale] for value-head normalization")
+    args = ap.parse_args()
+
+    local, is_main = setup_ddp()
+    # CUDA for the L40 box; MPS for Mac smoke tests (AGENTS.md dev workflow); CPU last.
+    if torch.cuda.is_available():
+        dev = torch.device(f"cuda:{local}")
+    elif torch.backends.mps.is_available():
+        dev = torch.device("mps")
+        if is_main:
+            print("device: mps (Mac smoke-test path)")
+    else:
+        dev = torch.device("cpu")
+    tcfg = yaml.safe_load(Path(args.config).read_text())
+    mcfg = yaml.safe_load(Path(args.model_config).read_text())
+    dcfg = yaml.safe_load(Path("configs/data.yaml").read_text())
+    n_targets = len(dcfg["target_concepts"])
+    vocab_size = mcfg["trunk"].get("target_vocab", 10000)
+
+    # KTD7: the data's tokenizer-v2 vocabulary binds everything below — the threshold
+    # head's value-bin count, the shard rows, the value stats and every checkpoint.
+    vblob = load_vocab_blob(Path(args.data) / "vocab.json",
+                            required_for="training is bound to its vocabulary and segments")
+    binding = artifact_binding(vblob)  # refuses a pre-v2 vocabulary (re-tokenize)
+
+    model = Model(vocab_size, n_targets, mcfg, n_value_bins=n_value_bins(vblob)).to(dev)
+    if is_main:
+        print(f"params: {count_params(model)/1e6:.1f}M")
+
+    loaders = build_loaders(
+        Path(args.data) / "events.parquet",
+        binding=binding,
+        vocab_blob=vblob,
+        tcfg=tcfg,
+        mcfg=mcfg,
+        vocab_size=vocab_size,
+        value_stats_path=args.value_stats,
+        dry_run=args.dry_run,
+        is_main=is_main,
+    )
+    dataset, dl, validation_dl = loaders.train_dataset, loaders.train, loaders.validation
 
     if args.dry_run:
         if is_main:
@@ -447,15 +570,14 @@ def main():
 
     total_steps = tcfg["schedule"].get("total_steps", 60000)
     warmup_steps = tcfg["schedule"].get("warmup_steps", 2000)
-    sched1 = LinearLR(opt, start_factor=0.01, end_factor=1.0, total_iters=warmup_steps)
-    sched2 = CosineAnnealingLR(opt, T_max=total_steps - warmup_steps)
-    scheduler = SequentialLR(opt, schedulers=[sched1, sched2], milestones=[warmup_steps])
+    scheduler = build_scheduler(opt, total_steps, warmup_steps)
 
     train_cfg = TrainConfig({}, tcfg, mcfg, total_steps)
 
     model, manifest = train(
         model, dl, validation_dl, opt, scheduler, train_cfg, dev,
         resume_ckpt=args.resume, seed=42, fresh_schedule=args.fresh_schedule,
+        vocab_binding=binding,
     )
 
     if is_main:

@@ -3,6 +3,13 @@
 `representation="decile"` is a legacy name for the canonical shards written by
 `src/data/tokenize.py`, whatever `value_binning.scheme` produced them (clinical
 segments by default).
+
+`representation="gem"` (U8, KTD10) reads gem_events.parquet: one row per window of a
+full-hospitalization stream. Windows are regrouped per stay and validated (contiguous
+source spans, consistent continuation flags); next-event targets are built ONCE on the
+whole stay by a `TargetBuilder(mode="gem")` and sliced per window — the packed-segment
+contract — so a window's last eligible event still predicts the first eligible event
+of the next window. GEM samples carry no TTE labels.
 """
 
 from __future__ import annotations
@@ -18,7 +25,9 @@ from torch.utils.data import DataLoader, Dataset, Sampler
 
 import logging
 
+from src.data.segments import RETOKENIZE, TOKENIZER_VERSION
 from src.data.targets import TargetBuilder, TargetContractError
+from src.data.tokenize_continuous import normalize_value
 
 try:
     from external.clifatron.AR.qwen2.data.packed_dataset import PACKED_SCHEMA_VERSION  # type: ignore[import-untyped]
@@ -40,9 +49,20 @@ class ModelDataset(Dataset):
         expected_hashes: Mapping[str, str],
         episode_targets: Mapping[str, Mapping[str, Any]] | None = None,
         epoch: int = 0,
+        value_channel: bool = False,
     ) -> None:
-        if representation not in {"decile", "clifatron_packed"}:
-            raise ValueError("representation must be 'decile' or 'clifatron_packed'")
+        """`value_channel` (continuous-fused arm, U6): each canonical sample also carries
+        `input_value` / `input_value_mask`, the CURRENT event's value normalized with the
+        target builder's frozen per-token stats (`tokenize_continuous.normalize_value`);
+        missing, categorical (NaN) and implausible values are masked to 0."""
+        if representation not in {"decile", "clifatron_packed", "gem"}:
+            raise ValueError("representation must be 'decile', 'clifatron_packed' or 'gem'")
+        if value_channel and representation != "decile":
+            raise ValueError("the input value channel is defined for canonical shards only")
+        if (representation == "gem") != (getattr(target_builder, "mode", "icu_24h") == "gem"):
+            raise TargetContractError(
+                "the gem representation requires TargetBuilder(mode='gem'), and only it"
+            )
         if isinstance(records, (str, Path)):
             records = pl.read_parquet(records).to_dicts()
         self.records = [dict(record) for record in records]
@@ -51,13 +71,33 @@ class ModelDataset(Dataset):
         self.expected_hashes = dict(expected_hashes)
         self.episode_targets = dict(episode_targets or {})
         self.epoch = int(epoch)
+        self.value_channel = bool(value_channel)
         for record in self.records:
             self._validate_hashes(record)
+            is_gem = record.get("trajectory") == "hospitalization"
+            if representation != "clifatron_packed" and is_gem != (representation == "gem"):
+                raise TargetContractError(
+                    "GEM (hospitalization) records load only through representation='gem'"
+                )
+        self._gem_built: dict[str, dict[str, Any]] = {}
+        if representation == "gem":
+            self.records, self._gem_streams = _gem_streams(self.records)
+            # Only a stay split into several windows reads its targets more than once
+            # per epoch, so only those are cached (a single-window stay rebuilds them).
+            windows: dict[str, int] = {}
+            for record in self.records:
+                key = _episode_key(record)
+                windows[key] = windows.get(key, 0) + 1
+            self._gem_multi_window = {key for key, n in windows.items() if n > 1}
 
     def __len__(self) -> int:
         return len(self.records)
 
     def __getitem__(self, index: int) -> dict[str, Any]:
+        if self.representation == "gem":
+            # `_gem_sample` never mutates the record and copies the per-token lists it
+            # returns except the soft fields, which every consumer (collate) only reads.
+            return self._gem_sample(self.records[index])
         record = deepcopy(self.records[index])
         if self.representation == "decile":
             return self._decile_sample(record)
@@ -65,11 +105,23 @@ class ModelDataset(Dataset):
 
     def set_epoch(self, epoch: int) -> None:
         self.epoch = int(epoch)
+        self._gem_built.clear()
 
     def _validate_hashes(self, record: Mapping[str, Any]) -> None:
         hashes = record.get("artifact_hashes")
         if not isinstance(hashes, Mapping):
             raise TargetContractError("sample is missing artifact_hashes")
+        if self.representation in ("decile", "gem") and (
+            not hashes.get("numeric_edges")
+            or str(hashes.get("tokenizer_version")) != str(TOKENIZER_VERSION)
+        ):
+            # KTD7: a canonical shard row records the tokenizer version and segments
+            # hash it was encoded with. Without them it was built by the previous
+            # tokenizer, whose bins no longer mean what the vocabulary says.
+            raise TargetContractError(
+                f"shard row is not bound to tokenizer-v{TOKENIZER_VERSION} segments "
+                f"(no numeric_edges/tokenizer_version in artifact_hashes); {RETOKENIZE}"
+            )
         for name, expected in self.expected_hashes.items():
             if hashes.get(name) != expected:
                 raise TargetContractError(f"artifact hash mismatch: {name}")
@@ -77,7 +129,7 @@ class ModelDataset(Dataset):
     def _decile_sample(self, record: dict[str, Any]) -> dict[str, Any]:
         built = self.target_builder.build(record, epoch=self.epoch)
         length = len(record["token"])
-        return {
+        sample = {
             "packed_schema_version": PACKED_SCHEMA_VERSION,
             "input_ids": record["token"],
             "attention_mask": [1] * length,
@@ -105,6 +157,52 @@ class ModelDataset(Dataset):
                 }
             ],
         }
+        if self.value_channel:
+            stats = self.target_builder.value_stats
+            values = record.get("value") or [None] * length
+            channel = [normalize_value(value, token, stats,
+                                       max_abs_z=self.target_builder.max_abs_value_z)
+                       for token, value in zip(record["token"], values)]
+            sample["input_value"] = [value for value, _ in channel]
+            sample["input_value_mask"] = [mask for _, mask in channel]
+        return sample
+
+    def _gem_sample(self, record: Mapping[str, Any]) -> dict[str, Any]:
+        key = _episode_key(record)
+        built = self._gem_built.get(key)
+        if built is None:
+            built = self.target_builder.build(self._gem_streams[key], epoch=self.epoch)
+            if key in self._gem_multi_window:
+                self._gem_built[key] = built
+        start, end = int(record["source_start"]), int(record["source_end"])
+        length = end - start
+        anchor = built["anchor_idx"]
+        contains_anchor = anchor is not None and start <= anchor < end
+        sample = {
+            "packed_schema_version": PACKED_SCHEMA_VERSION,
+            "input_ids": list(record["token"]),
+            "attention_mask": [1] * length,
+            "pos_min": list(record["pos_min"]),
+            "soft_token": record.get("soft_token"),
+            "soft_weight": record.get("soft_weight"),
+            "segments": [{
+                "episode_key": key,
+                "source_start": start,
+                "source_end": end,
+                "packed_start": 0,
+                "packed_end": length,
+                "continuation_index": int(record["continuation_index"]),
+                "continues_from_previous": bool(record["continues_from_previous"]),
+                "continues_to_next": bool(record["continues_to_next"]),
+                # Representation evaluation only: GEM has no TTE labels or queries.
+                "anchor_offset": anchor - start if contains_anchor else None,
+                "outcome_labels": [],
+                "threshold_query": None,
+            }],
+        }
+        for field in ("ntp_target", "ntp_mask", "ntp_delta_min", "value_target", "value_mask"):
+            sample[field] = built[field][start:end]
+        return sample
 
     def _packed_sample(self, record: dict[str, Any]) -> dict[str, Any]:
         if record.get("packed_schema_version") != PACKED_SCHEMA_VERSION:
@@ -175,6 +273,62 @@ class ModelDataset(Dataset):
         if not output["segments"]:
             raise TargetContractError("packed row contains no document segments")
         return output
+
+
+def _episode_key(record: Mapping[str, Any]) -> str:
+    key = record.get("episode_key") or record.get("hosp_id")
+    if not isinstance(key, str) or not key:
+        raise TargetContractError("GEM window is missing an opaque episode key")
+    return key
+
+
+_GEM_WINDOW_FIELDS = ("token", "pos_min", "value", "target_eligible")
+
+
+def _gem_streams(
+    records: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], dict[str, dict[str, Any]]]:
+    """Group GEM windows per stay, validate the continuation contract, and rebuild each
+    stay's full stream (the TargetBuilder input). Returns the windows ordered by
+    (episode key, continuation index) and ``{key: stream}``."""
+    by_key: dict[str, list[dict[str, Any]]] = {}
+    for record in records:
+        by_key.setdefault(_episode_key(record), []).append(record)
+    ordered: list[dict[str, Any]] = []
+    streams: dict[str, dict[str, Any]] = {}
+    for key in sorted(by_key):
+        windows = sorted(by_key[key], key=lambda r: int(r["continuation_index"]))
+        n = len(windows)
+        stream: dict[str, list] = {field: [] for field in _GEM_WINDOW_FIELDS}
+        for index, window in enumerate(windows):
+            length = len(window["token"])
+            if (int(window["continuation_index"]) != index
+                    or int(window.get("n_windows", n)) != n
+                    or int(window["source_start"]) != len(stream["token"])
+                    or int(window["source_end"]) - int(window["source_start"]) != length
+                    or length == 0
+                    or bool(window["continues_from_previous"]) != (index > 0)
+                    or bool(window["continues_to_next"]) != (index < n - 1)
+                    or any(len(window[f]) != length for f in _GEM_WINDOW_FIELDS)):
+                raise TargetContractError(
+                    f"GEM window {index} of a stay breaks the continuation contract "
+                    "(missing, duplicated or misaligned window)"
+                )
+            for field in ("anchor_idx", "anchor_min", "partition"):
+                if window.get(field) != windows[0].get(field):
+                    raise TargetContractError(f"GEM windows of a stay disagree on {field}")
+            for field in _GEM_WINDOW_FIELDS:
+                stream[field].extend(window[field])
+        anchor = windows[0].get("anchor_idx")
+        streams[key] = {
+            "episode_key": key,
+            **stream,
+            "anchor_idx": None if anchor is None else int(anchor),
+            "anchor_min": windows[0].get("anchor_min"),
+            "outcomes": [],
+        }
+        ordered.extend(windows)
+    return ordered, streams
 
 
 class LengthGroupedSampler(Sampler):

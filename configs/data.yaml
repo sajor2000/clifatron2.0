@@ -9,37 +9,191 @@ cohort_contract: "configs/cohort.yaml"
 artifact_policy: "configs/artifact_policy.yaml"
 episode_artifact: "output/intermediate_phi/episodes.parquet"
 
+# Every table MUST declare `availability` (R12; tokenize fails closed otherwise):
+#   result            - availability_col is when the result became available
+#   recorded          - availability_col is when the event was charted/administered
+#   missing_storetime - CLIF carries no store time; recorded_dttm stands in
+# `availability_lag_minutes` (optional, default 0, non-negative integer) shifts the
+# table's timestamps later before the observation window is applied (conservative).
 tables:
   vitals:
     file: "clif_vitals"
     availability_col: "recorded_dttm"     # CLIF has no separate vital storetime
+    availability: "missing_storetime"
+    availability_lag_minutes: 0
     concept_col: "vital_category"        # mCIDE controlled vocab
     value_col: "vital_value"
   labs:
     file: "clif_labs"
     availability_col: "lab_result_dttm"   # result availability; MIMIC storetime maps here
+    availability: "result"
+    availability_lag_minutes: 0
     concept_col: "lab_category"
     value_col: "lab_value_numeric"
     unit_col: "reference_unit"
-  resp_support:
+  resp_support:                           # INPUT ONLY
     file: "clif_respiratory_support"
     availability_col: "recorded_dttm"
-    concept_col: "device_category"       # imv, nippv, high_flow, ...
-    value_col: null                      # categorical event
+    availability: "missing_storetime"
+    availability_lag_minutes: 0
+    # Wide table (R8): every numeric setting/observation column is melted to its own
+    # event (concept = column name = the physician CSV measurement name), and every
+    # categorical column to a fused `column=value` token (KTD4). Nulls emit nothing.
+    value_cols: [fio2_set, lpm_set, tidal_volume_set, resp_rate_set, pressure_control_set,
+                 pressure_support_set, flow_rate_set, peak_inspiratory_pressure_set,
+                 inspiratory_time_set, peep_set, tidal_volume_obs, resp_rate_obs,
+                 plateau_pressure_obs, peak_inspiratory_pressure_obs, peep_obs,
+                 minute_vent_obs, mean_airway_pressure_obs]
+    categorical_value_cols: [device_category, mode_category, tracheostomy]
     input_only: true
   meds:                                   # INPUT ONLY (not a target)
     file: "clif_medication_admin_continuous"
     availability_col: "admin_dttm"
-    concept_col: "med_category"          # norepinephrine, propofol, heparin, furosemide...
-    value_col: null                       # v2 emits med_category only (no dose) — see data-tokenization T4
-    dose_tokenization: "tokenetl_only"    # dose bins exist only in vendored v1 tokenETL (not run by v2)
+    availability: "recorded"
+    availability_lag_minutes: 0
+    concept_col: "med_category"          # norepinephrine, propofol, heparin, ...
+    value_col: "med_dose"
+    unit_col: "med_dose_unit"
+    # R6: doses convert to the physician CSV's preferred unit for the med_category
+    # (concept = the CSV measurement name, e.g. norepinephrine_mcg_kg_min). Per-kg
+    # conversions use the most recent weight available at or before the dose (DuckDB
+    # ASOF join on availability time, both tables' lags applied). A dose that cannot be
+    # converted keeps its native unit under `{med_category}_{unit}`; the reference site
+    # also fits those fallback concepts from its pre-conversion doses (fit-only shadow).
+    # Rows whose action is in stop_actions are a dose of 0 (the [0,0] stop bin).
+    dose:
+      kind: "continuous"
+      action_col: "mar_action_category"
+      stop_actions: [stop]
+      weight_source: {table: vitals, concept: weight_kg}
+    input_only: true
+  meds_intermittent:                      # INPUT ONLY
+    file: "clif_medication_admin_intermittent"
+    availability_col: "admin_dttm"
+    availability: "recorded"
+    availability_lag_minutes: 0
+    concept_col: "med_category"
+    value_col: "med_dose"
+    unit_col: "med_dose_unit"
+    # R7: one canonical unit per kind (mass -> mg, units -> u); only `dose` / `mL` (and
+    # unrecognised units) fall back to `{med_category}_{unit}`.
+    dose:
+      kind: "intermittent"
+    input_only: true
+  assessments:                            # TARGET-ELIGIBLE (R9): measurements, not treatments
+    file: "clif_patient_assessments"
+    availability_col: "recorded_dttm"
+    availability: "missing_storetime"
+    availability_lag_minutes: 0
+    concept_col: "assessment_category"   # gcs_*, RASS -> rass, braden_*, cam_*, sbt_*
+    normalize_concept: true               # lowercase concept names (RASS -> rass)
+    value_col: "numerical_value"          # numeric scales -> binned (ordinal for GCS/RASS/Braden)
+    categorical_value_col: "categorical_value"   # fused only when there is no numeric value
+  crrt:                                   # INPUT ONLY
+    file: "clif_crrt_therapy"
+    availability_col: "recorded_dttm"
+    availability: "missing_storetime"
+    availability_lag_minutes: 0
+    value_cols: [blood_flow_rate, pre_filter_replacement_fluid_rate,
+                 post_filter_replacement_fluid_rate, dialysate_flow_rate, ultrafiltration_out]
+    categorical_value_cols: [crrt_mode_category]
+    input_only: true
+  ecmo:                                   # INPUT ONLY
+    file: "clif_ecmo_mcs"
+    availability_col: "recorded_dttm"
+    availability: "missing_storetime"
+    availability_lag_minutes: 0
+    # R10: concepts are `{mcs_group}_{column}` (normalized; a missing group -> unknown),
+    # so an ECMO pump speed and an LVAD pump speed are different concepts.
+    concept_qualifier_col: "mcs_group"
+    value_cols: [device_rate, flow, sweep, fdO2]
+    categorical_value_cols: [device_category]
+    input_only: true
+  code_status:                            # INPUT ONLY (R21)
+    file: "clif_code_status"
+    # Keyed by PATIENT: joined to stays through the hospitalization table. The status in
+    # effect at admission (latest start_dttm <= admission) is emitted at admission; each
+    # later change within the stay at its start_dttm.
+    key: "patient"
+    patient_id_col: "patient_id"
+    hospitalization_file: "clif_hospitalization"
+    admission_col: "admission_dttm"
+    discharge_col: "discharge_dttm"
+    availability_col: "start_dttm"
+    availability: "recorded"
+    availability_lag_minutes: 0
+    concept: "code_status"                # fused code_status=<category>
+    categorical_value_col: "code_status_category"
+    emit: "transitions"                   # first status + changes only
+    carry_forward: true                   # state in effect at window start is kept
+    input_only: true
+  position:                               # INPUT ONLY (R21)
+    file: "clif_position"
+    availability_col: "recorded_dttm"
+    availability: "missing_storetime"
+    availability_lag_minutes: 0
+    concept: "position"                   # fused position=prone|not_prone
+    categorical_value_col: "position_category"
+    emit: "transitions"
+    carry_forward: true
     input_only: true
   adt:
     file: "clif_adt"
     availability_col: "in_dttm"
+    availability: "recorded"
+    availability_lag_minutes: 0
     concept_col: "location_category"
     value_col: null
     input_only: true
+
+# Static admission tokens (R21, KTD11; BBJ CLIF GEM): emitted once at the stay start,
+# before any other event, in this fixed order. age_decile = quantile (decile) bins of
+# age_at_admission fit on the reference train partition; the rest are fused categoricals
+# (`sex=female`, ...). Input-only, never targets. `static_tokens: []` disables them.
+static_tokens: [age_decile, sex, race, ethnicity, admission_type]
+static_source:
+  hospitalization_file: "clif_hospitalization"   # age_at_admission, admission_type_category
+  patient_file: "clif_patient"                   # sex_category, race_category, ethnicity_category
+
+# Full-hospitalization GEM artifact (U8; R17, R18, KTD10). `tokenize_site(...,
+# trajectory="hospitalization")` writes gem_events.parquet beside events.parquet with the
+# SAME frozen vocab.json (built by the reference site's icu_24h run): window
+# [admission_dttm, discharge_dttm], positions = minutes since hospital admission, framed
+# `<bos> ADMISSION//<type> <static tokens> ...events... DISCHARGE//<disposition> <eos>`.
+# The two allowlists below are appended to the vocabulary at build time (after every
+# data-derived token, so data token ids do not move) whether or not the data contains
+# them. DISCHARGE//* is the ONLY place disposition appears, at the true discharge_dttm,
+# and it is target-eligible; <bos>, ADMISSION//*, static and treatment tokens are inputs.
+# Map keys are raw CLIF categories lowercased and stripped; anything unmapped (including
+# null/blank) -> `unknown` = end of observation, never read as survival.
+gem:
+  max_tokens: 8192                         # = configs/model.yaml trunk.max_tokens (test-locked)
+  dispositions: [home, facility, hospice, expired, ama, other, unknown]
+  disposition_map:
+    home: home
+    expired: expired
+    hospice: hospice
+    skilled nursing facility (snf): facility
+    acute inpatient rehab facility: facility
+    long term care hospital (ltach): facility
+    psychiatric hospital: facility
+    acute care hospital: facility
+    assisted living: facility
+    against medical advice (ama): ama
+    other: other
+    missing: unknown
+    unknown: unknown
+  admission_types: [ed, elective, direct, transfer, other, unknown]
+  admission_map:                           # CLIF admission_type_category (MIMIC: ed/elective/direct)
+    ed: ed
+    elective: elective
+    direct: direct
+    osh: transfer
+    facility: transfer
+    transfer: transfer
+    other: other
+    missing: unknown
+    unknown: unknown
 
 # Target measurement concepts (K hazard heads, ICareFM-style). Treatments excluded.
 target_concepts:
@@ -83,6 +237,21 @@ value_binning:
   scheme: "clinical_segment"               # {clinical_segment | decile_ablation}; continuous_fused is not a build_edges scheme yet
   segment_source: "external/clifatron/tokenETL/config/critical_illness_tokenization_final_with_intervals.csv"
   n_bins: 10                               # ignored by clinical_segment; used by the decile_ablation arm
+  # COVERAGE (U2, R4/KTD3): `all` bins EVERY numeric concept in the reference-site train
+  # partition. Source priority per concept: (1) physician CSV segments; (2) one point bin
+  # per value for integer scales with <= ordinal_max_distinct distinct values (GCS, RASS,
+  # Braden); (3) frozen quantile bins (quantile_n_bins target, deduplicated, [a,b),
+  # forced edges pinned). Fewer than min_count fitting values -> one bin ("single").
+  # The decile arm = coverage all with every source forced to quantile (n_bins target).
+  # The per-concept choice is recorded in vocab.json `binning_sources`.
+  # `targets_only` restores the pre-v2 behaviour (CSV bins for target_concepts only).
+  coverage: "all"                          # {all | targets_only}
+  ordinal_max_distinct: 25
+  min_count: 20
+  quantile_n_bins: 10
+  # Dose concepts (any concept charted by these tables, or a table flagged `dose: true`)
+  # get a [0,0] stop bin; their quantiles are fit on strictly positive doses only.
+  dose_sources: [meds, meds_intermittent]
   build_from_site: "mimic"                 # freeze bin edges on reference site, apply identically everywhere
   fit_partition: "train"                   # never fit vocabulary/edges on validation, calibration, or test
   # SOFT DISCRETIZATION: applied ON TOP of clinical segments to smooth hard bin boundaries
@@ -94,7 +263,7 @@ value_binning:
   # threshold-hazard head's queries. clinical_segment: ADDED to the CSV grid (bin count grows);
   # decile_ablation: REPLACES the nearest quantile edge (n_bins is an upper bound: duplicate
   # quantiles from repeated values are deduplicated, so a concept can end up with fewer bins).
-  # NOTE: clinical_segment bins ONLY target_concepts; other numeric concepts become bare tokens.
+  # Forced edges apply to whichever source bins the concept (ignored for ordinal point bins).
   forced_edges:                           # concept: [physical-value cutpoints guaranteed to be bin boundaries]
     lactate:    [2.0, 4.0]                # Sepsis-3 / Surviving Sepsis
     map:        [65.0]                    # vasopressor trigger
