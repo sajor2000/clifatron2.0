@@ -195,7 +195,7 @@ class LaunchCommandTest(unittest.TestCase):
 
         run = next(r for r in expand() if r["claim_bearing"])
         cmds = launch_commands(run, MATRIX)
-        self.assertTrue(cmds["torchrun"].startswith("torchrun --nproc_per_node=2 -m "
+        self.assertTrue(cmds["torchrun"].startswith("uv run torchrun --nproc_per_node=2 -m "
                                                     "src.train.run_tokenization_ablation"))
         self.assertIn("--device cpu", cmds["cpu"])
         self.assertNotIn("torchrun", cmds["cpu"])

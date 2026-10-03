@@ -390,22 +390,26 @@ def scenario_final_checkpoint(local: int, out_dir: Path) -> dict:
 
 
 class _SignalingMicrobatches(_Microbatches):
-    """Rank 1 sends itself SIGTERM while fetching microbatch `at` (once)."""
+    """Rank 1 sends itself `signals` (default one SIGTERM) while fetching microbatch `at`
+    (once). Two SIGINTs back to back are what a Ctrl-C under torchrun delivers: the
+    terminal's SIGINT to the worker's process group, then torchrun's forwarded copy."""
 
-    def __init__(self, batches, *, at: int):
+    def __init__(self, batches, *, at: int, signals: tuple[str, ...] = ("SIGTERM",)):
         super().__init__(batches)
-        self.at, self.sent = at, False
+        self.at, self.sent, self.signals = at, False, signals
 
     def __getitem__(self, index):
         if index == self.at and not self.sent and int(os.environ["RANK"]) == 1:
             import signal
 
             self.sent = True
-            os.kill(os.getpid(), signal.SIGTERM)
+            for name in self.signals:
+                os.kill(os.getpid(), getattr(signal, name))
         return super().__getitem__(index)
 
 
-def scenario_clean_stop(local: int, out_dir: Path) -> dict:
+def scenario_clean_stop(local: int, out_dir: Path, *,
+                        signals: tuple[str, ...] = ("SIGTERM",)) -> dict:
     """SIGTERM reaches rank 1 only, while it fetches its second microbatch (index 3): both
     ranks agree at that update's boundary, rank 0 checkpoints update 2, both return."""
     import signal
@@ -414,7 +418,8 @@ def scenario_clean_stop(local: int, out_dir: Path) -> dict:
     from src.train.pretrain import build_optimizer, build_scheduler
 
     before = signal.getsignal(signal.SIGTERM)
-    dataset = _SignalingMicrobatches([synthetic_batch(800 + i) for i in range(10)], at=3)
+    dataset = _SignalingMicrobatches([synthetic_batch(800 + i) for i in range(10)], at=3,
+                                     signals=signals)
     loader = DataLoader(dataset, batch_size=None,
                         sampler=DistributedSampler(dataset, shuffle=False))
     model = _wrap(build_model(tiny_mcfg()), local)
@@ -426,9 +431,66 @@ def scenario_clean_stop(local: int, out_dir: Path) -> dict:
             "handler_restored": signal.getsignal(signal.SIGTERM) is before}
 
 
+def scenario_double_sigint(local: int, out_dir: Path) -> dict:
+    """M2: a Ctrl-C under torchrun reaches a worker twice within milliseconds (its own
+    SIGINT, then torchrun's forwarded one). The repeat is not an abort: both ranks still
+    stop at the same update with one checkpoint."""
+    return scenario_clean_stop(local, out_dir, signals=("SIGINT", "SIGINT"))
+
+
+class _CountingMicrobatches(_Microbatches):
+    """Counts the microbatches this rank fetches."""
+
+    def __init__(self, batches):
+        super().__init__(batches)
+        self.fetched = 0
+
+    def __getitem__(self, index):
+        self.fetched += 1
+        return super().__getitem__(index)
+
+
+VAL_BATCHES = 5
+
+
+def scenario_sharded_validation(local: int, out_dir: Path) -> dict:
+    """M1: validation under DDP runs on every rank over its own share of the validation
+    batches (rank r takes batches r, r+2, ...) and the ranks combine their sums, so both
+    record the same loss: the mean over ALL validation batches. No rank idles at a
+    barrier while another validates."""
+    from src.train.engine import TrainConfig, train
+    from src.train.pretrain import build_optimizer, build_scheduler
+
+    val_set = _CountingMicrobatches([synthetic_batch(900 + i) for i in range(VAL_BATCHES)])
+    val_dl = DataLoader(val_set, batch_size=None, shuffle=False)
+    model = _wrap(build_model(tiny_mcfg()), local)
+    opt = build_optimizer(model, lr=1e-2, weight_decay=0.1, betas=(0.9, 0.95))
+    tcfg = tiny_tcfg(out_dir / "ckpt", ckpt_every=1000)
+    tcfg["eval_schedule"] = {"val_every": None, "validations_per_run": 1}
+    batches = [synthetic_batch(950 + i) for i in range(6)]
+    _, manifest = train(model, microbatch_loader(batches, distributed=True), val_dl, opt,
+                        build_scheduler(opt, 3, 1), TrainConfig({}, tcfg, tiny_mcfg(), 3),
+                        CPU, vocab_binding=BINDING)
+    fetched = val_set.fetched
+    module = model.module
+    module.eval()
+    with torch.no_grad(), torch.autocast("cpu", dtype=torch.bfloat16):
+        expected = [float(module(_prepare(b))["total"]) for b in val_set.batches]
+    return {"validation": manifest.validation, "fetched": fetched,
+            "expected": sum(expected) / len(expected), "state": _state(model)}
+
+
+def _prepare(batch: dict) -> dict:
+    from src.train.engine import _prepare_batch
+
+    return _prepare_batch(batch, CPU)
+
+
 SCENARIOS = {
     "final_checkpoint": scenario_final_checkpoint,
     "clean_stop": scenario_clean_stop,
+    "double_sigint": scenario_double_sigint,
+    "sharded_validation": scenario_sharded_validation,
     "tte_weights_zero": scenario_tte_weights_zero,
     "rank_without_anchor": scenario_rank_without_anchor,
     "accumulation_gradient": scenario_accumulation_gradient,
@@ -675,6 +737,25 @@ class TwoRankTrainingTest(unittest.TestCase):
         self.assertEqual(self.checkpoint["step"], 2)
         self.assertTrue(r0["handler_restored"] and r1["handler_restored"])
 
+    def test_two_sigints_on_one_rank_still_stop_both_with_one_checkpoint(self):
+        """M2: before the fix the repeated SIGINT raised KeyboardInterrupt on rank 1 and
+        the run died without a checkpoint."""
+        r0, r1 = self._launch("double_sigint")
+        self.assertEqual((r0["updates"], r1["updates"]), (2, 2))
+        self.assertSameState(r0["state"], r1["state"], "double SIGINT")
+        self.assertEqual(self.checkpoints, ["ckpt_ep0_step2.pt"])
+        self.assertTrue(r0["handler_restored"] and r1["handler_restored"])
+
+    def test_validation_is_sharded_across_ranks_and_combined(self):
+        """M1: both ranks validate (no rank-0-only pass behind a barrier), each over its
+        own share of the batches, and record the loss over all of them."""
+        r0, r1 = self._launch("sharded_validation")
+        self.assertEqual(len(r0["validation"]), 1)
+        self.assertEqual(r0["validation"], r1["validation"])
+        self.assertEqual((r0["fetched"], r1["fetched"]), (3, 2))
+        self.assertAlmostEqual(r0["validation"][0]["val_loss"], r0["expected"], places=5)
+        self.assertAlmostEqual(r1["validation"][0]["val_loss"], r1["expected"], places=5)
+
     def test_ablation_runner_trains_every_representation(self):
         r0, r1 = self._launch("ablation_runner")
         self.assertEqual(set(r0), set(ABLATION_TOKENIZERS))
@@ -682,9 +763,11 @@ class TwoRankTrainingTest(unittest.TestCase):
             with self.subTest(tokenizer=tokenizer):
                 self.assertEqual((r0[tokenizer]["updates"], r1[tokenizer]["updates"]), (3, 3))
                 self.assertSameState(r0[tokenizer]["state"], r1[tokenizer]["state"], tokenizer)
-                # Epoch-boundary validation runs on rank 0 only; rank 1 waits at the barrier.
+                # Validation (val_every 1: after each of the 3 updates) runs on both ranks,
+                # each over its share of the batches (M1); before, rank 0 alone validated
+                # once at the epoch's end while rank 1 waited at a barrier.
                 self.assertEqual((r0[tokenizer]["validations"], r1[tokenizer]["validations"]),
-                                 (1, 0))
+                                 (3, 3))
 
 
 class AdapterObjectiveTest(unittest.TestCase):

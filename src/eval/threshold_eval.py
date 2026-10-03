@@ -300,6 +300,13 @@ def status_counts(pairs: Sequence[Mapping], *, partition: str) -> dict[str, dict
 
 # ------------------------------------------------------------------------------ scoring
 
+def default_device() -> str:
+    """`--device` default: the GPU when there is one (the L40 node), else the CPU."""
+    import torch
+
+    return "cuda" if torch.cuda.is_available() else "cpu"
+
+
 def anchor_states(model, streams: Sequence[Mapping], anchors: Sequence[Mapping], *,
                   device: str = "cpu", context_tokens: int | None = None) -> np.ndarray:
     """The frozen trunk's hidden state at every anchor, ``[anchors, d]``.
@@ -753,7 +760,9 @@ def main(argv: list[str] | None = None) -> None:
     ap.add_argument("--eval-partition", help="partition to score (default: claims.yaml)")
     ap.add_argument("--final-evaluation", action="store_true",
                     help="allow scoring a sealed partition (internal_test)")
-    ap.add_argument("--device", default="cpu")
+    ap.add_argument("--device", default=None,
+                    help="torch device for the trunk and head (default: cuda when "
+                         "available, else cpu)")
     ap.add_argument("--max-context", type=int, default=None,
                     help="read each anchor over at most this many tokens of history (default: "
                          "the trunk's max_tokens); evaluates a trained model at e.g. 4096 vs "
@@ -780,7 +789,7 @@ def main(argv: list[str] | None = None) -> None:
     result = evaluate_run(model, streams, vblob, thresholds, claims,
                           target_concepts=dcfg["target_concepts"],
                           objective_arm=spec["objective_arm"], site=args.site, roles=roles,
-                          device=torch.device(args.device).type,
+                          device=torch.device(args.device or default_device()).type,
                           arm=spec["tokenization_arm"],
                           context_tokens=context_tokens(args.max_context, mcfg))
     if result["summary"]["vocabulary"] != spec["vocab_hash"]:

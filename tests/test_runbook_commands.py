@@ -1,9 +1,11 @@
 """U19: every command in docs/plans/l40-runbook.md resolves to an existing entry point.
 
-Each `uv run python -m <module> ...` and `torchrun ... -m <module> ...` line inside a
-fenced code block names a module that exists, and every `--flag` on the line appears in
+Each `uv run python -m <module> ...` and `uv run torchrun ... -m <module> ...` line inside
+a fenced code block names a module that exists, and every `--flag` on the line appears in
 that module's own `--help` (run in a subprocess, with the subcommand when the line has
-one). The timing run's torchrun line is the experiment matrix's own launch command.
+one). The timing run's torchrun line is the experiment matrix's own launch command. No
+command line starts a bare `torchrun`: outside `uv run` it is whichever torchrun is first
+on PATH, not the locked environment's.
 """
 
 import importlib.util
@@ -17,21 +19,40 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 RUNBOOK = ROOT / "docs/plans/l40-runbook.md"
-FENCE = re.compile(r"```(?:bash|sh)?\n(.*?)```", re.DOTALL)
+# Every fenced block, with its language tag; only shell blocks hold commands (a ```toml
+# block must still be consumed, or the fences after it pair up the wrong way).
+FENCE = re.compile(r"```([\w+-]*)\n(.*?)```", re.DOTALL)
+SHELL = ("", "bash", "sh")
+
+
+TORCHRUN = "uv run torchrun "
+
+
+def fenced_lines() -> list[str]:
+    """Every non-comment line of the runbook's fenced blocks."""
+    lines = []
+    for language, block in FENCE.findall(RUNBOOK.read_text()):
+        if language not in SHELL:
+            continue
+        for line in block.splitlines():
+            line = line.strip()
+            if line and not line.startswith("#"):
+                lines.append(line)
+    return lines
 
 
 def runbook_commands() -> list[list[str]]:
     """Token lists of the module launches in the runbook's fenced blocks."""
     commands = []
-    for block in FENCE.findall(RUNBOOK.read_text()):
-        for line in block.splitlines():
-            line = line.strip()
-            if line.startswith("#"):
-                continue
-            if line.startswith("uv run python -m ") or (
-                    line.startswith("torchrun ") and " -m " in line):
-                commands.append(shlex.split(line, comments=True))
+    for line in fenced_lines():
+        if line.startswith("uv run python -m ") or (
+                line.startswith(TORCHRUN) and " -m " in line):
+            commands.append(shlex.split(line, comments=True))
     return commands
+
+
+def is_torchrun(tokens: list[str]) -> bool:
+    return tokens[:3] == ["uv", "run", "torchrun"]
 
 
 def module_and_subcommand(tokens: list[str]) -> tuple[str, list[str], list[str]]:
@@ -59,6 +80,12 @@ def module_help(module: str, sub: tuple[str, ...]) -> str:
 
 
 class RunbookCommandsTest(unittest.TestCase):
+    def test_no_bare_torchrun(self):
+        bare = [line for line in fenced_lines()
+                if re.match(r"^(\S+=\S+\s+)*torchrun\b", line)]
+        self.assertEqual(bare, [], "launch torchrun through `uv run torchrun`")
+        self.assertTrue(any(is_torchrun(t) for t in runbook_commands()))
+
     def test_runbook_has_the_pipeline_commands(self):
         modules = {module_and_subcommand(t)[0] for t in runbook_commands()}
         for expected in ("src.data.cohort", "src.data.tokenize", "src.data.value_stats",
@@ -96,7 +123,7 @@ class RunbookCommandsTest(unittest.TestCase):
         run = next(r for r in expand_matrix(matrix)
                    if r["run_id"] == "clinical_soft.full.30m.time.s1.screening")
         expected = shlex.split(launch_commands(run, matrix)["torchrun"])
-        torchruns = [t for t in runbook_commands() if t[0] == "torchrun"]
+        torchruns = [t for t in runbook_commands() if is_torchrun(t)]
         self.assertIn(expected, torchruns)
 
 

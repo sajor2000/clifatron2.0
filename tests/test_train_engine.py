@@ -622,7 +622,7 @@ class DistributedLaunchGuardTest(unittest.TestCase):
         with mock.patch.object(engine.dist, "init_process_group") as init, \
                 mock.patch.object(engine.dist, "get_rank", return_value=1):
             self.assertEqual(engine.setup_ddp(allow_cpu=True), (1, False))
-        init.assert_called_once_with("gloo")
+        init.assert_called_once_with("gloo", timeout=engine.ddp_timeout())
 
     def test_cuda_launch_still_uses_nccl(self):
         self._environment(**self.LAUNCH_ENV)
@@ -631,7 +631,8 @@ class DistributedLaunchGuardTest(unittest.TestCase):
                 mock.patch.object(engine.dist, "init_process_group") as init, \
                 mock.patch.object(engine.dist, "get_rank", return_value=0):
             self.assertEqual(engine.setup_ddp(), (0, True))
-        init.assert_called_once_with("nccl")
+        init.assert_called_once_with("nccl", device_id=torch.device("cuda", 0),
+                                     timeout=engine.ddp_timeout())
         set_device.assert_called_once_with(0)
 
     def test_single_process_launch_needs_no_flag_and_no_process_group(self):

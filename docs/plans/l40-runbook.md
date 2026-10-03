@@ -5,9 +5,12 @@ Written 2026-10-03 under `docs/plans/2026-10-03-0845-feat-icu-gem-rct-recovery-p
 the full-hospitalization path and must not be used to launch anything.
 
 Node: `rudu-hpcg004`, 2x L40 (48 GB each, no NVLink), bf16, DDP through `torchrun`.
-Run every command from the repository root. `tests/test_runbook_commands.py` checks that
-every `uv run python -m ...` and `torchrun ... -m ...` line in this file names an existing
-module and only flags that module accepts, so edit commands here and in the code together.
+Run every command from the repository root. Launch torchrun as `uv run torchrun`, never a
+bare `torchrun` (that is whichever one is first on PATH, with whatever torch it brings).
+`tests/test_runbook_commands.py` checks that every `uv run python -m ...` and
+`uv run torchrun ... -m ...` line in this file names an existing module and only flags
+that module accepts, and that no line starts a bare `torchrun`, so edit commands here and
+in the code together.
 
 This runbook ends at the screening runs and their evaluation. Full-budget runs, and so
 every claim, wait for the decisions in "Before the first launch" and for the full budget
@@ -75,7 +78,11 @@ The code runs either way; none of these is decided by an engineer. The product a
    - a checkpoint is written every `max(1, updates // runtime.checkpoints_per_run)`
      updates (5 per run), plus a final checkpoint at the end of every run and on a clean
      stop (SIGTERM / Ctrl-C: the run finishes the current update, saves, and exits);
-   - an absolute `schedule.warmup_steps` / `runtime.ckpt_every` still wins when set; the
+   - validation runs every `max(1, updates // eval_schedule.validations_per_run)` updates
+     (2 per run: mid-run and at the end); under DDP each rank validates its share of the
+     validation batches and the ranks combine their sums;
+   - an absolute `schedule.warmup_steps` / `runtime.ckpt_every` /
+     `eval_schedule.val_every` still wins when set; the
      launcher refuses a warm-up as long as the run, or a run that would write no
      checkpoint at all, and the pre-flight's schedule check (step 15) applies the same
      rules to every matrix budget (it warns when only the final checkpoint would be
@@ -113,6 +120,44 @@ node), reboot before anything long runs:
 ```bash
 sudo reboot
 ```
+
+### CUDA build and driver
+
+`uv.lock` resolves torch from PyPI, which on Linux is the CUDA 13 build
+(`torch.version.cuda` prints `13.0`). CUDA 13.x runs on NVIDIA driver branch 580 or newer
+(CUDA 13.0 GA needs 580.65.06; minor-version compatibility covers 13.x on any >= 580
+driver), and CUDA 12.x on >= 525. The pre-flight (step 15, `gpu: driver vs CUDA build`)
+fails with this message when the driver is older. Fixes, in order of preference:
+
+1. upgrade the node's driver to the 580 branch or newer (needs the node administrator, a
+   reboot, then step 2 again);
+2. otherwise pin torch to the CUDA 12.6 wheels for Linux only. Not applied in the
+   repository; to do it, add to `pyproject.toml`, then `uv lock`, `uv sync --group dev`,
+   check that `torch.version.cuda` prints `12.6`, and rerun the pre-flight:
+
+   ```toml
+   [[tool.uv.index]]
+   name = "pytorch-cu126"
+   url = "https://download.pytorch.org/whl/cu126"
+   explicit = true
+
+   [tool.uv.sources]
+   torch = { index = "pytorch-cu126", marker = "sys_platform == 'linux'" }
+   ```
+
+   `explicit = true` keeps every other package on PyPI; the marker keeps macOS on the
+   default PyPI wheels. The cu126 build pulls its own `nvidia-nccl-cu12`, so the
+   `override-dependencies` entry in `pyproject.toml` that drops `nvidia-nccl-cu12` must be
+   removed in the same change, and xgboost pinned to a release that also uses the cu12
+   NCCL (or the xgboost wheel's `nvidia-nccl-cu13` dropped instead); the pre-flight's
+   `gpu: NCCL` check confirms one NCCL wheel.
+
+One NCCL: older xgboost releases (3.2.x, picked under Python 3.11) pull
+`nvidia-nccl-cu12` while torch's CUDA 13 build pulls `nvidia-nccl-cu13`; both install
+`nvidia/nccl/lib/libnccl.so.2`, so the last one installed wins. `pyproject.toml` drops the
+cu12 wheel (`[tool.uv] override-dependencies`; xgboost is used on CPU only). The
+pre-flight prints `torch.cuda.nccl.version()` and fails when more than one
+`nvidia-nccl-*` wheel is installed.
 
 ## 3. Stage the data
 
@@ -311,9 +356,11 @@ With Rush: add `--episodes rush=output/intermediate_phi/episodes_rush.parquet`.
 Prints one table and exits non-zero on any FAIL. It checks:
 
 - environment: versions, commit, a clean tree;
-- GPU: CUDA, two devices, native bf16, `nvidia-smi` (the driver mismatch is named), free
-  memory per device, and a two-rank nccl bf16 smoke step through `engine.setup_ddp` and
-  `engine.train` that must leave both ranks with identical parameters;
+- GPU: CUDA, two devices, native bf16, `nvidia-smi` (the driver mismatch is named), the
+  driver against torch's CUDA build (step 2, "CUDA build and driver"), one NCCL library
+  and its version, free memory per device, and a two-rank nccl bf16 smoke step through
+  `engine.setup_ddp` and `engine.train` that must leave both ranks with identical
+  parameters;
 - the split freeze matches every episode artifact, and every shard's stays carry the
   frozen partitions;
 - every arm's vocabulary (not a sample), shard rows and per-site vocabularies are bound to
@@ -336,6 +383,20 @@ Prints one table and exits non-zero on any FAIL. It checks:
   (`src/eval/context_length.py`, aggregate only); warns when more than 10% of the prompts
   exceed 8,192. A trained run can then be scored at 4K vs 8K with
   `src.eval.threshold_eval --max-context 4096`.
+
+If the two-rank smoke step hangs or times out (300 s) rather than failing, rerun it with
+NCCL's own log and look at the interconnect (the L40s have no NVLink; peer-to-peer goes
+over PCIe):
+
+```bash
+nvidia-smi topo -m
+NCCL_DEBUG=INFO uv run python -m src.train.preflight --episodes mimic=output/intermediate_phi/episodes.parquet --extubation-cohort mimic=output/intermediate_phi/extubation_cohort.parquet
+```
+
+If the log stalls at peer-to-peer setup (`P2P` / `via P2P/IPC`), retry with
+`NCCL_P2P_DISABLE=1` in front of the same command (traffic goes through host memory;
+slower, but the run is gradient all-reduce of a ~30M model). If that passes, launch the
+training runs with the same variable set and record it in the run's notes.
 
 Memory figures measured on the MIMIC verification sample (1.2M sampled events) on
 2026-10-03: 57 bytes per event of memory-mapped cache (one copy per node), 8-19 bytes per
@@ -369,13 +430,32 @@ screening run of the primary configuration:
 
 ```bash
 uv run python -m src.train.run_tokenization_ablation --arm clinical_soft --objective-arm full --seed 1 --trajectory hospitalization --data output/intermediate_phi/mimic --site mimic --value-stats output/intermediate_phi/mimic/gem_value_stats.json --dry-run
-torchrun --nproc_per_node=2 -m src.train.run_tokenization_ablation --arm clinical_soft --objective-arm full --seed 1 --trajectory hospitalization --data output/intermediate_phi/mimic --site mimic --value-stats output/intermediate_phi/mimic/gem_value_stats.json --passes 0.05 --trunk d_model=512 --trunk n_layers=8 --trunk n_heads=8 --run-dir output/intermediate_phi/runs/clinical_soft.full.30m.time.s1.screening
+uv run torchrun --nproc_per_node=2 -m src.train.run_tokenization_ablation --arm clinical_soft --objective-arm full --seed 1 --trajectory hospitalization --data output/intermediate_phi/mimic --site mimic --value-stats output/intermediate_phi/mimic/gem_value_stats.json --passes 0.05 --trunk d_model=512 --trunk n_layers=8 --trunk n_heads=8 --run-dir output/intermediate_phi/runs/clinical_soft.full.30m.time.s1.screening
 ```
 
 The second command is the matrix's own launch line for
 `clinical_soft.full.30m.time.s1.screening` (also in its `matrix_entry.json`). Check the
 log: the curriculum schedule line, `updates_per_min`, loss values that are finite and
-fall, the loader memory line, and the measured parameter count in `run.json`.
+fall, the loader memory line, a `validation ... loss=` line from each validation, and the
+measured parameter count in `run.json`.
+
+Runtime notes for every training launch:
+
+- Process-group timeout: collectives wait up to `CLIFATRON_DDP_TIMEOUT_MIN` minutes
+  (default 120; NCCL's own default is 10) before the job is aborted. Raise it only if a
+  legitimate step (a cache build, a checkpoint write) takes longer.
+- Reproducibility: a seed fixes initialisation, batch order and sampling, but CUDA
+  kernels that reduce with atomics (attention backward, embedding backward, index_add)
+  are not bit-reproducible run to run. Two runs with one seed agree statistically, not
+  bitwise; claims rest on the seed spread, never on bitwise equality.
+- Attention: training attention on CUDA is restricted to the flash and memory-efficient
+  SDPA kernels. A shape or dtype neither accepts raises instead of falling back to the
+  math kernel (which would materialize `[batch, heads, T, T]` scores and run out of
+  memory at 8,192 tokens).
+- `runtime.compile` stays false. If it is turned on, the launchers compile the inner
+  model and then wrap it in DDP. PyTorch documents both orders (the DDP notes wrap first
+  so DDPOptimizer splits graphs at gradient buckets; the torch.compile guides compile the
+  inner module first): time both on the node before enabling it for a claim run.
 
 Sizing: the full budget is a placeholder of 1.0 pass in `configs/experiment_matrix.yaml`.
 A pass is `ceil(batches per rank / grad_accum)` updates; the screening run trains 0.05 of
@@ -416,7 +496,7 @@ for d in output/intermediate_phi/runs/*.screening; do
   arm=$(uv run python -c "import json, sys; print(json.load(open(sys.argv[1]))['tokenization_arm'])" "$d/run_spec.json")
   dir=output/intermediate_phi/${ARM_DIR[$arm]}
   ckpt=$(ls -t "$d"/checkpoints/*.pt | head -1)
-  uv run python -m src.eval.threshold_eval --run-dir "$d" --checkpoint "$ckpt" --vocab "$dir/vocab.json" --shards "$dir/gem_events.parquet" --site mimic
+  uv run python -m src.eval.threshold_eval --run-dir "$d" --checkpoint "$ckpt" --vocab "$dir/vocab.json" --shards "$dir/gem_events.parquet" --site mimic --device cuda
 done
 ```
 
@@ -444,17 +524,29 @@ before leaving the node.
 ## Recovery
 
 - A run that dies, or was stopped cleanly, resumes. To stop cleanly, send SIGTERM to
-  the two worker processes, `pkill -TERM -P <torchrun pid>`: each finishes its current
-  update, they agree, rank 0 checkpoints, and both exit 0 (a second signal aborts without
-  a checkpoint). Signalling torchrun itself (or Ctrl-C in its terminal) forwards the
-  signal but kills the workers 30 s later, which may be before a 32-microbatch update
-  and its checkpoint finish. Then relaunch it with `--resume latest`, the
+  the two worker processes, not to torchrun:
+
+  ```bash
+  pgrep -f "bin/torchrun --nproc_per_node=2"   # the torchrun agent's pid (not uv's)
+  pkill -TERM -P <torchrun pid>                 # SIGTERM to its two workers
+  ```
+
+  (`uv run torchrun` leaves a `uv` parent whose command line also contains
+  `torchrun --nproc_per_node=2`; the `bin/torchrun` pattern matches the agent only.)
+
+  Each worker finishes its current update, they agree, rank 0 checkpoints, and both exit
+  0. SIGINT and SIGHUP are handled the same way. A repeat of the signal within 5 s of the
+  first is ignored (a Ctrl-C reaches each worker twice: from the terminal and forwarded by
+  torchrun); a signal after that aborts without a checkpoint. Signalling torchrun itself
+  (or Ctrl-C in its terminal) forwards the signal but kills the workers 30 s later, which
+  may be before a 32-microbatch update and its checkpoint finish: prefer the `pkill`
+  form. Then relaunch it with `--resume latest`, the
   `launch.torchrun_resume` line of its `matrix_entry.json` (the launch line plus
   `--resume latest`). `latest` is the checkpoint with the most updates in
   `<run-dir>/checkpoints`; a path works too. For the timing run of step 17:
 
   ```bash
-  torchrun --nproc_per_node=2 -m src.train.run_tokenization_ablation --arm clinical_soft --objective-arm full --seed 1 --trajectory hospitalization --data output/intermediate_phi/mimic --site mimic --value-stats output/intermediate_phi/mimic/gem_value_stats.json --passes 0.05 --trunk d_model=512 --trunk n_layers=8 --trunk n_heads=8 --run-dir output/intermediate_phi/runs/clinical_soft.full.30m.time.s1.screening --resume latest
+  uv run torchrun --nproc_per_node=2 -m src.train.run_tokenization_ablation --arm clinical_soft --objective-arm full --seed 1 --trajectory hospitalization --data output/intermediate_phi/mimic --site mimic --value-stats output/intermediate_phi/mimic/gem_value_stats.json --passes 0.05 --trunk d_model=512 --trunk n_layers=8 --trunk n_heads=8 --run-dir output/intermediate_phi/runs/clinical_soft.full.30m.time.s1.screening --resume latest
   ```
 
   Model, optimizer (every per-head group), LR schedule, RNG, the optimizer-update

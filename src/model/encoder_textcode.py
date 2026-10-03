@@ -17,6 +17,10 @@ from src.model.encoder import CLIFEncoder
 
 
 class TextCodeEncoder(CLIFEncoder):
+    # The frozen table is a constant: `engine.wrap_ddp` does not broadcast it before every
+    # forward (it is synced once when DDP wraps the model and stays in checkpoints).
+    static_input_table = True
+
     def __init__(self, vocab_size: int, cfg: dict, text_table):
         if cfg["trunk"].get("tied_embeddings", False):
             raise ValueError("the TextCode arm needs untied embeddings: its input table "

@@ -38,6 +38,16 @@ runtime:
   ckpt_dir: "checkpoints"
   # trunk saved separately from heads so probes/finetune reuse it
 
+eval_schedule:
+  # Validation interval scales with the run (engine.resolve_schedule): every
+  # max(1, updates // validations_per_run) updates. The old fixed val_every 2000 never
+  # validated a 9-300-update run. Every rank validates its share of the validation batches
+  # and the ranks combine their sums (no rank-0-only pass behind a barrier). A validation
+  # pass reads the whole validation partition (15% of stays, forward only), so keep the
+  # count low for 0.05-pass screening runs. An absolute val_every still wins when set.
+  val_every: null
+  validations_per_run: 2
+
 data_contract:
   cohort: "configs/cohort.yaml"
   artifact_policy: "configs/artifact_policy.yaml"

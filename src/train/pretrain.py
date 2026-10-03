@@ -4,12 +4,12 @@ Loss = w_A*next_event + w_B*competing_risk + w_C*threshold_hazard + w_D*value_re
 (ORA marked-TTE; RESEARCH.md §3). Uses the training engine for resumable DDP training.
 
 Run (24-hour representation, one site):
-    torchrun --nproc_per_node=2 -m src.train.pretrain --config configs/train.yaml \
+    uv run torchrun --nproc_per_node=2 -m src.train.pretrain --config configs/train.yaml \
         --model-config configs/model.yaml --data data/mimic --site mimic
 
 Run (full-hospitalization representation, in-stream labels, one or more sites sharing ONE
 frozen vocabulary; the first --data directory's vocab.json unless --vocab is given):
-    torchrun --nproc_per_node=2 -m src.train.pretrain --trajectory hospitalization \
+    uv run torchrun --nproc_per_node=2 -m src.train.pretrain --trajectory hospitalization \
         --data output/intermediate_phi/mimic output/intermediate_phi/rush \
         --site mimic rush --value-stats output/intermediate_phi/mimic/gem_value_stats.json
 
@@ -401,12 +401,17 @@ class Model(ObjectiveSchedule, torch.nn.Module):
 
     def forward(self, batch):
         if "document_ids" in batch:
-            for row in range(batch["document_ids"].size(0)):
-                docs = batch["document_ids"][row][batch["document_ids"][row] >= 0].unique()
-                if docs.numel() > 1:
-                    raise RuntimeError(
-                        "CLIFEncoder dense causal path cannot train multi-document packed rows without block-diagonal attention"
-                    )
+            # One device->host read for the whole batch (not one per row): a row is
+            # multi-document when its smallest and largest valid document id differ.
+            docs = batch["document_ids"]
+            valid = docs >= 0
+            high = torch.where(valid, docs, torch.full_like(docs, -1)).amax(dim=-1)
+            low = torch.where(valid, docs, torch.full_like(docs, torch.iinfo(docs.dtype).max)
+                              ).amin(dim=-1)
+            if bool((valid.any(dim=-1) & (high != low)).any()):
+                raise RuntimeError(
+                    "CLIFEncoder dense causal path cannot train multi-document packed rows without block-diagonal attention"
+                )
         if getattr(self.enc, "uses_value_channel", False):
             # Continuous-fused arm: edgeless concept ids + the normalized current value.
             if "input_value" not in batch or "input_value_mask" not in batch:
@@ -464,10 +469,13 @@ class Model(ObjectiveSchedule, torch.nn.Module):
             cr_mask = observed if cr_mask is None else cr_mask & observed
         else:
             cr_bin = batch["cr_bin"]
-        if cr_mask is not None and not bool(cr_mask.any()):
-            return zero_touch(self.cr, H)
         if cr_mask is not None:
-            h_last, cr_type, cr_bin = h_last[cr_mask], cr_type[cr_mask], cr_bin[cr_mask]
+            # One device->host read: the selected rows' indices (an empty mask selects
+            # none, and the head is touched at zero instead).
+            rows = cr_mask.nonzero(as_tuple=True)[0]
+            if rows.numel() == 0:
+                return zero_touch(self.cr, H)
+            h_last, cr_type, cr_bin = h_last[rows], cr_type[rows], cr_bin[rows]
         return self.cr.loss(h_last, cr_type, cr_bin)
 
     def _th_loss(self, batch, h_last, H):
@@ -485,14 +493,17 @@ class Model(ObjectiveSchedule, torch.nn.Module):
             th_mask = observed if th_mask is None else th_mask & observed
         else:
             crossed, observed_bin = batch["th_crossed"], batch.get("th_observed_bin")
-        if th_mask is not None and not bool(th_mask.any()):
-            return zero_touch(self.th, H)
+        rows = None
+        if th_mask is not None:
+            rows = th_mask.nonzero(as_tuple=True)[0]     # one device->host read
+            if rows.numel() == 0:
+                return zero_touch(self.th, H)
         # Several threshold queries can share one anchor's hidden state.
         th_h = h_last[batch["th_anchor"]] if "th_anchor" in batch else h_last
         fields = [th_h, batch["th_target"], batch["th_tau"], batch["th_dir"], crossed]
-        if th_mask is not None:
-            fields = [field[th_mask] for field in fields]
-            observed_bin = None if observed_bin is None else observed_bin[th_mask]
+        if rows is not None:
+            fields = [field[rows] for field in fields]
+            observed_bin = None if observed_bin is None else observed_bin[rows]
         return self.th.loss(*fields, observed_bin)
 
     def _val_loss(self, batch, H):
@@ -1173,6 +1184,8 @@ def main():
         return
 
     compile_enabled = tcfg["runtime"].get("compile", mcfg.get("compile", False))
+    # Inner module compiled, then wrapped (see engine.wrap_ddp on the two documented
+    # orders); compile is off by default.
     if compile_enabled and torch.cuda.is_available():
         model = torch.compile(model, dynamic=True)
     if is_distributed():

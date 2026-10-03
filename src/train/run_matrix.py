@@ -209,7 +209,8 @@ def run_dir(run: Mapping, matrix: Mapping, root: str | Path | None = None) -> Pa
 
 
 def launch_commands(run: Mapping, matrix: Mapping) -> dict[str, str]:
-    """The exact commands for one run: ``torchrun`` (the L40 node, one process per GPU)
+    """The exact commands for one run: ``torchrun`` (the L40 node, one process per GPU,
+    launched as ``uv run torchrun`` so the locked environment's torchrun and torch run)
     and ``cpu`` (a single process forced onto the CPU), and their recovery forms
     ``torchrun_resume`` / ``cpu_resume`` (the same command + ``--resume latest``: continue
     from the newest checkpoint in the run directory after a crash or a clean stop)."""
@@ -225,7 +226,8 @@ def launch_commands(run: Mapping, matrix: Mapping) -> dict[str, str]:
         args += ["--trunk", f"{key}={value}"]
     args += ["--run-dir", str(run_dir(run, matrix))]
     tail = " ".join(shlex.quote(a) for a in args)
-    torchrun = f"torchrun --nproc_per_node={int(launch['nproc_per_node'])} {tail}"
+    # `uv run`: the project environment's torchrun, never one found first on PATH.
+    torchrun = f"uv run torchrun --nproc_per_node={int(launch['nproc_per_node'])} {tail}"
     cpu = f"uv run python {tail} --device cpu"
     return {"torchrun": torchrun, "cpu": cpu,
             "torchrun_resume": f"{torchrun} --resume latest",

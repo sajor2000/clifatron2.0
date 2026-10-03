@@ -5,9 +5,15 @@ clips once per update, validates periodically, saves step-granular checkpoints p
 final one when the run ends (or stops cleanly on SIGTERM / SIGINT), and records a
 provenance manifest.
 
-The run's warm-up length and checkpoint interval scale with its length
-(`resolve_schedule`): a 0.05-pass screening run is a few dozen updates, far below any
-fixed interval sized for a long run.
+The run's warm-up length, checkpoint interval and validation interval scale with its
+length (`resolve_schedule`): a 0.05-pass screening run is a few dozen updates, far below
+any fixed interval sized for a long run. Under DDP every rank validates its own share of
+the validation batches and the ranks combine their sums (no rank waits at a barrier while
+another validates, which an NCCL watchdog would kill).
+
+Stop signals (SIGTERM, SIGINT, SIGHUP) ask for a clean stop: checkpoint, then exit. A
+repeat within `StopRequest.REPEAT_GRACE_S` of the first is ignored (a Ctrl-C under
+torchrun reaches each worker twice: the terminal's SIGINT and torchrun's forwarded copy).
 
 Before each optimizer update the engine hands its update counter (restored from the
 checkpoint on resume) to a model that sets its loss weights per update
@@ -17,6 +23,7 @@ that head's weight is zero.
 from __future__ import annotations
 
 import contextlib
+import datetime as dt
 import math
 import os
 import re
@@ -37,6 +44,20 @@ from src.train.manifest import Manifest
 
 
 ALLOW_CPU_DDP_FLAG = "--allow-cpu-ddp"
+# Process-group timeout in minutes (`ddp_timeout`). NCCL's default is 10 minutes: a
+# collective that waits longer (a long validation or checkpoint write on one rank, a slow
+# GEM cache build) aborts the job. The environment variable overrides the default.
+DDP_TIMEOUT_ENV = "CLIFATRON_DDP_TIMEOUT_MIN"
+DEFAULT_DDP_TIMEOUT_MIN = 120
+
+
+def ddp_timeout() -> dt.timedelta:
+    """The process-group timeout: `CLIFATRON_DDP_TIMEOUT_MIN` minutes (default 120)."""
+    raw = os.environ.get(DDP_TIMEOUT_ENV)
+    minutes = float(raw) if raw not in (None, "") else float(DEFAULT_DDP_TIMEOUT_MIN)
+    if not (math.isfinite(minutes) and minutes > 0):
+        raise ValueError(f"{DDP_TIMEOUT_ENV} must be a positive number of minutes, got {raw!r}")
+    return dt.timedelta(minutes=minutes)
 
 
 def is_distributed_launch() -> bool:
@@ -62,11 +83,15 @@ def setup_ddp(*, allow_cpu: bool = False) -> tuple[int, bool]:
     if "RANK" not in os.environ:
         return 0, True
     local = int(os.environ["LOCAL_RANK"])
+    timeout = ddp_timeout()
     if torch.cuda.is_available():
-        dist.init_process_group("nccl")
+        # Bind the device first, then hand it to the group (device_id): NCCL creates its
+        # communicator on this rank's GPU, not on cuda:0 of every rank.
         torch.cuda.set_device(local)
+        dist.init_process_group("nccl", device_id=torch.device("cuda", local),
+                                timeout=timeout)
     else:
-        dist.init_process_group("gloo")
+        dist.init_process_group("gloo", timeout=timeout)
     return local, dist.get_rank() == 0
 
 
@@ -84,11 +109,82 @@ def select_device(local: int) -> torch.device:
     return torch.device("mps")
 
 
+def _has_static_input_table(model) -> bool:
+    """Whether `model` holds a frozen input table (the TextCode arm's `text_table`)."""
+    return any(getattr(module, "static_input_table", False) for module in model.modules())
+
+
 def wrap_ddp(model, dev: torch.device, local: int) -> DistributedDataParallel:
     """DDP over `model`. `find_unused_parameters` stays off (KTD2): every head touches
     its parameters on every step, so a parameter left without a gradient is a real bug
-    and raises. `device_ids` is a CUDA-only argument."""
-    return DistributedDataParallel(model, device_ids=[local] if dev.type == "cuda" else None)
+    and raises. `device_ids` is a CUDA-only argument.
+
+    A model with a frozen input table (TextCode: vocab x text_dim floats) does not
+    broadcast its buffers before every forward: the table is a constant, synced once at
+    construction, and the only other buffer (`_loss_mix`) is set identically on every
+    rank each update. Other models keep DDP's default.
+
+    torch.compile: the launchers compile the inner model and then wrap it (compile is off
+    by default, `runtime.compile: false`). PyTorch documents both orders — the DDP notes
+    wrap first so DDPOptimizer can split graphs at bucket boundaries, the torch.compile
+    guides compile the inner module first — so benchmark both before switching compile on
+    (docs/plans/l40-runbook.md)."""
+    kwargs: dict[str, Any] = {"device_ids": [local] if dev.type == "cuda" else None}
+    if _has_static_input_table(model):
+        import inspect
+
+        params = inspect.signature(DistributedDataParallel.__init__).parameters
+        # torch >= 2.13 renames broadcast_buffers (deprecated) to forward_sync_buffers,
+        # which still syncs at construction.
+        kwargs["forward_sync_buffers" if "forward_sync_buffers" in params
+               else "broadcast_buffers"] = False
+    return DistributedDataParallel(model, **kwargs)
+
+
+def ddp_syncs_buffers(ddp: DistributedDataParallel) -> bool:
+    """Whether `ddp` broadcasts its module's buffers before every forward."""
+    if hasattr(ddp, "forward_sync_buffers"):
+        return bool(ddp.forward_sync_buffers)
+    return bool(ddp.broadcast_buffers)
+
+
+def autocast_device_type() -> str:
+    """The engine's bf16 autocast scope: CUDA on the L40 node, else CPU."""
+    return "cuda" if torch.cuda.is_available() else "cpu"
+
+
+class ShardedBatches(torch.utils.data.Sampler):
+    """Rank `rank`'s share of an (index or batch) sampler: items rank, rank+W, ..."""
+
+    def __init__(self, inner, rank: int, world: int):
+        self.inner, self.rank, self.world = inner, int(rank), int(world)
+
+    def __iter__(self):
+        for index, item in enumerate(self.inner):
+            if index % self.world == self.rank:
+                yield item
+
+    def __len__(self) -> int:
+        return len(range(self.rank, len(self.inner), self.world))
+
+
+def shard_loader(dl, rank: int, world: int):
+    """`dl` restricted to rank `rank` of `world` (same dataset, collate, workers): each
+    rank evaluates a disjoint share of the batches. None when `dl` cannot be re-sampled
+    (an iterable dataset); the caller then skips other ranks' batches by position."""
+    from torch.utils.data import DataLoader, IterableDataset
+
+    if world <= 1:
+        return dl
+    if not isinstance(dl, DataLoader) or isinstance(dl.dataset, IterableDataset):
+        return None
+    common = {"collate_fn": dl.collate_fn, "num_workers": dl.num_workers,
+              "pin_memory": dl.pin_memory}
+    if dl.batch_sampler is not None:
+        return DataLoader(dl.dataset, batch_sampler=ShardedBatches(dl.batch_sampler, rank,
+                                                                    world), **common)
+    return DataLoader(dl.dataset, batch_size=None,
+                      sampler=ShardedBatches(dl.sampler, rank, world), **common)
 
 
 def precision_note(dev: torch.device) -> str | None:
@@ -117,6 +213,7 @@ def _all_gather(obj: Any) -> list[Any]:
 # Defaults when a config leaves the warm-up / checkpoint interval to scale with the run.
 DEFAULT_WARMUP_FRAC = 0.05          # schedule.warmup_frac: share of the run's updates
 DEFAULT_CHECKPOINTS_PER_RUN = 5     # runtime.checkpoints_per_run: periodic saves per run
+DEFAULT_VALIDATIONS_PER_RUN = 2     # eval_schedule.validations_per_run: mid-run + end
 
 
 class ScheduleError(ValueError):
@@ -133,6 +230,8 @@ class RunSchedule:
     warmup_source: str      # "warmup_steps" (absolute) or "warmup_frac"
     ckpt_source: str        # "ckpt_every" (absolute) or "checkpoints_per_run"
     final_checkpoint: bool = True   # runtime.final_checkpoint
+    val_every: int = 1      # validation interval in updates
+    val_source: str = "validations_per_run"   # or "val_every" (absolute)
 
     @property
     def periodic_checkpoints(self) -> int:
@@ -143,7 +242,8 @@ class RunSchedule:
         final = " + final" if self.final_checkpoint else ", no final"
         return (f"{self.total_steps} updates, warm-up {self.warmup_steps} "
                 f"({self.warmup_source}), checkpoint every {self.ckpt_every} "
-                f"({self.ckpt_source}: {self.periodic_checkpoints} periodic{final})")
+                f"({self.ckpt_source}: {self.periodic_checkpoints} periodic{final}), "
+                f"validate every {self.val_every} ({self.val_source})")
 
 
 def resolve_schedule(tcfg: dict, total_steps: int, *, validate: bool = True) -> RunSchedule:
@@ -157,7 +257,10 @@ def resolve_schedule(tcfg: dict, total_steps: int, *, validate: bool = True) -> 
       `DEFAULT_CHECKPOINTS_PER_RUN`), so every run writes at least that many periodic
       checkpoints (one per update when it is shorter);
     - final checkpoint: the engine saves the run's last update unless
-      `runtime.final_checkpoint` is false.
+      `runtime.final_checkpoint` is false;
+    - validation interval: `eval_schedule.val_every` when set (absolute), else
+      max(1, total // `eval_schedule.validations_per_run`) (default
+      `DEFAULT_VALIDATIONS_PER_RUN`). A fixed 2000 never validated a 9-300-update run.
 
     `validate` refuses (ScheduleError) a warm-up as long as the run (the learning rate
     would never leave the linear warm-up) and a run that would write no checkpoint at all
@@ -204,6 +307,18 @@ def resolve_schedule(tcfg: dict, total_steps: int, *, validate: bool = True) -> 
             raise ScheduleError(f"runtime.checkpoints_per_run must be >= 1, got {per_run}")
         every, ckpt_source = max(1, total // max(1, per_run)), "checkpoints_per_run"
     final = bool(runtime.get("final_checkpoint", True))
+    evals = tcfg.get("eval_schedule") or {}
+    if evals.get("val_every") is not None:
+        val_every, val_source = int(evals["val_every"]), "val_every"
+        if validate and val_every < 1:
+            raise ScheduleError(f"eval_schedule.val_every must be >= 1, got {val_every}")
+    else:
+        per_run = evals.get("validations_per_run")
+        per_run = DEFAULT_VALIDATIONS_PER_RUN if per_run is None else int(per_run)
+        if per_run < 1:
+            raise ScheduleError(
+                f"eval_schedule.validations_per_run must be >= 1, got {per_run}")
+        val_every, val_source = max(1, total // per_run), "validations_per_run"
     if validate and every > total and not final:
         raise ScheduleError(
             f"runtime.ckpt_every {every} > the run's {total} updates and "
@@ -211,7 +326,7 @@ def resolve_schedule(tcfg: dict, total_steps: int, *, validate: bool = True) -> 
             "evaluate or resume). Set runtime.ckpt_every to null and use "
             "runtime.checkpoints_per_run (scales with the run), or keep the final checkpoint")
     return RunSchedule(total, max(0, warmup), max(1, every), warmup_source, ckpt_source,
-                       final)
+                       final, max(1, val_every), val_source)
 
 
 class TrainConfig:
@@ -219,7 +334,8 @@ class TrainConfig:
         eff_batch = tcfg["batch"]["per_gpu"] * max(1, dist.get_world_size() if is_distributed() else 1) * tcfg["batch"].get("grad_accum", 1)
         resolved = resolve_schedule(tcfg, total_steps, validate=False)
         self.grad_accum = tcfg["batch"].get("grad_accum", 1)
-        self.val_every = tcfg.get("eval_schedule", {}).get("val_every", 2000)
+        # Resolved from eval_schedule.val_every or eval_schedule.validations_per_run.
+        self.val_every = resolved.val_every
         # Resolved from runtime.ckpt_every or runtime.checkpoints_per_run.
         self.ckpt_every = resolved.ckpt_every
         self.final_checkpoint = resolved.final_checkpoint
@@ -428,18 +544,21 @@ def _train_one_epoch(
             or batch_idx == last_batch_idx
         )
         with contextlib.nullcontext() if synchronized else ddp.no_sync():
-            with torch.autocast("cuda" if torch.cuda.is_available() else "cpu", dtype=torch.bfloat16):
+            with torch.autocast(autocast_device_type(), dtype=torch.bfloat16):
                 losses = model(batch)
                 loss = losses["total"]
 
-            nonfinite = [
-                name for name, value in losses.items()
-                if isinstance(value, torch.Tensor) and not bool(torch.isfinite(value).all())
-            ]
-            failed = torch.tensor(bool(nonfinite), dtype=torch.int32, device=dev)
+            # One device->host read per microbatch: every loss's finiteness stacked into
+            # one flag, agreed across ranks (a rank that raised alone would leave its peer
+            # blocked in the next collective).
+            names = [name for name, value in losses.items() if isinstance(value, torch.Tensor)]
+            finite = torch.stack([torch.isfinite(losses[name].detach()).all()
+                                  for name in names])
+            failed = (~finite).any().to(device=dev, dtype=torch.int32)
             if is_distributed():
                 dist.all_reduce(failed, op=dist.ReduceOp.MAX)
             if failed.item():
+                nonfinite = [name for name, ok in zip(names, finite.tolist()) if not ok]
                 detail = ", ".join(nonfinite) if nonfinite else "another rank"
                 raise FloatingPointError(
                     f"non-finite training loss at epoch {epoch}, batch {batch_idx}, "
@@ -449,9 +568,11 @@ def _train_one_epoch(
             loss.backward()
         micro += 1
         samples_seen += batch["input_ids"].size(0)
-        batch_tokens = int(batch.get("attention_mask", batch["input_ids"] > 0).sum().item())
-        tokens_seen += batch_tokens
-        ntp_tokens += int(batch["ntp_mask"].sum().item()) if "ntp_mask" in batch else batch_tokens
+        # Token counts stay on the device and are read once, when the epoch returns.
+        batch_tokens = batch.get("attention_mask", batch["input_ids"] > 0).sum()
+        tokens_seen = tokens_seen + batch_tokens
+        ntp_tokens = ntp_tokens + (batch["ntp_mask"].sum() if "ntp_mask" in batch
+                                   else batch_tokens)
 
         if micro % tcfg.grad_accum == 0:
             _scale_grads(model, tcfg.grad_accum)
@@ -466,11 +587,11 @@ def _train_one_epoch(
                 elapsed = max(time.monotonic() - started_at, 1e-6)
                 print(
                     f"epoch={epoch} update={updates} "
-                    f"loss={_as_float(losses['total']):.4f} "
-                    f"ntp={_as_float(losses.get('ntp', 0)):.4f} "
-                    f"cr={_as_float(losses.get('cr', 0)):.4f} "
-                    f"th={_as_float(losses.get('th', 0)):.4f} "
-                    f"val={_as_float(losses.get('val', 0)):.4f} "
+                    f"loss={ml.loss_total[-1]:.4f} "
+                    f"ntp={ml.loss_ntp[-1]:.4f} "
+                    f"cr={ml.loss_cr[-1]:.4f} "
+                    f"th={ml.loss_th[-1]:.4f} "
+                    f"val={ml.loss_val[-1]:.4f} "
                     + ("" if weights is None else
                        "w=" + "/".join(f"{w:.3g}" for w in weights.values()) + " ")
                     + f"lr={scheduler.get_last_lr()[0]:.3e} "
@@ -505,26 +626,37 @@ def _train_one_epoch(
 
 
 class StopRequest:
-    """A clean stop asked for by SIGTERM / SIGINT (a scheduler's pre-emption, Ctrl-C).
+    """A clean stop asked for by SIGTERM / SIGINT / SIGHUP (a scheduler's pre-emption,
+    Ctrl-C, a closed terminal).
 
     The first signal only sets a flag; the engine reads it at the next optimizer update,
     agrees on it across ranks (one all-reduce per update, so every rank stops at the same
-    update), saves a checkpoint and returns. A second signal raises KeyboardInterrupt at
-    once. Handlers are installed only from the main thread and restored on exit."""
+    update), saves a checkpoint and returns. A repeat within `REPEAT_GRACE_S` of the first
+    is ignored: a Ctrl-C under torchrun reaches every worker twice (the terminal sends
+    SIGINT to the whole foreground process group, and torchrun forwards its own copy).
+    A later signal raises KeyboardInterrupt at once (abort without a checkpoint).
+    Handlers are installed only from the main thread and restored on exit."""
 
-    SIGNALS = (signal.SIGTERM, signal.SIGINT)
+    SIGNALS = tuple(getattr(signal, name) for name in ("SIGTERM", "SIGINT", "SIGHUP")
+                    if hasattr(signal, name))
+    REPEAT_GRACE_S = 5.0
 
     def __init__(self):
         self.requested = False
         self.signum: int | None = None
+        self._first_at: float | None = None
         self._previous: dict = {}
 
     def _handle(self, signum, frame):
+        now = time.monotonic()
         if self.requested:
+            if self._first_at is not None and now - self._first_at < self.REPEAT_GRACE_S:
+                return   # the same stop request delivered twice (torchrun forwarding)
             raise KeyboardInterrupt(f"second signal {signum}: stopping without a checkpoint")
-        self.requested, self.signum = True, signum
+        self.requested, self.signum, self._first_at = True, signum, now
         print(f"signal {signum}: stopping cleanly after the current optimizer update "
-              "(checkpoint first); send it again to abort", flush=True)
+              f"(checkpoint first); send it again after {self.REPEAT_GRACE_S:.0f} s to "
+              "abort", flush=True)
 
     def __enter__(self):
         if threading.current_thread() is threading.main_thread():
@@ -695,36 +827,53 @@ def train(model, train_dl, val_dl, opt, scheduler, tcfg: TrainConfig, dev, *,
                   flush=True)
         return True
 
-    def _maybe_validate(epoch_n: int, gs: int) -> None:
-        """Step-granular validation. Single-process only: a rank-0-only eval
-        mid-epoch would desync DDP ranks (epoch-boundary val covers DDP, below)."""
-        nonlocal next_val_step
-        if val_dl is None or not is_main or gs < next_val_step or is_distributed():
-            return
-        validation_model = (
-            model.module
-            if is_distributed() and hasattr(model, "module")
-            else model
-        )
+    world = dist.get_world_size() if is_distributed() else 1
+    rank_index = dist.get_rank() if is_distributed() else 0
+    sharded_val = {}
+
+    def _validate(epoch_n: int, gs: int) -> None:
+        """Validation loss: the mean of the per-batch total loss over every validation
+        batch. Collective under DDP: every rank evaluates its own share of the batches
+        (`shard_loader`), the ranks add their sums, counts and non-finite counts in one
+        all-reduce, and every rank records the same value; no rank idles at a barrier."""
+        if "dl" not in sharded_val:
+            sharded_val["dl"] = shard_loader(val_dl, rank_index, world)
+        loader = sharded_val["dl"]
+        skip = loader is None          # not re-samplable: skip other ranks' batches
+        validation_model = (model.module if isinstance(model, DistributedDataParallel)
+                            else model)
         validation_model.eval()
-        with torch.no_grad(), torch.autocast("cuda" if torch.cuda.is_available() else "cpu", dtype=torch.bfloat16):
-            vlosses = []
-            for vb in val_dl:
-                vb = _prepare_batch(vb, dev)
-                value = validation_model(vb)["total"]
-                if not bool(torch.isfinite(value)):
-                    raise FloatingPointError(
-                        f"non-finite validation loss at epoch {epoch_n}, rank {local_rank}"
-                    )
-                vlosses.append(value.item())
-            validation_loss = sum(vlosses) / len(vlosses)
-            manifest.record_validation(epoch_n, validation_loss)
-            print(
-                f"validation epoch={epoch_n} global_step={gs} "
-                f"loss={validation_loss:.4f}",
-                flush=True,
-            )
+        stats = torch.zeros(3, dtype=torch.float64, device=dev)   # sum, batches, bad
+        with torch.no_grad(), torch.autocast(autocast_device_type(), dtype=torch.bfloat16):
+            for index, vb in enumerate(val_dl if skip else loader):
+                if skip and index % world != rank_index:
+                    continue
+                value = validation_model(_prepare_batch(vb, dev))["total"].detach().double()
+                finite = torch.isfinite(value)
+                stats[0] += torch.where(finite, value, torch.zeros_like(value))
+                stats[1] += 1
+                stats[2] += (~finite).double()
         model.train()
+        if is_distributed():
+            dist.all_reduce(stats, op=dist.ReduceOp.SUM)
+        total, batches, bad = stats.tolist()
+        if bad:
+            raise FloatingPointError(
+                f"non-finite validation loss at epoch {epoch_n} ({int(bad)} batch(es))")
+        if not batches:
+            return
+        validation_loss = total / batches
+        manifest.record_validation(epoch_n, validation_loss)
+        if is_main:
+            print(f"validation epoch={epoch_n} global_step={gs} "
+                  f"loss={validation_loss:.4f}", flush=True)
+
+    def _maybe_validate(epoch_n: int, gs: int) -> None:
+        """Step-granular validation, at the same update on every rank."""
+        nonlocal next_val_step
+        if val_dl is None or gs < next_val_step:
+            return
+        _validate(epoch_n, gs)
         while next_val_step <= gs:
             next_val_step += tcfg.val_every
 
@@ -782,35 +931,8 @@ def train(model, train_dl, val_dl, opt, scheduler, tcfg: TrainConfig, dev, *,
             if stopped:
                 break
 
-            if val_dl is not None and is_main and global_step >= next_val_step:
-                validation_model = (
-                    model.module
-                    if is_distributed() and hasattr(model, "module")
-                    else model
-                )
-                validation_model.eval()
-                with torch.no_grad(), torch.autocast("cuda" if torch.cuda.is_available() else "cpu", dtype=torch.bfloat16):
-                    vlosses = []
-                    for vb in val_dl:
-                        vb = _prepare_batch(vb, dev)
-                        value = validation_model(vb)["total"]
-                        if not bool(torch.isfinite(value)):
-                            raise FloatingPointError(
-                                f"non-finite validation loss at epoch {epoch}, rank {local_rank}"
-                            )
-                        vlosses.append(value.item())
-                    validation_loss = sum(vlosses) / len(vlosses)
-                    manifest.record_validation(epoch, validation_loss)
-                    print(
-                        f"validation epoch={epoch} global_step={global_step} "
-                        f"loss={validation_loss:.4f}",
-                        flush=True,
-                    )
-                model.train()
-                while next_val_step <= global_step:
-                    next_val_step += tcfg.val_every
-            if val_dl is not None and is_distributed():
-                dist.barrier()
+            # The pass's partial accumulation update never reached the boundary callback.
+            _maybe_validate(epoch, global_step)
 
             # End of a pass: the partial accumulation's update never reached the
             # boundary callback, so its checkpoint and stop check happen here.
@@ -841,13 +963,13 @@ class MetricsLog:
     loss_total: list[float] = field(default_factory=list)
     lr: list[float] = field(default_factory=list)
 
+    KEYS = ("ntp", "cr", "th", "val", "total")
+
     def record(self, step_n: int, losses: dict, lr_val: float):
+        values = _as_floats([losses.get(key, 0) for key in self.KEYS])
         self.step.append(step_n)
-        self.loss_ntp.append(_as_float(losses.get("ntp", 0)))
-        self.loss_cr.append(_as_float(losses.get("cr", 0)))
-        self.loss_th.append(_as_float(losses.get("th", 0)))
-        self.loss_val.append(_as_float(losses.get("val", 0)))
-        self.loss_total.append(_as_float(losses.get("total", 0)))
+        for key, value in zip(self.KEYS, values):
+            getattr(self, f"loss_{key}").append(value)
         self.lr.append(lr_val)
 
 
@@ -855,3 +977,16 @@ def _as_float(value) -> float:
     if isinstance(value, torch.Tensor):
         return float(value.detach())
     return float(value)
+
+
+def _as_floats(values) -> list[float]:
+    """Python floats of `values` (tensors and numbers), with ONE device->host read for
+    all the tensors together."""
+    tensors = [v.detach().float().reshape(()) for v in values if isinstance(v, torch.Tensor)]
+    if not tensors:
+        return [float(v) for v in values]
+    devices = {t.device for t in tensors}
+    stacked = (torch.stack(tensors) if len(devices) == 1
+               else torch.stack([t.cpu() for t in tensors])).tolist()
+    read = iter(stacked)
+    return [next(read) if isinstance(v, torch.Tensor) else float(v) for v in values]

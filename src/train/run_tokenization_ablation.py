@@ -19,13 +19,13 @@ the arm's vocabulary) is given; otherwise it warns and the trunk stays trainable
 freezing a random trunk would train the heads on noise.
 
 Usage:
-    torchrun --nproc_per_node=2 -m src.train.run_tokenization_ablation --arm clinical_soft
+    uv run torchrun --nproc_per_node=2 -m src.train.run_tokenization_ablation --arm clinical_soft
     # per-arm data paths come from the config; override on the CLI:
-    torchrun --nproc_per_node=2 -m src.train.run_tokenization_ablation --arm global_deciles \
+    uv run torchrun --nproc_per_node=2 -m src.train.run_tokenization_ablation --arm global_deciles \
         --events <dir>/events_with_outcomes.parquet --vocab <dir>/vocab.json \
         --value-stats <dir>/value_stats.json
     # after a crash or a clean stop (SIGTERM): the same command plus --resume latest
-    torchrun --nproc_per_node=2 -m src.train.run_tokenization_ablation --arm clinical_soft \
+    uv run torchrun --nproc_per_node=2 -m src.train.run_tokenization_ablation --arm clinical_soft \
         ... --run-dir <run_dir> --resume latest
 """
 

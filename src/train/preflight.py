@@ -14,7 +14,10 @@ Checks, in order:
 - environment: torch / CUDA / cuDNN / driver versions, git commit, and a dirty-tree refusal
   (``--allow-dirty`` turns it into a warning);
 - GPU: CUDA available, two devices, native bf16, a usable driver (``nvidia-smi`` runs; the
-  node's known driver/library mismatch is reported as such), free memory per device, and a
+  node's known driver/library mismatch is reported as such), a driver new enough for
+  torch's CUDA build (CUDA 13.x needs >= 580, 12.x >= 525), one NCCL library (only one
+  ``nvidia-nccl-*`` wheel installed; ``torch.cuda.nccl.version()`` printed), free memory
+  per device, and a
   two-rank smoke step: two processes (``torch.multiprocessing.spawn``) join an nccl process
   group through ``engine.setup_ddp``, train a tiny ``pretrain.Model`` for two accumulated
   updates on synthetic batches through ``engine.train`` under DDP and bf16, and must end
@@ -231,24 +234,101 @@ def environment_checks(*, allow_dirty: bool) -> list[Check]:
 
 # ------------------------------------------------------------------ GPU
 
+# Minimum NVIDIA Linux driver branch per CUDA major version (CUDA minor version
+# compatibility; CUDA Toolkit 13.0 Update 3 release notes, table "CTK Version / Driver
+# Range for Minor Version Compatibility": 13.x >= 580, 12.x >= 525, 11.x >= 450).
+DRIVER_FOR_CUDA_MAJOR = {13: 580, 12: 525, 11: 450}
+CU126_FALLBACK = ("upgrade the driver, or pin torch to the cu126 index for Linux "
+                  "(docs/plans/l40-runbook.md, 'CUDA build and driver')")
+
+
+def required_driver_major(cuda_build: str | None) -> int | None:
+    """The smallest driver branch (e.g. 580) torch's CUDA build `cuda_build` (``torch.
+    version.cuda``, e.g. "13.0") runs on; None for a CPU build or an unknown major."""
+    if not cuda_build:
+        return None
+    try:
+        major = int(str(cuda_build).split(".")[0])
+    except ValueError:
+        return None
+    return DRIVER_FOR_CUDA_MAJOR.get(major)
+
+
+def driver_requirement_check(driver: str | None, cuda_build: str | None) -> Check:
+    """FAIL when the installed driver is older than torch's CUDA build needs."""
+    name = "gpu: driver vs CUDA build"
+    need = required_driver_major(cuda_build)
+    if need is None:
+        return Check(name, WARN if cuda_build else FAIL,
+                     f"torch CUDA build {cuda_build!r}: no known driver requirement")
+    if not driver:
+        return Check(name, FAIL, f"driver version unknown (nvidia-smi unusable); torch's "
+                     f"CUDA {cuda_build} build needs driver >= {need}")
+    try:
+        branch = int(str(driver).split(".")[0])
+    except ValueError:
+        return Check(name, FAIL, f"unparseable driver version {driver!r}")
+    if branch < need:
+        return Check(name, FAIL, f"driver {driver} is older than torch's CUDA {cuda_build} "
+                     f"build needs (>= {need}): {CU126_FALLBACK}")
+    return Check(name, PASS, f"driver {driver} >= {need} for torch's CUDA {cuda_build} build")
+
+
+def installed_nccl_wheels() -> list[str]:
+    """Names of the installed ``nvidia-nccl-*`` distributions."""
+    from importlib import metadata
+
+    names = set()
+    for dist in metadata.distributions():
+        name = (dist.metadata.get("Name") or "").lower().replace("_", "-")
+        if name.startswith("nvidia-nccl"):
+            names.add(name)
+    return sorted(names)
+
+
+def nccl_check(*, version: tuple | None = None) -> Check:
+    """One NCCL library: two ``nvidia-nccl-*`` wheels (xgboost's cu12, torch's cu13)
+    write the same ``nvidia/nccl/lib/libnccl.so.2``, so torch could load the wrong one.
+    `version` defaults to ``torch.cuda.nccl.version()``."""
+    import torch
+
+    name = "gpu: NCCL"
+    wheels = installed_nccl_wheels()
+    if version is None:
+        try:
+            version = torch.cuda.nccl.version()
+        except Exception as exc:  # noqa: BLE001 - reported, not raised
+            return Check(name, FAIL, f"torch.cuda.nccl.version() failed: {exc}")
+    shown = ".".join(str(v) for v in version) if isinstance(version, tuple) else str(version)
+    detail = f"torch NCCL {shown}; wheels: {', '.join(wheels) or 'none'}"
+    if len(wheels) > 1:
+        return Check(name, FAIL, detail + " (more than one NCCL wheel: they overwrite one "
+                     "libnccl.so.2; `uv sync` with the locked override drops "
+                     "nvidia-nccl-cu12)")
+    return Check(name, PASS, detail)
+
+
 def gpu_checks(*, skip_gpu: bool, expected: int = EXPECTED_GPUS) -> list[Check]:
-    """CUDA, device count, native bf16, driver and free memory. `skip_gpu` reports them
-    as skipped (a Mac rehearsal); otherwise a missing GPU is a failure, never a crash."""
+    """CUDA, device count, native bf16, driver (usable, and new enough for torch's CUDA
+    build), NCCL and free memory. `skip_gpu` reports them as skipped (a Mac rehearsal);
+    otherwise a missing GPU is a failure, never a crash."""
     import torch
 
     names = ("gpu: CUDA available", "gpu: device count", "gpu: bf16", "gpu: driver",
-             "gpu: free memory")
+             "gpu: free memory", "gpu: driver vs CUDA build", "gpu: NCCL")
     if skip_gpu:
         return [Check(name, SKIP, "--skip-gpu") for name in names]
     checks = []
-    ok, detail, _ = nvidia_smi()
+    ok, detail, driver = nvidia_smi()
     available = torch.cuda.is_available()
     checks.append(Check(names[0], PASS if available else FAIL,
                         f"torch sees CUDA (build {torch.version.cuda})" if available else
                         "torch.cuda.is_available() is False"))
     if not available:
+        requirement = driver_requirement_check(driver, torch.version.cuda)
         checks += [Check(names[1], FAIL, "no CUDA"), Check(names[2], FAIL, "no CUDA"),
-                   Check(names[3], FAIL, detail), Check(names[4], FAIL, "no CUDA")]
+                   Check(names[3], FAIL, detail), Check(names[4], FAIL, "no CUDA"),
+                   Check(names[5], FAIL, requirement.detail), Check(names[6], FAIL, "no CUDA")]
         return checks
     count = torch.cuda.device_count()
     checks.append(Check(names[1], PASS if count >= expected else FAIL,
@@ -264,6 +344,8 @@ def gpu_checks(*, skip_gpu: bool, expected: int = EXPECTED_GPUS) -> list[Check]:
                         f"native bf16 on {sum(bf16)}/{count} device(s)"))
     checks.append(Check(names[3], PASS if ok else FAIL, detail))
     checks.append(Check(names[4], PASS, "; ".join(free)))
+    checks.append(driver_requirement_check(driver, torch.version.cuda))
+    checks.append(nccl_check())
     return checks
 
 
