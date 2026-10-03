@@ -608,7 +608,10 @@ def checkpoint_model_config(ckpt: Mapping, mcfg: Mapping,
     size = config.get("vocab_size")
     if size is None:
         state = ckpt.get("model", ckpt) if isinstance(ckpt, Mapping) else {}
-        weight = state.get("enc.tok_emb.weight") if isinstance(state, Mapping) else None
+        weight = None
+        if isinstance(state, Mapping):
+            # The TextCode arm has no token embedding: its frozen table has one row per id.
+            weight = state.get("enc.tok_emb.weight", state.get("enc.text_table"))
         if weight is not None:
             size = int(weight.shape[0])
         elif vocab_blob is not None:
@@ -623,16 +626,37 @@ def load_model_from_checkpoint(checkpoint, mcfg: Mapping, n_targets: int,
     """The `Model` of a training checkpoint (path or loaded dict), sized from its
     manifest (`checkpoint_model_config`), refused unless bound to `vocab_blob`, with its
     weights loaded. `n_value_bins` comes from the vocabulary (the primary segments' for a
-    continuous-fused one)."""
+    continuous-fused one); the encoder is the arm's (`checkpoint_encoder`)."""
     from src.train.checkpoint import load_checkpoint, verify_checkpoint_binding
 
     ckpt = load_checkpoint(checkpoint) if not isinstance(checkpoint, Mapping) else checkpoint
     if verify:
         verify_checkpoint_binding(ckpt, vocab_blob)
     vocab_size, cfg = checkpoint_model_config(ckpt, mcfg, vocab_blob)
-    model = Model(vocab_size, n_targets, cfg, n_value_bins=vocab_value_bins(vocab_blob))
-    model.load_state_dict(ckpt.get("model", ckpt))
+    state = ckpt.get("model", ckpt)
+    model = Model(vocab_size, n_targets, cfg, n_value_bins=vocab_value_bins(vocab_blob),
+                  encoder=checkpoint_encoder(state, vocab_size, cfg, vocab_blob))
+    model.load_state_dict(state)
     return model
+
+
+def checkpoint_encoder(state: Mapping, vocab_size: int, cfg: Mapping,
+                       vocab_blob: Mapping) -> torch.nn.Module | None:
+    """The input encoder a checkpoint was trained with, as the tokenization ablation
+    builds it (`run_tokenization_ablation.TokenizationAblationModel`): the
+    continuous-fused value channel for a continuous-fused vocabulary, the TextCode
+    encoder (its frozen description table restored from the saved buffer) when the
+    state carries `enc.text_table`, else None (`Model`'s fused / order-only default)."""
+    if vocab_blob.get("representation") == CONTINUOUS_FUSED:
+        from src.model.encoder_continuous import ContinuousFusedEncoder
+
+        return ContinuousFusedEncoder(vocab_size, cfg)
+    table = state.get("enc.text_table")
+    if table is not None:
+        from src.model.encoder_textcode import TextCodeEncoder
+
+        return TextCodeEncoder(vocab_size, cfg, table.detach().cpu().float().numpy())
+    return None
 
 
 def vocab_value_bins(vocab_blob: Mapping) -> int:

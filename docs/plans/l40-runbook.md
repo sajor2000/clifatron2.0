@@ -496,9 +496,12 @@ for d in output/intermediate_phi/runs/*.screening; do
   arm=$(uv run python -c "import json, sys; print(json.load(open(sys.argv[1]))['tokenization_arm'])" "$d/run_spec.json")
   dir=output/intermediate_phi/${ARM_DIR[$arm]}
   ckpt=$(ls -t "$d"/checkpoints/*.pt | head -1)
-  uv run python -m src.eval.threshold_eval --run-dir "$d" --checkpoint "$ckpt" --vocab "$dir/vocab.json" --shards "$dir/gem_events.parquet" --site mimic --device cuda
+  uv run python -m src.eval.threshold_eval --run-dir "$d" --checkpoint "$ckpt" --vocab "$dir/vocab.json" --shards "$dir/gem_events.parquet" --value-stats "$dir/gem_value_stats.json" --site mimic --device cuda
 done
 ```
+
+`--value-stats` is read for the continuous-fused arm only (its trunk reads each event's
+normalized value; refused without it) and ignored for the others.
 
 Produces `<run>/threshold_eval/scores.parquet` (row-level, governed) and
 `<run>/threshold_eval/summary.json` (aggregate). Check: every scorer row is `evaluable`

@@ -461,10 +461,6 @@ class DecileArmGridTest(unittest.TestCase):
         self.assertIsNone(spo2["distance"])
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class ClifUnitsTest(unittest.TestCase):
     """Product authority (2026-10-03): every threshold is in the CLIF 2.1 unit of its
     concept and every concept is a CLIF 2.1 category. Read from the mCIDE 2.1.1 snapshot
@@ -526,3 +522,7 @@ class ClifUnitsTest(unittest.TestCase):
             with self.subTest(concept=concept):
                 want = self._norm(declared[concept])
                 self.assertEqual(self._norm(spec["unit"]), aliases.get(want, want))
+
+
+if __name__ == "__main__":
+    unittest.main()

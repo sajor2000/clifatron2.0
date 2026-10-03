@@ -54,6 +54,9 @@ CLI (one run; `src.eval.claims_report` reads the outputs of many):
 
     uv run python -m src.eval.threshold_eval --run-dir <run> --checkpoint <ckpt.pt> \
         --vocab <vocab.json> --shards <gem_events.parquet> [--final-evaluation]
+
+A continuous-fused run also needs `--value-stats` (the run's train-partition
+value_stats.json, bound to its vocabulary): its trunk reads each event's normalized value.
 """
 from __future__ import annotations
 
@@ -71,6 +74,12 @@ from scipy.special import expit
 from src.data.segments import vocab_segments
 from src.data.targets import InStreamTargets, TargetBuilder
 from src.data.threshold_grid import ThresholdGrid, load_thresholds
+from src.data.tokenize_continuous import REPRESENTATION as CONTINUOUS_FUSED
+from src.data.tokenize_continuous import (
+    ContinuousThresholdGrid,
+    normalize_value,
+    primary_segments,
+)
 from src.eval import metrics as M
 from src.eval import schema as _schema
 from src.eval.clif_tasks import NOT_EVALUABLE
@@ -569,7 +578,10 @@ def evaluate_run(model, streams: Sequence[Mapping], vocab_blob: Mapping,
             f"({label_horizon:g} h): it is the zero-shot threshold evaluation")
     for horizon in horizons:
         horizon_bin(model, horizon)
-    grid = ThresholdGrid(vocab_blob, target_concepts, thresholds)
+    continuous = vocab_blob.get("representation") == CONTINUOUS_FUSED
+    # A continuous-fused vocabulary is edgeless: thresholds sit on its primary segments.
+    grid = (ContinuousThresholdGrid if continuous else ThresholdGrid)(
+        vocab_blob, target_concepts, thresholds)
     edges = edge_rows(grid, arm=arm)
     built = evaluation_set(streams, grid, thresholds, horizons_hours=horizons,
                            anchors_per_stay=int(evaluation["anchors_per_stay"]),
@@ -592,7 +604,7 @@ def evaluate_run(model, streams: Sequence[Mapping], vocab_blob: Mapping,
         seed=int(evaluation["seed"]))
     scores += probe_scores + rollout_scores
     rows += probe_rows + rollout_rows
-    segments = vocab_segments(vocab_blob)
+    segments = primary_segments(vocab_blob) if continuous else vocab_segments(vocab_blob)
     summary = {
         "version": SUMMARY_VERSION,
         "vocabulary": grid.binding["vocabulary"],
@@ -697,9 +709,14 @@ def read_run_outputs(run_dir: str | Path) -> dict[str, Any]:
             "summary": json.loads((out / SUMMARY_FILE).read_text())}
 
 
-def stay_streams(frame) -> list[dict]:
+def stay_streams(frame, *, value_stats: Mapping[int, tuple[float, float]] | None = None
+                 ) -> list[dict]:
     """Full stays from GEM window rows (`gem_events.parquet`): windows concatenated in
-    `continuation_index` order per episode key, with values, partition and soft bins."""
+    `continuation_index` order per episode key, with values, partition and soft bins.
+
+    With `value_stats` (a continuous-fused run's frozen per-token stats), each stream
+    also carries the value channel its trunk reads, normalized as in training
+    (`dataset.ModelDataset(value_channel=True)`): `input_value` / `input_value_mask`."""
     key_column = "episode_key" if "episode_key" in frame.columns else "hosp_id"
     order = [key_column] + (["continuation_index"] if "continuation_index" in frame.columns
                             else [])
@@ -720,7 +737,14 @@ def stay_streams(frame) -> list[dict]:
             stream["soft_weight"] += list(row["soft_weight"])
         else:
             stream["soft_token"] = stream["soft_weight"] = None
-    return list(streams.values())
+    out = list(streams.values())
+    if value_stats is not None:
+        for stream in out:
+            channel = [normalize_value(value, token, value_stats)
+                       for token, value in zip(stream["token"], stream["value"])]
+            stream["input_value"] = [value for value, _ in channel]
+            stream["input_value_mask"] = [mask for _, mask in channel]
+    return out
 
 
 # ---------------------------------------------------------------------------------- CLI
@@ -729,6 +753,24 @@ def context_tokens(max_context: int | None, mcfg: Mapping) -> int | None:
     """The history length each anchor is read over: `--max-context`, else the trunk's
     `max_tokens`. Recorded in the run summary (`context_tokens`)."""
     return int(max_context) if max_context is not None else mcfg["trunk"].get("max_tokens")
+
+
+def run_value_stats(path, vocab_blob: Mapping) -> dict[int, tuple[float, float]] | None:
+    """A continuous-fused run's value stats, bound as in training (`pretrain`): the
+    vocabulary and segments hashes of `vocab_blob`, fit on `train`. Refused when missing
+    for a continuous-fused run; not read for the other arms."""
+    if vocab_blob.get("representation") != CONTINUOUS_FUSED:
+        return None
+    if path is None:
+        raise SystemExit("a continuous-fused run needs --value-stats (its train-partition "
+                         "value_stats.json): the trunk reads each event's normalized value")
+    from src.data.segments import artifact_binding
+    from src.data.value_stats import load_value_stats
+
+    binding = artifact_binding(vocab_blob)
+    return load_value_stats(path, expected_vocab_hash=binding["vocabulary"],
+                            expected_segments_hash=binding["numeric_edges"],
+                            expected_fit_partition="train")
 
 
 def load_model(checkpoint, vocab_blob: Mapping, mcfg: Mapping, *, n_targets: int):
@@ -752,6 +794,9 @@ def main(argv: list[str] | None = None) -> None:
     ap.add_argument("--checkpoint", required=True)
     ap.add_argument("--vocab", required=True, help="the run's tokenizer-v2 vocab.json")
     ap.add_argument("--shards", required=True, help="the arm's gem_events.parquet")
+    ap.add_argument("--value-stats", default=None,
+                    help="the run's train-partition value_stats.json (required for a "
+                         "continuous-fused run: its trunk reads normalized values)")
     ap.add_argument("--model-config", default=str(ROOT / "configs/model.yaml"))
     ap.add_argument("--data-config", default=str(ROOT / "configs/data.yaml"))
     ap.add_argument("--thresholds", default=str(ROOT / "configs/thresholds.yaml"))
@@ -785,7 +830,8 @@ def main(argv: list[str] | None = None) -> None:
     dcfg = yaml.safe_load(Path(args.data_config).read_text())
     vblob = load_vocab_blob(args.vocab, required_for="threshold evaluation")
     model = load_model(args.checkpoint, vblob, mcfg, n_targets=len(dcfg["target_concepts"]))
-    streams = stay_streams(pl.read_parquet(args.shards))
+    streams = stay_streams(pl.read_parquet(args.shards),
+                           value_stats=run_value_stats(args.value_stats, vblob))
     result = evaluate_run(model, streams, vblob, thresholds, claims,
                           target_concepts=dcfg["target_concepts"],
                           objective_arm=spec["objective_arm"], site=args.site, roles=roles,

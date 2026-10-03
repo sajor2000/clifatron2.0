@@ -123,8 +123,8 @@ def encode(stays: list[dict], segments: dict) -> list[dict]:
     return streams
 
 
-def tiny_model(vocab_size: int, n_value_bins: int, seed: int = 0) -> Model:
-    mcfg = {
+def tiny_mcfg() -> dict:
+    return {
         "trunk": {"d_model": 16, "n_layers": 1, "n_heads": 2, "ffn_mult": 2, "dropout": 0.0,
                   "rope_base": 10000.0, "tied_embeddings": False},
         "heads": {
@@ -135,8 +135,12 @@ def tiny_model(vocab_size: int, n_value_bins: int, seed: int = 0) -> Model:
             "value_regression": {"enabled": True, "weight": 0.5},
         },
     }
+
+
+def tiny_model(vocab_size: int, n_value_bins: int, seed: int = 0, encoder=None) -> Model:
     torch.manual_seed(seed)
-    return Model(vocab_size, len(TARGETS), mcfg, n_value_bins=n_value_bins)
+    return Model(vocab_size, len(TARGETS), tiny_mcfg(), n_value_bins=n_value_bins,
+                 encoder=encoder)
 
 
 def claims_cfg(**evaluation) -> dict:
@@ -348,6 +352,98 @@ class RunEvaluationTest(unittest.TestCase):
             te.evaluate_run(self.model, self.streams, self.blob, registry(), cfg,
                             target_concepts=TARGETS, objective_arm="full", site="SYNTH",
                             roles=ROLES, probe_cfg=PROBE)
+
+
+class OtherTokenizationArmsTest(unittest.TestCase):
+    """PR #17 review: the continuous-fused and TextCode arms' checkpoints load with their
+    own encoder, and a continuous-fused run is scored with its value channel (the
+    training normalization: frozen per-token stats of the train partition)."""
+
+    @classmethod
+    def setUpClass(cls):
+        from src.data.tokenize_continuous import continuous_fused_vocab
+
+        cls.stays = synthetic_stays(n=80)
+        cls.blob = vocab_blob(clinical_segments())
+        cls.cblob, remap = continuous_fused_vocab(cls.blob)
+        cls.cstreams = [{**s, "token": [remap[t] for t in s["token"]]}
+                        for s in encode(cls.stays, clinical_segments())]
+        by_token: dict[int, list[float]] = {}
+        for stream in cls.cstreams:
+            if stream["partition"] != "train":
+                continue
+            for token, value in zip(stream["token"], stream["value"]):
+                if value is not None:
+                    by_token.setdefault(token, []).append(value)
+        cls.stats = {t: (float(np.median(v)), float(np.std(v)) or 1.0)
+                     for t, v in by_token.items()}
+
+    def roundtrip(self, model, blob):
+        from src.train.pretrain import load_model_from_checkpoint
+
+        ckpt = {"model": model.state_dict()}
+        loaded = load_model_from_checkpoint(ckpt, tiny_mcfg(), len(TARGETS), blob,
+                                            verify=False)
+        for key, value in model.state_dict().items():
+            self.assertTrue(torch.equal(loaded.state_dict()[key], value), key)
+        return loaded
+
+    def test_a_continuous_fused_checkpoint_loads_with_its_value_channel_encoder(self):
+        from src.data.tokenize_continuous import primary_n_value_bins
+        from src.model.encoder_continuous import ContinuousFusedEncoder
+
+        size = len(self.cblob["vocab"])
+        model = tiny_model(size, primary_n_value_bins(self.cblob),
+                           encoder=ContinuousFusedEncoder(size, tiny_mcfg()))
+        self.assertIsInstance(self.roundtrip(model, self.cblob).enc, ContinuousFusedEncoder)
+
+    def test_a_textcode_checkpoint_loads_with_its_frozen_table_encoder(self):
+        from src.data.segments import n_value_bins
+        from src.model.encoder_textcode import TextCodeEncoder
+
+        size = len(self.blob["vocab"])
+        table = np.random.default_rng(0).normal(size=(size, 8)).astype(np.float32)
+        model = tiny_model(size, n_value_bins(self.blob),
+                           encoder=TextCodeEncoder(size, tiny_mcfg(), table))
+        loaded = self.roundtrip(model, self.blob)
+        self.assertIsInstance(loaded.enc, TextCodeEncoder)
+        self.assertTrue(np.array_equal(loaded.enc.text_table.numpy(), table))
+
+    def test_a_continuous_fused_run_is_scored_with_its_value_channel(self):
+        import polars as pl
+
+        from src.data.tokenize_continuous import normalize_value, primary_n_value_bins
+        from src.model.encoder_continuous import ContinuousFusedEncoder
+
+        frame = pl.DataFrame([{k: s[k] for k in ("episode_key", "partition", "token",
+                                                  "pos_min", "value")}
+                              for s in self.cstreams])
+        bare = te.stay_streams(frame)
+        self.assertTrue(all(s.get("input_value") is None for s in bare))
+        streams = te.stay_streams(frame, value_stats=self.stats)
+        some = False
+        for stream in streams:
+            want = [normalize_value(v, t, self.stats)
+                    for t, v in zip(stream["token"], stream["value"])]
+            self.assertEqual(stream["input_value"], [z for z, _ in want])
+            self.assertEqual(stream["input_value_mask"], [m for _, m in want])
+            some = some or any(stream["input_value_mask"])
+        self.assertTrue(some)
+
+        size = len(self.cblob["vocab"])
+        model = tiny_model(size, primary_n_value_bins(self.cblob),
+                           encoder=ContinuousFusedEncoder(size, tiny_mcfg()))
+        with self.assertRaisesRegex(te.ThresholdEvalError, "input_value"):
+            te.evaluate_run(model, bare, self.cblob, registry(), claims_cfg(),
+                            target_concepts=TARGETS, objective_arm="full", site="SYNTH",
+                            roles=ROLES, probe_cfg=PROBE)
+        result = te.evaluate_run(model, streams, self.cblob, registry(), claims_cfg(),
+                                 target_concepts=TARGETS, objective_arm="full",
+                                 site="SYNTH", roles=ROLES, probe_cfg=PROBE)
+        rows = result["summary"]["rows"]
+        self.assertEqual({r["scorer"] for r in rows}, {"head", "probe", "rollout"})
+        self.assertTrue(any(r["status"] == "evaluable" for r in rows if r["scorer"] == "head"))
+        self.assertEqual(set(result["summary"]["bin_counts"]), set(CONCEPTS))
 
 
 class ClaimsConfigTest(unittest.TestCase):

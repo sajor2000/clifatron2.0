@@ -372,7 +372,11 @@ class ModelDataset(Dataset):
         return part.value_list(base, base + h) + values
 
     def sample_lengths(self) -> list[int]:
-        """Tokens per training row, header included (for the token-budget sampler)."""
+        """Tokens per training row, header included (for the token-budget sampler).
+
+        With `continuation_header`, a row over `max_tokens` once its header is added is
+        refused here, when the loader is built, rather than when the row is first drawn:
+        the shard was cut with `gem_window_bounds`, not `gem_window_bounds_with_header`."""
         corpus = getattr(self, "corpus", None)
         if corpus is None:
             return [len(record["token"]) for record in self.records]
@@ -380,13 +384,21 @@ class ModelDataset(Dataset):
         if self.continuation_header is None:
             return lengths
         out = []
+        over = 0
         for index, length in enumerate(lengths):
             part, row = corpus.window(index)
             first, _ = part.stay_windows(int(part.win_stay[row]))
             if row > first:
                 base = int(part.win_offset[first])
                 length += stay_header_length(part.token[base:base + 64].tolist(), self.continuation_header)
+            if self.max_tokens is not None and length > self.max_tokens:
+                over += 1
             out.append(length)
+        if over:
+            raise TargetContractError(
+                f"{over} continuation window(s) exceed max_tokens {self.max_tokens} with the "
+                "stay header: re-cut the shard with dataset.gem_window_bounds_with_header "
+                "or set trunk.continuation_header: false")
         return out
 
     def _packed_sample(self, record: dict[str, Any]) -> dict[str, Any]:

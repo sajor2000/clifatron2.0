@@ -398,6 +398,10 @@ class GemLoaderTest(unittest.TestCase):
                               max_tokens=len(second["input_ids"]))
         with self.assertRaisesRegex(TargetContractError, "max_tokens"):
             capped[indices[1]]
+        # ...and refused when the loader is built (the batch sampler reads
+        # sample_lengths), not hours into an epoch: shards cut without room for the header.
+        with self.assertRaisesRegex(TargetContractError, "gem_window_bounds_with_header"):
+            capped.sample_lengths()
 
     def test_header_aware_window_bounds_keep_every_sample_within_the_budget(self):
         from src.data.dataset import gem_window_bounds_with_header
