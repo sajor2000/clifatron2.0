@@ -1022,5 +1022,294 @@ class ResumeEquivalenceTest(unittest.TestCase):
                 train(*args, vocab_binding=None)
 
 
+
+class ScheduleResolutionTest(unittest.TestCase):
+    """`engine.resolve_schedule`: warm-up and checkpoint interval scale with the run;
+    absolute values still work; a schedule that cannot do its job is refused."""
+
+    def _tcfg(self, *, warmup_steps=None, warmup_frac=None, ckpt_every=None,
+              checkpoints_per_run=None, final_checkpoint=None):
+        schedule = {"warmup_steps": warmup_steps}
+        if warmup_frac is not None:
+            schedule["warmup_frac"] = warmup_frac
+        runtime = {"ckpt_every": ckpt_every}
+        if checkpoints_per_run is not None:
+            runtime["checkpoints_per_run"] = checkpoints_per_run
+        if final_checkpoint is not None:
+            runtime["final_checkpoint"] = final_checkpoint
+        return {"schedule": schedule, "runtime": runtime}
+
+    def test_warmup_frac_resolves_to_a_share_of_the_run(self):
+        plan = engine.resolve_schedule(self._tcfg(warmup_frac=0.05), 300)
+        self.assertEqual((plan.warmup_steps, plan.warmup_source), (15, "warmup_frac"))
+        # Default share when the key is absent.
+        self.assertEqual(engine.resolve_schedule(self._tcfg(), 200).warmup_steps,
+                         int(200 * engine.DEFAULT_WARMUP_FRAC))
+        # A few-update screening run still gets one warm-up update, never the whole run.
+        self.assertEqual(engine.resolve_schedule(self._tcfg(warmup_frac=0.05), 13).warmup_steps, 1)
+        self.assertEqual(engine.resolve_schedule(self._tcfg(warmup_frac=0.05), 1).warmup_steps, 0)
+        # An absolute warmup_steps wins.
+        plan = engine.resolve_schedule(self._tcfg(warmup_steps=7, warmup_frac=0.5), 300)
+        self.assertEqual((plan.warmup_steps, plan.warmup_source), (7, "warmup_steps"))
+
+    def test_warmup_as_long_as_the_run_is_refused(self):
+        # The pre-fix configs/train.yaml (warmup_steps 2000) on a 13-update sample pass.
+        with self.assertRaisesRegex(engine.ScheduleError, "never leave the linear warm-up"):
+            engine.resolve_schedule(self._tcfg(warmup_steps=2000), 13)
+        with self.assertRaisesRegex(engine.ScheduleError, "never leave"):
+            engine.resolve_schedule(self._tcfg(warmup_steps=13), 13)
+        with self.assertRaisesRegex(engine.ScheduleError, r"warmup_frac must be in \[0, 1\)"):
+            engine.resolve_schedule(self._tcfg(warmup_frac=1.0), 13)
+        # Unvalidated (TrainConfig) it resolves as given.
+        self.assertEqual(engine.resolve_schedule(self._tcfg(warmup_steps=2000), 13,
+                                                 validate=False).warmup_steps, 2000)
+
+    def test_checkpoint_interval_scales_and_guarantees_periodic_checkpoints(self):
+        for total in (1, 4, 13, 15, 287, 60000):
+            plan = engine.resolve_schedule(self._tcfg(checkpoints_per_run=5), total)
+            with self.subTest(total=total):
+                self.assertEqual(plan.ckpt_source, "checkpoints_per_run")
+                self.assertGreaterEqual(plan.periodic_checkpoints, min(5, total))
+                self.assertTrue(plan.final_checkpoint)
+        self.assertEqual(engine.resolve_schedule(self._tcfg(), 13).ckpt_every,
+                         13 // engine.DEFAULT_CHECKPOINTS_PER_RUN)
+        plan = engine.resolve_schedule(self._tcfg(ckpt_every=4), 13)
+        self.assertEqual((plan.ckpt_every, plan.ckpt_source, plan.periodic_checkpoints),
+                         (4, "ckpt_every", 3))
+
+    def test_a_config_that_writes_no_checkpoint_is_refused(self):
+        # Interval longer than the run: the final checkpoint is the only one (allowed) ...
+        plan = engine.resolve_schedule(self._tcfg(ckpt_every=2000), 13)
+        self.assertEqual(plan.periodic_checkpoints, 0)
+        # ... and with the final checkpoint off there is none: refused.
+        with self.assertRaisesRegex(engine.ScheduleError, "no checkpoint would be written"):
+            engine.resolve_schedule(self._tcfg(ckpt_every=2000, final_checkpoint=False), 13)
+        with self.assertRaisesRegex(engine.ScheduleError, "ckpt_every must be >= 1"):
+            engine.resolve_schedule(self._tcfg(ckpt_every=0), 13)
+        with self.assertRaisesRegex(engine.ScheduleError, "checkpoints_per_run must be >= 1"):
+            engine.resolve_schedule(self._tcfg(checkpoints_per_run=0), 13)
+
+    def test_shipped_configs_resolve_for_the_matrix_budgets(self):
+        """configs/train.yaml on a 13-update sample pass (0.05 pass -> 1 update) and full
+        MIMIC (~180-300 updates per pass): every run leaves warm-up and checkpoints."""
+        import yaml
+
+        from src.train.engine import resolve_total_steps
+
+        tcfg = yaml.safe_load((ROOT / "configs/train.yaml").read_text())
+        for batches_per_rank in (13 * 32, 180 * 32, 300 * 32):
+            for passes in (0.05, 1.0):
+                cfg = {**tcfg, "schedule": {**tcfg["schedule"], "passes": passes}}
+                total = resolve_total_steps(cfg, batches_per_rank)
+                plan = engine.resolve_schedule(cfg, total)
+                with self.subTest(batches=batches_per_rank, passes=passes):
+                    self.assertTrue(plan.warmup_steps < total or plan.warmup_steps == 0)
+                    self.assertGreaterEqual(plan.periodic_checkpoints, 1)
+        for name in ("train.smoke.yaml", "train.mps.yaml"):
+            cfg = yaml.safe_load((ROOT / "configs" / name).read_text())
+            engine.resolve_schedule(cfg, int(cfg["schedule"]["total_steps"]))
+
+    def test_lr_leaves_warmup_on_a_short_run(self):
+        """The fixed warmup_steps 2000 pinned a 13-update run in linear warm-up; the
+        resolved warm-up reaches the peak LR and then decays."""
+        from src.train.pretrain import build_scheduler
+
+        for total in (1, 2, 13):
+            plan = engine.resolve_schedule({"schedule": {"warmup_frac": 0.05},
+                                            "runtime": {}}, total)
+            opt = torch.optim.SGD(torch.nn.Linear(2, 2).parameters(), lr=0.1)
+            sched = build_scheduler(opt, total, plan.warmup_steps)
+            lrs = []
+            for _ in range(total):
+                lrs.append(opt.param_groups[0]["lr"])
+                opt.step()
+                sched.step()
+            with self.subTest(total=total):
+                self.assertAlmostEqual(max(lrs), 0.1, places=6)
+
+
+def _short_cfg(ckpt_dir, total_steps, ckpt_every=None):
+    return TrainConfig({}, {
+        "batch": {"per_gpu": 2, "grad_accum": 1},
+        "runtime": {"ckpt_dir": ckpt_dir, "ckpt_every": ckpt_every},
+        "schedule": {"warmup_steps": None, "total_steps": total_steps},
+        "eval_schedule": {"val_every": 10_000},
+        "optimizer": {"grad_clip": 1.0},
+    }, {"compile": False}, total_steps=total_steps)
+
+
+class FinalCheckpointTest(unittest.TestCase):
+    """A run shorter than ckpt_every still ends with a checkpoint that loads and resumes
+    (6 samples, batch 2: 3 updates per pass)."""
+
+    def _build(self):
+        torch.manual_seed(20260829)
+        m = _DropoutModel()
+        o = torch.optim.SGD(m.parameters(), lr=0.1, momentum=0.9)
+        s = torch.optim.lr_scheduler.StepLR(o, step_size=2, gamma=0.9)
+        return m, o, s
+
+    @staticmethod
+    def _loader():
+        return torch.utils.data.DataLoader(_FixedDS(), batch_size=2, shuffle=False)
+
+    def test_run_shorter_than_ckpt_every_writes_a_final_checkpoint_that_resumes(self):
+        from src.train.engine import latest_checkpoint, train
+
+        dev = torch.device("cpu")
+        torch.manual_seed(7)
+        m_s, o_s, s_s = self._build()
+        with tempfile.TemporaryDirectory() as td:
+            train(m_s, self._loader(), None, o_s, s_s, _short_cfg(td, 6, 2000), dev, seed=7,
+                  vocab_binding=BINDING)
+            straight = [p.detach().clone() for p in m_s.parameters()]
+            self.assertEqual([p.name for p in Path(td).glob("*.pt")], ["ckpt_ep2_step6.pt"])
+
+        torch.manual_seed(7)
+        m_a, o_a, s_a = self._build()
+        with tempfile.TemporaryDirectory() as td:
+            # 3 updates (one full pass) with ckpt_every 2000: only the final checkpoint.
+            train(m_a, self._loader(), None, o_a, s_a, _short_cfg(td, 3, 2000), dev, seed=7,
+                  vocab_binding=BINDING)
+            self.assertEqual(sorted(p.name for p in Path(td).glob("*.pt")),
+                             ["ckpt_ep1_step3.pt"])
+            ckpt = latest_checkpoint(td)
+            loaded = load_checkpoint(ckpt)
+            self.assertEqual((loaded["epoch"], loaded["step"]), (1, 3))
+            self.assertEqual(loaded["vocab_binding"], BINDING)
+            self.assertEqual(loaded["manifest"]["ledger"]["optimizer_updates"], 3)
+
+            torch.manual_seed(999_999)
+            m_b, o_b, s_b = self._build()
+            train(m_b, self._loader(), None, o_b, s_b, _short_cfg(td, 6, 2000), dev,
+                  vocab_binding=BINDING, resume_ckpt=ckpt, seed=7)
+            resumed = [p.detach().clone() for p in m_b.parameters()]
+            self.assertEqual(latest_checkpoint(td).name, "ckpt_ep2_step6.pt")
+        for a, b in zip(straight, resumed, strict=True):
+            self.assertTrue(torch.equal(a, b), "resume from the final checkpoint diverged")
+
+    def test_final_checkpoint_mid_pass_and_no_duplicate(self):
+        from src.train.engine import train
+
+        dev = torch.device("cpu")
+        with tempfile.TemporaryDirectory() as td:
+            m, o, s = self._build()
+            # 4 updates: one pass + 1 update of the next (mid-pass: epoch 1 consumed).
+            train(m, self._loader(), None, o, s, _short_cfg(td, 4, 2000), dev,
+                  vocab_binding=BINDING)
+            self.assertEqual(sorted(p.name for p in Path(td).glob("*.pt")),
+                             ["ckpt_ep1_step4.pt"])
+        with tempfile.TemporaryDirectory() as td:
+            m, o, s = self._build()
+            # Scaled interval (null ckpt_every): 6 // 5 = every update, the final save is
+            # the periodic one (not written twice).
+            train(m, self._loader(), None, o, s, _short_cfg(td, 6), dev, vocab_binding=BINDING)
+            names = sorted(p.name for p in Path(td).glob("*.pt"))
+            self.assertEqual(len(names), 6)
+            self.assertIn("ckpt_ep2_step6.pt", names)
+        with tempfile.TemporaryDirectory() as td:
+            m, o, s = self._build()
+            cfg = _short_cfg(td, 3, 2000)
+            cfg.final_checkpoint = False
+            train(m, self._loader(), None, o, s, cfg, dev, vocab_binding=BINDING)
+            self.assertEqual(list(Path(td).glob("*.pt")), [])
+
+    def test_resume_of_a_finished_run_trains_nothing_and_writes_nothing(self):
+        from src.train.engine import train
+
+        dev = torch.device("cpu")
+        with tempfile.TemporaryDirectory() as td:
+            m, o, s = self._build()
+            train(m, self._loader(), None, o, s, _short_cfg(td, 3, 2000), dev,
+                  vocab_binding=BINDING)
+            ckpt = Path(td) / "ckpt_ep1_step3.pt"
+            mtime = ckpt.stat().st_mtime_ns
+            m2, o2, s2 = self._build()
+            _, manifest = train(m2, self._loader(), None, o2, s2, _short_cfg(td, 3, 2000), dev,
+                                vocab_binding=BINDING, resume_ckpt=ckpt)
+            self.assertEqual(manifest.ledger["optimizer_updates"], 3)
+            self.assertEqual(sorted(p.name for p in Path(td).glob("*.pt")),
+                             ["ckpt_ep1_step3.pt"])
+            self.assertEqual(ckpt.stat().st_mtime_ns, mtime)
+
+    def test_resume_refuses_a_checkpoint_of_another_run(self):
+        from src.train.engine import train
+
+        dev = torch.device("cpu")
+        with tempfile.TemporaryDirectory() as td:
+            m, o, s = self._build()
+            cfg = _short_cfg(td, 3, 2000)
+            cfg.tokenization_arm = "clinical_soft"
+            train(m, self._loader(), None, o, s, cfg, dev, vocab_binding=BINDING, seed=1)
+            ckpt = Path(td) / "ckpt_ep1_step3.pt"
+            for attr, value, seed in (("tokenization_arm", "global_deciles", 1),
+                                      ("tokenization_arm", "clinical_soft", 2)):
+                m2, o2, s2 = self._build()
+                other = _short_cfg(td, 6, 2000)
+                setattr(other, attr, value)
+                with self.subTest(attr=attr, value=value, seed=seed), \
+                        self.assertRaisesRegex(ValueError, "different run"):
+                    train(m2, self._loader(), None, o2, s2, other, dev, vocab_binding=BINDING,
+                          resume_ckpt=ckpt, seed=seed,
+                          resume_match=("tokenization_arm", "seed"))
+
+
+class _SigtermAt(_FixedDS):
+    def __init__(self, at):
+        super().__init__()
+        self.at, self.sent = at, False
+
+    def __getitem__(self, i):
+        if i == self.at and not self.sent:
+            import signal
+
+            self.sent = True
+            os.kill(os.getpid(), signal.SIGTERM)
+        return super().__getitem__(i)
+
+
+class CleanStopTest(unittest.TestCase):
+    def test_sigterm_checkpoints_the_current_update_and_returns(self):
+        import signal
+
+        from src.train.engine import latest_checkpoint, train
+
+        before = signal.getsignal(signal.SIGTERM)
+        torch.manual_seed(0)
+        model = _DropoutModel()
+        opt = torch.optim.SGD(model.parameters(), lr=0.1)
+        sched = torch.optim.lr_scheduler.StepLR(opt, step_size=1000)
+        # Sample 3 is in the second batch (batch 2): the stop lands after update 2.
+        loader = torch.utils.data.DataLoader(_SigtermAt(3), batch_size=2, shuffle=False)
+        with tempfile.TemporaryDirectory() as td:
+            _, manifest = train(model, loader, None, opt, sched, _short_cfg(td, 100, 2000),
+                                torch.device("cpu"), vocab_binding=BINDING)
+            self.assertEqual(manifest.ledger["optimizer_updates"], 2)
+            self.assertEqual(sorted(p.name for p in Path(td).glob("*.pt")),
+                             ["ckpt_ep0_step2.pt"])
+            self.assertEqual(load_checkpoint(latest_checkpoint(td))["step"], 2)
+        self.assertIs(signal.getsignal(signal.SIGTERM), before)
+
+
+class ResumeArgumentTest(unittest.TestCase):
+    def test_latest_picks_the_most_updates_and_refuses_an_empty_directory(self):
+        from src.train.engine import latest_checkpoint, resolve_resume
+
+        with tempfile.TemporaryDirectory() as td:
+            self.assertIsNone(latest_checkpoint(td))
+            with self.assertRaisesRegex(SystemExit, "no checkpoint"):
+                resolve_resume("latest", td)
+            for name in ("ckpt_ep0_step2.pt", "ckpt_ep1_step10.pt", "ckpt_ep1_step9.pt",
+                         "ckpt_tmpabc.pt", "notes.txt"):
+                (Path(td) / name).write_bytes(b"")
+            self.assertEqual(latest_checkpoint(td).name, "ckpt_ep1_step10.pt")
+            self.assertEqual(resolve_resume("latest", td).name, "ckpt_ep1_step10.pt")
+            self.assertEqual(resolve_resume(Path(td) / "ckpt_ep0_step2.pt", td).name,
+                             "ckpt_ep0_step2.pt")
+            with self.assertRaisesRegex(SystemExit, "no such checkpoint"):
+                resolve_resume(Path(td) / "missing.pt", td)
+            self.assertIsNone(resolve_resume(None, td))
+
+
 if __name__ == "__main__":
     unittest.main()

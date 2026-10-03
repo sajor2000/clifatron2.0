@@ -11,7 +11,8 @@ optimizer:
   grad_clip: 1.0
 
 schedule:
-  warmup_steps: 150
+  warmup_steps: 150     # absolute (this documents what the Mac ran); null ->
+  warmup_frac: 0.05     # floor(warmup_frac x updates). >= the run's updates is refused.
   total_steps: 6000   # 3000 (done) + 3000 continuation; resumed with --fresh-schedule
   # Run length in passes over the training data (U5). When set, it replaces total_steps:
   # updates = ceil(passes x ceil(batches per pass per rank / grad_accum)).
@@ -29,6 +30,8 @@ runtime:
   num_workers: 0
   log_every: 10
   ckpt_every: 100        # the 2026-09-26 OOM crash lost 200 updates with no checkpoint
+  checkpoints_per_run: 5 # used only when ckpt_every is null; a final checkpoint is
+                         # always written at the end of the run
   ckpt_dir: "output/intermediate_phi/checkpoints_mps"
   cache_clear_every: 1   # MPS ratchet guard (math-path attention T^2 buffers on long
                         # batches ratchet the caching-allocator watermark to OOM);

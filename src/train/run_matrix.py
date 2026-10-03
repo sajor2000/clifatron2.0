@@ -210,7 +210,9 @@ def run_dir(run: Mapping, matrix: Mapping, root: str | Path | None = None) -> Pa
 
 def launch_commands(run: Mapping, matrix: Mapping) -> dict[str, str]:
     """The exact commands for one run: ``torchrun`` (the L40 node, one process per GPU)
-    and ``cpu`` (a single process forced onto the CPU)."""
+    and ``cpu`` (a single process forced onto the CPU), and their recovery forms
+    ``torchrun_resume`` / ``cpu_resume`` (the same command + ``--resume latest``: continue
+    from the newest checkpoint in the run directory after a crash or a clean stop)."""
     launch = matrix["launch"]
     dirs = [matrix["arm_data"][run["tokenization_arm"]][site] for site in launch["sites"]]
     args = ["-m", launch["module"], "--arm", run["tokenization_arm"],
@@ -223,8 +225,11 @@ def launch_commands(run: Mapping, matrix: Mapping) -> dict[str, str]:
         args += ["--trunk", f"{key}={value}"]
     args += ["--run-dir", str(run_dir(run, matrix))]
     tail = " ".join(shlex.quote(a) for a in args)
-    return {"torchrun": f"torchrun --nproc_per_node={int(launch['nproc_per_node'])} {tail}",
-            "cpu": f"uv run python {tail} --device cpu"}
+    torchrun = f"torchrun --nproc_per_node={int(launch['nproc_per_node'])} {tail}"
+    cpu = f"uv run python {tail} --device cpu"
+    return {"torchrun": torchrun, "cpu": cpu,
+            "torchrun_resume": f"{torchrun} --resume latest",
+            "cpu_resume": f"{cpu} --resume latest"}
 
 
 def vocab_hashes(matrix: Mapping, overrides: Mapping[str, str] | None = None) -> dict[str, str]:
@@ -408,6 +413,8 @@ def main(argv: list[str] | None = None) -> int:
     print(f"\nclaim-bearing (full budget, listed before launch): {len(bearing)} runs")
     for run in bearing:
         print(f"  {run['tokenization_arm']} / {run['objective_arm']} seed {run['seed']}")
+    print("\nrecovery: after a crash or a clean stop (SIGTERM), rerun a run's command with "
+          "--resume latest (matrix_entry.json: launch.torchrun_resume)")
     for row in matrix.get("not_trained") or ():
         print(f"not trained here: {row['table_row']} -> {row['source']}")
     if args.write:

@@ -194,7 +194,8 @@ def _tiny_tcfg(ckpt_dir: Path) -> dict:
     return {
         "optimizer": {"lr": 1e-3, "weight_decay": 0.0, "betas": [0.9, 0.95],
                       "grad_clip": 1.0},
-        "schedule": {"warmup_steps": 1, "total_steps": 2, "cosine_decay": True},
+        # warmup_steps null: warmup_frac scales it (1 update of 2; none for 1-update runs).
+        "schedule": {"warmup_steps": None, "total_steps": 2, "cosine_decay": True},
         "batch": {"per_gpu": 4, "grad_accum": 1},
         "runtime": {"num_workers": 0, "log_every": 1000, "ckpt_every": 1000,
                     "ckpt_dir": str(ckpt_dir)},
@@ -724,6 +725,118 @@ class AblationArmsEndToEndTest(unittest.TestCase):
         self.assertGreater(vals[0.5], 0.0)
         self.assertAlmostEqual(vals[0.5], vals[2.0], places=5)
         self.assertAlmostEqual(totals[2.0] - totals[0.5], 1.5 * vals[0.5], places=4)
+
+
+class ArmResumeTest(unittest.TestCase):
+    """`train_arm(resume=...)` / `--resume`: a matrix run continues from its checkpoint
+    with the same curriculum weights, optimizer groups (one per head) and result as a
+    run straight through (4 microbatches per pass, accumulation 1, 8 updates)."""
+
+    TOTAL = 8
+
+    def setUp(self):
+        try:  # pytest puts tests/ on sys.path (rootdir-less test modules)
+            import test_ddp_multihead as ddp
+        except ImportError:  # pragma: no cover
+            from tests import test_ddp_multihead as ddp
+        self.ddp = ddp
+        self.mcfg = ddp.tiny_mcfg(curriculum="ntp_then_tte")
+        self._td = tempfile.TemporaryDirectory()
+        self.work = Path(self._td.name)
+
+    def tearDown(self):
+        self._td.cleanup()
+
+    def _run(self, *, seed: int = 0):
+        from src.train.pretrain import Loaders
+        from src.train.run_tokenization_ablation import ArmRun, TokenizationAblationModel
+
+        ddp = self.ddp
+        arm = {"name": "clinical_soft", "tokenizer": "fused", "total_steps": self.TOTAL,
+               "lr": 1e-2}
+        torch.manual_seed(seed)
+        model = TokenizationAblationModel(ddp.VOCAB, ddp.N_TARGETS, self.mcfg, arm,
+                                          n_value_bins=ddp.N_VALUE_BINS)
+        weights = ddp.record_weights(model)
+        dl = ddp.microbatch_loader([ddp.synthetic_batch(900 + i) for i in range(4)],
+                                   distributed=False)
+        loaders = Loaders(train=dl, validation=None, train_dataset=dl.dataset,
+                          validation_dataset=None, records=[], data_path=self.work,
+                          value_stats={})
+        return ArmRun("clinical_soft", arm, model, loaders, {}, ddp.BINDING,
+                      ddp.N_VALUE_BINS, seed=seed), weights
+
+    def _tcfg(self):
+        tcfg = self.ddp.tiny_tcfg(self.work / "unused", ckpt_every=4)
+        tcfg["schedule"]["warmup_steps"] = None      # warmup_frac: scales with the run
+        return tcfg
+
+    def _train(self, out_dir, **kwargs):
+        from src.train.run_tokenization_ablation import train_arm
+
+        run, weights = self._run(seed=kwargs.pop("seed", 0))
+        trained, manifest = train_arm(run, tcfg=self._tcfg(), mcfg=self.mcfg,
+                                      device=torch.device("cpu"), out_dir=out_dir, **kwargs)
+        return trained, manifest, weights
+
+    @staticmethod
+    def _groups(path):
+        from src.train.checkpoint import load_checkpoint
+
+        return [{k: v for k, v in g.items() if k != "params"}
+                for g in load_checkpoint(path)["optimizer"]["param_groups"]]
+
+    def test_resume_continues_with_the_same_curriculum_and_optimizer_groups(self):
+        straight_dir, split_dir = self.work / "straight", self.work / "split"
+        straight, _, straight_weights = self._train(straight_dir)
+        ckpts = straight_dir / "checkpoints"
+        self.assertEqual(sorted(p.name for p in ckpts.glob("*.pt")),
+                         ["ckpt_ep1_step4.pt", "ckpt_ep2_step8.pt"])
+
+        # The split run: the first pass, then (as after a crash) its later checkpoints
+        # are gone and `--resume latest` picks the update-4 one.
+        self._train(split_dir)
+        (split_dir / "checkpoints" / "ckpt_ep2_step8.pt").unlink()
+        resumed, manifest, resumed_weights = self._train(split_dir, resume="latest", seed=0)
+        self.assertEqual(manifest.ledger["optimizer_updates"], self.TOTAL)
+        self.assertTrue(manifest.lineage_parent)
+        # Curriculum: the resumed updates 4..7 used exactly the straight run's weights.
+        self.assertEqual(resumed_weights, straight_weights[4:])
+        self.assertNotEqual(len(set(straight_weights)), 1)       # the weights do change
+        # Optimizer: same groups (one per head, with their scheduled weight decay).
+        final = split_dir / "checkpoints" / "ckpt_ep2_step8.pt"
+        groups = self._groups(final)
+        self.assertEqual(groups, self._groups(ckpts / "ckpt_ep2_step8.pt"))
+        self.assertEqual({g.get("head") for g in groups} - {None},
+                         {"competing_risk", "threshold_hazard", "value_regression"})
+        for name, value in straight.state_dict().items():
+            self.assertTrue(torch.equal(value, resumed.state_dict()[name]), name)
+
+    def test_resume_refuses_another_seed_or_schedule(self):
+        out = self.work / "run"
+        self._train(out)
+        ckpt = out / "checkpoints" / "ckpt_ep1_step4.pt"
+        with self.assertRaisesRegex(ValueError, "different run: seed"):
+            self._train(out, resume=ckpt, seed=1)
+        with self.assertRaisesRegex(ValueError, "total_steps"):
+            self._train(out, resume=ckpt, total_steps=12)
+        # --fresh-schedule: a continuation with a new length is allowed.
+        _, manifest, _ = self._train(out, resume=ckpt, total_steps=12, fresh_schedule=True)
+        self.assertEqual(manifest.ledger["optimizer_updates"], 12)
+        with self.assertRaisesRegex(SystemExit, "no checkpoint"):
+            self._train(self.work / "empty", resume="latest")
+
+    def test_cli_accepts_resume(self):
+        import contextlib
+        import io
+
+        from src.train import run_tokenization_ablation as runner
+
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), self.assertRaises(SystemExit):
+            runner.main(["--help"])
+        self.assertIn("--resume", out.getvalue())
+        self.assertIn("--fresh-schedule", out.getvalue())
 
 
 if __name__ == "__main__":

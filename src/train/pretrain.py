@@ -81,8 +81,11 @@ from src.train.curriculum import (
 )
 from src.train.engine import (
     ALLOW_CPU_DDP_FLAG,
+    ScheduleError,
     TrainConfig,
     is_distributed,
+    resolve_resume,
+    resolve_schedule,
     resolve_total_steps,
     select_device,
     setup_ddp,
@@ -1052,7 +1055,11 @@ def build_optimizer(model, *, lr: float, weight_decay: float, betas, head_lr: fl
 
 
 def build_scheduler(opt, total_steps: int, warmup_steps: int):
-    """Linear warmup then cosine decay (the pretrain schedule)."""
+    """Linear warmup then cosine decay (the pretrain schedule). `warmup_steps` comes from
+    `engine.resolve_schedule` (absolute or a share of the run); with none (a run too short
+    for `schedule.warmup_frac` to give one update) it is cosine decay alone."""
+    if warmup_steps <= 0:
+        return CosineAnnealingLR(opt, T_max=max(1, total_steps))
     sched1 = LinearLR(opt, start_factor=0.01, end_factor=1.0, total_iters=warmup_steps)
     sched2 = CosineAnnealingLR(opt, T_max=max(1, total_steps - warmup_steps))
     return SequentialLR(opt, schedulers=[sched1, sched2], milestones=[warmup_steps])
@@ -1072,7 +1079,9 @@ def main():
     ap.add_argument("--vocab", default=None,
                     help="the frozen vocab.json (default: the first --data directory's)")
     ap.add_argument("--data-config", default="configs/data.yaml")
-    ap.add_argument("--resume", default=None, help="path to checkpoint to resume")
+    ap.add_argument("--resume", default=None,
+                    help="checkpoint to resume, or 'latest' for the newest one in "
+                         "runtime.ckpt_dir")
     ap.add_argument("--fresh-schedule", action="store_true",
                     help="with --resume: load model+optimizer but keep THIS run's "
                          "config LR schedule (continuation runs; the saved decayed "
@@ -1171,11 +1180,16 @@ def main():
     )
 
     total_steps = resolve_total_steps(tcfg, len(dl))
-    warmup_steps = tcfg["schedule"].get("warmup_steps", 2000)
-    scheduler = build_scheduler(opt, total_steps, warmup_steps)
-    if is_main and tcfg["schedule"].get("passes") is not None:
-        print(f"run length: {tcfg['schedule']['passes']} passes x {len(dl)} batches per rank "
-              f"-> {total_steps} optimizer updates")
+    try:
+        schedule = resolve_schedule(tcfg, total_steps)
+    except ScheduleError as exc:
+        raise SystemExit(f"refusing to train: {exc}") from exc
+    scheduler = build_scheduler(opt, total_steps, schedule.warmup_steps)
+    if is_main:
+        if tcfg["schedule"].get("passes") is not None:
+            print(f"run length: {tcfg['schedule']['passes']} passes x {len(dl)} batches per "
+                  f"rank -> {total_steps} optimizer updates")
+        print(f"schedule: {schedule.describe()}")
 
     train_cfg = TrainConfig({}, tcfg, mcfg, total_steps)
     # Recorded in every checkpoint manifest (config): what a consumer needs to rebuild the
@@ -1188,8 +1202,8 @@ def main():
 
     model, manifest = train(
         model, dl, validation_dl, opt, scheduler, train_cfg, dev,
-        resume_ckpt=args.resume, seed=args.seed, fresh_schedule=args.fresh_schedule,
-        vocab_binding=binding,
+        resume_ckpt=resolve_resume(args.resume, train_cfg.ckpt_dir), seed=args.seed,
+        fresh_schedule=args.fresh_schedule, vocab_binding=binding,
     )
 
     if is_main:

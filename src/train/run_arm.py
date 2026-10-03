@@ -41,6 +41,7 @@ from src.train.engine import (
     ALLOW_CPU_DDP_FLAG,
     TrainConfig,
     is_distributed,
+    resolve_schedule,
     select_device,
     setup_ddp,
     train,
@@ -216,7 +217,8 @@ def main():
         trunk_prefixes=("enc.", "adapter.backbone."),
         weight_decay=tcfg["optimizer"]["weight_decay"], betas=tcfg["optimizer"]["betas"],
     )
-    warmup = min(int(tcfg["schedule"].get("warmup_steps", 2000)), total_steps)
+    # warmup_steps, or floor(warmup_frac x updates) when it is null (configs/train.yaml).
+    warmup = min(resolve_schedule(tcfg, total_steps, validate=False).warmup_steps, total_steps)
     scheduler = build_scheduler(opt, total_steps, warmup)
 
     out_dir = Path(args.out) / args.arm

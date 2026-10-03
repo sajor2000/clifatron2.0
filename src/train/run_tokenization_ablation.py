@@ -24,6 +24,9 @@ Usage:
     torchrun --nproc_per_node=2 -m src.train.run_tokenization_ablation --arm global_deciles \
         --events <dir>/events_with_outcomes.parquet --vocab <dir>/vocab.json \
         --value-stats <dir>/value_stats.json
+    # after a crash or a clean stop (SIGTERM): the same command plus --resume latest
+    torchrun --nproc_per_node=2 -m src.train.run_tokenization_ablation --arm clinical_soft \
+        ... --run-dir <run_dir> --resume latest
 """
 
 from __future__ import annotations
@@ -59,8 +62,11 @@ from src.model.encoder_textcode import TextCodeEncoder
 from src.train.checkpoint import load_checkpoint
 from src.train.engine import (
     ALLOW_CPU_DDP_FLAG,
+    ScheduleError,
     TrainConfig,
     is_distributed,
+    resolve_resume,
+    resolve_schedule,
     resolve_total_steps,
     select_device,
     setup_ddp,
@@ -262,10 +268,26 @@ def setup_arm(arm: dict, *, mcfg: dict, tcfg: dict, n_targets: int, device,
                   vocab_size)
 
 
+# What a resumed arm run must share with its checkpoint (manifest config), beyond the
+# vocabulary binding `engine.train` always checks. The schedule keys are skipped under
+# `fresh_schedule` (a continuation run with a new schedule).
+RESUME_MATCH = ("tokenization_arm", "trunk", "objective", "vocab_size", "seed")
+RESUME_SCHEDULE_MATCH = ("total_steps", "warmup_steps")
+
+
 def train_arm(run: ArmRun, *, tcfg: dict, mcfg: dict, device, total_steps=None, lr=None,
-              out_dir=None, local: int = 0):
+              out_dir=None, local: int = 0, resume=None, fresh_schedule: bool = False):
     """`engine.train` over the arm's loaders: AdamW on the trainable parameters, the
-    pretrain warmup+cosine schedule, checkpoints bound to the arm's vocabulary."""
+    pretrain warmup+cosine schedule (`engine.resolve_schedule`: warm-up and checkpoint
+    interval scale with the run unless set absolutely; a schedule that would never leave
+    warm-up or write no periodic checkpoint is refused), checkpoints bound to the arm's
+    vocabulary.
+
+    `resume` (a checkpoint path, or ``latest`` in the run's checkpoint directory)
+    continues a run as `pretrain --resume` does: model, optimizer (every per-head group),
+    scheduler, RNG, update counter (so the curriculum continues from it) and epoch (the
+    sampler's) are restored; a checkpoint of another arm, trunk, objective, seed or
+    schedule is refused (`RESUME_MATCH`). `fresh_schedule` keeps this run's LR schedule."""
     if total_steps is None:
         # A run sized in passes (`schedule.passes`, the matrix budgets) wins over the
         # arm's fixed step count.
@@ -277,6 +299,11 @@ def train_arm(run: ArmRun, *, tcfg: dict, mcfg: dict, device, total_steps=None, 
     tcfg = copy.deepcopy(tcfg)
     if out_dir is not None:
         tcfg["runtime"]["ckpt_dir"] = str(Path(out_dir) / "checkpoints")
+    try:
+        schedule = resolve_schedule(tcfg, total_steps)
+    except ScheduleError as exc:
+        raise SystemExit(f"refusing to train arm {run.name}: {exc}") from exc
+    resume_ckpt = resolve_resume(resume, tcfg["runtime"].get("ckpt_dir", "checkpoints"))
     model = run.model
     if tcfg["runtime"].get("compile", mcfg.get("compile", False)) and torch.cuda.is_available():
         model = torch.compile(model, dynamic=True)
@@ -286,15 +313,19 @@ def train_arm(run: ArmRun, *, tcfg: dict, mcfg: dict, device, total_steps=None, 
         model, lr=lr,
         weight_decay=tcfg["optimizer"]["weight_decay"], betas=tcfg["optimizer"]["betas"],
     )
-    warmup = min(int(tcfg["schedule"].get("warmup_steps", 2000)), total_steps)
-    scheduler = build_scheduler(opt, total_steps, warmup)
+    scheduler = build_scheduler(opt, total_steps, schedule.warmup_steps)
     train_cfg = TrainConfig({}, tcfg, mcfg, total_steps)
     # Recorded in every checkpoint manifest: what a consumer needs to rebuild the model.
     train_cfg.vocab_size = run.vocab_size
     train_cfg.trunk = dict(mcfg["trunk"])
     train_cfg.tokenization_arm = run.name
+    if not is_distributed() or dist.get_rank() == 0:
+        print(f"[{run.name}] schedule: {schedule.describe()}", flush=True)
+    match = RESUME_MATCH + (() if fresh_schedule else RESUME_SCHEDULE_MATCH)
     return train(model, run.loaders.train, run.loaders.validation, opt, scheduler,
-                 train_cfg, device, seed=run.seed, vocab_binding=run.binding)
+                 train_cfg, device, seed=run.seed, vocab_binding=run.binding,
+                 resume_ckpt=resume_ckpt, fresh_schedule=fresh_schedule,
+                 resume_match=match)
 
 
 def masked_target_counts(batch: dict) -> dict[str, int]:
@@ -346,6 +377,13 @@ def main(argv: list[str] | None = None):
                     help="write checkpoints and run.json here (default: <out>/<arm>)")
     ap.add_argument("--dry-run", action="store_true",
                     help="build the arm's model and loaders, print shapes, and exit")
+    ap.add_argument("--resume", default=None,
+                    help="continue from a checkpoint of this run: a path, or 'latest' for "
+                         "the newest in <run-dir>/checkpoints (model, optimizer, schedule, "
+                         "RNG, update counter and epoch are restored)")
+    ap.add_argument("--fresh-schedule", action="store_true",
+                    help="with --resume: keep THIS run's LR schedule instead of the saved "
+                         "one (continuation runs)")
     ap.add_argument(ALLOW_CPU_DDP_FLAG, action="store_true",
                     help="let a distributed (torchrun) launch run on CPU over gloo when "
                          "CUDA is unavailable; without it such a launch is refused")
@@ -400,13 +438,15 @@ def main(argv: list[str] | None = None):
 
     out_dir = Path(args.run_dir) if args.run_dir else Path(args.out) / args.arm
     _, manifest = train_arm(run, tcfg=tcfg, mcfg=mcfg, device=dev,
-                            total_steps=args.total_steps, out_dir=out_dir, local=local)
+                            total_steps=args.total_steps, out_dir=out_dir, local=local,
+                            resume=args.resume, fresh_schedule=args.fresh_schedule)
     if is_main:
         # Aggregate-only run record (no row-level data).
         out_dir.mkdir(parents=True, exist_ok=True)
         (out_dir / "run.json").write_text(json.dumps({
             "arm": args.arm, "run_id": manifest.run_id, "seed": args.seed,
             "objective_arm": args.objective_arm, "trajectory": args.trajectory,
+            "resumed_from": manifest.lineage_parent,
             "parameters": manifest.parameters, "ledger": manifest.ledger,
             "validation": manifest.validation, "vocab_binding": run.binding,
             "n_value_bins": run.n_value_bins,

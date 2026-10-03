@@ -57,17 +57,29 @@ The code runs either way; none of these is decided by an engineer.
    deliberate run, not part of this runbook.
 6. **Claim 1 attribution arm.** Off in `configs/experiment_matrix.yaml`; whether the claim 1
    rule uses it is open.
-7. **Checkpoint cadence and warm-up against the run length.** The engine writes a
-   checkpoint only every `runtime.ckpt_every` updates (2000 in `configs/train.yaml`); there
-   is no unconditional final checkpoint. With `per_gpu: 4`, `grad_accum: 32` and two ranks
-   an update is 256 windows, so one pass over the MIMIC sample's train stays is 13
-   updates, and the full corpus is likely a few hundred. At that length a screening run
-   (0.05 pass) and even a 1-pass full run write no checkpoint, so step 19 has nothing to
-   evaluate and nothing can be resumed; `warmup_steps: 2000` also exceeds the run, so the
-   learning rate never leaves the linear warm-up. The pre-flight's schedule check prints
-   the update count per budget from the real sampler and fails on this. Set
-   `runtime.ckpt_every`, `schedule.warmup_steps` (and if wanted `grad_accum`) in
-   `configs/train.yaml` from the step 15 numbers, commit, and rerun step 15.
+7. **Checkpoint cadence and warm-up against the run length.** Settled in code: the
+   defaults in `configs/train.yaml` now scale with the run (`engine.resolve_schedule`).
+   With `per_gpu: 4`, `grad_accum: 32` and two ranks an update is 256 windows, so one
+   pass over the MIMIC sample's train stays is 13 updates and the full corpus roughly
+   180-300; a fixed `ckpt_every: 2000` / `warmup_steps: 2000` wrote no checkpoint and
+   never left warm-up at that length. Now:
+   - warm-up is `floor(schedule.warmup_frac x updates)` (0.05; at least one update,
+     never the whole run);
+   - a checkpoint is written every `max(1, updates // runtime.checkpoints_per_run)`
+     updates (5 per run), plus a final checkpoint at the end of every run and on a clean
+     stop (SIGTERM / Ctrl-C: the run finishes the current update, saves, and exits);
+   - an absolute `schedule.warmup_steps` / `runtime.ckpt_every` still wins when set; the
+     launcher refuses a warm-up as long as the run, or a run that would write no
+     checkpoint at all, and the pre-flight's schedule check (step 15) applies the same
+     rules to every matrix budget (it warns when only the final checkpoint would be
+     written).
+
+   Left to decide: `grad_accum`. It sets the effective batch (256 windows) and therefore
+   the update count: a 0.05-pass screening run on full MIMIC is only about 9-15 updates,
+   so its learning-rate schedule is one warm-up update and a short cosine. A smaller
+   `grad_accum` gives more, noisier updates per pass and changes the recipe for every
+   arm; it is a choice for the product authority, made before the first full run and
+   recorded in `configs/train.yaml` (commit, then rerun step 15).
 
 ## 1. Update the code and the environment
 
@@ -232,10 +244,11 @@ uv run python -m src.data.value_stats --events output/intermediate_phi/mimic_con
 ```
 
 Check: each JSON carries `fit_partition: train` and the vocabulary and segments hashes.
-Memory: this step reads the whole shard into Python lists. On the MIMIC verification
-sample (8.85M events) it peaked at 1.7 GB resident; scaled linearly, the full shard
-(about 134M events) needs roughly 20-25 GB. Run the four commands one at a time and
-watch `free -g`.
+Memory: the shard is streamed in row batches and only the finite values are kept (about
+8 bytes per numeric event). On a synthetic 8.8M-event shard the peak was 0.55 GB
+resident against 1.5 GB for the previous whole-shard version (which peaked at 1.7 GB on
+the 8.85M-event MIMIC sample); the full shard (about 134M events) should need a few GB,
+not 20-25. Run the four commands one at a time and watch `free -g` the first time.
 
 ## 13. (Rush) Tokenize Rush with the frozen MIMIC vocabularies
 
@@ -293,7 +306,9 @@ Prints one table and exits non-zero on any FAIL. It checks:
   validation corpus (warn above 70 % of available RAM, fail above 90 %); the cache
   directories are on a local filesystem;
 - schedule: updates per screening and full budget, computed with the launch's own
-  sampler, against `ckpt_every` and `warmup_steps` (decision 7);
+  sampler, and the warm-up and checkpoint interval each run resolves to (decision 7):
+  fails on a warm-up as long as the run or a run that writes no checkpoint, warns when
+  only the final checkpoint would be written;
 - disk: room for the caches still to build and for checkpoints.
 
 Memory figures measured on the MIMIC verification sample (1.2M sampled events) on
@@ -358,9 +373,9 @@ done
 ```
 
 Check after each run: `run.json` exists (written at the end), `train.log` has no
-traceback, and `checkpoints/` holds a checkpoint (it will not if the run had fewer than
-`ckpt_every` updates; see decision 7). Run in `tmux` so a
-dropped SSH session does not kill the loop.
+traceback and a `schedule:` line, and `checkpoints/` holds the periodic checkpoints and
+the final one (`ckpt_ep<E>_step<S>.pt` with `S` the run's update count; decision 7). Run
+in `tmux` so a dropped SSH session does not kill the loop.
 
 ## 19. Evaluation
 
@@ -402,13 +417,29 @@ before leaving the node.
 
 ## Recovery
 
-- A run that dies: delete its `run.json` if present, and relaunch the same line from its
-  `matrix_entry.json`. The run is reproducible from its seed, but it restarts from step
-  0: `src.train.run_tokenization_ablation` has no `--resume` yet (see "Known gaps").
-- `src.train.pretrain` does resume (`--resume <ckpt>`, `--fresh-schedule` for a new
-  schedule). On resume the curriculum continues from the checkpoint's optimizer-update
-  counter, not a count of forward calls, so the loss weights pick up where they stopped.
-  Checkpoints are written every `runtime.ckpt_every` updates (2000) and at the end.
+- A run that dies, or was stopped cleanly, resumes. To stop cleanly, send SIGTERM to
+  the two worker processes, `pkill -TERM -P <torchrun pid>`: each finishes its current
+  update, they agree, rank 0 checkpoints, and both exit 0 (a second signal aborts without
+  a checkpoint). Signalling torchrun itself (or Ctrl-C in its terminal) forwards the
+  signal but kills the workers 30 s later, which may be before a 32-microbatch update
+  and its checkpoint finish. Then relaunch it with `--resume latest`, the
+  `launch.torchrun_resume` line of its `matrix_entry.json` (the launch line plus
+  `--resume latest`). `latest` is the checkpoint with the most updates in
+  `<run-dir>/checkpoints`; a path works too. For the timing run of step 17:
+
+  ```bash
+  torchrun --nproc_per_node=2 -m src.train.run_tokenization_ablation --arm clinical_soft --objective-arm full --seed 1 --trajectory hospitalization --data output/intermediate_phi/mimic --site mimic --value-stats output/intermediate_phi/mimic/gem_value_stats.json --passes 0.05 --trunk d_model=512 --trunk n_layers=8 --trunk n_heads=8 --run-dir output/intermediate_phi/runs/clinical_soft.full.30m.time.s1.screening --resume latest
+  ```
+
+  Model, optimizer (every per-head group), LR schedule, RNG, the optimizer-update
+  counter (so the curriculum continues where it stopped) and the epoch (the sampler's)
+  are restored. A checkpoint of another arm, trunk, objective, seed or schedule length is
+  refused; `--fresh-schedule` keeps the new run's LR schedule for a deliberate
+  continuation. A mid-pass checkpoint resumes by replaying that pass from its start
+  (the documented approximation). `--resume latest` with no checkpoint is refused: drop
+  it to restart from scratch.
+- `src.train.pretrain` resumes the same way (`--resume <ckpt>` or `--resume latest` in
+  `runtime.ckpt_dir`, `--fresh-schedule`).
 - A stale or half-built GEM cache is refused with "stale GEM cache ... delete it": remove
   that `gem_cache/<partition>-...` directory and rerun; it is rebuilt under the lock.
 - A rebuilt shard or vocabulary gets a new cache directory automatically (the name holds
@@ -418,10 +449,8 @@ before leaving the node.
 
 ## Known gaps in the entry points (as of 2026-10-03)
 
-- `src.train.run_tokenization_ablation` (the matrix launcher) has no `--resume`; a crashed
-  matrix run restarts from scratch.
 - `src.data.tokenize` has no `--arm` option; the decile arms' data configs are written by
   the `python -c` line in step 9.
-- `src.data.value_stats` loads the whole shard into Python lists (step 12 memory note).
-- `src.train.engine.train` checkpoints only every `ckpt_every` updates and never at the
-  end of a run (decision 7).
+- Checkpoints are not pruned: a run keeps all its periodic checkpoints (about 5 + 1;
+  the 30M model with AdamW state is a few hundred MB each). Prune finished runs by hand
+  when the pre-flight's disk check gets close.

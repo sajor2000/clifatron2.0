@@ -1,6 +1,8 @@
 # Local smoke-test schedule (Mac MPS or CPU) — proves the full ETL→train→checkpoint
 # loop on real data before the L40 run. NOT a training recipe: 40 optimizer steps,
-# tiny effective batch, checkpoint every 20 steps. Real pretrain = configs/train.yaml.
+# tiny effective batch, checkpoint every 20 steps + a final one. Real pretrain =
+# configs/train.yaml. The absolute warmup_steps / ckpt_every below are kept on purpose
+# (a fixed 40-step run); engine.resolve_schedule refuses either one if it outgrows the run.
 optimizer:
   name: adamw
   lr: 3.0e-4
@@ -9,7 +11,8 @@ optimizer:
   grad_clip: 1.0
 
 schedule:
-  warmup_steps: 8
+  warmup_steps: 8          # absolute; null -> floor(warmup_frac x updates)
+  warmup_frac: 0.05
   total_steps: 40
   # Run length in passes over the training data (U5). When set, it replaces total_steps:
   # updates = ceil(passes x ceil(batches per pass per rank / grad_accum)).
@@ -26,7 +29,8 @@ runtime:
   ddp: false                # single process on the dev box
   num_workers: 0
   log_every: 2
-  ckpt_every: 20
+  ckpt_every: 20            # absolute; null -> updates // checkpoints_per_run
+  checkpoints_per_run: 5
   ckpt_dir: "output/intermediate_phi/checkpoints_smoke"
 
 data_contract:

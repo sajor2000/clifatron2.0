@@ -206,6 +206,15 @@ class LaunchCommandTest(unittest.TestCase):
                          "--trajectory hospitalization", "--site mimic"):
                 self.assertIn(flag, cmd)
 
+    def test_each_run_has_a_resume_form_of_its_commands(self):
+        from src.train.run_matrix import launch_commands
+
+        run = next(r for r in expand() if r["claim_bearing"])
+        cmds = launch_commands(run, MATRIX)
+        for key in ("torchrun", "cpu"):
+            self.assertEqual(cmds[f"{key}_resume"], cmds[key] + " --resume latest")
+            self.assertNotIn("--resume", cmds[key])
+
     def test_main_prints_every_run_and_starts_no_training(self):
         from src.train import run_matrix
 

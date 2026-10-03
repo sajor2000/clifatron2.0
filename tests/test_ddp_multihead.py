@@ -15,7 +15,10 @@ What is proven:
     stop at the update limit, leave both ranks with identical parameters;
   - U4 (KTD5): under the next-token warm-up of the curriculum both ranks apply the same
     weights on the same update, complete their updates, and leave every head bit-identical
-    to its initialisation until the transition starts.
+    to its initialisation until the transition starts;
+  - a run shorter than its checkpoint interval ends with ONE final checkpoint written by
+    rank 0 (no hang), which both ranks resume from; a SIGTERM to one rank stops both at
+    the same update with one checkpoint.
 
 All data is synthetic. Each launch picks a free port, is killed at a deadline instead of
 hanging, and never leaves a child process behind.
@@ -358,7 +361,74 @@ def scenario_ablation_runner(local: int, out_dir: Path) -> dict:
     return result
 
 
+FINAL_STEPS, RESUMED_STEPS = 4, 6     # 3 microbatches per rank per pass, accumulation 1
+
+
+def scenario_final_checkpoint(local: int, out_dir: Path) -> dict:
+    """4 updates with ckpt_every 1000: no periodic checkpoint, so the run's only
+    checkpoint is the final one (pass 1 done + 1 update of pass 2: ckpt_ep1_step4). Both
+    ranks then resume from it (`engine.latest_checkpoint`) and train to update 6."""
+    from src.train.engine import TrainConfig, latest_checkpoint, train
+    from src.train.pretrain import build_optimizer, build_scheduler
+
+    batches = [synthetic_batch(700 + i) for i in range(6)]
+    tcfg = tiny_tcfg(out_dir / "ckpt", ckpt_every=1000)
+    out = {}
+    for phase, total, resume in (("first", FINAL_STEPS, False),
+                                 ("resumed", RESUMED_STEPS, True)):
+        model = _wrap(build_model(tiny_mcfg(), seed=0 if phase == "first" else 5), local)
+        opt = build_optimizer(model, lr=1e-2, weight_decay=0.1, betas=(0.9, 0.95))
+        ckpt = latest_checkpoint(out_dir / "ckpt") if resume else None
+        _, manifest = train(model, microbatch_loader(batches, distributed=True), None, opt,
+                            build_scheduler(opt, total, 1),
+                            TrainConfig({}, tcfg, tiny_mcfg(), total), CPU,
+                            vocab_binding=BINDING, resume_ckpt=ckpt)
+        out[phase] = {"updates": manifest.ledger["optimizer_updates"], "state": _state(model),
+                      "resumed_from": None if ckpt is None else ckpt.name,
+                      "files": sorted(p.name for p in (out_dir / "ckpt").glob("*.pt"))}
+    return out
+
+
+class _SignalingMicrobatches(_Microbatches):
+    """Rank 1 sends itself SIGTERM while fetching microbatch `at` (once)."""
+
+    def __init__(self, batches, *, at: int):
+        super().__init__(batches)
+        self.at, self.sent = at, False
+
+    def __getitem__(self, index):
+        if index == self.at and not self.sent and int(os.environ["RANK"]) == 1:
+            import signal
+
+            self.sent = True
+            os.kill(os.getpid(), signal.SIGTERM)
+        return super().__getitem__(index)
+
+
+def scenario_clean_stop(local: int, out_dir: Path) -> dict:
+    """SIGTERM reaches rank 1 only, while it fetches its second microbatch (index 3): both
+    ranks agree at that update's boundary, rank 0 checkpoints update 2, both return."""
+    import signal
+
+    from src.train.engine import TrainConfig, train
+    from src.train.pretrain import build_optimizer, build_scheduler
+
+    before = signal.getsignal(signal.SIGTERM)
+    dataset = _SignalingMicrobatches([synthetic_batch(800 + i) for i in range(10)], at=3)
+    loader = DataLoader(dataset, batch_size=None,
+                        sampler=DistributedSampler(dataset, shuffle=False))
+    model = _wrap(build_model(tiny_mcfg()), local)
+    opt = build_optimizer(model, lr=1e-2, weight_decay=0.1, betas=(0.9, 0.95))
+    tcfg = tiny_tcfg(out_dir / "ckpt", ckpt_every=1000)
+    _, manifest = train(model, loader, None, opt, build_scheduler(opt, 100, 1),
+                        TrainConfig({}, tcfg, tiny_mcfg(), 100), CPU, vocab_binding=BINDING)
+    return {"updates": manifest.ledger["optimizer_updates"], "state": _state(model),
+            "handler_restored": signal.getsignal(signal.SIGTERM) is before}
+
+
 SCENARIOS = {
+    "final_checkpoint": scenario_final_checkpoint,
+    "clean_stop": scenario_clean_stop,
     "tte_weights_zero": scenario_tte_weights_zero,
     "rank_without_anchor": scenario_rank_without_anchor,
     "accumulation_gradient": scenario_accumulation_gradient,
@@ -577,6 +647,33 @@ class TwoRankTrainingTest(unittest.TestCase):
                 self.assertTrue(torch.equal(value, frozen[pname]), pname)
         self.assertFalse(torch.equal(r0["frozen"]["state"]["adapter.cr.fc.weight"],
                                      frozen["adapter.cr.fc.weight"]))
+
+    def test_short_run_ends_with_one_final_checkpoint_that_both_ranks_resume(self):
+        r0, r1 = self._launch("final_checkpoint")
+        self.assertEqual((r0["first"]["updates"], r1["first"]["updates"]),
+                         (FINAL_STEPS, FINAL_STEPS))
+        # Written once (by rank 0) although the run is shorter than ckpt_every.
+        self.assertEqual(r0["first"]["files"], ["ckpt_ep1_step4.pt"])
+        self.assertSameState(r0["first"]["state"], r1["first"]["state"], "final")
+        self.assertEqual((r0["resumed"]["resumed_from"], r1["resumed"]["resumed_from"]),
+                         ("ckpt_ep1_step4.pt", "ckpt_ep1_step4.pt"))
+        self.assertEqual((r0["resumed"]["updates"], r1["resumed"]["updates"]),
+                         (RESUMED_STEPS, RESUMED_STEPS))
+        self.assertSameState(r0["resumed"]["state"], r1["resumed"]["state"], "resumed")
+        # The step-4 checkpoint is mid-pass, so the resume replays pass 2 from its start
+        # (the engine's documented approximation): updates 5-6 do not finish it.
+        self.assertEqual(self.checkpoints, ["ckpt_ep1_step4.pt", "ckpt_ep1_step6.pt"])
+        self.assertEqual(self.checkpoint["step"], RESUMED_STEPS)
+        self.assertEqual(len(self.checkpoint["rng_states"]), 2)
+        self.assertSameState(self.checkpoint["model"], r0["resumed"]["state"], "checkpoint")
+
+    def test_sigterm_on_one_rank_stops_both_at_the_same_update(self):
+        r0, r1 = self._launch("clean_stop")
+        self.assertEqual((r0["updates"], r1["updates"]), (2, 2))
+        self.assertSameState(r0["state"], r1["state"], "clean stop")
+        self.assertEqual(self.checkpoints, ["ckpt_ep0_step2.pt"])
+        self.assertEqual(self.checkpoint["step"], 2)
+        self.assertTrue(r0["handler_restored"] and r1["handler_restored"])
 
     def test_ablation_runner_trains_every_representation(self):
         r0, r1 = self._launch("ablation_runner")

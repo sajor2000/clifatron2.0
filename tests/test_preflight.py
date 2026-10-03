@@ -209,19 +209,51 @@ class PreflightSyntheticTest(unittest.TestCase):
     def test_schedule_counts_updates_and_refuses_a_run_without_a_checkpoint(self):
         tcfg = {"batch": {"per_gpu": 4, "grad_accum": 1},
                 "runtime": {"token_budget": 0, "ckpt_every": 2},
-                "schedule": {"warmup_steps": 1, "total_steps": 99}}
+                "schedule": {"warmup_steps": 0, "total_steps": 99}}
         # 24 single-window stays: 6 global batches, 3 per rank per pass.
         batches, updates = pf.updates_per_budget([10] * 24, tcfg,
                                                  {"screening": 0.05, "full": 1.0})
         self.assertEqual((batches, updates), (3, {"screening": 1, "full": 3}))
+        # Absolute ckpt_every 2 > the 1-update screening run: the final checkpoint only.
+        check = pf.schedule_check(self.arm(), tcfg, {"screening": 0.05, "full": 1.0})
+        self.assertEqual(check.status, pf.WARN, check.detail)
+        self.assertIn("screening run(s) write no periodic checkpoint", check.detail)
+        # ... and with the final checkpoint off it would write none: refused.
+        tcfg["runtime"]["final_checkpoint"] = False
         check = pf.schedule_check(self.arm(), tcfg, {"screening": 0.05, "full": 1.0})
         self.assertEqual(check.status, pf.FAIL)
-        self.assertIn("screening run(s) would write NO checkpoint", check.detail)
+        self.assertIn("screening: runtime.ckpt_every 2 > the run's 1 updates", check.detail)
+        self.assertIn("no checkpoint would be written", check.detail)
+        del tcfg["runtime"]["final_checkpoint"]
         ok = pf.schedule_check(self.arm(), tcfg, {"screening": 1.0, "full": 2.0})
         self.assertEqual(ok.status, pf.PASS, ok.detail)
+        # Absolute warm-up as long as the run: refused (it never leaves warm-up).
         tcfg["schedule"]["warmup_steps"] = 10
-        self.assertEqual(pf.schedule_check(self.arm(), tcfg,
-                                           {"screening": 1.0, "full": 2.0}).status, pf.WARN)
+        refused = pf.schedule_check(self.arm(), tcfg, {"screening": 1.0, "full": 2.0})
+        self.assertEqual(refused.status, pf.FAIL)
+        self.assertIn("never leave the linear warm-up", refused.detail)
+
+    def test_schedule_scaled_with_the_run_passes_every_budget(self):
+        """warmup_frac + checkpoints_per_run (configs/train.yaml) fit every budget: each
+        run gets a warm-up shorter than itself and at least one periodic checkpoint."""
+        tcfg = {"batch": {"per_gpu": 1, "grad_accum": 1},
+                "runtime": {"token_budget": 0, "ckpt_every": None, "checkpoints_per_run": 5},
+                "schedule": {"warmup_steps": None, "warmup_frac": 0.05, "total_steps": 99}}
+        check = pf.schedule_check(self.arm(), tcfg, {"screening": 1.0, "full": 20.0})
+        self.assertEqual(check.status, pf.PASS, check.detail)
+        self.assertIn("warmup_frac", check.detail)
+        self.assertIn("periodic + final", check.detail)
+        # The shipped train config scales the same way.
+        import yaml
+
+        shipped = yaml.safe_load(pf.TRAIN_CONFIG_PATH.read_text())
+        self.assertIsNone(shipped["schedule"]["warmup_steps"])
+        self.assertIsNone(shipped["runtime"]["ckpt_every"])
+        shipped["batch"]["grad_accum"] = 1
+        shipped["batch"]["per_gpu"] = 1
+        shipped["runtime"]["token_budget"] = 0
+        check = pf.schedule_check(self.arm(), shipped, {"screening": 1.0, "full": 20.0})
+        self.assertEqual(check.status, pf.PASS, check.detail)
 
     # ---------------------------------------------------------------- thresholds
 

@@ -43,9 +43,11 @@ Checks, in order:
   above 90 %); the cache directory must be on a local filesystem (``fcntl`` locks and
   memory maps are not safe on NFS/SMB);
 - schedule: the optimizer updates each matrix budget gives (the launch's own sampler and
-  `engine.resolve_total_steps`) against ``runtime.ckpt_every`` (the engine checkpoints
-  only every ckpt_every updates: a shorter run leaves nothing to evaluate or resume) and
-  ``schedule.warmup_steps``;
+  `engine.resolve_total_steps`), and the warm-up and checkpoint interval
+  `engine.resolve_schedule` gives each run — the same rules the launcher applies: fails
+  when a run would never leave warm-up (an absolute ``warmup_steps`` that outgrows it) or
+  write no checkpoint at all; warns when it writes only the final checkpoint (an
+  absolute ``ckpt_every`` longer than the run) or gets no warm-up;
 - disk: free space for the cache still to be built and for checkpoints.
 
 ``--synthetic`` builds a synthetic site in a temporary directory and runs every non-GPU
@@ -867,10 +869,14 @@ def updates_per_budget(window_lengths: Sequence[int], tcfg: Mapping,
 
 def schedule_check(arm: ArmData, tcfg: Mapping, budgets: Mapping[str, float], *,
                    ranks: int = EXPECTED_GPUS) -> Check:
-    """Updates per matrix budget against `runtime.ckpt_every` (the engine checkpoints only
-    every ckpt_every updates, so a shorter run leaves no checkpoint to evaluate or resume)
-    and `schedule.warmup_steps` (a run no longer than its warm-up never reaches peak LR)."""
+    """Updates per matrix budget, then `engine.resolve_schedule` per budget (the rules
+    `run_tokenization_ablation` refuses a launch by): FAIL when a run's warm-up is as long
+    as the run or the run would write no checkpoint at all; WARN when it writes only the
+    final one (`runtime.ckpt_every` longer than the run: a crash loses everything) or has
+    no warm-up (a one-update run under `schedule.warmup_frac`)."""
     import polars as pl
+
+    from src.train.engine import ScheduleError, resolve_schedule
 
     lengths: list[int] = []
     for directory in arm.sites.values():
@@ -881,22 +887,37 @@ def schedule_check(arm: ArmData, tcfg: Mapping, budgets: Mapping[str, float], *,
     if not lengths:
         return Check(name, FAIL, "no train windows")
     batches, updates = updates_per_budget(lengths, tcfg, budgets, ranks=ranks)
-    ckpt_every = int(tcfg["runtime"].get("ckpt_every", 2000))
-    warmup = int(tcfg["schedule"].get("warmup_steps", 2000))
     accum = int(tcfg["batch"].get("grad_accum", 1))
+    parts, refused, no_warmup, final_only = [], [], [], []
+    for budget, n in updates.items():
+        try:
+            plan = resolve_schedule(dict(tcfg), n)
+        except ScheduleError as exc:
+            refused.append(f"{budget}: {exc}")
+            parts.append(f"{budget} {budgets[budget]:g} pass = {n:,} updates (REFUSED)")
+            continue
+        if plan.warmup_steps == 0 and plan.warmup_source == "warmup_frac":
+            no_warmup.append(budget)
+        if plan.periodic_checkpoints == 0:
+            final_only.append(budget)
+        parts.append(f"{budget} {budgets[budget]:g} pass = {n:,} updates, warm-up "
+                     f"{plan.warmup_steps} ({plan.warmup_source}), checkpoint every "
+                     f"{plan.ckpt_every} ({plan.periodic_checkpoints} periodic"
+                     + (" + final)" if plan.final_checkpoint else ", no final)"))
     detail = (f"{len(lengths):,} train windows -> {batches:,} batches per rank per pass "
               f"(per_gpu {tcfg['batch']['per_gpu']}, grad_accum {accum}, {ranks} ranks): "
-              + ", ".join(f"{b} {budgets[b]:g} pass = {n:,} updates"
-                          for b, n in updates.items())
-              + f"; ckpt_every {ckpt_every}, warmup_steps {warmup}")
-    short = [b for b, n in updates.items() if n < ckpt_every]
-    if short:
-        return Check(name, FAIL, detail + f": the {', '.join(short)} run(s) would write NO "
-                     "checkpoint (nothing for threshold_eval or a resume); lower "
-                     "runtime.ckpt_every or raise the budget before launch")
-    if any(n <= warmup for n in updates.values()):
-        return Check(name, WARN, detail + ": a run no longer than warmup_steps never "
-                     "leaves the linear warm-up")
+              + "; ".join(parts))
+    if refused:
+        return Check(name, FAIL, detail + ". Refused: " + " | ".join(refused))
+    if final_only:
+        return Check(name, WARN, detail + f": the {', '.join(final_only)} run(s) write no "
+                     "periodic checkpoint (runtime.ckpt_every is longer than the run), only "
+                     "the final one, so a crash before the end loses the whole run; set "
+                     "runtime.ckpt_every to null (runtime.checkpoints_per_run)")
+    if no_warmup:
+        return Check(name, WARN, detail + f": the {', '.join(no_warmup)} run(s) are too "
+                     "short for schedule.warmup_frac to give one warm-up update (one update "
+                     "at the peak LR); consider a smaller grad_accum")
     return Check(name, PASS, detail)
 
 

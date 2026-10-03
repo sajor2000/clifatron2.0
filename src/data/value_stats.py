@@ -27,7 +27,6 @@ from pathlib import Path
 import numpy as np
 
 from src.data.segments import json_sha256, segments_hash, vocab_segments
-from src.data.splits import fit_partition
 
 # 1.349 = IQR of a standard normal (Φ⁻¹(0.75) − Φ⁻¹(0.25)); makes robust scale
 # comparable to a standard deviation for well-behaved concepts.
@@ -70,13 +69,20 @@ def compute_value_stats(
             if not math.isfinite(v):
                 continue
             buckets.setdefault(int(tok), []).append(v)
+    return _stats_from_buckets(
+        {token: np.asarray(observed, dtype=np.float64) for token, observed in buckets.items()},
+        min_count=min_count, robust=robust)
 
+
+def _stats_from_buckets(buckets: dict[int, np.ndarray], *, min_count: int,
+                        robust: bool) -> dict[int, tuple[float, float]]:
+    """(center, scale) per token from its finite values, in observation order (the
+    estimators below are order-sensitive in the last bits: `np.mean` sums pairwise)."""
     stats: dict[int, tuple[float, float]] = {}
-    for token_id, observed in buckets.items():
-        arr = np.asarray(observed, dtype=np.float64)
+    for token_id, arr in buckets.items():
         # A token seen too few times for a stable robust estimate still gets stats
         # (coverage contract) — we just widen the fallback so its NLL isn't overconfident.
-        under_min = len(observed) < min_count
+        under_min = len(arr) < min_count
         if robust and not under_min:
             center = float(np.median(arr))
             q75, q25 = np.percentile(arr, [75, 25])
@@ -97,27 +103,74 @@ def compute_value_stats(
     return stats
 
 
+# Rows per streamed chunk of the events shard (each row is one stay / window).
+_STREAM_ROWS = 4096
+
+
 def compute_value_stats_from_events(
     events_path: str | Path,
     *,
     partition: str = "train",
     min_count: int = _MIN_COUNT,
     robust: bool = True,
+    chunk_rows: int = _STREAM_ROWS,
 ) -> dict[int, tuple[float, float]]:
     """Compute value stats from a reference-site tokenized `events.parquet`.
 
     Expects the tokenizer schema: parallel `token` (list[int]) and `value`
-    (list[float|null]) columns per stay (see `src/data/tokenize.py`)."""
-    import polars as pl
+    (list[float|null]) columns per stay (see `src/data/tokenize.py`).
 
-    df = pl.read_parquet(events_path)
+    Streams the shard (`pyarrow.parquet.ParquetFile.iter_batches`, file order) in chunks
+    of `chunk_rows` stays: only the finite (token, value) pairs are kept, as two flat
+    numpy columns, never Python lists of every event — the full MIMIC shard would
+    otherwise need ~20-25 GB. (Polars' streaming `collect_batches` buffered ~450 MB of
+    row groups on an 8.8M-event sample; the arrow batch reader stays near one chunk.)
+    The result is identical to `compute_value_stats` over the same rows (each token's
+    values keep their observation order)."""
+    import polars as pl
+    import pyarrow.parquet as pq
+
+    shard = pq.ParquetFile(events_path)
+    columns = shard.schema_arrow.names
     for col in ("token", "value"):
-        if col not in df.columns:
+        if col not in columns:
             raise ValueError(f"{events_path} missing required column {col!r}")
-    df = fit_partition(df, partition)
-    tokens = df["token"].to_list()
-    values = df["value"].to_list()
-    return compute_value_stats(tokens, values, min_count=min_count, robust=robust)
+    if "partition" not in columns:
+        raise ValueError("partition column is required before fitting artifacts")
+
+    # Per token, its finite values chunk by chunk, in file order (a stable sort within
+    # each chunk keeps the observation order): ~8 bytes per numeric event in total.
+    pieces: dict[int, list[np.ndarray]] = {}
+    rows = 0
+    for batch in shard.iter_batches(batch_size=chunk_rows,
+                                    columns=["token", "value", "partition"]):
+        chunk = (pl.from_arrow(batch).filter(pl.col("partition") == partition)
+                 .select("token", "value"))
+        rows += chunk.height
+        if not chunk.height:
+            continue
+        aligned = chunk.select(pl.col("token").list.len().fill_null(0)
+                               == pl.col("value").list.len().fill_null(0)).to_series()
+        if not aligned.all():
+            raise ValueError("token and value sequences must align within a stay")
+        flat = (chunk.explode(["token", "value"], empty_as_null=False)
+                .drop_nulls("value")
+                .filter(pl.col("value").cast(pl.Float64).is_finite()))
+        if not flat.height:
+            continue
+        tokens = flat["token"].cast(pl.Int64).to_numpy()
+        values = flat["value"].cast(pl.Float64).to_numpy()
+        order = np.argsort(tokens, kind="stable")
+        tokens, values = tokens[order], values[order]
+        starts = np.flatnonzero(np.r_[True, tokens[1:] != tokens[:-1]])
+        ends = np.r_[starts[1:], len(tokens)]
+        for token, a, b in zip(tokens[starts].tolist(), starts, ends):
+            pieces.setdefault(token, []).append(values[a:b].copy())
+    if not rows:
+        raise ValueError(f"artifact fit partition {partition!r} has zero rows")
+    buckets = {token: np.concatenate(parts) for token, parts in pieces.items()}
+    del pieces
+    return _stats_from_buckets(buckets, min_count=min_count, robust=robust)
 
 
 def vocab_hash(vocab: dict) -> str:

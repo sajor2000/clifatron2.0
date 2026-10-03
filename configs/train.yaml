@@ -7,7 +7,12 @@ optimizer:
   grad_clip: 1.0
 
 schedule:
-  warmup_steps: 2000
+  # Warm-up scales with the run (engine.resolve_schedule): floor(warmup_frac x updates).
+  # A fixed 2000 outlasted every matrix run (a pass of full MIMIC is ~180-300 updates at
+  # an effective batch of 256), so the LR never left linear warm-up. An absolute
+  # warmup_steps still wins when set; one >= the run's updates is refused.
+  warmup_steps: null
+  warmup_frac: 0.05
   total_steps: 60000
   # Run length in passes over the training data (U5). When set, it replaces total_steps:
   # updates = ceil(passes x ceil(batches per pass per rank / grad_accum)).
@@ -24,7 +29,12 @@ runtime:
   ddp: true
   num_workers: 0         # Avoid extra per-rank dataset copies on this shared node.
   log_every: 10          # Rank-0 optimizer updates between progress messages.
-  ckpt_every: 2000
+  # Checkpoint interval scales with the run: every max(1, updates // checkpoints_per_run)
+  # updates, plus a final checkpoint at the end (and on a clean SIGTERM/SIGINT stop). A
+  # fixed 2000 wrote NO checkpoint in a 0.05-pass screening or 1-pass full run. An
+  # absolute ckpt_every still wins when set; one longer than the run is refused.
+  ckpt_every: null
+  checkpoints_per_run: 5
   ckpt_dir: "checkpoints"
   # trunk saved separately from heads so probes/finetune reuse it
 

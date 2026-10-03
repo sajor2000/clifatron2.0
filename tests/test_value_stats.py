@@ -205,5 +205,96 @@ class ValueStatsTest(unittest.TestCase):
         self.assertIsInstance(tb, TargetBuilder)
 
 
+def _legacy_stats_from_events(path, *, partition="train", min_count=20, robust=True):
+    """The pre-streaming implementation (whole shard -> Python lists), the reference the
+    streamed result must match byte for byte."""
+    from src.data.splits import fit_partition
+
+    df = fit_partition(pl.read_parquet(path), partition)
+    return compute_value_stats(df["token"].to_list(), df["value"].to_list(),
+                               min_count=min_count, robust=robust)
+
+
+def _synthetic_shard(path, *, stays=3000, seed=11, row_group_size=257):
+    """A gem-shaped shard: varied magnitudes, rare (< min_count) and constant tokens,
+    categorical tokens, nulls, NaN / inf, empty stays, three partitions, many row groups
+    and chunks (sizes not multiples of each other)."""
+    rng = np.random.default_rng(seed)
+    centers = {t: 10.0 ** rng.uniform(-2, 5) for t in range(5, 60)}
+    tokens, values, parts = [], [], []
+    for i in range(stays):
+        n = int(rng.integers(0, 40))
+        toks = rng.integers(1, 64, size=n).tolist()
+        vals = []
+        for t in toks:
+            r = rng.random()
+            if t < 5 or r < 0.1:
+                vals.append(None)                       # categorical / missing
+            elif r < 0.12:
+                vals.append(float(rng.choice([np.nan, np.inf, -np.inf])))
+            elif t == 60:
+                vals.append(7.0)                        # constant token
+            elif t >= 61:
+                vals.append(float(rng.integers(0, 5)))  # spiky discrete (degenerate IQR)
+            else:
+                vals.append(float(rng.normal(centers[t], centers[t] / 3)))
+        tokens.append(toks)
+        values.append(vals)
+        parts.append(["train", "validation", "internal_test"][i % 7 % 3])
+    # A rare token seen only a few times in train.
+    tokens[0] = tokens[0] + [63, 63]
+    values[0] = values[0] + [1.5, 2.5]
+    pl.DataFrame({"hosp_id": [str(i) for i in range(stays)], "token": tokens,
+                  "value": values, "partition": parts},
+                 schema_overrides={"value": pl.List(pl.Float64)}).write_parquet(
+        path, row_group_size=row_group_size)
+    return path
+
+
+class StreamingValueStatsTest(unittest.TestCase):
+    """`compute_value_stats_from_events` streams the shard; its artifact is byte-identical
+    to the whole-shard implementation."""
+
+    def test_streamed_artifact_is_byte_identical_to_the_whole_shard_one(self):
+        with tempfile.TemporaryDirectory() as directory:
+            shard = _synthetic_shard(Path(directory) / "gem_events.parquet")
+            for robust in (True, False):
+                for chunk_rows in (1, 97, 4096):
+                    with self.subTest(robust=robust, chunk_rows=chunk_rows):
+                        streamed = compute_value_stats_from_events(
+                            shard, robust=robust, chunk_rows=chunk_rows)
+                        legacy = _legacy_stats_from_events(shard, robust=robust)
+                        self.assertEqual(streamed, legacy)
+                        a = write_value_stats(streamed, Path(directory) / "a.json",
+                                              vocab_sha="v", segments_sha="s",
+                                              fit_partition_name="train", robust=robust)
+                        b = write_value_stats(legacy, Path(directory) / "b.json",
+                                              vocab_sha="v", segments_sha="s",
+                                              fit_partition_name="train", robust=robust)
+                        self.assertEqual(a.read_bytes(), b.read_bytes())
+            stats = compute_value_stats_from_events(shard)
+            self.assertIn(63, stats)          # rare token still covered
+            self.assertNotIn(1, stats)        # categorical only: nothing to normalize
+            self.assertEqual(stats[60][0], 7.0)
+
+    def test_streaming_refuses_what_the_whole_shard_path_refused(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "events.parquet"
+            pl.DataFrame({"token": [[1, 2]], "value": [[1.0]],
+                          "partition": ["train"]}).write_parquet(path)
+            with self.assertRaisesRegex(ValueError, "must align within a stay"):
+                compute_value_stats_from_events(path)
+            pl.DataFrame({"token": [[1]], "value": [[1.0]],
+                          "partition": ["validation"]}).write_parquet(path)
+            with self.assertRaisesRegex(ValueError, "has zero rows"):
+                compute_value_stats_from_events(path)
+            pl.DataFrame({"token": [[1]], "value": [[1.0]]}).write_parquet(path)
+            with self.assertRaisesRegex(ValueError, "partition column is required"):
+                compute_value_stats_from_events(path)
+            pl.DataFrame({"token": [[1]], "partition": ["train"]}).write_parquet(path)
+            with self.assertRaisesRegex(ValueError, "missing required column 'value'"):
+                compute_value_stats_from_events(path)
+
+
 if __name__ == "__main__":
     unittest.main()
