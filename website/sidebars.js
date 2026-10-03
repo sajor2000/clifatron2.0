@@ -5,6 +5,8 @@
 const sidebars = {
   workflowSidebar: [
     'overview',
+    'paper-claims',
+    'extubation-application',
     'v1-vs-v2',
     'data-tokenization',
     'architecture',

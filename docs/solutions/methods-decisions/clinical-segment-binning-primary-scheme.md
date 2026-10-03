@@ -16,12 +16,12 @@ fingerprint: methods_decision::tokenize::physician-clinical-segment-binning-prim
 CLIFATRON 2.0's tokenizer had been configured to use **population deciles** (10 data-driven
 quantile bins per concept) as the default binning scheme, based on Lee (arXiv:2604.16775)
 showing deciles ≈ clinical-reference-range anchoring at matched granularity. The original
-CLIFATRON v1 used **physician-designed clinical segments** from a 1268-row CSV
+CLIFATRON v1 used **physician-designed clinical segments** from a CSV of 1267 segment rows plus a header
 (`critical_illness_tokenization_final_with_intervals.csv`) — tighter bins in decision zones,
 progressively wider intervals above/below normal, extreme-value quintiles at tails.
 
 The code had been changed to deciles as default with clinical segments relegated to an
-"ablation arm." This was a mistake: the clinical team's 1268 segments encode measurement-
+"ablation arm." This was a mistake: the clinical team's 1267 segments encode measurement-
 density domain expertise that data-driven deciles cannot recover. For example, lactate has 15
 physician-designed CSV segments (16 bins once the forced 4.0 edge is added, vs 10 deciles), with 5
 extreme-value quintiles above 5.4 mmol/L that capture the physiologically dangerous tail the model

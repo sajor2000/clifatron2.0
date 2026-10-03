@@ -72,6 +72,9 @@ distance-to-observed were flat-to-worse from 3k → 6k steps (the model gets mor
 not more locally faithful). That is evidence **for** the plan's sequencing: pure NTP for
 the marginal distribution, then **G4 prefix conditioning + G5 RL** for anchoring — more
 NTP alone will not make rollouts locally faithful.
+*(2026-10-03: reward-based post-training (G5) is dropped under the three-claim plan, and the
+base run now trains the combined time-to-event objective on the full-hospitalization stream;
+see [Objectives & Training](./objectives-training.md).)*
 :::
 
 ## The token-sequence viewer
@@ -97,5 +100,5 @@ operable records, both themes, desktop and mobile).
 | Item | Status |
 |---|---|
 | **L40 G2 base run** | User decision — exact commands, gates, and gotchas frozen in `docs/plans/l40-g2-runbook.md` (reboot-first for the driver mismatch, full restage, `torchrun` with `configs/train.yaml` + `configs/model.gem-ntp.yaml`, MPS guards off on CUDA) |
-| **G4 prefix conditioning → G5 RL** | The anchoring levers, on the L40 base (per the key finding above) |
+| **G4 prefix conditioning → G5 RL** | Superseded 2026-10-03: no reward-based post-training. The L40 sequence is now the L40 runbook (`docs/plans/l40-runbook.md`) |
 | **Local checkpoint prune** | User decision (local artifacts are git-ignored) |

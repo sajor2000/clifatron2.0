@@ -63,10 +63,11 @@ and every update the same parameters receive a gradient and DDP can run without
 Supervision comes from the stay's own future, not from a separate 24-hour cohort table. The
 labeller is `TargetBuilder(mode="gem_tte")`, built by `pretrain.in_stream_target_builder`.
 
-:::note[Loader still on the 24-hour path]
-`pretrain.build_loaders` still feeds the 24-hour representation and its joined outcome labels
-(kept as a regression path). Wiring the full-hospitalization loader to the in-stream labeller is
-the next training-path unit; the losses below already read both.
+:::note[Two training paths]
+`pretrain.py --trajectory hospitalization` trains on the full-hospitalization stream with these
+in-stream labels ([the loader](#the-full-hospitalization-loader)). The default,
+`--trajectory icu_24h`, keeps the 24-hour representation and its joined outcome labels as a
+regression path. The losses read both.
 :::
 
 - **Anchors along the whole stay.** Each context window of a stay gets up to
@@ -89,6 +90,68 @@ the next training-path unit; the losses below already read both.
   bin it fell in; a censored or event-free interval earns survival credit only for **fully**
   observed bins, never for the partial bin it ended in. The CLIFATRON adapter
   (`src/model/head_adapter.py`) uses the same contract.
+
+---
+
+## The full-hospitalization loader
+
+`pretrain.build_loaders(..., representation="gem")` is the training path for the claims. It
+is selected with `--trajectory hospitalization`.
+
+```mermaid
+flowchart LR
+    S1["Site A<br/>gem_events.parquet"] --> C["Columnar corpus<br/>(memory-mapped cache<br/>beside each shard)"]
+    S2["Site B<br/>gem_events.parquet"] --> C
+    V["ONE frozen vocab.json<br/>+ value stats"] --> TB["TargetBuilder gem_tte<br/>whole-stay labels"]
+    C --> TB
+    TB --> SM["Token-budget batches<br/>formed globally,<br/>dealt to ranks"]
+    SM --> R0["rank 0"]
+    SM --> R1["rank 1"]
+
+    classDef d fill:#e3f2fd,stroke:#1565c0,color:#0d1b2a;
+    classDef t fill:#e8f5e9,stroke:#2e7d32,color:#0d1b2a;
+    class S1,S2,V,C d;
+    class TB,SM,R0,R1 t;
+```
+
+- **Several sites, one vocabulary.** Pass one `--site` per `--data` directory. Every site's
+  `vocab.json` must carry the same binding as the training vocabulary (the first directory's,
+  or `--vocab`), and a verification-sample vocabulary is refused outside `--dry-run`. Stays are
+  keyed `<site>:<hosp_id>`. Sites are read side by side on the node that trains; nothing is
+  pooled on disk.
+- **Whole stays.** A window's labels read events from later windows, so every window of every
+  stay is loaded and each stay is assembled before labelling.
+- **Columnar, shared cache.** Windows are stored as flat arrays with window and stay offsets
+  (`dataset.GemCorpus`). With the cache on, a columnar copy of each shard partition is built
+  once under a lock in `gem_cache/` beside the shard, keyed by the shard's sha256 and the
+  vocabulary hash, and memory-mapped by every rank. The ranks on one node share one copy in the
+  page cache. A rewritten shard or a new vocabulary gets a new cache directory.
+- **Token-budget batches across ranks.** `DistributedTokenBudgetBatchSampler` forms batches
+  globally, length-grouped with batch × longest window ≤ `runtime.token_budget` and at most
+  `batch.per_gpu` rows, shuffled per seed and epoch. Every rank computes the same list without
+  communicating. When the count does not divide by the number of ranks, the first batches are
+  repeated so every rank yields the same number of batches per pass. The engine needs that to
+  find the epoch's last, synchronized microbatch.
+- **Run length in passes.** `--passes` (or `schedule.passes`) replaces `schedule.total_steps`:
+  updates = ⌈passes × ⌈batches per pass per rank ÷ `grad_accum`⌉⌉. Every arm trained for the same
+  passes sees the same data and the same number of updates.
+- **Measured, recorded.** The embedding size is the frozen vocabulary's largest id + 1
+  (`trunk.target_vocab` is only a cap). Each checkpoint manifest records the measured parameter
+  count (trunk, heads, total), the sites, the trajectory, the trunk config, and the loader's
+  resident-memory increase and bytes per event.
+- **Value stats.** Real training on numeric values refuses to start without `--value-stats`.
+  Fit them on the reference site's `gem_events.parquet` train stays: the 24-hour stats lack
+  tokens seen only outside the ICU window, and target building refuses such a token.
+
+```bash
+torchrun --nproc_per_node=2 -m src.train.pretrain --trajectory hospitalization \
+  --data output/intermediate_phi/mimic output/intermediate_phi/rush --site mimic rush \
+  --value-stats output/intermediate_phi/mimic/gem_value_stats.json --passes 1
+```
+
+Rush data are not staged on the L40 node yet, so today the path runs on MIMIC alone. The exact
+L40 sequence, from raw CLIF tables to the screening runs, is in the L40 runbook
+(`docs/plans/l40-runbook.md`).
 
 ---
 
@@ -197,7 +260,7 @@ the sparse heads is a question for the objective arms, not a hidden re-weighting
 
 ```mermaid
 flowchart TB
-    SHARDS["v2 event shards<br/>(src/data/tokenize.py)"] --> SCRATCH["From-scratch pretrain (PRIMARY)<br/>random-init Qwen2-arch ~30M<br/>+ heads · NTP→TTE curriculum<br/>src/train/pretrain.py"]
+    SHARDS["v2 shards: gem_events (primary)<br/>· events (24 h regression path)<br/>(src/data/tokenize.py)"] --> SCRATCH["From-scratch pretrain (PRIMARY)<br/>random-init Qwen2-arch ~30M<br/>+ heads · NTP→TTE curriculum<br/>src/train/pretrain.py"]
     SHARDS --> TOK["Tokenization ablation<br/>same objective, input varies<br/>src/train/run_tokenization_ablation.py"]
     CKPT["Released CLIFATRON checkpoint<br/>(Qwen2 0.5B, larger comparator)"] --> MODE{run_arm.py arm}
 
@@ -217,7 +280,8 @@ The from-scratch model is the primary federation candidate and carries the claim
 adapter is the larger comparator. The two use different token streams
 ([details](./data-tokenization.md#8--two-token-streams-from-scratch-vs-the-wedge)).
 
-**Systems:** 2× L40 (48GB, no NVLink), bf16, DDP via `torchrun`, per-patient sequence packing.
+**Systems:** 2× L40 (48GB, no NVLink), bf16, DDP via `torchrun`, token-budget batches of whole
+windows, padded to the longest window in the batch.
 FSDP is *not* used (only pays off past ~2.3B params and is worse without NVLink).
 `src/train/pretrain.py` drives the from-scratch path and `src/train/run_arm.py` the
 finetune-vs-scratch ablation arms (including the CLIFATRON adapter); both launch through

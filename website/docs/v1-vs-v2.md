@@ -21,14 +21,14 @@ tokenizer spec is **[Data & Tokenization](./data-tokenization.md)**.
 | **Outcome at inference** | Roll out tokens, then map to a label | Query any (concept, threshold, direction) — answer in one forward pass | Zero-shot: a new hospital asks any clinical question with no retraining |
 | **Backbone** | Qwen2-0.5B (fixed) | **Qwen2-arch ~30M from scratch** (primary) OR attach to CLIFATRON's Qwen2-0.5B (wedge, a larger comparator) | Our own ~30M is the compact headline; the Qwen2-0.5B attach is the cheap first result and half of the finetune-vs-scratch ablation |
 | **Architecture** | Qwen2 (RoPE, GQA, RMSNorm) | Qwen2-arch from scratch: standard pre-norm, RMSNorm, SwiGLU, time-aware RoPE, plain multi-head attention (no GQA), **no QK-Norm**. Qwen3-arch (QK-Norm) is a measured ablation row only | "Qwen2 vs Qwen3" becomes a quantified finding, not an assertion |
-| **Vocabulary / Binning** | Physician-designed clinical segments from the CLIF consortium CSV (1268 segment rows), intervals `(a, b]` | **Same physician-designed CSV KEPT from v1** as the primary scheme, with the CSV's interval flags honored (`(a, b]` stays `(a, b]`) under a published precedence policy, and **every numeric concept binned**: CSV segments where the CSV defines the concept, else one bin per value for ordinal scales (GCS, RASS, Braden), else frozen quantile bins; every dose has a zero bin. Additions: soft discretization (Gaussian weight to adjacent bins), forced clinical-threshold edges with outcome-direction closure (lactate 2/4, MAP 65, SpO₂ 88/90, creatinine 1.5/2/3), and a frozen, hash-verified vocab ([bin assignment rule](./data-tokenization.md#bin-assignment-rule)). Population deciles retained as the `decile_ablation` arm only | The clinical-expert bin design is preserved — it encodes measurement-density domain expertise that data-driven deciles cannot recover. v2 adds soft smoothing and forced edges but does not replace the consortium's bin design |
+| **Vocabulary / Binning** | Physician-designed clinical segments from the CLIF consortium CSV (1267 segment rows), intervals `(a, b]` | **Same physician-designed CSV KEPT from v1** as the primary scheme, with the CSV's interval flags honored (`(a, b]` stays `(a, b]`) under a published precedence policy, and **every numeric concept binned**: CSV segments where the CSV defines the concept, else one bin per value for ordinal scales (GCS, RASS, Braden), else frozen quantile bins; every dose has a zero bin. Additions: soft discretization (Gaussian weight to adjacent bins), forced clinical-threshold edges with outcome-direction closure (lactate 2/4, MAP 65, SpO₂ 88/90, creatinine 1.5/2/3), and a frozen, hash-verified vocab ([bin assignment rule](./data-tokenization.md#bin-assignment-rule)). Population deciles retained as the `decile_ablation` arm only | The clinical-expert bin design is preserved — it encodes measurement-density domain expertise that data-driven deciles cannot recover. v2 adds soft smoothing and forced edges but does not replace the consortium's bin design |
 | **Tokenization** | v1 `tokenETL`: one token per event, with the interval in the string (`labs_lactate_(2.0,2.2]`) via `bin_numeric_values_with_intervals_by_category` | Our own single-file `src/data/tokenize.py` (v1 `tokenETL` is vendored but not executed): one token per event as `concept=bin` (`lactate=6`), plus soft discretization (Gaussian spread to ±1 neighbor bin) and ICU-admission-relative minute RoPE (replacing inserted `day_N`/`hour_N` time tokens) | **Different vocabularies, not interchangeable**: a v2 shard cannot feed the v1 checkpoint, or vice versa ([two token streams](./data-tokenization.md#8--two-token-streams-from-scratch-vs-the-wedge)). What is shared is the bin-design CSV and the one-token-per-event idea |
 | **Event coverage** | Labs, vitals, med **doses** (weight-normalized dose bins), ventilator **settings** (FiO₂, PEEP, tidal volume, …), assessments (GCS, RASS), therapies, demographics, comorbidities | Labs, vitals, continuous and intermittent med **doses** (weight-normalized via an availability-safe weight join, zero bin for stops), the 17 ventilator **settings** plus device / mode, assessments (GCS, RASS, Braden, CAM, SBT), CRRT and ECMO/MCS settings, code status, proning, ADT location, and static admission tokens (age decile, sex, race, ethnicity, admission type). Comorbidities and SOFA not yet emitted | v2 now sees *how much* norepinephrine runs, not only *that* it runs ([source tables](./data-tokenization.md#1--source-tables-and-roles)) |
 | **Time encoding** | Inserted `day_N` / `hour_N` time tokens | ICU-admission-relative **RoPE** (minutes since ICU admission) | −11% sequence length; matches or beats time tokens on 71/74 tasks; transfers across hospitals |
 | **Embeddings** | Tied (input = output weight) | **Untied** (separate input + output) | +4–7% AUPRC, gap **widens under federation** |
 | **Training objective** | Next-token prediction (NTP) only | **Marked time-to-event** — competing-risk CIF + threshold hazard + value regression + low-weight NTP | The objective, not the backbone, drives EHR performance (ORA: Transformer +10.7%, Mamba +11.4%) |
 | **Curriculum** | None — one objective from step 1 | NTP → TTE (15% warmup, 5% transition) | Stabilizes embeddings before asking survival questions |
-| **Loss balancing** | None | Uncertainty weighting (learned per-task 1/2σ²) + grad-norm | Prevents dense mortality signal from starving sparse threshold outcomes |
+| **Loss balancing** | None | Fixed weights (uncertainty weighting was planned, never implemented, and removed 2026-10-03) | Whether a dense signal starves the sparse heads is tested by the objective arms, not hidden in a learned re-weighting |
 | **Zero-shot survival** | Not supported — needs local labels | **Training-free** threshold (ICareFM) + competing-risk (SurvivEHR) heads | A consortium hospital runs the frozen model with no local training or manual annotation. Scoring it still uses labels the site auto-derives locally from its CLIF fields |
 | **Evaluation** | AUROC / AUPRC on 4 benchmark tasks | **TRIPOD+AI panel**: AUROC, AUPRC, ECE, Brier, calibration slope+intercept, ICI, net benefit (decision-curve analysis), temperature scaling, LPE, subgroup fairness | Journals and regulators demand calibration, net benefit, and fairness — not just discrimination |
 | **Competing risks** | Not modeled — death is just "not discharged" | Explicit competing-risk CIF (SurvivEHR discrete-time) | Death is a competing event for discharge, not censoring — treating it as censoring overestimates discharge probability |
@@ -85,7 +85,7 @@ tighter intervals around the 2.0 decision threshold and five extreme-value bins 
 
 **v2 binning — primary scheme and the ablation that tests it.** The primary scheme (revised
 2026-09-02) is physician-designed clinical segments
-(`configs/data.yaml → value_binning.scheme: clinical_segment`), built from the CSV of 1268
+(`configs/data.yaml → value_binning.scheme: clinical_segment`), built from the CSV of 1267
 physician-designed segment rows (`critical_illness_tokenization_final_with_intervals.csv`). Since
 tokenizer v2 (2026-10-02) every numeric concept is binned; the 10 target concepts carry 186
 numeric tokens. Population **deciles** are the `decile_ablation` arm over the same concept set:
@@ -165,16 +165,16 @@ A v2 validation requires the `clif-validate` package and two runs (a draft, then
 > **v1 paper (2025):** "CLIFATRON: a CLIF-native ICU foundation model (Qwen2-0.5B) using next-token
 > prediction on structured EHR data. We demonstrate competitive AUROC on 4 benchmark tasks."
 
-> **v2 paper (2026):** "CLIFATRON 2.0 replaces next-token prediction with a threshold-conditioned
-> time-to-event objective, enabling zero-shot multi-outcome survival queries from a single
-> ~30M-parameter model. Validated across 3 development and N external CLIF-consortium hospitals
-> via model-to-data federation with full TRIPOD+AI calibration, decision-curve, and fairness
-> reporting."
+> **v2, Paper 1 (2026):** three claims about one from-scratch ~30M CLIF-native model, each with
+> a pre-specified test that can fail: threshold-aligned tokenization, the combined time-to-event
+> objective against next-token training at equal compute, and an extubation application checked
+> against randomized trials. **Paper 2:** an extubation-failure risk model validated externally at
+> UChicago by model-to-data.
 
-v2 does not claim a better backbone, a bigger model, or a novel loss function. It claims an
-**integration** — the first CLIF-native model that answers a clinician's question directly,
-without local training labels, and validates across real hospitals without sharing data. That is the
-difference between a research artifact and a deployable clinical tool.
+v2 does not claim a better backbone, a bigger model, or a new method: every objective component
+is published. It claims the pairing of those components, three controlled tests, and an open,
+CLIF-native execution. Everything is evaluated retrospectively; a clinician-facing tool is not
+part of this work. See [Paper 1 — the three claims](./paper-claims.md).
 
 ---
 

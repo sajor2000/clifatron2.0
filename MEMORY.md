@@ -87,7 +87,8 @@ Five-thread deep research + 2 focused 2026-preprint threads (tokenization a76bb9
   New eval to add: competing-risk D-calibration / Aalen-Johansen K-cal (arXiv:2602.00194).
 - **Objectives:** primary = threshold-hazard (ICareFM) + competing-risk CIF (SurvivEHR);
   **ENABLED value-regression** (ORA "mark", arXiv:2602.00541, +33-38% on physiology tasks);
-  next-event demoted to low-weight (0.2) auxiliary. Uncertainty+gradnorm loss balancing; NTP→TTE curriculum.
+  next-event demoted to low-weight (0.2) auxiliary. ~~Uncertainty+gradnorm loss balancing~~ *(superseded
+  2026-10-03: never implemented and removed; loss balancing is fixed weights only)*; NTP→TTE curriculum.
 - **Multimodal (v2):** BioClinical ModernBERT-base frozen; inject per-note embeddings as
   timestamped event tokens (pre-anchor only). Oversized note gain = leakage flag.
 - **Eval:** CLIF→MEDS ETL (exists, consortium) → MEDS-Tab XGBoost baseline (mandatory) + MEDS-DEV;

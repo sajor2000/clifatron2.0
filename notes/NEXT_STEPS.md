@@ -112,6 +112,9 @@ AUPRC bump. If you grow the vocab, revisit this.
   competing-risk subnetworks** (TraCeR/SurvivEHR).
 - `next_event` demoted to low-weight (0.2) auxiliary.
 - Loss balancing: uncertainty (Kendall 1/2σ²) + grad-norm. Curriculum: NTP → TTE.
+  *(Superseded 2026-10-03: uncertainty weighting and grad-norm were never implemented and the
+  option has been removed; loss balancing is fixed weights only, and the curriculum runs per optimizer
+  update. See `website/docs/objectives-training.md`.)*
 - **New required eval:** competing-risk **D-calibration / Aalen-Johansen K-cal** (deep CR models are
   badly miscalibrated by default).
 
@@ -187,6 +190,10 @@ Do these roughly in order. Each is scoped to be a single clean commit. **Commit 
 - Runs on ANY released checkpoint TODAY (frozen-probe mode needs no retraining).
 
 ### Step 3 — Phase-2: joint-pretrain our heads on the CLIFATRON backbone
+*(Superseded 2026-10-03: the joint-pretraining entry point, `src/train/joint_pretrain.py`, never had a
+data loader and has been removed. The joint fine-tune is the `joint_finetune` arm of `src/train/run_arm.py`,
+and the CLIFATRON checkpoint is now a larger frozen comparator only; the three claims are tested on the
+from-scratch model.)*
 - Use `head_adapter.CLIFATRONHeads.loss` (weights `w_ntp=0.2, w_cr=1.0, w_th=1.0, w_val=0.5`) with the
   NTP→TTE curriculum. This produces **zero-shot** threshold/CR predictions — the mechanism that makes
   external federation validation work (a new site needs no local labels).

@@ -20,13 +20,13 @@ const config = {
   organizationName: 'sajor2000',
   projectName: 'clifatron2.0',
 
-  onBrokenLinks: 'warn',
+  onBrokenLinks: 'throw',
 
   // Mermaid diagram support
   markdown: {
     mermaid: true,
     hooks: {
-      onBrokenMarkdownLinks: 'warn',
+      onBrokenMarkdownLinks: 'throw',
     },
   },
   themes: ['@docusaurus/theme-mermaid'],

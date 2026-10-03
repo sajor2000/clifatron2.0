@@ -121,6 +121,10 @@ tokenizer+backbone fixed: **marked-TTE > TTE > next-token-prediction**. "Marked"
 normalization to the primary task's gradient, so the dense mortality signal doesn't starve
 sparse auxiliaries ("signal-balance problem," arXiv:2607.22264). Robust fallback: just sum
 the TTE loss over many randomly-sampled τ per step (MOTOR/ORA default).
+*(Superseded 2026-10-03: uncertainty weighting and grad-norm were never implemented and have been
+removed. The objective is a fixed-weight sum with many sampled τ per anchor, the fallback above;
+whether a dense signal starves the sparse heads is tested by the objective arms in
+`configs/objective_arms.yaml`.)*
 
 **Curriculum:** warm up on NTP to stabilize token embeddings, then phase in TTE/threshold/
 value heads. (Reasoned default; no paper ablates the exact schedule.)
@@ -236,7 +240,8 @@ pre-anchor only.
 
 **Heads / objectives:** threshold-hazard (ICareFM, primary) + competing-risk CIF (SurvivEHR)
 + **value regression (ORA mark, NEW-enabled)** + low-weight next-event. Uncertainty +
-grad-norm loss weighting; NTP→TTE curriculum; random τ/horizons.
+grad-norm loss weighting *(superseded 2026-10-03: never implemented, removed; fixed weights)*;
+NTP→TTE curriculum; random τ/horizons.
 
 **Training:** 2× L40 (48GB, no NVLink), DDP via torchrun, bf16. MacBook (MPS, fp32, no
 compile/DDP) for dev/overfit-one-batch/finetune only. Do not rent GPUs — PhysioNet

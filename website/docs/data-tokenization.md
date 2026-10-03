@@ -484,6 +484,26 @@ The target builder (`src/data/targets.py`) consumes the shards:
 - **GEM mode.** `TargetBuilder(mode="gem")` builds next-event targets over the whole
   hospitalization (including the terminal `DISCHARGE//*` token) and no TTE labels; the 24 h mode
   keeps its post-anchor feature check.
+- **In-stream mode (`gem_tte`).** `gem` plus time-to-event labels computed from the stay's own
+  future. Anchors are sampled along the stay, deterministically per (run seed, epoch, stay), and
+  each (anchor, threshold query) gets exactly one state: `prevalent`, `positive`,
+  `competing_event`, `censored`, `not_ascertainable` or `negative`, at the exact threshold value.
+  A horizon with no measurement of the queried concept is `not_ascertainable`, never a negative.
+  This is the mode the full-hospitalization training path uses; the label rule is in
+  [Objectives & Training → in-stream targets](./objectives-training.md#in-stream-targets) and
+  the registered thresholds in `configs/thresholds.yaml`.
+
+| Mode | Stream | Next-event targets | Time-to-event labels |
+|------|--------|--------------------|----------------------|
+| `icu_24h` | `events.parquet` | up to the 24 h anchor | joined outcome labels at the anchor |
+| `gem` | `gem_events.parquet` | whole stay | none |
+| `gem_tte` | `gem_events.parquet` | whole stay | in-stream, at sampled anchors |
+
+:::warning[Value stats for the full-hospitalization path]
+Fit value stats on the reference site's `gem_events.parquet` train stays, not on the 24 h
+`events.parquet`. The 24 h stats lack tokens seen only outside the ICU window (ED, ward,
+post-ICU), and target building refuses a token with no stats.
+:::
 
 ```mermaid
 flowchart TB
@@ -574,6 +594,15 @@ mortality is the `expired` count over terminated rollouts, with a Wilson confide
 the censored count reported separately. The generative evaluation reports terminal-type confusion,
 the nontermination (censoring) rate, and mortality discrimination and calibration against the
 observed disposition. Time-to-terminal is **not** estimated yet (see residuals).
+
+**Training on it.** `python -m src.train.pretrain --trajectory hospitalization` reads one or
+more sites' `gem_events.parquet` under **one** frozen vocabulary and labels anchors in-stream
+(`gem_tte`). Sites are read side by side and never pooled on disk; a stay key is
+`<site>:<hosp_id>`, so the same raw id at two sites stays two stays. Every window of a stay is
+kept, because a window's labels read events from later windows. The windows are stored
+columnar and memory-mapped from a cache beside each shard (`gem_cache/`), so the ranks on one
+node share one copy. Details:
+[Objectives & Training → the full-hospitalization loader](./objectives-training.md#the-full-hospitalization-loader).
 
 ---
 
@@ -757,6 +786,10 @@ uv run python -m src.data.tokenize --site site2 --in "$SITE2_DIR" \
 # 4. Value-head stats from the reference site's train partition
 uv run python -m src.data.value_stats \
   --events output/intermediate_phi/mimic/events.parquet --out value_stats.json
+#    For the full-hospitalization training path, refit on the GEM shard's train stays
+uv run python -m src.data.value_stats \
+  --events output/intermediate_phi/mimic/gem_events.parquet \
+  --out output/intermediate_phi/mimic/gem_value_stats.json
 
 # Verification sample (smoke-only vocabulary), then the gate and the training smoke
 uv run python -m src.data.tokenize --site mimic --in "$SITE1_DIR" \
