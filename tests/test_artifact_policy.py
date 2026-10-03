@@ -132,6 +132,34 @@ class ArtifactPolicyTest(unittest.TestCase):
                 self.assertEqual(len(episodes["split_sha256"].item()), 64)
                 self.assertIn("clif_hospitalization", manifest["source_provenance"])
                 self.assertIn("source_provenance_json", episodes.columns)
+                # Item 46: strata without the option, or the option without strata, refuse.
+                strata = Path("output/intermediate_phi/extubation_cohort.parquet")
+                pl.DataFrame({"patient_id": ["patient-1"], "eligible": [True],
+                              "arm_first_device": ["niv"]}).write_parquet(strata)
+                with self.assertRaisesRegex(ValueError, "not enabled"):
+                    build_cohort_artifact(
+                        data, "output/intermediate_phi/episodes.parquet",
+                        cohort_config=cohort_config, train_config=train_config,
+                        artifact_policy=ROOT / "configs/artifact_policy.yaml",
+                        held_out_strata=strata)
+                enabled = base / "train_enabled.yaml"
+                enabled.write_text(
+                    "data_contract:\n  split_seed: 7\n  partitions:\n    train: 0.5\n    validation: 0.5\n"
+                    "  required_partitions: [validation]\n  held_out_stratification:\n    enabled: true\n"
+                    "    arm_column: arm_first_device\n    arms: [niv, hfnc]\n    held_out_share: 0.99\n"
+                    "    held_out_partitions: [validation]\n")
+                with self.assertRaisesRegex(ValueError, "strata source"):
+                    build_cohort_artifact(
+                        data, "output/intermediate_phi/episodes.parquet",
+                        cohort_config=cohort_config, train_config=enabled,
+                        artifact_policy=ROOT / "configs/artifact_policy.yaml")
+                stratified, manifest = build_cohort_artifact(
+                    data, "output/intermediate_phi/episodes.parquet",
+                    cohort_config=cohort_config, train_config=enabled,
+                    artifact_policy=ROOT / "configs/artifact_policy.yaml", held_out_strata=strata)
+                self.assertEqual(stratified["partition"].item(), "validation")
+                self.assertEqual(manifest["held_out_stratification"]["achieved"],
+                                 {"niv": {"patients": 1, "held_out_share": 1.0}})
                 with self.assertRaisesRegex(ValueError, "output/intermediate_phi"):
                     build_cohort_artifact(
                         data,

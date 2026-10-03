@@ -325,6 +325,14 @@ def _device_choice(frame: pl.DataFrame, registry: bm.Registry, config: est.Nuisa
     return out
 
 
+def _rounded(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return {k: _rounded(v) for k, v in value.items()}
+    if isinstance(value, float):
+        return round(value, 4)
+    return value
+
+
 def _finite(value: float) -> float | None:
     value = float(value)
     return round(value, 4) if math.isfinite(value) else None
@@ -486,11 +494,73 @@ def harmful_side_rule(ratio: Mapping[str, float] | None, audit_config: Mapping[s
     return {**rule, "status": "evaluated", "fired": bool(lower > threshold), "observed": round(float(lower), 4)}
 
 
-def negative_control_rule(audit_config: Mapping[str, Any]) -> dict[str, Any]:
+NCO_MIN, NCO_MAX = 5, 15
+
+
+def negative_control_outcomes(audit_config: Mapping[str, Any]) -> dict[str, dict[str, Any]]:
+    """The registered negative-control outcomes (item 45): 5 to 15 entries, each with a
+    definition, a one-line rationale (shared confounding by severity, no causal path from
+    the post-extubation device) and a status. Refuses a malformed register."""
+    entries = audit_config.get("negative_control_outcomes")
+    if not isinstance(entries, Mapping) or not NCO_MIN <= len(entries) <= NCO_MAX:
+        raise ValueError(f"negative_control_outcomes must register {NCO_MIN} to {NCO_MAX} outcomes")
+    out = {}
+    for name, entry in entries.items():
+        for key in ("definition", "rationale", "status"):
+            if not isinstance(entry, Mapping) or not isinstance(entry.get(key), str) or not entry[key].strip():
+                raise ValueError(f"negative_control_outcomes.{name} needs a `{key}`")
+        if entry["status"] not in bm.STATUSES:
+            raise ValueError(f"negative_control_outcomes.{name}: status must be one of {bm.STATUSES}")
+        out[str(name)] = dict(entry)
+    return out
+
+
+def negative_control_failed(interval: Mapping[str, float]) -> bool:
+    """A negative control FAILS when its risk-ratio interval excludes no effect (1)."""
+    lower, upper = float(interval["lower"]), float(interval["upper"])
+    if not (math.isfinite(lower) and math.isfinite(upper)) or lower > upper:
+        raise ValueError("a negative-control interval needs finite lower <= upper")
+    return bool(lower > 1.0 or upper < 1.0)
+
+
+def negative_control_rule(audit_config: Mapping[str, Any],
+                          results: Mapping[str, Mapping[str, float]] | None = None) -> dict[str, Any]:
+    """R32 (3), item 45: fires when more than `max_failed` registered negative-control
+    outcomes have a risk-ratio interval (device contrast) that excludes 1. `results` maps
+    a registered outcome name to its interval ({"lower", "upper"}); None before
+    registration, when the comparisons may not run (KTD9)."""
     threshold, status = _parameter(audit_config, "stop_rules", "negative_controls", "max_failed")
-    return {"status": "not_evaluated", "fired": False, "threshold": threshold, "threshold_status": status,
-            "reason": "negative-control comparisons by arm need the registered protocol (KTD9); "
-                      "they are pre-registered in the protocol draft and run after registration"}
+    registered = negative_control_outcomes(audit_config)
+    rule = {"threshold": threshold, "threshold_status": status,
+            "requirement": f"registered negative-control outcomes ({len(registered)}) whose risk-ratio "
+                           "interval excludes 1"}
+    if results is None:
+        return {**rule, "status": "not_evaluated", "fired": False,
+                "reason": "negative-control comparisons by arm need the registered protocol (KTD9); "
+                          "they are pre-registered in the audit thresholds file and run after registration"}
+    unknown = sorted(set(results) - set(registered))
+    if unknown:
+        raise ValueError(f"negative-control results for unregistered outcome(s) {unknown}")
+    if not results:
+        return {**rule, "status": "not_evaluable", "fired": False, "reason": "no negative-control result"}
+    failed = sorted(name for name, interval in results.items() if negative_control_failed(interval))
+    reason = (f"{len(results)} of {len(registered)} evaluated; failed: {', '.join(failed)}" if failed
+              else f"{len(results)} of {len(registered)} evaluated; none failed")
+    return {**rule, "status": "evaluated", "fired": bool(len(failed) > threshold),
+            "observed": len(failed), "reason": reason}
+
+
+def positive_control_check(rate: float | None, audit_config: Mapping[str, Any]) -> dict[str, Any]:
+    """Item 45: the pipeline must detect a planted true effect at least `min_detection_rate`
+    of the time. A planted-effect statistic; no outcome is read by arm."""
+    spec = audit_config.get("positive_control") or {}
+    floor, status = _parameter(audit_config, "positive_control", "min_detection_rate")
+    planted = spec.get("planted_risk_ratio", {}).get("value")
+    if rate is None:
+        return {"status": "not_evaluable", "detected": None, "min_detection_rate": floor,
+                "planted_risk_ratio": planted, "threshold_status": status}
+    return {"status": "evaluated", "detection_rate": round(float(rate), 4), "min_detection_rate": floor,
+            "passed": bool(rate >= floor), "planted_risk_ratio": planted, "threshold_status": status}
 
 
 def adoption_era_trigger(cells: Mapping[str, dict], table: str, site: str, audit_config: Mapping[str, Any],
@@ -723,8 +793,17 @@ def run_simulate(args: argparse.Namespace) -> dict[str, Any]:
                 book.results[f"{site}|simulation|{trial_id}"] = {
                     **fields, "status": schema.RUNTIME_FAILURE, "reason": str(exc)}
                 continue
+            planted_rr, _ = _parameter(audit_config, "positive_control", "planted_risk_ratio")
+            positive = sim.positive_control_detection(
+                covariates.X[keep], covariates.arm[keep], registry, trial_id, baseline=baseline,
+                planted_rr=float(planted_rr), n_reps=args.n_reps, n_sim=args.n_sim, config=config,
+                seed=args.seed)
+            checks = {"positive_control": positive_control_check(positive.detection_rate, audit_config),
+                      "margin": _rounded(trial.margin.as_dict()),
+                      "second_hurdle": registry.second_hurdle.value}
             book.result(
                 f"{site}|simulation|{trial_id}", **fields, pass_rates=report.summary(), n_reps=args.n_reps,
+                checks=checks,
                 n_sim=report.n_sim, baseline_risk=round(baseline, 4),
                 baseline_risk_source=TRIAL_PUBLISHED if args.baseline_risk is None else SUPPLIED,
                 n_completed={f"{e}|{'confounded' if c else 'measured'}": r.n_completed
@@ -796,19 +875,15 @@ def run_unblinded(args: argparse.Namespace) -> dict[str, Any]:
         else:
             diagnostics = {k: v for k, v in aggregate["diagnostics"].items() if k != "n_followers"}
             estimate = result.trial_estimate()
-            reproduced = bm.single_trial_agreement(
-                trial, estimate, agreement_margin_ratio=registry.agreement_margin_ratio.value,
-                equivalence_margin_ratio=registry.equivalence_margin_ratio.value)
+            verdict = bm.trial_agreement(trial, estimate, second_hurdle=registry.uses_second_hurdle)
             book.result(f"{site}|effect|{trial_id}", **fields, estimates=aggregate["estimates"],
                         diagnostics=diagnostics, primary=aggregate["primary"], event=aggregate["event"],
                         horizon_hours=aggregate["horizon_hours"],
                         discharge_alive_rule=aggregate["discharge_alive_rule"],
                         authorization_basis=aggregate["authorization_basis"],
                         unresolved_handling=aggregate["unresolved_handling"],
-                        agreement={"agrees_with_trial": bool(reproduced), "finding": trial.finding,
-                                   "benchmark_risk_ratio": round(trial.effect.estimate, 4),
-                                   "equivalence_margin_ratio": registry.equivalence_margin_ratio.value,
-                                   "agreement_margin_ratio": registry.agreement_margin_ratio.value},
+                        agreement={**_rounded(verdict.as_dict()),
+                                   "benchmark_risk_ratio": round(trial.effect.estimate, 4)},
                         margins_status=aggregate["margins_status"], notes=aggregate["notes"])
             ratio = aggregate["estimates"][aggregate["primary"]]["risk_ratio"]
         if name != POOLED and trial_id == registry.audit_trial:

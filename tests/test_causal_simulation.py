@@ -58,9 +58,7 @@ def test_planted_zero_effect_false_pass_rate_matches_the_simulation_count(regist
     # Each recorded pass is the rule applied to that replicate's estimate.
     trial = registry.trials["hernandez_2022_very_high_risk"]
     for estimate, passed in zip(zero.estimates, zero.passes, strict=True):
-        assert passed == bm.single_trial_agreement(
-            trial, estimate, agreement_margin_ratio=registry.agreement_margin_ratio.value,
-            equivalence_margin_ratio=registry.equivalence_margin_ratio.value)
+        assert passed == bm.single_trial_agreement(trial, estimate, second_hurdle=registry.uses_second_hurdle)
     # Deterministic for a fixed seed.
     again = report(registry, frozen_cohort, "hernandez_2022_very_high_risk",
                    effects=("zero",), confounded=(False,))
@@ -156,3 +154,33 @@ def test_failed_replicates_are_counted_and_left_out_of_the_pass_rate(registry, f
     assert (zero.n_completed, zero.n_failed, zero.n_pass) == (6, 3, 6)
     assert zero.pass_rate == 1.0                     # 6 of 6 completed, not 6 of 9
     assert len(zero.passes) == len(zero.estimates) == 6
+
+
+def test_second_hurdle_cuts_the_reversed_effect_pass_rate_of_a_null_trial(registry, frozen_cohort):
+    """Casey (a null benchmark, RR about 1.2) passed most replicates under a REVERSED planted
+    effect with the old rule (interval inside a 1.5 equivalence margin, no hurdle). With the
+    Roehmel-Kieser second hurdle the reversed effect lands on the wrong side of 1 and fails."""
+    from dataclasses import replace
+
+    result = report(registry, frozen_cohort, "casey_2021_all_comers", effects=("reversed",),
+                    confounded=(False,), n_reps=12, n_sim=3000)
+    reversed_ = result.scenarios[("reversed", False)]
+    trial = registry.trials["casey_2021_all_comers"]
+    without = sum(bm.single_trial_agreement(trial, e, second_hurdle=False) for e in reversed_.estimates)
+    assert reversed_.n_pass < without
+    assert reversed_.pass_rate <= 0.25
+    assert replace(registry.second_hurdle).value == "direction_consistent"
+
+
+def test_positive_control_detects_a_planted_true_effect(registry, frozen_cohort):
+    X, arm = frozen_cohort
+    result = sim.positive_control_detection(X, arm, registry, "hernandez_2022_very_high_risk",
+                                            baseline=0.25, planted_rr=0.5, n_reps=8, n_sim=3000,
+                                            config=CONFIG, seed=1)
+    assert result.n_completed == 8
+    assert result.detection_rate >= 0.8
+    assert result.mean_log_estimate == pytest.approx(math.log(0.5), abs=0.2)
+    # A planted null is not a positive control.
+    with pytest.raises(ValueError):
+        sim.positive_control_detection(X, arm, registry, "hernandez_2022_very_high_risk",
+                                       baseline=0.25, planted_rr=1.0, n_reps=2, config=CONFIG)

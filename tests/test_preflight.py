@@ -140,7 +140,21 @@ class PreflightSyntheticTest(unittest.TestCase):
         self.assertEqual(set(summary), {"file", "file_sha256", "split_sha256",
                                         "episode_sha256", "eligible_episodes",
                                         "observed_shares", "configured_proportions",
-                                        "split_seed"})
+                                        "split_seed", "held_out_stratification"})
+        self.assertEqual(summary["held_out_stratification"]["enabled"], False)
+        self.assertEqual(summary["held_out_stratification"]["held_out_share"], 0.5)
+
+    def test_a_changed_held_out_stratification_after_the_freeze_is_refused(self):
+        import yaml
+
+        path = self.freeze("strata_changed")
+        config = yaml.safe_load(pf.TRAIN_CONFIG_PATH.read_text())
+        config["data_contract"]["held_out_stratification"]["held_out_share"] = 0.6
+        changed = self.work / "train_strata.yaml"
+        changed.write_text(yaml.safe_dump(config))
+        check = pf.check_split_freeze(path, self.episodes, train_config=changed)
+        self.assertEqual(check.status, pf.FAIL)
+        self.assertIn("held_out_stratification changed", check.detail)
 
     def test_shard_partitions_must_equal_the_episode_artifact(self):
         shard = self.site["shard_dir"] / pf.GEM_EVENTS
@@ -273,8 +287,25 @@ class PreflightSyntheticTest(unittest.TestCase):
         self.assertIn("'decile_like'", edge.detail)
         self.assertNotIn("'clean'", edge.detail)
         self.assertEqual(checks["thresholds: registry"].status, pf.PASS)
-        self.assertEqual(checks["thresholds: competing-risk causes"].status, pf.WARN)
+        # Product authority, 2026-10-03: every competing-risk cause is confirmed.
+        self.assertEqual(checks["thresholds: competing-risk causes"].status, pf.PASS)
         self.assertEqual(pf.threshold_checks({"clean": blob})[1].status, pf.PASS)
+
+    def test_a_proposed_competing_risk_cause_warns_and_a_rule_cause_is_named(self):
+        import yaml
+
+        blob = json.loads((self.site["shard_dir"] / "vocab.json").read_text())
+        raw = yaml.safe_load((pf.THRESHOLDS_PATH).read_text())
+        for entry in raw["competing_risk_cause"]:
+            if entry["concept"] in ("creatinine", "temp_c"):
+                entry["status"] = "proposed"
+        path = self.work / "thresholds_proposed.yaml"
+        path.write_text(yaml.safe_dump(raw))
+        checks = {c.name: c for c in pf.threshold_checks({"clean": blob}, thresholds_path=path)}
+        cause = checks["thresholds: competing-risk causes"]
+        self.assertEqual(cause.status, pf.WARN)
+        self.assertIn("creatinine kdigo_aki", cause.detail)
+        self.assertIn("temp_c 39.166", cause.detail)
 
     # ---------------------------------------------------------------- GPU / end to end
 

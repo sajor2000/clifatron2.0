@@ -88,11 +88,121 @@ def test_benchmark_risk_ratio_is_computed_from_the_published_arm_counts(registry
 
 def test_margins_and_thresholds_are_proposed_not_final(registry, raw):
     assert registry.status == "proposed"
-    for parameter in (registry.agreement_margin_ratio, registry.equivalence_margin_ratio,
-                      registry.pooling, registry.discharge_alive_rule, registry.max_unresolved_share):
+    for parameter in (registry.preserved_fraction, registry.mortality_cap_ratio,
+                      registry.equivalence_margin_ratio, registry.second_hurdle, registry.pooling,
+                      registry.discharge_alive_rule, registry.hospice_rule, registry.max_unresolved_share):
         assert parameter.status == "proposed"
     assert raw["feasibility_screen"]["status"] == "proposed"
-    assert registry.agreement_margin_ratio.value > 1.0
+    assert registry.margins_status() == "proposed"
+    for trial in registry.trials.values():
+        assert trial.margin.status == "proposed" and trial.margin.ratio > 1.0
+
+
+# ---------------------------------------------------------------------------
+# margins (item 42), second hurdle (Roehmel-Kieser), CLIF device categories
+# ---------------------------------------------------------------------------
+
+def test_effect_trial_margin_preserves_half_of_the_conservative_benchmark_effect(registry):
+    """FDA fixed margin: M1 = |log| of the interval bound nearest 1; margin = 0.5 * M1, on
+    the relative scale, with the absolute (risk difference) form beside it."""
+    trial = registry.trials["hernandez_2016_low_risk"]
+    m1 = abs(math.log(trial.effect.upper))                 # benefit: the upper bound is nearest 1
+    assert trial.margin.kind == "fda_fixed_margin"
+    assert trial.margin.m1_log == pytest.approx(m1)
+    assert trial.margin.log == pytest.approx(0.5 * m1)
+    assert trial.margin.ratio == pytest.approx(math.exp(0.5 * m1))
+    rt, rc = 13 / 264, 32 / 263
+    se = math.sqrt(rt * (1 - rt) / 264 + rc * (1 - rc) / 263)
+    assert trial.margin.m1_absolute == pytest.approx(abs(rt - rc) - 1.959964 * se, rel=1e-5)
+    assert trial.margin.absolute == pytest.approx(0.5 * trial.margin.m1_absolute)
+    assert not trial.margin.capped
+    # Every derived effect margin is tighter than the retired common 1.5.
+    for t in registry.trials.values():
+        if t.finding == "effect":
+            assert 1.0 < t.margin.ratio < 1.5, t.trial_id
+
+
+def test_null_trial_keeps_the_equivalence_margin_on_both_scales(registry):
+    trial = registry.trials["casey_2021_all_comers"]
+    assert trial.margin.kind == "equivalence" and trial.margin.m1_log is None
+    assert trial.margin.ratio == pytest.approx(registry.equivalence_margin_ratio.value)
+    assert trial.margin.absolute == pytest.approx(trial.effect.risk_control * (trial.margin.ratio - 1))
+
+
+def test_a_mortality_type_endpoint_caps_the_relative_margin(raw):
+    capped = copy.deepcopy(raw)
+    capped["trials"]["casey_2021_all_comers"]["outcome"]["event"] = "reintubation_or_death"
+    trial = bm.validate_registry(capped).trials["casey_2021_all_comers"]
+    assert trial.margin.capped and trial.margin.ratio == pytest.approx(1.2)
+    for value in (1.05, 1.3):
+        out_of_range = copy.deepcopy(raw)
+        out_of_range["agreement"]["margin_derivation"]["mortality_composite_cap_ratio"]["value"] = value
+        with pytest.raises(bm.RegistryError, match="1.1"):
+            bm.validate_registry(out_of_range)
+
+
+def test_second_hurdle_refuses_a_reversed_point_estimate_inside_the_margin(registry):
+    """Casey (null; benchmark RR about 1.2): a narrow reversed estimate (RR 0.9) sits inside
+    the equivalence margin, so it passed before; the second hurdle now refuses it."""
+    trial = registry.trials["casey_2021_all_comers"]
+    reversed_ = estimate(0.9, 0.05)
+    verdict = bm.trial_agreement(trial, reversed_)
+    assert verdict.interval_rule is True and verdict.direction_consistent is False
+    assert verdict.reproduced is False
+    assert bm.trial_agreement(trial, reversed_, second_hurdle=False).reproduced is True
+    assert bm.single_trial_agreement(trial, estimate(1.1, 0.05)) is True
+    # Effect trial: a gap inside the margin on the wrong side of 1 cannot pass either.
+    low = registry.trials["hernandez_2016_low_risk"]
+    assert bm.direction_consistent(low, estimate(low.effect.estimate, 0.1))
+    assert not bm.direction_consistent(low, estimate(1.05, 0.1))
+
+
+def test_a_pooled_pass_needs_every_effect_trial_on_the_benchmarks_side(raw):
+    from dataclasses import replace
+
+    def widened(second_hurdle: str) -> bm.Registry:
+        changed = copy.deepcopy(raw)
+        changed["agreement"]["second_hurdle"]["value"] = second_hurdle
+        registry = bm.validate_registry(changed)
+        for trial_id, trial in list(registry.trials.items()):    # very wide margins
+            registry.trials[trial_id] = replace(trial, margin=replace(trial.margin, log=5.0,
+                                                                      ratio=math.exp(5.0)))
+        return registry
+
+    registry = widened("direction_consistent")
+    screens = {t: feasible(registry, t) for t in registry.trials}
+    ids = [t for t, trial in registry.trials.items() if trial.finding == "effect" and screens[t].evaluable]
+    estimates = {t: estimate(registry.trials[t].effect.estimate, 0.1) for t in registry.trials
+                 if screens[t].evaluable}
+    flipped = ids[0]
+    estimates[flipped] = estimate(1.1, 0.1)          # benchmark shows benefit; this shows harm
+    result = bm.score_agreement(registry, {"classical": estimates}, screens).estimators["classical"]
+    assert result.pooled_statistic <= 1.0
+    assert result.direction_consistent[flipped] is False
+    assert result.passes is False
+    off = widened("none")
+    assert bm.score_agreement(off, {"classical": estimates}, screens).estimators["classical"].passes
+
+
+def test_arm_groupings_are_permissible_clif_2_1_device_categories(raw):
+    import csv
+
+    snapshot = next(p for p in (ROOT / "configs/clif_mcide_2.1.1", ROOT / "output/final_no_phi/clif_spec_v2.1.1")
+                    if (p / "mCIDE/respiratory_support").is_dir())
+    with open(snapshot / "mCIDE/respiratory_support/clif_respiratory_support_device_categories.csv",
+              encoding="utf-8") as fh:
+        permissible = {row["device_category"] for row in csv.DictReader(fh) if row["device_category"]}
+    grouping = raw["arm_device_categories"]
+    assert set(grouping) == set(raw["cohort"]["arms"])
+    for arm, categories in grouping.items():
+        assert set(categories) <= permissible, (arm, set(categories) - permissible)
+    extubation = yaml.safe_load((ROOT / "configs/extubation.yaml").read_text())
+    assert {k: sorted(v) for k, v in grouping.items()} == \
+        {k: sorted(v) for k, v in extubation["arms"]["device_categories"].items()}
+    broken = copy.deepcopy(raw)
+    broken["arm_device_categories"].pop("niv")
+    with pytest.raises(bm.RegistryError, match="arm_device_categories"):
+        bm.validate_registry(broken)
 
 
 def test_every_trial_states_representability_expected_bias_and_verification(registry):
@@ -155,8 +265,12 @@ def test_malformed_values_are_rejected(raw):
         lambda r: r["trials"]["high_wean_2019"]["eligibility"].update(rules=[{"kind": "sometimes"}]),
         lambda r: r["trials"]["high_wean_2019"]["eligibility"].update(
             rules=[{"kind": "any_true", "set": "no_such_set"}]),
-        lambda r: r["agreement"]["agreement_margin_ratio"].update(value=0.9),
-        lambda r: r["agreement"]["agreement_margin_ratio"].update(status="final"),
+        lambda r: r["agreement"].update(agreement_margin_ratio={"value": 1.5, "status": "proposed"}),
+        lambda r: r["agreement"]["margin_derivation"]["preserved_fraction"].update(value=1.0),
+        lambda r: r["agreement"]["margin_derivation"]["preserved_fraction"].update(status="final"),
+        lambda r: r["agreement"]["margin_derivation"].update(method="synthesis"),
+        lambda r: r["agreement"]["second_hurdle"].update(value="sometimes"),
+        lambda r: r["estimand"]["hospice_rule"].update(value="ignore"),
         lambda r: r["agreement"]["pooling"].update(value="vote_count"),
         lambda r: r["estimand"]["discharge_alive_rule"].update(value="ignore"),
         lambda r: r["adjustment"].update(covariates=["age_at_admission", "rescue_support"]),
@@ -233,15 +347,27 @@ def test_gap_inside_the_margin_passes_and_outside_fails(registry):
             if screens[t.trial_id].evaluable}}
         return bm.score_agreement(registry, estimates, screens).estimators["classical"]
 
-    inside = score(1.2)
-    assert inside.pooled_abs_gap == pytest.approx(math.log(1.2))
-    assert inside.margin_log == pytest.approx(math.log(registry.agreement_margin_ratio.value))
+    # Per-trial margins: a gap of half its own margin passes, twice its margin fails.
+    def scaled(fraction: float) -> bm.EstimatorAgreement:
+        estimates = {"classical": {
+            t.trial_id: estimate(t.effect.estimate * math.exp(fraction * t.margin.log), 0.1)
+            for t in registry.trials.values() if screens[t.trial_id].evaluable}}
+        return bm.score_agreement(registry, estimates, screens).estimators["classical"]
+
+    inside = scaled(0.5)
+    assert inside.pooled_statistic == pytest.approx(0.5)
+    assert inside.threshold == 1.0
+    assert inside.margins_log == {t.trial_id: t.margin.log for t in registry.trials.values()
+                                  if screens[t.trial_id].evaluable}
     assert inside.passes is True
     assert {g.trial_id for g in inside.effect_gaps} == {t.trial_id for t in evaluable}
-    outside = score(1.8)
-    assert outside.pooled_abs_gap == pytest.approx(math.log(1.8))
+    outside = scaled(2.0)
+    assert outside.pooled_statistic == pytest.approx(2.0)
     assert outside.passes is False
     assert inside.margin_status == "proposed"
+    # The retired common margin of 1.5 would have passed a 1.2-fold gap; per-trial
+    # margins (all below 1.5) do not.
+    assert score(1.2).passes is False
 
 
 def test_gaps_of_opposite_sign_do_not_cancel_under_the_absolute_pooling(registry):

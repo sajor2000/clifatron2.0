@@ -10,10 +10,26 @@ Three things live here:
    that fails is "not evaluable" and is left out of every estimator's results.
 3. The agreement rule (R10, R27): the gap between an emulation's estimate and the
    benchmark effect on the log risk-ratio scale, pooled per estimator over the evaluable
-   trials that found an effect and judged against a registered margin; null trials are
-   scored separately and count as reproduced only when the estimate's whole interval
+   trials that found an effect and judged against each trial's own margin; null trials
+   are scored separately and count as reproduced only when the estimate's whole interval
    lies inside the equivalence margin; and the paired difference in absolute gap between
    two estimators on identical patients, with a paired bootstrap interval.
+
+Margins (product authority, 2026-10-03, item 42; docs/decisions/2026-10-03-clinical-
+decisions.md). Each trial that found an effect gets its own margin by the FDA fixed-margin
+approach: M1 is the interval bound of the benchmark effect nearest no effect, and the
+margin keeps `preserved_fraction` (0.5) of it, so an emulation may lose at most half of
+the trial's conservatively estimated effect. It is stated on the relative scale (log risk
+ratio, the scale the rule decides on) and on the absolute scale (risk difference, Wald
+bound), and for a mortality-type event (`mortality_type_events`) the relative margin is
+capped at `mortality_composite_cap_ratio` (1.1-1.2). A null trial has no effect to
+preserve, so it keeps the registered equivalence margin (capped the same way).
+
+Second hurdle (Roehmel & Kieser 2013, doi:10.1002/sim.5563). A trial counts as reproduced
+only when, besides the interval rule, the emulation's point estimate is on the same side
+of no effect as the benchmark's (`direction_consistent`): a reversed effect cannot pass by
+landing inside a wide margin. The pooled verdict also requires every scored effect trial
+to clear it.
 
 Reading the result: an estimator that passes agrees with the pattern the trials
 established, to within the margin. That is not proof that its estimates are causal.
@@ -42,7 +58,16 @@ FINDINGS = ("effect", "null")
 REPRESENTABILITY = ("representable", "proxied", "not_representable")
 RULE_KINDS = ("all_true", "any_true", "none_true", "count_at_least", "count_at_most")
 EVENTS = ("reintubation_or_death", "reintubation", "death")
-DISCHARGE_ALIVE_RULES = ("censor", "event_free")
+# `competing` (item 39 sensitivity): a discharge alive before the horizon is a competing
+# event (cumulative incidence), not event-free and not censored.
+DISCHARGE_ALIVE_RULES = ("censor", "event_free", "competing")
+# Item 41: hospice discharge then death competes with the endpoint (primary) or joins it
+# (composite sensitivity).
+HOSPICE_RULES = ("competing", "composite")
+SECOND_HURDLES = ("direction_consistent", "none")
+MARGIN_METHODS = ("fda_fixed_margin",)
+# Item 42: the cap on the relative margin of a mortality-type endpoint must lie here.
+MORTALITY_CAP_RANGE = (1.1, 1.2)
 STATUSES = ("proposed", "registered")
 POOLINGS = ("mean_absolute_gap", "inverse_variance_signed")
 PUBLISHED_MEASURES = ("absolute_risk_difference", "odds_ratio", "risk_ratio")
@@ -97,6 +122,36 @@ class BenchmarkEffect:
 
 
 @dataclass(frozen=True)
+class TrialMargin:
+    """One trial's agreement margin on the relative and the absolute scale.
+
+    kind            `fda_fixed_margin` (effect trials) or `equivalence` (null trials)
+    ratio           relative margin as a ratio of risk ratios (> 1); `log` is its log
+    absolute        the same margin as a risk difference
+    m1_log          effect trials: |log| of the benchmark interval bound nearest 1
+    m1_absolute     effect trials: |risk difference| bound nearest 0 (Wald)
+    capped          the mortality-type cap bound the relative margin
+    """
+
+    kind: str
+    ratio: float
+    log: float
+    absolute: float
+    m1_log: float | None
+    m1_absolute: float | None
+    preserved_fraction: float | None
+    capped: bool
+    status: str
+    derivation: str
+
+    def as_dict(self) -> dict[str, Any]:
+        return {"kind": self.kind, "ratio": self.ratio, "absolute": self.absolute,
+                "m1_log": self.m1_log, "m1_absolute": self.m1_absolute,
+                "preserved_fraction": self.preserved_fraction, "capped": self.capped,
+                "status": self.status, "derivation": self.derivation}
+
+
+@dataclass(frozen=True)
 class EligibilityRule:
     """One rule over boolean cohort columns; a NULL column value counts as absent."""
 
@@ -127,6 +182,7 @@ class Trial:
     expected_bias_sign: int           # +1: confounding pushes the risk ratio up; -1: down
     unverified: tuple[str, ...]       # fields that could not be confirmed against the source
     overrides: dict[str, Any] = field(default_factory=dict)
+    margin: TrialMargin | None = None
 
     def columns(self) -> set[str]:
         used = {self.base_column, self.assignment_column}
@@ -153,13 +209,18 @@ class Registry:
     study_primary_window_hours: float
     discharge_alive_rule: Parameter
     discharge_alive_rule_sensitivity: tuple[str, ...]
+    hospice_rule: Parameter
+    hospice_rule_sensitivity: tuple[str, ...]
     max_unresolved_share: Parameter
     missing_risk_factor: Parameter
     covariates: tuple[str, ...]
     forbidden_covariates: tuple[str, ...]
     alpha: float
-    agreement_margin_ratio: Parameter
+    preserved_fraction: Parameter
+    mortality_cap_ratio: Parameter
+    mortality_type_events: tuple[str, ...]
     equivalence_margin_ratio: Parameter
+    second_hurdle: Parameter
     pooling: Parameter
     screen: dict[str, Any]
 
@@ -175,9 +236,15 @@ class Registry:
         return self.sites.get(site, "confirmatory")
 
     def margins_status(self) -> str:
-        """`registered` only when every margin and the pooling rule are registered."""
-        parts = (self.agreement_margin_ratio, self.equivalence_margin_ratio, self.pooling)
+        """`registered` only when every margin parameter, the second hurdle and the
+        pooling rule are registered."""
+        parts = (self.preserved_fraction, self.mortality_cap_ratio, self.equivalence_margin_ratio,
+                 self.second_hurdle, self.pooling)
         return "registered" if all(p.status == "registered" for p in parts) else "proposed"
+
+    @property
+    def uses_second_hurdle(self) -> bool:
+        return self.second_hurdle.value == "direction_consistent"
 
 
 # ---------------------------------------------------------------------------
@@ -212,6 +279,63 @@ def relative_effect_from_counts(
         upper=math.exp(log_ratio + z * se), log_estimate=log_ratio, se_log=se,
         risk_treated=risk_t, risk_control=risk_c, derivation="published_arm_counts",
     )
+
+
+def derive_margin(
+    effect: BenchmarkEffect,
+    *,
+    finding: str,
+    event: str,
+    n_treated: int,
+    n_control: int,
+    alpha: float,
+    preserved_fraction: float,
+    equivalence_ratio: float,
+    cap_ratio: float,
+    mortality_type_events: Sequence[str],
+    status: str,
+) -> TrialMargin:
+    """A trial's agreement margin (module docstring, "Margins").
+
+    Effect trial: M1 = |log| of the Katz interval bound nearest 1; the relative margin
+    is exp((1 - preserved_fraction) * M1). On the absolute scale M1 is the Wald interval
+    bound of the risk difference nearest 0 (0 if that interval crosses 0) and the margin
+    is (1 - preserved_fraction) * M1. Null trial: the registered equivalence ratio; its
+    absolute form is control risk * (ratio - 1). A mortality-type event caps the relative
+    margin at `cap_ratio` (the absolute margin is scaled down with it).
+    """
+    if not 0.0 < preserved_fraction < 1.0:
+        raise ValueError("preserved_fraction must lie strictly between 0 and 1")
+    mortality = event in mortality_type_events
+    if finding == "effect":
+        m1_log = min(abs(math.log(effect.lower)), abs(math.log(effect.upper)))
+        rd = effect.risk_treated - effect.risk_control
+        se_rd = math.sqrt(effect.risk_treated * (1.0 - effect.risk_treated) / n_treated
+                          + effect.risk_control * (1.0 - effect.risk_control) / n_control)
+        m1_abs = max(0.0, abs(rd) - _z(alpha) * se_rd)
+        keep = 1.0 - preserved_fraction
+        log_margin, absolute = keep * m1_log, keep * m1_abs
+        derivation = (f"FDA fixed margin: M1 = |log {('upper' if effect.upper < 1 else 'lower')} "
+                      f"bound| = {m1_log:.4f}; margin keeps {preserved_fraction:g} of M1")
+        kind = "fda_fixed_margin"
+    else:
+        m1_log = m1_abs = None
+        log_margin = math.log(equivalence_ratio)
+        absolute = effect.risk_control * (equivalence_ratio - 1.0)
+        derivation = ("null benchmark: no effect to preserve, so the FDA fixed-margin approach "
+                      "does not apply; registered equivalence margin")
+        kind = "equivalence"
+    capped = False
+    if mortality and log_margin > math.log(cap_ratio):
+        absolute *= math.log(cap_ratio) / log_margin
+        log_margin, capped = math.log(cap_ratio), True
+        derivation += f"; capped at {cap_ratio:g} (mortality-type endpoint)"
+    if not log_margin > 0.0:
+        raise RegistryError("a derived margin must be above no effect")
+    return TrialMargin(kind=kind, ratio=math.exp(log_margin), log=log_margin, absolute=absolute,
+                       m1_log=m1_log, m1_absolute=m1_abs,
+                       preserved_fraction=preserved_fraction if finding == "effect" else None,
+                       capped=capped, status=status, derivation=derivation)
 
 
 # ---------------------------------------------------------------------------
@@ -332,6 +456,7 @@ def _trial(
     eligibility_columns: tuple[str, ...],
     sets: Mapping[str, tuple[str, ...]],
     alpha: float,
+    margin_rule: Mapping[str, Any],
 ) -> Trial:
     where = f"trial {trial_id}"
     if not isinstance(raw, Mapping):
@@ -410,6 +535,8 @@ def _trial(
             f"{where}: finding {finding!r} does not match the benchmark interval "
             f"({effect.lower:.2f} to {effect.upper:.2f})"
         )
+    margin = derive_margin(effect, finding=finding, event=event, n_treated=n1, n_control=n0,
+                           alpha=alpha, **margin_rule)
     return Trial(
         trial_id=trial_id, label=str(raw.get("label", trial_id)), pmid=pmid,
         identifier_verified=bool(identifier.get("verified", False)), finding=finding,
@@ -418,6 +545,7 @@ def _trial(
         representability=representability, effect=effect, published=dict(published),
         expected_bias_direction=direction, expected_bias_sign=BIAS_DIRECTIONS[direction],
         unverified=tuple(unverified), overrides=dict(raw.get("feasibility_screen") or {}),
+        margin=margin,
     )
 
 
@@ -455,6 +583,12 @@ def validate_registry(raw: Mapping[str, Any]) -> Registry:
         raise RegistryError(f"registry: status must be one of {STATUSES}")
     cohort = _need(raw, "cohort", "registry")
     arms = _strings(_need(cohort, "arms", "cohort"), "cohort.arms")
+    grouping = raw.get("arm_device_categories")
+    if grouping is not None:
+        if not isinstance(grouping, Mapping) or set(grouping) != set(arms) or not all(
+                _strings(v, f"arm_device_categories.{k}") for k, v in grouping.items()):
+            raise RegistryError("arm_device_categories must give a non-empty list of CLIF device "
+                                "categories for exactly the cohort arms")
     assignment_columns = _strings(_need(cohort, "assignment_columns", "cohort"), "cohort.assignment_columns")
     eligibility_columns = _strings(_need(cohort, "eligibility_columns", "cohort"), "cohort.eligibility_columns")
     sets = {
@@ -468,10 +602,35 @@ def validate_registry(raw: Mapping[str, Any]) -> Registry:
     alpha = _number(_need(agreement, "alpha", "agreement"), "agreement.alpha", minimum=0.0, strict=True)
     if alpha >= 1.0:
         raise RegistryError("agreement.alpha must lie strictly between 0 and 1")
-    margin = _parameter(agreement, "agreement_margin_ratio", "agreement")
+    if "agreement_margin_ratio" in agreement:
+        raise RegistryError("agreement.agreement_margin_ratio is retired: each trial's margin is "
+                            "derived under agreement.margin_derivation (item 42)")
+    derivation = _need(agreement, "margin_derivation", "agreement")
+    if _need(derivation, "method", "agreement.margin_derivation") not in MARGIN_METHODS:
+        raise RegistryError(f"agreement.margin_derivation.method must be one of {MARGIN_METHODS}")
+    preserved = _parameter(derivation, "preserved_fraction", "agreement.margin_derivation")
+    if not 0.0 < _number(preserved.value, "agreement.margin_derivation.preserved_fraction") < 1.0:
+        raise RegistryError("agreement.margin_derivation.preserved_fraction must lie in (0, 1)")
+    cap = _parameter(derivation, "mortality_composite_cap_ratio", "agreement.margin_derivation")
+    lo, hi = MORTALITY_CAP_RANGE
+    if not lo <= _number(cap.value, "agreement.margin_derivation.mortality_composite_cap_ratio") <= hi:
+        raise RegistryError(f"agreement.margin_derivation.mortality_composite_cap_ratio must lie in "
+                            f"[{lo}, {hi}] (item 42)")
+    mortality_events = _strings(_need(derivation, "mortality_type_events", "agreement.margin_derivation"),
+                                "agreement.margin_derivation.mortality_type_events")
+    if not set(mortality_events) <= set(EVENTS):
+        raise RegistryError(f"agreement.margin_derivation.mortality_type_events must be within {EVENTS}")
     equivalence = _parameter(agreement, "equivalence_margin_ratio", "agreement")
-    for name, parameter in (("agreement_margin_ratio", margin), ("equivalence_margin_ratio", equivalence)):
-        _number(parameter.value, f"agreement.{name}", minimum=1.0, strict=True)
+    _number(equivalence.value, "agreement.equivalence_margin_ratio", minimum=1.0, strict=True)
+    hurdle = _parameter(agreement, "second_hurdle", "agreement")
+    if hurdle.value not in SECOND_HURDLES:
+        raise RegistryError(f"agreement.second_hurdle must be one of {SECOND_HURDLES}")
+    status_of = {preserved.status, cap.status, equivalence.status}
+    margin_rule = {
+        "preserved_fraction": float(preserved.value), "equivalence_ratio": float(equivalence.value),
+        "cap_ratio": float(cap.value), "mortality_type_events": mortality_events,
+        "status": "registered" if status_of == {"registered"} else "proposed",
+    }
     pooling = _parameter(agreement, "pooling", "agreement")
     if pooling.value not in POOLINGS:
         raise RegistryError(f"agreement.pooling must be one of {POOLINGS}, got {pooling.value!r}")
@@ -483,6 +642,12 @@ def validate_registry(raw: Mapping[str, Any]) -> Registry:
     sensitivity = _strings(estimand.get("discharge_alive_rule_sensitivity", []), "estimand")
     if not set(sensitivity) <= set(DISCHARGE_ALIVE_RULES):
         raise RegistryError(f"estimand.discharge_alive_rule_sensitivity must be within {DISCHARGE_ALIVE_RULES}")
+    hospice = _parameter(estimand, "hospice_rule", "estimand")
+    if hospice.value not in HOSPICE_RULES:
+        raise RegistryError(f"estimand.hospice_rule must be one of {HOSPICE_RULES}")
+    hospice_sensitivity = _strings(estimand.get("hospice_rule_sensitivity", []), "estimand")
+    if not set(hospice_sensitivity) <= set(HOSPICE_RULES):
+        raise RegistryError(f"estimand.hospice_rule_sensitivity must be within {HOSPICE_RULES}")
     unresolved = _parameter(estimand, "max_unresolved_share", "estimand")
     if not 0.0 <= _number(unresolved.value, "estimand.max_unresolved_share") < 1.0:
         raise RegistryError("estimand.max_unresolved_share must lie in [0, 1)")
@@ -520,7 +685,7 @@ def validate_registry(raw: Mapping[str, Any]) -> Registry:
     trials = {
         str(trial_id): _trial(
             str(trial_id), entry, arms=arms, assignment_columns=assignment_columns,
-            eligibility_columns=eligibility_columns, sets=sets, alpha=alpha,
+            eligibility_columns=eligibility_columns, sets=sets, alpha=alpha, margin_rule=margin_rule,
         )
         for trial_id, entry in raw_trials.items()
     }
@@ -541,9 +706,11 @@ def validate_registry(raw: Mapping[str, Any]) -> Registry:
             _need(primary, "window_hours", "estimand.study_primary_outcome"),
             "estimand.study_primary_outcome.window_hours", minimum=0.0, strict=True),
         discharge_alive_rule=rule, discharge_alive_rule_sensitivity=sensitivity,
+        hospice_rule=hospice, hospice_rule_sensitivity=hospice_sensitivity,
         max_unresolved_share=unresolved, missing_risk_factor=missing, covariates=covariates,
-        forbidden_covariates=forbidden, alpha=alpha, agreement_margin_ratio=margin,
-        equivalence_margin_ratio=equivalence, pooling=pooling,
+        forbidden_covariates=forbidden, alpha=alpha, preserved_fraction=preserved,
+        mortality_cap_ratio=cap, mortality_type_events=mortality_events,
+        equivalence_margin_ratio=equivalence, second_hurdle=hurdle, pooling=pooling,
         screen=_screen(_need(raw, "feasibility_screen", "registry")),
     )
 
@@ -634,6 +801,27 @@ class NullTrialResult:
     gap: TrialGap
     margin_ratio: float
     reproduced: bool
+    interval_rule: bool = True
+    direction_consistent: bool = True
+
+
+@dataclass(frozen=True)
+class TrialAgreement:
+    """One trial's verdict: the interval rule, the second hurdle and their conjunction."""
+
+    trial_id: str
+    finding: str
+    interval_rule: bool
+    direction_consistent: bool
+    second_hurdle_applied: bool
+    reproduced: bool
+    margin: TrialMargin
+
+    def as_dict(self) -> dict[str, Any]:
+        return {"finding": self.finding, "interval_rule": self.interval_rule,
+                "direction_consistent": self.direction_consistent,
+                "second_hurdle_applied": self.second_hurdle_applied,
+                "agrees_with_trial": self.reproduced, "margin": self.margin.as_dict()}
 
 
 def trial_gap(trial: Trial, estimate: TrialEstimate) -> TrialGap:
@@ -657,13 +845,32 @@ def reproduces_null(estimate: TrialEstimate, margin_ratio: float) -> bool:
     return bool(1.0 / margin_ratio <= estimate.lower and estimate.upper <= margin_ratio)
 
 
-def single_trial_agreement(
-    trial: Trial, estimate: TrialEstimate, *, agreement_margin_ratio: float, equivalence_margin_ratio: float
-) -> bool:
-    """The rule applied to one trial alone (used by the planted-effect simulation)."""
+def direction_consistent(trial: Trial, estimate: TrialEstimate) -> bool:
+    """The second hurdle: the emulation's point estimate is not on the opposite side of
+    no effect from the benchmark's point estimate (an estimate of exactly 1 is allowed)."""
+    return bool(estimate.log_effect * trial.effect.log_estimate >= 0.0)
+
+
+def trial_agreement(trial: Trial, estimate: TrialEstimate, *, second_hurdle: bool = True) -> TrialAgreement:
+    """One trial's verdict under its own margin: effect trial, |gap| within the margin;
+    null trial, the whole interval inside [1/m, m]; and, with `second_hurdle`, the point
+    estimate direction-consistent with the benchmark."""
+    if trial.margin is None:
+        raise AgreementError(f"trial {trial.trial_id} has no derived margin")
     if trial.finding == "null":
-        return reproduces_null(estimate, equivalence_margin_ratio)
-    return bool(trial_gap(trial, estimate).abs_log_gap <= math.log(agreement_margin_ratio))
+        interval = reproduces_null(estimate, trial.margin.ratio)
+    else:
+        interval = bool(trial_gap(trial, estimate).abs_log_gap <= trial.margin.log)
+    consistent = direction_consistent(trial, estimate)
+    return TrialAgreement(
+        trial_id=trial.trial_id, finding=trial.finding, interval_rule=interval,
+        direction_consistent=consistent, second_hurdle_applied=second_hurdle,
+        reproduced=bool(interval and (consistent or not second_hurdle)), margin=trial.margin)
+
+
+def single_trial_agreement(trial: Trial, estimate: TrialEstimate, *, second_hurdle: bool = True) -> bool:
+    """The rule applied to one trial alone (used by the planted-effect simulation)."""
+    return trial_agreement(trial, estimate, second_hurdle=second_hurdle).reproduced
 
 
 def pooled_absolute_gap(log_gaps: Sequence[float]) -> float:
@@ -694,9 +901,9 @@ class FeasibilityInputs:
 
     n_*                          patients observed in each compared arm.
     ess_*                        Kish effective sample size of each arm's weights.
-    share_below_min_probability  share of the trial population whose probability of
-                                 following a compared arm is below the registered floor
-                                 (the worse of the two arms).
+    share_below_min_probability  share of the patients in the TWO compared arms whose
+                                 probability of the treated arm (given one of the two)
+                                 lies outside [floor, 1 - floor] (item 44).
     estimators_runnable          estimator name -> whether it can run on this trial.
     """
 
@@ -706,6 +913,14 @@ class FeasibilityInputs:
     ess_control: float
     share_below_min_probability: float
     estimators_runnable: Mapping[str, bool] = field(default_factory=dict)
+    # Item 44: overlap is measured on the two compared arms only. `n_compared` patients
+    # follow one of them; `share_trimmed_of_compared` / `share_trimmed_of_eligible` are the
+    # shares a trim to [min_probability, 1 - min_probability] would exclude, over the two
+    # arms and over all trial-eligible patients. None when not measured.
+    n_eligible: int | None = None
+    n_compared: int | None = None
+    share_trimmed_of_compared: float | None = None
+    share_trimmed_of_eligible: float | None = None
 
 
 @dataclass(frozen=True)
@@ -760,6 +975,9 @@ def feasibility_screen(registry: Registry, trial_id: str, inputs: FeasibilityInp
         "share_below_min_probability": inputs.share_below_min_probability,
         "thresholds_status": screen["status"],
     }
+    for key in ("share_trimmed_of_compared", "share_trimmed_of_eligible"):
+        if getattr(inputs, key) is not None:
+            checks[key] = getattr(inputs, key)
     effect = trial.effect
     if inputs.ess_treated > 0 and inputs.ess_control > 0:
         if trial.finding == "effect":
@@ -775,7 +993,7 @@ def feasibility_screen(registry: Registry, trial_id: str, inputs: FeasibilityInp
                 + (1.0 - effect.risk_control) / (inputs.ess_control * effect.risk_control)
             )
             half_width = NormalDist().inv_cdf(1.0 - screen["alpha"] / 2.0) * projected_se
-            allowed = screen["max_fraction_of_equivalence_margin"] * math.log(registry.equivalence_margin_ratio.value)
+            allowed = screen["max_fraction_of_equivalence_margin"] * trial.margin.log
             checks.update(projected_half_width=half_width, allowed_half_width=allowed)
             if half_width > allowed:
                 reasons.append("precision: the projected interval cannot fit inside the equivalence margin")
@@ -790,9 +1008,11 @@ def feasibility_screen(registry: Registry, trial_id: str, inputs: FeasibilityInp
 class EstimatorAgreement:
     """One estimator's agreement with the evaluable trials.
 
-    `passes` judges the trials that found an effect: the pooled gap against the margin.
-    It is None when no such trial is evaluable (no verdict, not a pass). Null trials are
-    listed separately with their equivalence result.
+    `passes` judges the trials that found an effect. Each gap is divided by its trial's
+    own log margin, so the pooled statistic is on the margin scale and passes at most
+    `threshold` (1.0); with the second hurdle every scored effect trial must also be
+    direction-consistent. It is None when no such trial is evaluable (no verdict, not a
+    pass). Null trials are listed separately with their equivalence result.
     """
 
     estimator: str
@@ -802,7 +1022,9 @@ class EstimatorAgreement:
     pooled_signed_se: float | None
     pooled_statistic: float | None
     pooling: str
-    margin_log: float
+    threshold: float
+    margins_log: dict[str, float]
+    direction_consistent: dict[str, bool]
     margin_status: str
     passes: bool | None
     null_results: tuple[NullTrialResult, ...]
@@ -860,27 +1082,38 @@ def score_agreement(
         else:
             evaluable.append(trial_id)
 
-    margin_log = math.log(registry.agreement_margin_ratio.value)
-    equivalence = float(registry.equivalence_margin_ratio.value)
     pooling = registry.pooling.value
+    hurdle = registry.uses_second_hurdle
+    margins_log = {trial_id: registry.trials[trial_id].margin.log for trial_id in evaluable}
     results = {}
     for name, by_trial in estimates.items():
         gaps = {trial_id: trial_gap(registry.trials[trial_id], by_trial[trial_id]) for trial_id in evaluable}
+        verdicts = {trial_id: trial_agreement(registry.trials[trial_id], by_trial[trial_id], second_hurdle=hurdle)
+                    for trial_id in evaluable}
         effect_gaps = tuple(g for g in gaps.values() if g.finding == "effect")
         null_results = tuple(
-            NullTrialResult(trial_id, gap, equivalence, reproduces_null(by_trial[trial_id], equivalence))
+            NullTrialResult(trial_id, gap, verdicts[trial_id].margin.ratio, verdicts[trial_id].reproduced,
+                            verdicts[trial_id].interval_rule, verdicts[trial_id].direction_consistent)
             for trial_id, gap in gaps.items() if gap.finding == "null"
         )
         pooled_abs = signed = signed_se = statistic = passes = None
         if effect_gaps:
             pooled_abs = pooled_absolute_gap([g.log_gap for g in effect_gaps])
             signed, signed_se = pooled_signed_gap([g.log_gap for g in effect_gaps], [g.se for g in effect_gaps])
-            statistic = pooled_abs if pooling == "mean_absolute_gap" else abs(signed)
-            passes = bool(statistic <= margin_log)
+            scaled = [g.log_gap / margins_log[g.trial_id] for g in effect_gaps]
+            if pooling == "mean_absolute_gap":
+                statistic = pooled_absolute_gap(scaled)
+            else:
+                statistic = abs(pooled_signed_gap(
+                    scaled, [g.se / margins_log[g.trial_id] for g in effect_gaps])[0])
+            consistent = all(verdicts[g.trial_id].direction_consistent for g in effect_gaps)
+            passes = bool(statistic <= 1.0 and (consistent or not hurdle))
         results[name] = EstimatorAgreement(
             estimator=name, effect_gaps=effect_gaps, pooled_abs_gap=pooled_abs, pooled_signed_gap=signed,
-            pooled_signed_se=signed_se, pooled_statistic=statistic, pooling=pooling, margin_log=margin_log,
-            margin_status=registry.agreement_margin_ratio.status, passes=passes, null_results=null_results,
+            pooled_signed_se=signed_se, pooled_statistic=statistic, pooling=pooling, threshold=1.0,
+            margins_log=dict(margins_log),
+            direction_consistent={t: v.direction_consistent for t, v in verdicts.items()},
+            margin_status=registry.margins_status(), passes=passes, null_results=null_results,
             n_null_reproduced=sum(r.reproduced for r in null_results),
         )
     return AgreementReport(

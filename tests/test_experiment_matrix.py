@@ -272,13 +272,61 @@ class EdgeDistanceTest(unittest.TestCase):
         from src.train.run_matrix import MatrixError, edge_distance_table
 
         edges = copy.deepcopy(self.EDGES)
-        edges["map"] = [55.0, 60.5, 63.0, 72.0, 80.0]        # control MAP 63 on an edge
+        edges["map"] = [55.0, 60.5, 62.5, 72.0, 80.0]        # control MAP 62.5 on an edge
         vocabs = {"clean_arm": _blob(_segments(self.EDGES, False)),
                   "edgy_arm": _blob(_segments(edges, False))}
         with self.assertRaisesRegex(MatrixError, "edgy_arm") as caught:
             edge_distance_table(vocabs)
-        self.assertIn("63", str(caught.exception))
+        self.assertIn("62.5", str(caught.exception))
         self.assertNotIn("clean_arm", str(caught.exception))
+
+
+class EdgeCheckCommandTest(unittest.TestCase):
+    """`run_matrix --edge-check` crashed with a TypeError when no --vocab matched a matrix
+    arm (no vocabulary loaded). It now reports that nothing was checked, and refuses an
+    unknown arm name."""
+
+    def _main(self, *argv):
+        from contextlib import redirect_stderr
+
+        from src.train.run_matrix import main
+
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            code = main(list(argv))
+        return code, out.getvalue(), err.getvalue()
+
+    def test_no_vocabulary_for_any_arm_is_reported_not_a_crash(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            matrix = copy.deepcopy(MATRIX)
+            matrix["arm_data"] = {arm: {site: str(Path(tmp) / arm) for site in sites}
+                                  for arm, sites in matrix["arm_data"].items()}
+            path = Path(tmp) / "matrix.yaml"
+            path.write_text(yaml.safe_dump(matrix))
+            code, out, err = self._main("--matrix", str(path), "--edge-check")
+        self.assertEqual(code, 2)
+        self.assertIn("NOT run", err)
+        self.assertNotIn("edge check passed", out)
+
+    def test_an_unknown_vocab_arm_is_refused_by_name(self):
+        code, _, err = self._main("--edge-check", "--vocab", "no_such_arm=/tmp/vocab.json")
+        self.assertEqual(code, 2)
+        self.assertIn("no_such_arm", err)
+
+    def test_one_arm_vocabulary_is_checked_and_the_table_prints(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            arm = next(iter(MATRIX["arm_data"]))
+            vocab = Path(tmp) / "vocab.json"
+            vocab.write_text(json.dumps(_blob(_segments(EdgeDistanceTest.EDGES, False))))
+            code, out, _ = self._main("--edge-check", "--vocab", f"{arm}={vocab}")
+        self.assertEqual(code, 0, out)
+        self.assertIn("edge check passed", out)
+        self.assertIn("control map < 62.5", out)
+
+    def test_format_edge_table_with_no_rows_does_not_crash(self):
+        from src.train.run_matrix import format_edge_table
+
+        self.assertIn("threshold", format_edge_table([]))
 
 
 class OrderOnlyArmTest(unittest.TestCase):

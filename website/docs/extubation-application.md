@@ -130,14 +130,16 @@ may use an endpoint defined by a treatment event. `tests/test_data_config.py` en
 - **Reintubation** is the first invasive-ventilation row of the index stay strictly after time
   zero, on the same availability clock. NIV or HFNC after extubation is never a failure.
 - **Death** comes from the patient death timestamp, read together with the discharge category.
-- **Hospice discharge** is a competing event at discharge time.
+- **Hospice discharge** is a competing event at discharge time; a composite sensitivity
+  analysis counts hospice-then-death as the endpoint (product authority, item 41).
 - Follow-up ends at death or discharge; readmissions are not searched. Windows are right-closed.
 - **Discharge alive before the horizon, no event.** Two rules exist. `censor` censors the
   patient at discharge (the labeller's default). `event_free` counts the patient as event-free at
   the horizon, assuming no out-of-hospital reintubation or death. About 29% of MIMIC patients
-  leave alive before day 7, so the choice matters. The benchmark registry proposes `event_free`
-  as primary and `censor` as the sensitivity analysis; the protocol registers which one is
-  primary, and both are reported. An unknown discharge disposition is censored under both rules,
+  leave alive before day 7, so the choice matters. The product authority chose `event_free` as
+  primary (it emulates the trials' intention-to-treat counting), with discharge alive as a
+  **competing event** (cumulative incidence) and `censor` as sensitivity analyses
+  ([decision log](https://github.com/sajor2000/clifatron2.0/blob/main/docs/decisions/2026-10-03-clinical-decisions.md), item 39). An unknown discharge disposition is censored under both rules,
   never read as survival.
 
 ---
@@ -197,18 +199,28 @@ every estimator's agreement results.
 ### Agreement rule and simulation
 
 - **Scale.** Log risk ratio; gap = emulation minus trial.
-- **Trials that found an effect.** Per estimator, the mean absolute gap over evaluable trials
-  must lie within log 1.5. Absolute gaps are used so gaps of opposite sign cannot cancel. The
-  inverse-variance signed mean gap is reported as a description of systematic bias.
+- **Margins (item 42).** Each trial that found an effect gets its own margin by the FDA
+  fixed-margin approach: the margin preserves half of the benchmark's interval bound nearest 1,
+  stated on the relative and the absolute scale; a mortality-type endpoint is capped at 1.2.
+  The derived margins (about 1.03 to 1.27) replace the common 1.5.
+- **Trials that found an effect.** Per estimator, each gap is scaled by its trial's margin and
+  the mean absolute scaled gap must be at most 1. Absolute gaps are used so gaps of opposite
+  sign cannot cancel. The inverse-variance signed mean gap is reported as a description of
+  systematic bias.
 - **Null trials.** Reproduced only when the emulation's **whole** interval lies inside
   [1/1.5, 1.5], so a wide interval cannot pass by being wide.
+- **Second hurdle (Röhmel–Kieser).** A trial is reproduced only if the emulation's point
+  estimate is also on the benchmark's side of 1. On the synthetic fixture this cut the
+  reversed-effect pass rate for Casey 2021 from 60% to 2%.
 - **Comparing estimators (R27).** The paired difference in absolute gap between two estimators
   on identical patients, with a paired bootstrap interval.
 - **Operating characteristics (R29).** A planted-effect simulation on each frozen cohort reports
   how often the rule passes when the true effect equals the trial's, is zero, or is reversed,
   with and without a withheld confounder. Treatment is drawn from a device-choice model fitted
   to the real covariates and arms; the baseline risk comes from a model fitted without the arm,
-  or from a supplied number. These pass rates are published with any result.
+  or from a supplied number. These pass rates are published with any result, beside a
+  **positive control**: a planted risk ratio of 0.5 must be detected in at least 80% of
+  replicates (item 45).
 
 All margins are `proposed` until registration.
 
@@ -245,9 +257,14 @@ The extubation application stops, or is re-scoped with the product authority, if
 
 - **Precision:** more than half of the registered trials fail the feasibility screen at the site.
 - **Harmful side:** the lower bound of the unblinded all-comer risk ratio is above 1.0, so the
-  whole interval says HFNC is worse.
-- **Negative controls:** any registered negative control fails. These need outcome-by-arm runs,
-  so they are not evaluated before registration.
+  whole interval says HFNC is worse (decided, item 43).
+- **Negative controls:** any of the eight registered negative-control outcomes (new lab
+  abnormalities that share confounding by severity but have no path from the device) has an
+  interval that excludes no effect (item 45). These need outcome-by-arm runs, so they are not
+  evaluated before registration.
+
+The feasibility screen measures overlap on the **two compared arms only** and reports the share
+of eligible patients a trim would exclude (item 44).
 
 A shift of more than 0.20 in an arm's first-device share across calendar periods or units (each
 level with at least 50 patients) flags an adoption-era contrast as a supporting analysis (R40).

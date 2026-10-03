@@ -121,11 +121,13 @@ bin edge with thresholds that do not, across the tokenization arms. The primary 
   2 and 3. Each equals a `forced_edges` entry in `configs/data.yaml`, so it is a bin edge in the
   clinical arm and in the forced-edge decile arm. A test locks this.
 - **Control thresholds (off-edge).** One or more per decision threshold of the same concept,
-  each strictly inside a physician segment: lactate 2.5 and 3, MAP 63, SpO₂ 85 and 89,
-  creatinine 1.3, 2.3 and 3.5. They are registered as `candidate`.
+  each strictly inside a physician segment: lactate 2.5 and 3, MAP 62.5, SpO₂ 85 and 89,
+  creatinine 1.35, 2.3 and 3.5. They are registered as `candidate`; MAP 62.5 and creatinine
+  1.35 (moved off edges by the product authority on 2026-10-03) are provisional until the
+  edge check on the production vocabularies.
 - **Why controls are not chosen by eye.** The physician segments already have edges at MAP 60
   and 61 and at every integer SpO₂ from 88 to 98. So the plan's example control, MAP below 60,
-  is itself an edge; MAP 63 replaces it.
+  is itself an edge; MAP 62.5 replaces it.
 
 :::info[The edge-distance check]
 `threshold_grid.edge_distance` computes, for one frozen vocabulary, the distance from every

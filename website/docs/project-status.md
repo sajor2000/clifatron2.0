@@ -58,8 +58,8 @@ flowchart TB
         U19["U19 docs · L40 runbook · pre-flight"]
     end
     subgraph GATES["Blockers (not code)"]
-        G1["Split frozen by hash<br/>(held-out share from blind-stage arm sizes)"]
-        G2["Physician sign-off:<br/>seven proposed competing-risk thresholds"]
+        G1["Split frozen by hash<br/>(stratified held-out split for NIV/HFNC)"]
+        G2["Off-edge controls MAP 62.5 / creatinine 1.35:<br/>re-verify on production vocabularies"]
         G3["Rush data staged on the L40 node"]
         G4["L40 GPU driver<br/>(reboot; pre-flight)"]
         G5["G5: written approval to transfer<br/>Rush-derived weights to UChicago"]
@@ -116,22 +116,32 @@ registered.
 |---------|------------|--------|
 | **Rush data not staged** | Only MIMIC is on the L40 node (546,028 stays, about 134M events). Claim 3 is confirmed at Rush, and development needs Rush for power. | Stage under existing governance; point `CLIF_DATA_DIR` at it. |
 | **Frozen split and held-out arm sizes** | Model-based extubation estimators use only patients outside the pretraining partition, and the split is baked into every checkpoint. The held-out share (60/15/10/15 today) must be decided from the blind-stage arm sizes and frozen by hash before the first L40 run. | Decide the share; freeze the split. |
-| **Competing-risk thresholds** | Three of the ten competing-risk cause thresholds repeat the outcome contract. The other seven in `configs/thresholds.yaml` are proposed defaults. | Physician confirmation before the first L40 run. |
-| **Proposed margins** | Every agreement margin, feasibility threshold, stop rule and negative control is `proposed`. | Register the protocol (`docs/protocols/extubation-emulation-protocol.md`). |
+| **Competing-risk thresholds** | Settled 2026-10-03: three repeat the outcome contract and seven are confirmed by the product authority (creatinine by the KDIGO AKI rule). The off-edge controls MAP 62.5 and creatinine 1.35 are provisional. | Re-verify the controls with the edge check on the production vocabularies (runbook step 16). |
+| **Proposed margins** | The method is decided (2026-10-03); every margin value, feasibility threshold, stop-rule threshold and negative-control outcome is still `proposed`. | Register the protocol (`docs/protocols/extubation-emulation-protocol.md`). |
 | **G5 — weight transfer** | Written approval to transfer Rush-derived weights to UChicago is not obtained. | Obtain and record it. |
 | **`clif-validate` partner readiness** | The site package is not ready for the UChicago run, and fitting the classical emulation at a partner site is a new capability that needs its own governance review. | Land the package fixes; review. |
 | **MIMIC calendar period** | MIMIC dates are shifted per patient, so the by-period audit table is not evaluable without the MIMIC-IV `anchor_year_group` table. The by-unit table is unaffected. | Stage `anchor_year_group` if the adoption-era contrast is needed on MIMIC. |
 | **L40 GPU driver** | `nvidia-smi` fails on a driver/library mismatch; torch CUDA still allocates. | Reboot before long multi-GPU runs; the pre-flight checks it. |
 | **No CLIFATRON checkpoint staged** | Needed only for the larger frozen-comparator row. | Does not gate the claims. |
 
+:::info[Clinical decisions of 2026-10-03]
+The product authority (J.C. Rojas) answered 47 open clinical questions; the
+[decision log](https://github.com/sajor2000/clifatron2.0/blob/main/docs/decisions/2026-10-03-clinical-decisions.md) lists each decision, the default it replaced, its references and where it is
+implemented. In short: the competing-risk thresholds are confirmed (creatinine by the KDIGO
+AKI rule; temperature above 39.166 °C), the off-edge controls are MAP 62.5 and creatinine 1.35
+(provisional until the production edge check), trial agreement uses per-trial FDA fixed
+margins with the Röhmel–Kieser second hurdle, overlap is screened on the two compared arms,
+eight negative-control outcomes are registered, the harmful-side stop needs the whole
+interval above 1, discharge alive before day 7 is event-free (competing-event sensitivity),
+and the held-out partitions are enlarged for the NIV and HFNC arms by a stratified split
+(switched on at the split freeze).
+:::
+
 :::warning[Open decisions for the product authority]
 - **Claim 1 attribution:** whether the optional attribution arm enters claim 1's rejection rule
   ([Paper 1 claims](./paper-claims.md#claim-1--threshold-aligned-tokenization)).
-- **AE6's control value:** MAP below 60 is an edge in the physician segments; the code registers
-  MAP 63 as the off-edge control.
-- **Discharge rule:** whether `event_free` or `censor` is primary for patients discharged alive
-  before day 7.
-- **Harmful-side bound:** 1.0 or the equivalence margin.
+- **Registration values:** the margin method is decided; its values (preserved fraction 0.5,
+  mortality cap 1.2, equivalence 1.5) stay `proposed` until the protocol is registered.
 :::
 
 ---

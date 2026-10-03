@@ -18,7 +18,13 @@ Recipe (Shaw 2026, PMID 42487285; Desai 2026, PMID 42093129):
    arm the registry expects sicker patients to receive (its `expected_bias` direction)
    and multiplies every arm's risk by exp(delta U - delta^2 / 2). U is not given to the
    estimator.
-6. Run the estimator and apply the agreement rule to the trial alone.
+6. Run the estimator and apply the agreement rule to the trial alone: the trial's own
+   derived margin plus the registered second hurdle (`benchmark.trial_agreement`).
+
+Positive control (item 45). `positive_control_detection` plants a known non-null effect
+and reports how often the estimator's interval excludes no effect in the planted
+direction: a pipeline that cannot detect a planted true effect cannot be read as having
+found none.
 
 The default estimator is the point-treatment AIPW estimator. With the decision at time
 zero it is the same computation as the one-step clone-censor-weight estimator (U11), and
@@ -42,6 +48,8 @@ from . import benchmark as bm
 from . import estimators as est
 
 EFFECTS = ("trial", "zero", "reversed")
+# Default planted risk ratio of the positive control (configs/extubation_audit.yaml).
+POSITIVE_CONTROL_RR = 0.5
 RISK_CEILING = 0.99
 RISK_FLOOR = 1e-4
 
@@ -262,7 +270,7 @@ def simulate_operating_characteristics(
     estimator = estimator or aipw_estimator(config, registry.alpha)
     model = fit_device_choice_model(X, arm, config=config)
     fitted = model.probabilities(np.asarray(X, dtype=np.float64))
-    margin, equivalence = registry.agreement_margin_ratio.value, registry.equivalence_margin_ratio.value
+    hurdle = registry.uses_second_hurdle
     planted = {"trial": trial.effect.log_estimate, "zero": 0.0, "reversed": -trial.effect.log_estimate}
     rng = np.random.default_rng(seed)
     scenarios = {}
@@ -281,8 +289,7 @@ def simulate_operating_characteristics(
                     failed += 1
                     continue
                 estimates.append(estimate)
-                passes.append(bm.single_trial_agreement(
-                    trial, estimate, agreement_margin_ratio=margin, equivalence_margin_ratio=equivalence))
+                passes.append(bm.single_trial_agreement(trial, estimate, second_hurdle=hurdle))
             completed = len(passes)
             mean = float(np.mean([e.log_effect for e in estimates])) if estimates else None
             bias = None if mean is None else mean - planted[effect]
@@ -302,3 +309,59 @@ def simulate_operating_characteristics(
             label: (float(fitted[:, k].min()), float(fitted[:, k].max())) for k, label in enumerate(model.classes)},
         margins_status=registry.margins_status(), n_sim=int(np.asarray(X).shape[0] if n_sim is None else n_sim),
     )
+
+
+@dataclass(frozen=True)
+class PositiveControlResult:
+    """Detection of a planted true effect (item 45)."""
+
+    trial_id: str
+    planted_rr: float
+    n_reps: int
+    n_completed: int
+    n_detected: int
+    detection_rate: float | None      # interval excludes 1 on the planted side
+    mean_log_estimate: float | None
+
+
+def positive_control_detection(
+    X: np.ndarray,
+    arm: np.ndarray,
+    registry: bm.Registry,
+    trial_id: str,
+    *,
+    baseline: float | BaselineRiskModel,
+    planted_rr: float = POSITIVE_CONTROL_RR,
+    n_reps: int = 200,
+    n_sim: int | None = None,
+    config: est.NuisanceConfig | None = None,
+    estimator: Estimator | None = None,
+    seed: int = 0,
+) -> PositiveControlResult:
+    """Plant `planted_rr` on one trial's comparison (no withheld confounder) and count the
+    replicates whose interval excludes 1 on the planted side. Outcome-blind like the rest
+    of the simulation: only covariates and arms are read."""
+    if not math.isfinite(planted_rr) or planted_rr <= 0 or planted_rr == 1.0:
+        raise ValueError("a positive control needs a planted risk ratio other than 1")
+    if n_reps < 1:
+        raise ValueError("n_reps must be positive")
+    trial = registry.trials[trial_id]
+    config = config or est.NuisanceConfig()
+    estimator = estimator or aipw_estimator(config, registry.alpha)
+    model = fit_device_choice_model(X, arm, config=config)
+    rng = np.random.default_rng(seed)
+    detected, logs = 0, []
+    for _ in range(n_reps):
+        data = simulate_once(model, X, treated=trial.treated, control=trial.control, baseline=baseline,
+                             planted_rr=planted_rr, rng=rng, n_sim=n_sim)
+        try:
+            estimate = estimator(data.X, data.arm, data.y, trial.treated, trial.control)
+        except (est.EstimationError, ValueError, ArithmeticError):
+            continue
+        logs.append(estimate.log_effect)
+        detected += bool(estimate.upper < 1.0) if planted_rr < 1.0 else bool(estimate.lower > 1.0)
+    completed = len(logs)
+    return PositiveControlResult(
+        trial_id=trial_id, planted_rr=planted_rr, n_reps=n_reps, n_completed=completed, n_detected=detected,
+        detection_rate=(detected / completed) if completed else None,
+        mean_log_estimate=float(np.mean(logs)) if logs else None)

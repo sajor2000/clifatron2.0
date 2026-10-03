@@ -22,6 +22,7 @@ from src.data.segments import (
     load_csv_segments,
     segments_from_edges,
 )
+from src.data.segments import threshold_bin as threshold_bin_of
 from src.data.threshold_grid import (
     DEATH_TOKEN,
     THRESHOLD_KINDS,
@@ -102,14 +103,42 @@ class ThresholdRegistryTest(unittest.TestCase):
         self.assertEqual(sorted(causes), sorted(DIRECTIONS))
         self.assertEqual(len(causes), len(set(causes)))
 
-    def test_contract_causes_repeat_the_outcome_contract_and_the_rest_are_proposed(self):
+    def test_contract_causes_repeat_the_outcome_contract_and_the_rest_are_confirmed(self):
+        """Product authority, 2026-10-03 (docs/decisions/2026-10-03-clinical-decisions.md
+        items 1-7): no cause is left `proposed`."""
         contract = {(spec["concept"], float(spec["threshold"]), spec["direction"])
                     for spec in COHORT_CFG["outcomes"].values()}
-        by_status = {"contract": set(), "proposed": set()}
+        by_status = {"contract": set(), "confirmed": set(), "proposed": set()}
         for t in self.registry["competing_risk_cause"]:
             by_status[t.status].add((t.concept, t.value, t.direction))
         self.assertEqual(by_status["contract"], contract)
-        self.assertEqual(len(by_status["proposed"]), len(DIRECTIONS) - len(contract))
+        self.assertEqual(by_status["proposed"], set())
+        self.assertEqual(len(by_status["confirmed"]), len(DIRECTIONS) - len(contract))
+
+    def test_confirmed_cause_values_are_the_product_authoritys(self):
+        causes = {t.concept: t for t in self.registry["competing_risk_cause"]}
+        expected = {"respiratory_rate": 24.0, "bilirubin_total": 2.0, "platelet_count": 100.0,
+                    "heart_rate": 130.0, "sbp": 90.0, "temp_c": 39.166}
+        self.assertEqual({c: causes[c].value for c in expected}, expected)
+        creatinine = causes["creatinine"]
+        self.assertEqual((creatinine.rule, creatinine.value), ("kdigo_aki", None))
+        self.assertEqual(creatinine.params, {"absolute_rise": 0.3, "absolute_window_hours": 48.0,
+                                             "relative_rise": 1.5, "relative_window_hours": 168.0})
+
+    def test_temperature_cause_is_a_physician_csv_edge_and_the_top_bin(self):
+        """Item 7 (final): above 39.166 C, exactly a physician-CSV temp_c edge, so the
+        event is the top bin (39.166, 44.0] and readable from the token stream."""
+        cause = next(t for t in self.registry["competing_risk_cause"] if t.concept == "temp_c")
+        segs = clinical_segments()["temp_c"]
+        self.assertEqual(cause.value, 39.166)
+        self.assertIn(cause.value, segment_edges(segs))
+        top = segs[threshold_bin_of(cause.value, segs, cause.direction)]
+        self.assertEqual((top["lo"], top["hi"]), (39.166, segs[-1]["hi"]))
+
+    def test_controls_are_the_provisional_off_edge_values(self):
+        controls = {(t.concept, t.paired_decision): t.value for t in self.registry["control"]}
+        self.assertEqual(controls[("map", 65.0)], 62.5)
+        self.assertEqual(controls[("creatinine", 1.5)], 1.35)
 
     def test_controls_are_candidates_paired_with_a_decision_threshold_of_their_concept(self):
         decision = {(t.concept, t.value) for t in self.registry["decision"]}
@@ -121,7 +150,7 @@ class ThresholdRegistryTest(unittest.TestCase):
                 self.assertNotIn((control.concept, control.value), decision)
 
     def test_control_candidates_are_off_edge_in_the_physician_segments(self):
-        """MAP 60 and 61 are physician edges, so the MAP control is 63; SpO2 89 sits
+        """MAP 60 and 61 are physician edges, so the MAP control is 62.5; SpO2 89 sits
         inside [88, 90)."""
         rows = {(r["kind"], r["concept"], r["value"]): r
                 for r in edge_distance(self.registry, vocab_blob(clinical_segments()))}
@@ -130,11 +159,11 @@ class ThresholdRegistryTest(unittest.TestCase):
             with self.subTest(concept=control.concept, value=control.value):
                 self.assertFalse(row["on_edge"])
                 self.assertGreater(row["distance"], 0.0)
-        self.assertEqual(rows[("control", "map", 63.0)]["distance"], 2.0)
-        self.assertEqual(rows[("control", "map", 63.0)]["nearest_edge"], 61.0)
+        self.assertEqual(rows[("control", "map", 62.5)]["distance"], 1.5)
+        self.assertEqual(rows[("control", "map", 62.5)]["nearest_edge"], 61.0)
         edges = segment_edges(clinical_segments()["map"])
         self.assertTrue({59.0, 60.0, 61.0, 65.0, 67.0} <= set(edges))
-        self.assertNotIn(63.0, edges)
+        self.assertNotIn(62.5, edges)
 
     def test_label_rule_repeats_the_outcome_contracts_windows(self):
         rule = self.registry["label_rule"]
@@ -165,6 +194,15 @@ class ThresholdRegistryTest(unittest.TestCase):
             dict(r["competing_risk_cause"][0], value=60.0)), "one competing-risk cause")
         refused(lambda r: r["decision"].append(dict(r["decision"][0])), "repeats")
         refused(lambda r: r["label_rule"].update(horizon_hours=0), "label_rule")
+        cr = next(i for i, e in enumerate(raw["competing_risk_cause"])
+                  if e["concept"] == "creatinine")
+        refused(lambda r: r["competing_risk_cause"][cr].update(rule="rifle"), "unknown rule")
+        refused(lambda r: r["competing_risk_cause"][cr].update(value=2.0), "no `value`")
+        refused(lambda r: r["competing_risk_cause"][cr].pop("absolute_rise"), "absolute_rise")
+        refused(lambda r: r["competing_risk_cause"][cr].update(relative_rise=0.9), "exceed 1")
+        refused(lambda r: r["decision"][0].update(rule="kdigo_aki"), "only a competing-risk")
+        refused(lambda r: r.pop("units"), "units")
+        refused(lambda r: r["units"].pop("lactate"), "no CLIF 2.1 unit")
         refused(lambda r: r["label_rule"].pop("required_measurement_within_hours_of_horizon"),
                 "label_rule")
 
@@ -199,7 +237,7 @@ class ClinicalGridTest(unittest.TestCase):
     def test_concept_index_is_the_target_concept_order(self):
         self.assertEqual(self.grid.concepts, tuple(c["name"] for c in TARGETS))
         self.assertEqual(self.grid.query("map", 65.0).target_idx, 0)
-        self.assertEqual(self.grid.query("temp_c", 38.3).target_idx, 9)
+        self.assertEqual(self.grid.query("temp_c", 39.166).target_idx, 9)
 
     def test_decision_thresholds_map_to_the_bin_on_their_event_side(self):
         """An on-edge threshold names the bin adjacent to the edge on the event side —
@@ -277,7 +315,11 @@ class ClinicalGridTest(unittest.TestCase):
 
     def test_edge_distance_reports_on_edge_and_distance_for_every_registered_threshold(self):
         rows = self.grid.edge_distance()
-        self.assertEqual(len(rows), sum(len(self.registry[k]) for k in THRESHOLD_KINDS))
+        # A rule cause (KDIGO creatinine) has no value and so no edge-distance row.
+        valued = sum(t.rule is None for k in THRESHOLD_KINDS for t in self.registry[k])
+        self.assertEqual(len(rows), valued)
+        self.assertNotIn(("competing_risk_cause", "creatinine"),
+                         {(r["kind"], r["concept"]) for r in rows})
         for row in rows:
             self.assertEqual(row["vocabulary"], self.grid.binding["vocabulary"])
             self.assertEqual(row["numeric_edges"], self.grid.binding["numeric_edges"])
@@ -406,7 +448,7 @@ class DecileArmGridTest(unittest.TestCase):
     def test_a_control_can_be_on_edge_in_a_decile_arm(self):
         """Why controls are only candidates: a quantile edge can land on one."""
         segments = decile_segments(forced=False)
-        segments["map"] = segments_from_edges([58.0, 63.0, 68.0], (), "below")
+        segments["map"] = segments_from_edges([58.0, 62.5, 68.0], (), "below")
         rows = edge_distance(self.registry, vocab_blob(segments))
         control = next(r for r in rows if (r["kind"], r["concept"]) == ("control", "map"))
         self.assertTrue(control["on_edge"])
@@ -421,3 +463,66 @@ class DecileArmGridTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ClifUnitsTest(unittest.TestCase):
+    """Product authority (2026-10-03): every threshold is in the CLIF 2.1 unit of its
+    concept and every concept is a CLIF 2.1 category. Read from the mCIDE 2.1.1 snapshot
+    (configs/clif_mcide_2.1.1/, else output/final_no_phi/clif_spec_v2.1.1/)."""
+
+    @classmethod
+    def setUpClass(cls):
+        candidates = [ROOT / "configs/clif_mcide_2.1.1", ROOT / "output/final_no_phi/clif_spec_v2.1.1"]
+        cls.snapshot = next((p for p in candidates
+                             if (p / "mCIDE/labs/clif_lab_categories.csv").is_file()), None)
+        if cls.snapshot is None:
+            raise unittest.SkipTest("no CLIF 2.1.1 mCIDE snapshot in the repository")
+        import csv
+
+        with open(cls.snapshot / "mCIDE/labs/clif_lab_categories.csv", encoding="utf-8") as fh:
+            cls.labs = {row["lab_category"]: row["reference_unit"] for row in csv.DictReader(fh)}
+        with open(cls.snapshot / "mCIDE/vitals/clif_vitals_categories.csv", encoding="utf-8") as fh:
+            cls.vitals = {row["vital_category"] for row in csv.DictReader(fh) if row["vital_category"]}
+        ddl = next((cls.snapshot / "ddl").rglob("*.sql"))
+        line = next(l for l in ddl.read_text(encoding="utf-8").splitlines()
+                    if l.strip().startswith("vital_value"))
+        permissible = line.split('"permissible": "', 1)[1].split('"', 1)[0]
+        declared, _, no_unit = permissible.partition("No unit for ")
+        cls.vital_units = {k.strip(): v.strip() for k, v in
+                           (part.split("=") for part in declared.strip(" .").split(",") if "=" in part)}
+        cls.vital_no_unit = {name.strip() for name in no_unit.split(",") if name.strip()}
+        cls.registry = load_thresholds()
+
+    @staticmethod
+    def _norm(unit: str) -> str:
+        return unit.replace("µ", "u").replace("μ", "u").strip().lower()
+
+    def test_every_threshold_concept_is_a_clif_lab_or_vital_category(self):
+        for kind in THRESHOLD_KINDS:
+            for t in self.registry[kind]:
+                with self.subTest(kind=kind, concept=t.concept):
+                    self.assertIn(t.concept, set(self.labs) | self.vitals)
+
+    def test_every_threshold_unit_is_the_clif_2_1_unit(self):
+        units = self.registry["units"]
+        for concept, spec in units.items():
+            with self.subTest(concept=concept):
+                if concept in self.labs:
+                    self.assertTrue(spec["clif_declared"])
+                    self.assertEqual(self._norm(spec["unit"]), self._norm(self.labs[concept]))
+                elif concept in self.vital_units:
+                    self.assertTrue(spec["clif_declared"])
+                    self.assertEqual(self._norm(spec["unit"]), self._norm(self.vital_units[concept]))
+                else:
+                    # CLIF 2.1 states "no unit" for this vital: the value is used as charted.
+                    self.assertIn(concept, self.vital_no_unit)
+                    self.assertFalse(spec["clif_declared"])
+
+    def test_registry_units_agree_with_the_target_concept_contract(self):
+        declared = {c["name"]: c.get("unit") for c in TARGETS}
+        aliases = {"celsius": "celsius", "breaths per minute": "breaths/min",
+                   "beats per minute": "beats/min"}
+        for concept, spec in self.registry["units"].items():
+            with self.subTest(concept=concept):
+                want = self._norm(declared[concept])
+                self.assertEqual(self._norm(spec["unit"]), aliases.get(want, want))

@@ -28,6 +28,13 @@ Unresolved follow-up (`discharge_alive_rule`, a registered parameter):
     clone-weighted Aalen-Johansen cumulative incidence at the horizon, with a patient
     bootstrap interval that holds the clone weights fixed. The count of censored rows is
     reported.
+  - `competing` (item 39 sensitivity, product authority 2026-10-03): a discharge alive
+    before the horizon with no event is a COMPETING event at the discharge time (status
+    code 2), so the estimate is the same clone-weighted Aalen-Johansen cumulative
+    incidence of the endpoint with discharge alive competing. Only an unknown
+    disposition stays censored.
+Hospice (`hospice_rule`, item 41): hospice discharge then death competes with the endpoint
+(`competing`, primary); the `composite` sensitivity counts it as the endpoint.
 No row is ever dropped silently.
 
 Layering. The polars handling of the cohort, label and device-row frames is confined to
@@ -316,6 +323,7 @@ class TrialArrays:
     event_time: np.ndarray
     event_type: np.ndarray        # status coding: 0 none, 1 the endpoint, 2 competing
     resolved: np.ndarray
+    hospice_rule: str = "competing"
 
     @property
     def n_eligible(self) -> int:
@@ -341,6 +349,18 @@ def _rule(registry: bm.Registry, discharge_alive_rule: str | None) -> str:
     return rule
 
 
+def _hospice_rule(registry: bm.Registry, hospice_rule: str | None) -> str:
+    rule = registry.hospice_rule.value if hospice_rule is None else hospice_rule
+    if rule not in bm.HOSPICE_RULES:
+        raise ValueError(f"hospice_rule must be one of {bm.HOSPICE_RULES}, got {rule!r}")
+    return rule
+
+
+# Labeler codes (src/eval/extubation_labeler.py): status coding 0 none / 1 endpoint /
+# 2 competing; cause coding 3 = hospice discharge.
+_STATUS_COMPETING, _CAUSE_HOSPICE = 2, 3
+
+
 def trial_arrays(
     site: SiteData,
     registry: bm.Registry,
@@ -348,6 +368,7 @@ def trial_arrays(
     *,
     outcome: str = "trial",
     discharge_alive_rule: str | None = None,
+    hospice_rule: str | None = None,
 ) -> TrialArrays:
     """Outcome arrays for one trial's own event and window (or the study primary outcome)."""
     from src.eval.extubation_labeler import estimator_arrays  # repo-side labeler (polars)
@@ -355,18 +376,36 @@ def trial_arrays(
     trial = registry.trials[trial_id]
     event, horizon = _outcome_spec(registry, trial, outcome)
     rule = _rule(registry, discharge_alive_rule)
+    hospice = _hospice_rule(registry, hospice_rule)
     if site.labels is None:
         raise ValueError("outcome arrays need the site's labels")
     if site.labels.height != site.cohort.height or not site.labels["patient_id"].equals(site.cohort["patient_id"]):
         raise ValueError("cohort and labels must describe the same rows in the same order")
     covariates = trial_covariates(site, registry, trial_id)
-    arrays = estimator_arrays(site.labels, horizon, event=event, discharge_alive_rule=rule, coding="status")
+    # The labeler knows `censor` and `event_free`; `competing` starts from `censor` and
+    # recodes the discharges alive.
+    labeler_rule = "censor" if rule == "competing" else rule
+    arrays = estimator_arrays(site.labels, horizon, event=event, discharge_alive_rule=labeler_rule,
+                              coding="status")
+    event_time = arrays.event_time.copy()
+    event_type = arrays.event_type.copy()
+    resolved = arrays.resolved.copy()
+    if hospice == "composite":
+        causes = estimator_arrays(site.labels, horizon, event=event, discharge_alive_rule=labeler_rule,
+                                  coding="cause").event_type
+        event_type[causes == _CAUSE_HOSPICE] = 1
+    if rule == "competing":
+        alive = (site.labels["followup_end_reason"] == "discharge_alive").fill_null(False).to_numpy()
+        recode = alive & (event_type == 0) & ~resolved & (event_time < horizon)
+        event_type[recode] = _STATUS_COMPETING
+        resolved[recode] = True
     mask = covariates.mask
     return TrialArrays(
         trial_id=trial_id, treated=trial.treated, control=trial.control, event=event, horizon=float(horizon),
         discharge_alive_rule=rule, patient_id=covariates.patient_id, arm=covariates.arm, X=covariates.X,
         covariate_names=covariates.covariate_names, device_time=covariates.device_time, grace=covariates.grace,
-        event_time=arrays.event_time[mask], event_type=arrays.event_type[mask], resolved=arrays.resolved[mask],
+        event_time=event_time[mask], event_type=event_type[mask], resolved=resolved[mask],
+        hospice_rule=hospice,
     )
 
 
@@ -575,6 +614,9 @@ def _estimate(
             )
         keep = arrays.resolved
         handling = "excluded_and_reported"
+    elif arrays.discharge_alive_rule == "competing":
+        keep = np.ones(n, dtype=bool)
+        handling = "discharge_alive_competing"
     else:
         keep = np.ones(n, dtype=bool)
         handling = "censored_at_discharge"
@@ -612,8 +654,9 @@ def _estimate(
         estimates[primary], boot = _bootstrap_aalen_johansen(
             sub, result.risks.weights, groups_k, n_boot=n_boot, seed=seed, alpha=alpha)
         notes.append(
-            f"censor rule: weighted Aalen-Johansen at the horizon; bootstrap interval over {boot['n_boot_used']} "
-            "patient resamples with clone weights held fixed"
+            f"{arrays.discharge_alive_rule} rule: weighted Aalen-Johansen at the horizon"
+            + (" with discharge alive as a competing event" if handling == "discharge_alive_competing" else "")
+            + f"; bootstrap interval over {boot['n_boot_used']} patient resamples with clone weights held fixed"
         )
     diagnostics = _clone_diagnostics(result, X, arrays.covariate_names, registry)
     ratio = estimates[primary].risk_ratio
@@ -660,7 +703,7 @@ def _pooled_arrays(per_site: Mapping[str, TrialArrays]) -> tuple[TrialArrays, np
     pooled = TrialArrays(
         trial_id=first.trial_id, treated=first.treated, control=first.control, event=first.event,
         horizon=first.horizon, discharge_alive_rule=first.discharge_alive_rule,
-        patient_id=np.concatenate(groups), arm=cat("arm"), X=np.vstack(blocks),
+        hospice_rule=first.hospice_rule, patient_id=np.concatenate(groups), arm=cat("arm"), X=np.vstack(blocks),
         covariate_names=first.covariate_names + tuple(indicators), device_time=cat("device_time"),
         grace=first.grace, event_time=cat("event_time"), event_type=cat("event_type"), resolved=cat("resolved"),
     )
@@ -675,6 +718,7 @@ def emulate_trial(
     authorization: Authorization | None,
     outcome: str = "trial",
     discharge_alive_rule: str | None = None,
+    hospice_rule: str | None = None,
     pooled: bool = True,
     config: est.NuisanceConfig | None = None,
     n_boot: int = 200,
@@ -694,14 +738,17 @@ def emulate_trial(
     if outcome not in OUTCOMES:
         raise ValueError(f"outcome must be one of {OUTCOMES}, got {outcome!r}")
     rule = _rule(registry, discharge_alive_rule)
+    hospice = _hospice_rule(registry, hospice_rule)
     if authorization.basis == "pre_registration_audit" and (
         outcome != "trial" or rule != registry.discharge_alive_rule.value
+        or hospice != registry.hospice_rule.value
     ):
         raise EmulationRefused("the pre-registration audit comparison may only run as registered")
     config = config or est.NuisanceConfig()
     alpha = registry.alpha
     per_site = {
-        name: trial_arrays(data, registry, trial_id, outcome=outcome, discharge_alive_rule=rule)
+        name: trial_arrays(data, registry, trial_id, outcome=outcome, discharge_alive_rule=rule,
+                           hospice_rule=hospice)
         for name, data in sites.items()
     }
     for name, arrays in per_site.items():
@@ -734,6 +781,7 @@ def run_trial_emulation(
     local_hashes: Mapping[str, str] | None = None,
     outcome: str = "trial",
     discharge_alive_rule: str | None = None,
+    hospice_rule: str | None = None,
     **kwargs: Any,
 ) -> dict[str, EmulationResult]:
     """The emulation command: authorize, then emulate. Refuses before reading outcomes."""
@@ -742,14 +790,16 @@ def run_trial_emulation(
     if outcome not in OUTCOMES:
         raise ValueError(f"outcome must be one of {OUTCOMES}, got {outcome!r}")
     rule = _rule(registry, discharge_alive_rule)
-    modified = outcome != "trial" or rule != registry.discharge_alive_rule.value
+    hospice = _hospice_rule(registry, hospice_rule)
+    modified = (outcome != "trial" or rule != registry.discharge_alive_rule.value
+                or hospice != registry.hospice_rule.value)
     authorization = authorize_outcome_by_arm(
         registry, trial_id=trial_id, sites=list(sites), protocol_hash=protocol_hash,
         freeze_manifest=freeze_manifest, local_hashes=local_hashes, modified=modified,
     )
     return emulate_trial(
         sites, registry, trial_id, authorization=authorization, outcome=outcome,
-        discharge_alive_rule=rule, **kwargs,
+        discharge_alive_rule=rule, hospice_rule=hospice, **kwargs,
     )
 
 
@@ -762,29 +812,43 @@ def measure_feasibility(
 ) -> bm.FeasibilityInputs:
     """Arm sizes, overlap and effective sample size for one trial, without any outcome.
 
-    The probability of following each compared arm is cross-fitted on the trial's
-    eligible patients (everyone treated as reaching the decision, since that depends on
-    outcomes). Feed the result to `benchmark.feasibility_screen`.
+    Item 44 (product authority, 2026-10-03): positivity is a property of the comparison,
+    so it is measured on the TWO compared arms only. Among the trial-eligible patients who
+    follow the treated or the control arm, P(treated | covariates, one of the two) is
+    cross-fitted; a patient whose probability lies outside [floor, 1 - floor] is outside
+    the overlap region (`share_below_min_probability`) and would be excluded by trimming.
+    The trimmed share is reported over the compared patients and over every
+    trial-eligible patient. Effective sample sizes use the same two-arm probabilities.
+    Feed the result to `benchmark.feasibility_screen`.
     """
     config = config or est.NuisanceConfig()
     trial = registry.trials[trial_id]
     data = trial_covariates(site, registry, trial_id)
-    n_treated = int(np.sum(data.arm == trial.treated))
-    n_control = int(np.sum(data.arm == trial.control))
-    ess, below, runnable = {}, [], True
-    for key, label in (("treated", trial.treated), ("control", trial.control)):
-        follows = (data.arm == label).astype(np.float64)
-        try:
-            probability = est.cross_fit_probability(data.X, follows, groups=data.patient_id, config=config)
-        except (est.EstimationError, ValueError):
-            runnable = False
-            ess[key] = 0.0
-            below.append(1.0)
-            continue
-        clipped = np.clip(probability, config.clip, 1.0)
-        ess[key] = dx.effective_sample_size(1.0 / clipped[follows == 1]) if follows.any() else 0.0
-        below.append(float(np.mean(probability < registry.screen["min_probability"])))
+    n_eligible = int(data.arm.size)
+    treated = data.arm == trial.treated
+    control = data.arm == trial.control
+    compared = treated | control
+    n_treated, n_control, n_compared = int(treated.sum()), int(control.sum()), int(compared.sum())
+    floor = registry.screen["min_probability"]
+    try:
+        probability = est.cross_fit_probability(
+            data.X[compared], treated[compared].astype(np.float64), groups=data.patient_id[compared],
+            config=config)
+    except (est.EstimationError, ValueError):
+        return bm.FeasibilityInputs(
+            n_treated=n_treated, n_control=n_control, ess_treated=0.0, ess_control=0.0,
+            share_below_min_probability=1.0, estimators_runnable={"clone_censor_weight": False},
+            n_eligible=n_eligible, n_compared=n_compared)
+    outside = (probability < floor) | (probability > 1.0 - floor)
+    clipped = np.clip(probability, config.clip, 1.0 - config.clip)
+    on_treated = treated[compared]
+    ess_t = dx.effective_sample_size(1.0 / clipped[on_treated]) if on_treated.any() else 0.0
+    ess_c = dx.effective_sample_size(1.0 / (1.0 - clipped[~on_treated])) if (~on_treated).any() else 0.0
+    trimmed = int(outside.sum())
     return bm.FeasibilityInputs(
-        n_treated=n_treated, n_control=n_control, ess_treated=ess["treated"], ess_control=ess["control"],
-        share_below_min_probability=max(below), estimators_runnable={"clone_censor_weight": runnable},
+        n_treated=n_treated, n_control=n_control, ess_treated=ess_t, ess_control=ess_c,
+        share_below_min_probability=float(outside.mean()) if n_compared else 1.0,
+        estimators_runnable={"clone_censor_weight": True}, n_eligible=n_eligible, n_compared=n_compared,
+        share_trimmed_of_compared=trimmed / n_compared if n_compared else None,
+        share_trimmed_of_eligible=trimmed / n_eligible if n_eligible else None,
     )

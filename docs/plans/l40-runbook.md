@@ -34,24 +34,31 @@ an `fcntl` lock. It must sit on a local filesystem, not NFS or SMB: keep
 ## Before the first launch: decisions for the product authority
 
 These must be settled before step 15 (pre-flight) can pass or before the first full run.
-The code runs either way; none of these is decided by an engineer.
+The code runs either way; none of these is decided by an engineer. The product authority
+(J.C. Rojas) decided items 1-4 on 2026-10-03; the record, with references, is
+`docs/decisions/2026-10-03-clinical-decisions.md`.
 
-1. **Held-out share (KTD6).** The split is baked into the vocabulary, every shard and every
-   checkpoint. Decide the share from the held-out arm sizes of the audit blind stage
-   (step 6) and record it with `--write-split-freeze` (step 7). Changing it later means
-   rebuilding everything from step 4.
-2. **Seven proposed competing-risk thresholds.** `configs/thresholds.yaml` lists ten
-   competing-risk causes; three repeat the cohort contract and seven carry
-   `status: proposed` (respiratory rate 24, creatinine 2.0, bilirubin 2.0, platelets 100,
-   heart rate 130, SBP 90, temperature 38.3). They need physician confirmation. The
-   pre-flight reports them as a warning, not a failure.
-3. **Creatinine 1.3 control.** On the MIMIC verification sample the control creatinine
-   above 1.3 sits on a bin edge in both decile arms, so the edge check refuses it. The
-   full-data decile edges may differ; if step 16 refuses it again, either drop the control
-   from `configs/thresholds.yaml` or accept fewer controls for creatinine.
-4. **Agreement margins.** The extubation benchmark margins in
-   `configs/extubation_benchmarks.yaml` are `proposed` until the emulation protocol is
-   registered. They do not gate the screening runs.
+1. **Held-out share (KTD6) - decided: stratified held-out split (item 46).** The split is
+   baked into the vocabulary, every shard and every checkpoint. The product authority chose
+   to enlarge the held-out partitions for the scarce arms: patients whose first
+   post-extubation device is NIV or HFNC are over-sampled into the held-out partitions
+   until each arm holds 50% of its patients there, with the overall 60/15/10/15 kept
+   (`configs/train.yaml` `data_contract.held_out_stratification`; step 7 switches it on).
+   Changing it after the freeze means rebuilding everything from step 4.
+2. **Competing-risk thresholds - decided (items 1-7).** All ten causes are `contract` or
+   `confirmed`: respiratory rate > 24, bilirubin > 2.0, platelets < 100, heart rate > 130,
+   SBP < 90, temperature > 39.166 C (the physician-CSV edge at NEWS2's top temperature
+   band), and creatinine by the KDIGO AKI rule (+0.3 mg/dL in 48 h or 1.5x the lowest
+   value in 7 days, in-stay baseline). The pre-flight check passes.
+3. **Off-edge controls - provisional (item 8).** Creatinine 1.35 and MAP 62.5 replace 1.3
+   and 63. They are provisional: step 16's edge check on the production vocabularies
+   decides; if it refuses one, return it to the product authority.
+4. **Agreement margins - decided in method, values `proposed` (items 42-45).** Each trial's
+   margin is derived by the FDA fixed-margin approach (half of the conservative benchmark
+   effect preserved), with the Roehmel-Kieser second hurdle, a harmful-side stop on the
+   whole interval above 1, overlap measured on the two compared arms, and registered
+   negative-control outcomes. Values stay `proposed` until the protocol is registered;
+   they do not gate the screening runs.
 5. **Casey 2021 comparison.** The unblinded all-comer comparison against Casey 2021 is the
    one outcome-by-arm run allowed before registration. It is the product authority's
    deliberate run, not part of this runbook.
@@ -158,10 +165,24 @@ Produces: `output/final_no_phi/extubation_audit_blind_mimic.json` and `.csv`
 the MIMIC held-out NIV and HFNC arms are small (see the blind-stage report on the node; arm
 counts are not copied into this public repository).
 
-## 7. Decide the held-out share and freeze the split
+## 7. Stratify the held-out partitions and freeze the split
 
-If the held-out share changes, edit `configs/train.yaml` `data_contract.partitions`,
-commit, and rerun steps 4 to 6. Then freeze:
+The product authority chose the stratified held-out split (decision 1; item 46). Switch it
+on in `configs/train.yaml` (`data_contract.held_out_stratification.enabled: true`), commit,
+then rebuild the episode artifact with the step-5 extubation cohort as the strata source
+(only its `patient_id`, `eligible` and `arm_first_device` columns are read; no outcome),
+and rerun steps 5 and 6 so the cohort inherits the new partitions:
+
+```bash
+uv run python -m src.data.cohort --data ~/Data/clif-source --out output/intermediate_phi/episodes.parquet --held-out-strata output/intermediate_phi/extubation_cohort.parquet
+```
+
+Check: the printed `held_out_stratification.achieved` shows each of NIV and HFNC at about
+0.5 (aggregate shares only), and the step-6 blind stage's `held_out` arm sizes grew. The
+other patients only rebalance between train and the held-out partitions, so the overall
+shares stay 60/15/10/15. Rebuilding with the extubation cohort of the old split is fine:
+arms do not depend on the partition. With Rush staged, do the same for
+`episodes_rush.parquet` with the Rush extubation cohort. Then freeze:
 
 ```bash
 uv run python -m src.train.preflight --write-split-freeze --episodes mimic=output/intermediate_phi/episodes.parquet --audit-blind output/final_no_phi/extubation_audit_blind_mimic.json --approver "J.C. Rojas"

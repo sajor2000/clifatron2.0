@@ -494,6 +494,8 @@ def episode_split_summary(path: str | Path, train_config: str | Path = TRAIN_CON
         "observed_shares": {k: round(v / total, 4) for k, v in sorted(counts.items())},
         "configured_proportions": dict(contract["partitions"]),
         "split_seed": int(contract["split_seed"]),
+        # Item 46: the held-out stratification the split was built with (config only).
+        "held_out_stratification": dict(contract.get("held_out_stratification") or {}),
     }
 
 
@@ -585,6 +587,9 @@ def check_split_freeze(freeze_path: str | Path | None, episodes: Mapping[str, st
         if now["configured_proportions"] != was.get("configured_proportions") \
                 or now["split_seed"] != was.get("split_seed"):
             problems.append(f"site {site}: configs/train.yaml partitions or split_seed "
+                            "changed since the freeze")
+        if now["held_out_stratification"] != was.get("held_out_stratification", {}):
+            problems.append(f"site {site}: configs/train.yaml held_out_stratification "
                             "changed since the freeze")
     if problems:
         return Check(name, FAIL, "; ".join(problems))
@@ -832,8 +837,8 @@ def threshold_checks(vocabs: Mapping[str, Mapping], *,
                                 "control from configs/thresholds.yaml or change the arm)"))
         except Exception as exc:  # noqa: BLE001
             checks.append(Check("thresholds: edge check", FAIL, str(exc)[:200]))
-    proposed = [f"{t.concept} {t.value:g}" for t in registry["competing_risk_cause"]
-                if t.status == "proposed"]
+    proposed = [f"{t.concept} {t.rule if t.rule is not None else format(t.value, 'g')}"
+                for t in registry["competing_risk_cause"] if t.status == "proposed"]
     checks.append(Check("thresholds: competing-risk causes", WARN if proposed else PASS,
                         f"{len(proposed)} still status: proposed ({', '.join(proposed)}): "
                         "physician confirmation before the first run" if proposed

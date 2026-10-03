@@ -22,14 +22,74 @@ stop_rules:
     max_share_not_evaluable: {value: 0.5, status: proposed}
   # R32 (2): the unblinded all-comer estimate (Casey 2021, HFNC vs conventional oxygen)
   # stays clearly on the harmful side. Fires when the lower bound of the primary risk
-  # ratio interval is above this ratio: the whole interval says HFNC is worse.
+  # ratio interval is above this ratio: the whole interval says HFNC is worse. Product
+  # authority, 2026-10-03 (item 43): the ENTIRE interval above 1.0 - not a point estimate
+  # above 1.0 (too noisy) or 1.5 (too permissive) - the interval analogue of Pocock's
+  # "p < 0.01 the wrong way" safety guideline.
   harmful_side:
     lower_bound_ratio_above: {value: 1.0, status: proposed}
   # R32 (3): the negative controls fail. Fires when more than this many registered
-  # negative controls fail their check. Negative-control outcome comparisons by arm need
-  # the registered protocol (KTD9), so before registration this rule is not evaluated.
+  # negative-control outcomes (below) have a device risk-ratio interval that excludes 1.
+  # Negative-control comparisons by arm need the registered protocol (KTD9), so before
+  # registration this rule is not evaluated.
   negative_controls:
     max_failed: {value: 0, status: proposed}
+
+# Item 45 (product authority, 2026-10-03): pre-specified negative-control outcomes (NCOs).
+# Each shares the confounding by severity / indication of the primary outcome (sicker
+# patients get NIV or HFNC AND develop these) but has no plausible causal path from the
+# post-extubation device. None is validated for respiratory-support exposures
+# (Levintow 2023, doi:10.1002/pds.5623); together they also allow empirical calibration
+# (Wang 2026, doi:10.1016/j.jclinepi.2026.112188). Fan 2026 (doi:10.1038/s41467-026-74999-6)
+# is why: under strong confounding by indication no method reproduced the trials, and NCO
+# failure is how an invalid emulation shows itself. Every outcome is a CLIF 2.1 lab
+# category in its CLIF 2.1 unit, NEW (absent in the 24 h before time zero), ascertained
+# in (0, 48 h] after time zero and only BEFORE any reintubation, so an effect of the device
+# on reintubation cannot carry into it. Excluded on purpose (a device path exists): facial
+# pressure injury (NIV mask), aspiration fever or new antibiotics, delirium, hypoxemia,
+# lactate, ICU readmission. A shared threat: a device can change how often labs are drawn
+# (detection); lab-draw counts per arm are reported beside each NCO. All `proposed`.
+negative_control_outcomes:
+  new_thrombocytopenia:
+    definition: "platelet_count < 100 10^3/uL, none in the 24 h before time zero"
+    rationale: "SOFA coagulation dysfunction tracks sepsis severity; no route from nasal or mask support to platelet consumption"
+    status: proposed
+  new_hyperbilirubinemia:
+    definition: "bilirubin_total > 2.0 mg/dL, none in the 24 h before time zero"
+    rationale: "SOFA liver dysfunction tracks shock and sepsis severity; the device has no hepatic path"
+    status: proposed
+  hypoglycemia:
+    definition: "glucose_serum < 70 mg/dL"
+    rationale: "marks severity, sepsis and liver failure; independent of the respiratory interface"
+    status: proposed
+  new_severe_anemia:
+    definition: "hemoglobin < 7.0 g/dL, none in the 24 h before time zero"
+    rationale: "follows bleeding, haemolysis and critical-illness anaemia shared with severity; no device path"
+    status: proposed
+  new_hyponatremia:
+    definition: "sodium < 130 mmol/L, none in the 24 h before time zero"
+    rationale: "follows heart failure, cirrhosis and fluid shifts shared with severity; the device does not move sodium"
+    status: proposed
+  new_hyperkalemia:
+    definition: "potassium > 6.0 mmol/L, none in the 24 h before time zero"
+    rationale: "follows kidney injury and tissue breakdown shared with severity; no device path"
+    status: proposed
+  new_coagulopathy:
+    definition: "inr > 1.5, none in the 24 h before time zero"
+    rationale: "marks liver dysfunction and consumptive coagulopathy shared with severity; no device path"
+    status: proposed
+  new_hypoalbuminemia:
+    definition: "albumin < 2.5 g/dL, none in the 24 h before time zero"
+    rationale: "marks inflammation and catabolism shared with severity; no device path"
+    status: proposed
+
+# Item 45: positive control. The planted-effect simulation plants this risk ratio on each
+# evaluable trial's comparison and checks that the estimator's interval excludes 1 on the
+# planted side at least `min_detection_rate` of the time (src/eval/causal/simulation.py
+# `positive_control_detection`; reported by the `simulate` stage).
+positive_control:
+  planted_risk_ratio: {value: 0.5, status: proposed}
+  min_detection_rate: {value: 0.8, status: proposed}
 
 # R40: a sharp shift in first-device use by calendar period or by unit triggers the
 # adoption-era contrast as a supporting analysis. For each arm, the spread of its share

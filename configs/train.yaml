@@ -48,6 +48,23 @@ data_contract:
     calibration: 0.10
     internal_test: 0.15
   required_partitions: [train, validation, calibration, internal_test]
+  # Item 46 (product authority, J.C. Rojas, 2026-10-03): the held-out partitions are
+  # enlarged for the scarce extubation arms by a stratified split (src/data/splits.py):
+  # patients whose FIRST post-extubation device is NIV or HFNC are over-sampled into the
+  # held-out partitions (every partition except `train`) until each arm holds
+  # `held_out_share` of its patients there; as many other patients move the other way,
+  # partition by partition, so the proportions above are kept. Deterministic by
+  # split_seed. The stratum comes from the extubation cohort's pre-registered, outcome-blind
+  # membership only (patient_id, eligible, arm_column). It changes the training data's
+  # composition and is baked into every checkpoint: the product authority chose it, and it
+  # is switched on at the split-freeze step (docs/plans/l40-runbook.md step 7), not before.
+  held_out_stratification:
+    enabled: false
+    strata_source: extubation_cohort
+    arm_column: arm_first_device
+    arms: [niv, hfnc]
+    held_out_share: 0.5
+    held_out_partitions: [validation, calibration, internal_test]
   artifact_fit_partition: train
   sealed_partitions: [internal_test, external_confirmation]
   sealed_access_log: "output/intermediate_phi/sealed_access.parquet"

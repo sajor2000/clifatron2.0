@@ -79,16 +79,19 @@ codes are recorded after discharge and carry no present-on-admission flag.
 - **Follow-up:** from time zero to the trial's own outcome window (and 168 hours for the
   study primary outcome), to death, or to the index discharge. Readmissions are not
   searched.
-- **Discharge alive before the horizon:** primary rule `event_free` (proposed): a patient
-  discharged alive with no event inside the window is event-free at the horizon, which
-  assumes no out-of-hospital reintubation or death. Sensitivity: `censor` at discharge, with
-  a clone-weighted Aalen-Johansen estimate. Rows unresolved under the rule in force (unknown
+- **Discharge alive before the horizon (item 39, decided):** primary rule `event_free`: a
+  patient discharged alive with no event inside the window is event-free at the horizon,
+  which emulates the trials' intention-to-treat counting and assumes no out-of-hospital
+  reintubation or death. Sensitivity analyses: discharge alive as a **competing event**
+  (`competing`; clone-weighted Aalen-Johansen cumulative incidence with discharge alive
+  competing), and `censor` at discharge (clone-weighted Aalen-Johansen). Rows unresolved under the rule in force (unknown
   disposition) are counted and reported; above 5% (proposed) the emulation refuses rather
   than estimate on the remainder.
 - **Competing death:** death prevents later reintubation. Each emulation reports the
   composite (reintubation or death) and the cause-specific cumulative incidence of
   reintubation with death as a competing event; a hospice discharge is a competing event at
-  discharge.
+  discharge (item 41, decided), with a composite sensitivity (`hospice_rule: composite`)
+  that counts hospice-then-death as the endpoint.
 
 ## 5. Outcomes
 
@@ -122,8 +125,10 @@ codes are recorded after discharge and carry no present-on-admission flag.
 
 **Feasibility (R25), read without any outcome by arm.** A trial is evaluable only if its
 eligibility, exposure and outcome are representable; every estimator can run; each compared
-arm has at least 50 patients; at most 20% of the trial population has a cross-fitted
-probability below 0.02 of following a compared arm; each arm's Kish effective sample size is
+arm has at least 50 patients; overlap is measured on the **two compared arms only** (item 44,
+decided): at most 20% of the patients on the treated or the control arm have a cross-fitted
+probability of the treated arm (given one of the two) outside [0.02, 0.98], and the share of
+all trial-eligible patients a trim to that range would exclude is reported; each arm's Kish effective sample size is
 at least 30; and the projected precision is adequate: for a trial that found an effect, the
 smallest detectable risk difference (from the effective sample sizes and the trial's
 published control-arm risk) is at most 1.5 times the trial's difference; for a null trial,
@@ -161,17 +166,31 @@ the known-answer pattern (NIV for hypercapnic patients).
 ## 9. Agreement criteria (proposed)
 
 - **Scale:** log risk ratio; gap = emulation minus trial.
-- **Trials that found an effect:** per estimator, the mean absolute gap over evaluable
-  trials must lie within log 1.5 (agreement margin 1.5, proposed). The inverse-variance
-  signed mean gap is reported as a description of systematic bias.
+- **Margins (item 42, method decided, values proposed):** each trial that found an effect
+  gets its own margin by the FDA fixed-margin approach: M1 is the bound of the benchmark
+  risk-ratio interval nearest 1, and the margin preserves 50% of it (relative margin
+  exp(0.5 x |log M1|)); the same margin is stated on the absolute scale (half the Wald
+  risk-difference bound nearest 0). For a mortality-type endpoint (reintubation or death,
+  death) the relative margin is capped at 1.2 (allowed range 1.1-1.2). The derived margins
+  are about 1.03-1.27 for the registered effect trials, against the retired common 1.5.
+- **Trials that found an effect:** per estimator, each gap is divided by its trial's log
+  margin and the mean absolute scaled gap must be at most 1. The inverse-variance signed
+  mean gap is reported as a description of systematic bias.
 - **Null trials:** reproduced only when the emulation's whole interval lies inside
-  [1/1.5, 1.5] (equivalence margin 1.5, proposed), so a wide interval cannot pass by being
-  wide.
+  [1/1.5, 1.5] (equivalence margin 1.5, proposed; capped like the effect margins for a
+  mortality-type endpoint), so a wide interval cannot pass by being wide. A null trial has
+  no effect to preserve, so the fixed-margin approach does not apply to it.
+- **Second hurdle (Roehmel & Kieser 2013):** a trial counts as reproduced only if, besides
+  the interval rule, the emulation's point estimate lies on the benchmark's side of 1, and
+  the pooled verdict needs every scored effect trial to clear it. A reversed effect can no
+  longer pass by landing inside a wide margin.
 - **Operating characteristics (R29):** a planted-effect simulation on each frozen cohort
   reports how often the rule passes when the true effect equals the trial's, is zero, or is
   reversed, with and without a withheld confounder; treatment is drawn from a fitted
   device-choice model and the baseline risk is supplied as a number or fitted without the
-  arm. These pass rates are published with the results.
+  arm. These pass rates are published with the results, with a **positive control**
+  (item 45): a planted risk ratio of 0.5 must be detected (interval excluding 1) in at
+  least 80% of replicates.
 - **Known-answer pattern (R13):** the predicted advantage of NIV over HFNC grows with
   predicted baseline risk, and the lowest-risk device in trial-defined groups matches the
   trials (NIV for hypercapnic, obese and very-high-risk patients; HFNC over conventional
@@ -208,11 +227,12 @@ Before registration, a go/no-go audit runs on MIMIC with the classical estimator
 stops or is re-scoped with the product authority if any of these fires:
 
 - **Precision:** more than half of the registered trials fail the R25 screen at the site.
-- **Harmful side:** the lower bound of the unblinded all-comer risk ratio (HFNC over
-  conventional oxygen) is above 1.0, so the whole interval says HFNC is worse. (Open item:
-  whether the bound should instead be the equivalence margin, 1.5.)
-- **Negative controls:** more than zero registered negative controls fail (section 12).
-  These need outcome-by-arm runs and so are evaluated only after registration.
+- **Harmful side (item 43, decided):** the lower bound of the unblinded all-comer risk ratio
+  (HFNC over conventional oxygen) is above 1.0, so the whole interval says HFNC is worse;
+  not a point estimate above 1.0 (too noisy) or 1.5 (too permissive).
+- **Negative controls (item 45):** more than zero registered negative-control outcomes have
+  a device risk-ratio interval that excludes 1 (section 12). These need outcome-by-arm runs
+  and so are evaluated only after registration.
 
 **Adoption-era trigger (R40, proposed).** If, for some arm, its share of first devices
 differs by more than 0.20 between calendar periods (or units) with at least 50 patients
@@ -225,8 +245,24 @@ contrast is read. The adoption-era estimator is specified at registration.
 
 No validated negative controls exist for HFNC, NIV or oxygen exposures, so each candidate
 below states why a null is expected and how it could fail for reasons other than
-confounding. Each is run with the primary estimator and read on the risk difference: it
-passes when the interval covers zero.
+confounding. Each is run with the primary estimator: it passes when the interval covers no
+effect, and fails (and counts toward the stop rule) when it excludes it.
+
+**Registered negative-control outcomes (item 45, proposed; `configs/extubation_audit.yaml`
+`negative_control_outcomes`).** Eight new laboratory abnormalities, each a CLIF 2.1 lab
+category in its CLIF 2.1 unit, absent in the 24 hours before time zero, ascertained in the
+first 48 hours and only before any reintubation (so an effect of the device on
+reintubation cannot carry into them): platelet count < 100 x10^3/uL, total bilirubin
+> 2.0 mg/dL, serum glucose < 70 mg/dL, hemoglobin < 7.0 g/dL, sodium < 130 mmol/L,
+potassium > 6.0 mmol/L, INR > 1.5 and albumin < 2.5 g/dL. Each shares confounding by
+severity with the primary outcome and has no plausible path from the device. Left out on
+purpose because a device path exists: facial pressure injury (NIV mask), aspiration fever
+or new antibiotics, delirium, hypoxaemia and lactate, ICU readmission. Shared impurity: a
+device can change how often labs are drawn, so lab-draw counts per arm are reported beside
+each. Pairing them with the planted positive control (section 9) shows the pipeline can
+detect a true effect.
+
+The earlier candidates remain as supporting diagnostics:
 
 | Candidate | Type | Reason to expect a null | Known impurity |
 |---|---|---|---|
@@ -270,9 +306,12 @@ row-level data leaves Rush or UChicago.
 - Register or revise every `proposed` value: margins, the feasibility screen, the discharge
   rule, the maximum unresolved share, the balance threshold, the stop-rule and trigger
   thresholds, and the negative controls.
-- The harmful-side bound (1.0 or the equivalence margin).
-- Whether "Face Mask" (which may include aerosol face tents) belongs in the conventional
-  oxygen arm.
+- Settled by the product authority's decisions of 2026-10-03 (`docs/decisions/2026-10-03-clinical-decisions.md`): the harmful-side bound (1.0, whole interval), the margin method, the
+  second hurdle, the two-arm overlap screen, the negative-control register, the discharge
+  rule (event-free primary, competing sensitivity) and hospice handling.
+- ~~Whether "Face Mask" (which may include aerosol face tents) belongs in the conventional
+  oxygen arm.~~ Decided (item 36): face tents and aerosol masks count as conventional
+  oxygen ("Face Mask").
 - Clinical review of the comorbidity code lists.
 - Staging MIMIC-IV `anchor_year_group` so the period table and the adoption-era contrast
   are evaluable on MIMIC.

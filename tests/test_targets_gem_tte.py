@@ -466,6 +466,135 @@ class CompetingRiskLabelTest(unittest.TestCase):
         self.assertIsNone(anchor["cr"])
 
 
+class KdigoCreatinineCauseTest(unittest.TestCase):
+    """Creatinine's competing-risk cause is KDIGO AKI (product authority, 2026-10-03):
+    >= 0.3 mg/dL above the lowest value in the preceding 48 h, or >= 1.5x the lowest in the
+    preceding 7 days; in-stay baseline; no prior value = not assessable. The creatinine
+    threshold-hazard QUERY grid keeps its fixed decision thresholds."""
+
+    @classmethod
+    def setUpClass(cls):
+        concepts = ("map", "creatinine")
+        binning = DATA_CFG["value_binning"]
+        segments = load_csv_segments(ROOT / binning["segment_source"], list(concepts),
+                                     binning["forced_edges"], DIRECTIONS)
+        vocab = dict(SPECIAL)
+        for concept, segs in segments.items():
+            for b in range(len(segs)):
+                vocab[f"{concept}={b}"] = len(vocab)
+        for token in ("ADMISSION//ed", "DISCHARGE//home", DEATH_TOKEN):
+            vocab[token] = len(vocab)
+        cls.blob = {"vocab": vocab, "segments": segments,
+                    "manifest": {"tokenizer_version": 2},
+                    "concept_sources": {"tables": {"map": ["vitals"], "creatinine": ["labs"]},
+                                        "treatment_sources": ["meds"]}}
+        full = load_thresholds()
+        registry = {**full, **{kind: tuple(t for t in full[kind] if t.concept in concepts)
+                               for kind in THRESHOLD_KINDS}}
+        cls.grid = ThresholdGrid(cls.blob, TARGETS, registry)
+        cls.cr = cls.grid._index["creatinine"]
+        cls.aki = cls.grid.causes[cls.cr]
+        cls.stats = {token: (0.0, 100.0) for token in cls.grid.token_target}
+
+    def build(self):
+        return TargetBuilder(
+            vocab_size=len(self.blob["vocab"]), n_time_bins=16, horizon_hours=48,
+            value_stats=self.stats, run_seed=7, mode="gem_tte",
+            in_stream=InStreamTargets(grid=self.grid, anchors_per_window=1,
+                                      queries_per_anchor=1, baseline_lookback_hours=6,
+                                      required_measurement_within_hours_of_horizon=12))
+
+    def stream(self, events, end=("home", A + 100 * 60)):
+        vocab, segs = self.blob["vocab"], self.blob["segments"]
+        token = [SPECIAL["<bos>"], vocab["ADMISSION//ed"]]
+        pos, value, eligible = [0, 0], [None, None], [False, False]
+        for minute, concept, v in events:
+            token.append(vocab[f"{concept}={bin_index(v, segs[concept])}"])
+            pos.append(minute)
+            value.append(v)
+            eligible.append(True)
+        token += [vocab[f"DISCHARGE//{end[0]}"], SPECIAL["<eos>"]]
+        pos += [end[1], end[1]]
+        value += [None, None]
+        eligible += [True, False]
+        s = {"episode_key": "kdigo-stay", "token": token, "pos_min": pos, "value": value,
+             "target_eligible": eligible, "anchor_idx": None, "outcomes": []}
+        index = max(i for i, m in enumerate(pos) if m == A and i < len(pos) - 2)
+        return s, index
+
+    def label(self, events, **kw):
+        s, index = self.stream(events, **kw)
+        return self.build().label_anchor(s, index, self.aki)
+
+    def test_the_cause_is_a_rule_and_the_query_grid_keeps_fixed_creatinine_thresholds(self):
+        self.assertEqual(self.aki.rule, "kdigo_aki")
+        self.assertIsNone(self.aki.value)
+        self.assertEqual(dict(self.aki.params), {
+            "absolute_rise": 0.3, "absolute_window_hours": 48.0,
+            "relative_rise": 1.5, "relative_window_hours": 168.0})
+        decision = [q.value for q in self.grid.registered("decision") if q.concept == "creatinine"]
+        self.assertEqual(decision, [1.5, 2.0, 3.0])
+        self.assertTrue(all(q.value is not None for q in self.grid.sampling_edges("creatinine")))
+
+    def test_a_rise_of_0_3_within_48_h_is_positive_even_below_the_old_2_0_cut(self):
+        # Baseline 0.9 at the anchor; 1.2 thirty hours later: +0.3 inside 48 h.
+        status = self.label([(A, "creatinine", 0.9), (A + 30 * 60, "creatinine", 1.2)])
+        self.assertEqual(status, {"status": "positive", "minutes": 30 * 60})
+
+    def test_a_rise_of_0_3_spread_over_more_than_48_h_is_not_the_absolute_criterion(self):
+        # 0.9 at the anchor, 1.1 at +40 h, 1.2 at +50 h: the lowest value in the 48 h before
+        # +50 h is 1.1, so no +0.3; 1.2 < 1.5 x 0.9, so no relative rise either.
+        status = self.label([(A, "creatinine", 0.9), (A + 40 * 60, "creatinine", 1.1),
+                             (A + 47 * 60, "creatinine", 1.15)])
+        self.assertEqual(status["status"], "negative")
+
+    def test_1_5x_the_lowest_value_in_the_preceding_7_days_is_positive(self):
+        # Lowest 1.0 five days before; 1.25 then 1.5 (1.5x, and the 48 h rise is only 0.25).
+        status = self.label([(A - 5 * 24 * 60, "creatinine", 1.0), (A, "creatinine", 1.25),
+                             (A + 20 * 60, "creatinine", 1.5)])
+        self.assertEqual(status, {"status": "positive", "minutes": 20 * 60})
+
+    def test_a_baseline_older_than_7_days_does_not_count(self):
+        # 1.0 eight days back is outside the window; against the in-window baseline 1.3,
+        # 1.5 is +0.2 and 1.15x. A measurement near the horizon makes it ascertainable.
+        status = self.label([(A - 8 * 24 * 60, "creatinine", 1.0), (A, "creatinine", 1.3),
+                             (A + 20 * 60, "creatinine", 1.5), (A + 40 * 60, "creatinine", 1.4)])
+        self.assertEqual(status["status"], "negative")
+
+    def test_no_prior_value_is_not_ascertainable_never_negative(self):
+        # One creatinine, after the anchor: nothing to compare it with.
+        s, index = self.stream([(A, "map", 80.0), (A + 40 * 60, "creatinine", 4.0)])
+        status = self.build().label_anchor(s, index, self.aki)
+        self.assertEqual(status, {"status": "not_ascertainable", "minutes": None})
+
+    def test_aki_already_met_at_the_anchor_is_prevalent(self):
+        status = self.label([(A - 20 * 60, "creatinine", 1.0), (A, "creatinine", 1.6),
+                             (A + 30 * 60, "creatinine", 2.5)])
+        self.assertEqual(status, {"status": "prevalent", "minutes": None})
+
+    def test_death_before_any_rise_is_a_competing_event(self):
+        status = self.label([(A, "creatinine", 1.0), (A + 60, "creatinine", 1.1)],
+                            end=("expired", A + 600))
+        self.assertEqual(status, {"status": "competing_event", "minutes": 600})
+
+    def test_the_rule_cause_feeds_the_competing_risk_label(self):
+        s, index = self.stream([(A, "map", 80.0), (A, "creatinine", 0.9),
+                                (A + 90, "creatinine", 1.3), (A + 300, "map", 60.0)])
+        s = dict(s, windows=[(index, index + 1)])
+        (anchor,) = self.build().build(s)["anchors"]
+        self.assertEqual(anchor["cr"], {"status": "positive", "cause": self.cr, "minutes": 90})
+
+    def test_flags_helper_uses_inclusive_bounds_and_strictly_earlier_baselines(self):
+        from src.data.targets import kdigo_aki_flags
+
+        meets, assessable = kdigo_aki_flags(
+            [0, 0, 60], [0.9, 1.2, 1.2], absolute_rise=0.3, absolute_window_minutes=2880,
+            relative_rise=1.5, relative_window_minutes=10080)
+        # A same-minute value is not a baseline; 1.2 - 0.9 counts as exactly 0.3.
+        self.assertEqual(assessable.tolist(), [False, False, True])
+        self.assertEqual(meets.tolist(), [False, False, True])
+
+
 class StatusShareTest(unittest.TestCase):
     def test_shares_are_aggregate_counts_over_anchors_and_queries(self):
         positive, a1 = anchored([(A + 300, "map", 60.0)])

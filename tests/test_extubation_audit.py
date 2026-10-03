@@ -401,6 +401,70 @@ def test_harmful_side_stop_rule_fires_on_an_interval_above_one():
     assert extubation_audit.harmful_side_rule({"lower": 0.8, "estimate": 1.2, "upper": 1.7}, config)["fired"] is False
 
 
+def test_harmful_side_rule_needs_the_whole_interval_above_one_not_the_point_estimate():
+    """Item 43: the lower bound must exceed 1.0; a point estimate above 1 (even 1.5) with
+    an interval that still covers 1 does not stop the study."""
+    from src.eval import extubation_audit
+
+    config = yaml.safe_load((ROOT / "configs/extubation_audit.yaml").read_text())
+    assert config["stop_rules"]["harmful_side"]["lower_bound_ratio_above"]["value"] == 1.0
+    assert extubation_audit.harmful_side_rule({"lower": 0.99, "estimate": 1.6, "upper": 2.6}, config)["fired"] is False
+    assert extubation_audit.harmful_side_rule({"lower": 1.01, "estimate": 1.1, "upper": 1.2}, config)["fired"] is True
+
+
+def test_negative_control_outcomes_are_registered_with_rationales_in_clif_terms():
+    """Item 45: 5-15 proposed NCOs, each a CLIF 2.1 lab category with a rationale."""
+    import csv
+
+    from src.eval import extubation_audit
+
+    config = yaml.safe_load((ROOT / "configs/extubation_audit.yaml").read_text())
+    ncos = extubation_audit.negative_control_outcomes(config)
+    assert 5 <= len(ncos) <= 15
+    assert all(entry["status"] == "proposed" for entry in ncos.values())
+    snapshot = next(p for p in (ROOT / "configs/clif_mcide_2.1.1", ROOT / "output/final_no_phi/clif_spec_v2.1.1")
+                    if (p / "mCIDE/labs/clif_lab_categories.csv").is_file())
+    with open(snapshot / "mCIDE/labs/clif_lab_categories.csv", encoding="utf-8") as fh:
+        labs = {row["lab_category"] for row in csv.DictReader(fh)}
+    for name, entry in ncos.items():
+        assert entry["definition"].split()[0] in labs, name
+    too_few = copy.deepcopy(config)
+    too_few["negative_control_outcomes"] = dict(list(config["negative_control_outcomes"].items())[:4])
+    with pytest.raises(ValueError, match="5 to 15"):
+        extubation_audit.negative_control_outcomes(too_few)
+    no_reason = copy.deepcopy(config)
+    next(iter(no_reason["negative_control_outcomes"].values()))["rationale"] = " "
+    with pytest.raises(ValueError, match="rationale"):
+        extubation_audit.negative_control_outcomes(no_reason)
+
+
+def test_negative_control_failure_fires_the_stop_rule():
+    from src.eval import extubation_audit
+
+    config = yaml.safe_load((ROOT / "configs/extubation_audit.yaml").read_text())
+    names = list(config["negative_control_outcomes"])
+    assert extubation_audit.negative_control_rule(config)["status"] == "not_evaluated"
+    clean = {name: {"lower": 0.8, "upper": 1.2} for name in names}
+    rule = extubation_audit.negative_control_rule(config, clean)
+    assert (rule["status"], rule["fired"], rule["observed"]) == ("evaluated", False, 0)
+    failing = {**clean, names[0]: {"lower": 1.05, "upper": 1.6}}       # CI excludes the null
+    rule = extubation_audit.negative_control_rule(config, failing)
+    assert rule["fired"] is True and rule["observed"] == 1 and names[0] in rule["reason"]
+    assert extubation_audit.negative_control_failed({"lower": 0.5, "upper": 0.95}) is True
+    with pytest.raises(ValueError, match="unregistered"):
+        extubation_audit.negative_control_rule(config, {"made_up": {"lower": 0.9, "upper": 1.1}})
+
+
+def test_positive_control_check_reports_detection_against_the_registered_floor():
+    from src.eval import extubation_audit
+
+    config = yaml.safe_load((ROOT / "configs/extubation_audit.yaml").read_text())
+    ok = extubation_audit.positive_control_check(0.9, config)
+    assert ok["passed"] is True and ok["planted_risk_ratio"] == 0.5
+    assert extubation_audit.positive_control_check(0.5, config)["passed"] is False
+    assert extubation_audit.positive_control_check(None, config)["status"] == "not_evaluable"
+
+
 def test_unblinded_refuses_every_comparison_but_casey_without_a_protocol_hash(workdir):
     from src.eval.causal.emulate import EmulationRefused
 

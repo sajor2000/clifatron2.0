@@ -16,6 +16,9 @@ import yaml
 from src.data.splits import (
     assign_grouped_splits,
     content_manifest,
+    held_out_shares,
+    held_out_stratification,
+    load_held_out_strata,
     validate_grouped_splits,
     validate_required_partitions,
 )
@@ -427,8 +430,13 @@ def build_cohort_artifact(
     cohort_config: str | Path,
     train_config: str | Path,
     artifact_policy: str | Path,
+    held_out_strata: str | Path | None = None,
 ) -> tuple[pl.DataFrame, dict[str, Any]]:
-    """Build, validate, and persist the canonical patient-grouped episode artifact."""
+    """Build, validate, and persist the canonical patient-grouped episode artifact.
+
+    `held_out_strata` is the extubation cohort artifact, required exactly when
+    `data_contract.held_out_stratification.enabled` (item 46; src/data/splits.py): only its
+    patient_id, eligible and device-arm columns are read."""
     base = Path(data_dir)
     cohort_path = Path(cohort_config)
     train_path = Path(train_config)
@@ -448,8 +456,20 @@ def build_cohort_artifact(
         cohort_cfg,
         return_waterfall=True,
     )
+    block = train_cfg.get("held_out_stratification") or {}
+    strata = None
+    if held_out_strata is not None:
+        if not block.get("enabled"):
+            raise QualificationError("--held-out-strata given but data_contract.held_out_stratification "
+                                     "is not enabled in the train config")
+        strata = load_held_out_strata(held_out_strata, arm_column=block["arm_column"], arms=block["arms"])
+    try:
+        stratification = held_out_stratification(train_cfg, strata)
+    except ValueError as exc:
+        raise QualificationError(str(exc)) from exc
     eligible = assign_grouped_splits(
-        episodes.filter(pl.col("eligible")), train_cfg["partitions"], seed=train_cfg["split_seed"]
+        episodes.filter(pl.col("eligible")), train_cfg["partitions"], seed=train_cfg["split_seed"],
+        held_out=stratification,
     )
     validate_grouped_splits(eligible)
     validate_required_partitions(eligible, train_cfg["required_partitions"])
@@ -475,6 +495,11 @@ def build_cohort_artifact(
             adt_path.stem: _file_sha256(adt_path),
         },
         "waterfall": waterfall,
+        "held_out_stratification": None if stratification is None else {
+            "arms": list(stratification.arms), "held_out_share": stratification.share,
+            "held_out_partitions": list(stratification.held_out),
+            "achieved": held_out_shares(eligible, stratification.strata, stratification.held_out),
+        },
     }
     episodes = episodes.with_columns(
         pl.lit(manifest["contract_version"]).alias("cohort_contract_version"),
@@ -555,14 +580,21 @@ def main() -> None:
     parser.add_argument("--cohort-config", default="configs/cohort.yaml")
     parser.add_argument("--train-config", default="configs/train.yaml")
     parser.add_argument("--artifact-policy", default="configs/artifact_policy.yaml")
+    parser.add_argument("--held-out-strata", default=None,
+                        help="extubation cohort artifact; required when data_contract."
+                             "held_out_stratification is enabled (item 46)")
     args = parser.parse_args()
-    build_cohort_artifact(
+    _, manifest = build_cohort_artifact(
         args.data,
         args.out,
         cohort_config=args.cohort_config,
         train_config=args.train_config,
         artifact_policy=args.artifact_policy,
+        held_out_strata=args.held_out_strata,
     )
+    if manifest.get("held_out_stratification"):
+        # Aggregate shares only (patients per arm and held-out share).
+        print(json.dumps({"held_out_stratification": manifest["held_out_stratification"]}, indent=2))
 
 
 if __name__ == "__main__":

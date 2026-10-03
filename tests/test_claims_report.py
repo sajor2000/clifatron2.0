@@ -21,18 +21,18 @@ from src.eval import claims_report as cr
 from src.eval import threshold_eval as te
 
 MAP_65 = te.threshold_key("decision", "map", 65.0, "below")
-MAP_63 = te.threshold_key("control", "map", 63.0, "below")
+MAP_62_5 = te.threshold_key("control", "map", 62.5, "below")
 VOCAB = {"clinical_soft": "a" * 64, "global_deciles": "b" * 64,
          "deciles_clinical_query": "c" * 64}
-ON_EDGE = {"clinical_soft": {MAP_65: True, MAP_63: False},
-           "global_deciles": {MAP_65: False, MAP_63: False},
-           "deciles_clinical_query": {MAP_65: False, MAP_63: False}}
+ON_EDGE = {"clinical_soft": {MAP_65: True, MAP_62_5: False},
+           "global_deciles": {MAP_65: False, MAP_62_5: False},
+           "deciles_clinical_query": {MAP_65: False, MAP_62_5: False}}
 N_STAYS = 300
 
 
 def registry() -> dict:
     full = load_thresholds()
-    keep = {("decision", 65.0), ("control", 63.0)}
+    keep = {("decision", 65.0), ("control", 62.5)}
     return {**full, **{kind: tuple(t for t in full[kind]
                                    if t.concept == "map" and (kind, t.value) in keep)
                        for kind in THRESHOLD_KINDS}}
@@ -74,7 +74,7 @@ def write_run(root: Path, tokenization: str, objective: str, seed: int, *,
     scorers = (["head"] if objective not in ("next_token_only", "minus_threshold") else []) \
         + ["probe"] + (["rollout"] if rollout else [])
     scores, rows, counts = [], [], {}
-    for threshold in (MAP_65, MAP_63):
+    for threshold in (MAP_65, MAP_62_5):
         kind, concept, value, direction = threshold.split(":")
         for horizon in (24.0, 48.0):
             y = labels(threshold, horizon)
@@ -113,7 +113,7 @@ def write_run(root: Path, tokenization: str, objective: str, seed: int, *,
               "value": float(key.split(":")[2]), "direction": "below",
               "on_edge": ON_EDGE[tokenization][key],
               "distance": 0.0 if ON_EDGE[tokenization][key] else 2.0,
-              "nearest_edge": None, "threshold_bin": 3} for key in (MAP_65, MAP_63)]
+              "nearest_edge": None, "threshold_bin": 3} for key in (MAP_65, MAP_62_5)]
     summary = {"version": 1, "vocabulary": vocab_hash or VOCAB[tokenization],
                "numeric_edges": "e" * 64, "objective_arm": objective,
                "evaluation_partition": "internal_test", "horizons_hours": [24.0, 48.0],
@@ -143,10 +143,10 @@ class Claim1Test(unittest.TestCase):
     def claim1(self, primary_on, primary_off, decile_on, decile_off, *, shared_noise=True):
         noise = "shared" if shared_noise else None
         dirs = arm(self.tmp, "clinical_soft", "full",
-                   {("head", MAP_65): primary_on, ("head", MAP_63): primary_off},
+                   {("head", MAP_65): primary_on, ("head", MAP_62_5): primary_off},
                    noise_key=noise)
         dirs += arm(self.tmp, "global_deciles", "full",
-                    {("head", MAP_65): decile_on, ("head", MAP_63): decile_off},
+                    {("head", MAP_65): decile_on, ("head", MAP_62_5): decile_off},
                     noise_key=noise)
         return report_of(dirs)["claims"]["claim_1"]
 
@@ -178,18 +178,18 @@ class Claim1Test(unittest.TestCase):
 
     def test_a_win_without_matched_bin_count_is_not_supported(self):
         dirs = arm(self.tmp, "clinical_soft", "full",
-                   {("head", MAP_65): STRONG, ("head", MAP_63): WEAK})
+                   {("head", MAP_65): STRONG, ("head", MAP_62_5): WEAK})
         dirs += arm(self.tmp, "global_deciles", "full",
-                    {("head", MAP_65): WEAK, ("head", MAP_63): WEAK}, bin_counts={"map": 7})
+                    {("head", MAP_65): WEAK, ("head", MAP_62_5): WEAK}, bin_counts={"map": 7})
         claim = report_of(dirs)["claims"]["claim_1"]
         self.assertEqual(claim["status"], cr.NOT_SUPPORTED)
         self.assertTrue(any("matched bin count" in r for r in claim["reasons"]))
 
     def test_fewer_than_three_seeds_is_incomplete_and_never_averaged(self):
         dirs = arm(self.tmp, "clinical_soft", "full",
-                   {("head", MAP_65): STRONG, ("head", MAP_63): WEAK})
+                   {("head", MAP_65): STRONG, ("head", MAP_62_5): WEAK})
         dirs += arm(self.tmp, "global_deciles", "full",
-                    {("head", MAP_65): WEAK, ("head", MAP_63): WEAK}, seeds=(1, 2))
+                    {("head", MAP_65): WEAK, ("head", MAP_62_5): WEAK}, seeds=(1, 2))
         report = report_of(dirs)
         claim = report["claims"]["claim_1"]
         self.assertEqual(claim["status"], cr.INCOMPLETE)
@@ -204,13 +204,13 @@ class Claim1Test(unittest.TestCase):
 
     def test_the_attribution_arm_is_reported_and_enters_the_rule_only_when_flagged(self):
         dirs = arm(self.tmp, "clinical_soft", "full",
-                   {("head", MAP_65): STRONG, ("head", MAP_63): WEAK}, noise_key="n")
+                   {("head", MAP_65): STRONG, ("head", MAP_62_5): WEAK}, noise_key="n")
         dirs += arm(self.tmp, "global_deciles", "full",
-                    {("head", MAP_65): WEAK, ("head", MAP_63): WEAK}, noise_key="n")
+                    {("head", MAP_65): WEAK, ("head", MAP_62_5): WEAK}, noise_key="n")
         # The query grid, not the input tokens, carries the gain: the attribution arm
         # matches the primary arm on-edge.
         dirs += arm(self.tmp, "deciles_clinical_query", "full",
-                    {("head", MAP_65): STRONG, ("head", MAP_63): WEAK}, noise_key="n")
+                    {("head", MAP_65): STRONG, ("head", MAP_62_5): WEAK}, noise_key="n")
         off = report_of(dirs)["claims"]["claim_1"]
         self.assertEqual(off["status"], cr.SUPPORTED)
         attribution = [c for c in off["descriptive"] if c["comparator"] ==
@@ -226,12 +226,12 @@ class Claim2Test(unittest.TestCase):
         self.tmp = Path(self.enterContext(tempfile.TemporaryDirectory()))
 
     def runs(self, head, next_probe, *, rollout=False):
-        quality = {("head", MAP_65): head, ("head", MAP_63): head,
-                   ("probe", MAP_65): WEAK, ("probe", MAP_63): WEAK}
+        quality = {("head", MAP_65): head, ("head", MAP_62_5): head,
+                   ("probe", MAP_65): WEAK, ("probe", MAP_62_5): WEAK}
         dirs = arm(self.tmp, "clinical_soft", "full", quality, noise_key="n")
         dirs += arm(self.tmp, "clinical_soft", "next_token_only",
-                    {("probe", MAP_65): next_probe, ("probe", MAP_63): next_probe,
-                     ("rollout", MAP_65): next_probe, ("rollout", MAP_63): next_probe},
+                    {("probe", MAP_65): next_probe, ("probe", MAP_62_5): next_probe,
+                     ("rollout", MAP_65): next_probe, ("rollout", MAP_62_5): next_probe},
                     noise_key="n", rollout=rollout)
         dirs += arm(self.tmp, "clinical_soft", "minus_value", quality, noise_key="n")
         return dirs
@@ -249,7 +249,7 @@ class Claim2Test(unittest.TestCase):
     def test_a_next_token_probe_that_matches_rejects_the_claim(self):
         quality = WEAK
         dirs = arm(self.tmp, "clinical_soft", "full",
-                   {("head", MAP_65): quality, ("head", MAP_63): quality}, noise_key="n")
+                   {("head", MAP_65): quality, ("head", MAP_62_5): quality}, noise_key="n")
         # Identical predictions: the probe matches the head on every metric.
         for s in (1, 2, 3):
             src = self.tmp / f"clinical_soft.full.s{s}.full"
@@ -384,11 +384,11 @@ class RunAdmissionTest(unittest.TestCase):
             report_of(dirs)
 
     def test_a_control_on_edge_in_any_arm_is_refused_with_the_arm_named(self):
-        ON_EDGE["odd_deciles"] = {MAP_65: False, MAP_63: True}
+        ON_EDGE["odd_deciles"] = {MAP_65: False, MAP_62_5: True}
         VOCAB["odd_deciles"] = "d" * 64
         try:
             dirs = arm(self.tmp, "odd_deciles", "full", {})
-            with self.assertRaisesRegex(cr.ClaimsError, r"control map 63.*'odd_deciles'"):
+            with self.assertRaisesRegex(cr.ClaimsError, r"control map 62.5.*'odd_deciles'"):
                 report_of(dirs)
         finally:
             ON_EDGE.pop("odd_deciles")
@@ -401,21 +401,21 @@ class DisclosureTest(unittest.TestCase):
 
     def test_no_identifier_small_cells_suppressed_and_written_aggregate_only(self):
         dirs = arm(self.tmp, "clinical_soft", "full",
-                   {("head", MAP_65): STRONG, ("head", MAP_63): WEAK},
-                   positives={MAP_63: 4}, status_extra={"censored": 3, "prevalent": 40})
+                   {("head", MAP_65): STRONG, ("head", MAP_62_5): WEAK},
+                   positives={MAP_62_5: 4}, status_extra={"censored": 3, "prevalent": 40})
         runs = cr.load_runs(dirs)
         report = cr.build_report(runs, config(), registry())
         text = json.dumps(report)
         for token in ("pair_id", "cluster_id", "p00001", "c00001"):
             self.assertNotIn(token, text)
         control = [c for c in report["cells"]
-                   if c["threshold"] == MAP_63 and c["scorer"] != "rollout"]
+                   if c["threshold"] == MAP_62_5 and c["scorer"] != "rollout"]
         self.assertTrue(control)
         for cell in control:
             self.assertEqual(cell["status"], "small_cell_suppressed")
             self.assertNotIn("n", cell)
             self.assertNotIn("auroc", cell)
-        status = report["label_status"][MAP_63]["48"]
+        status = report["label_status"][MAP_62_5]["48"]
         self.assertEqual(status["positive"], "<10")
         self.assertEqual(status["censored"], "<10")
         self.assertNotIn("negative", {k for k, v in status.items() if isinstance(v, int)
@@ -437,7 +437,7 @@ class DisclosureTest(unittest.TestCase):
 
     def test_the_report_marks_each_claim_and_renders(self):
         dirs = arm(self.tmp, "clinical_soft", "full",
-                   {("head", MAP_65): STRONG, ("head", MAP_63): WEAK})
+                   {("head", MAP_65): STRONG, ("head", MAP_62_5): WEAK})
         report = report_of(dirs)
         for claim in ("claim_1", "claim_2"):
             self.assertIn(report["claims"][claim]["status"],

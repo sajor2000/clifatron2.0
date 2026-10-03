@@ -164,9 +164,9 @@ class EdgeClassificationTest(unittest.TestCase):
 
     def test_a_control_on_an_edge_in_any_arm_is_refused_with_the_arm_named(self):
         segments = decile_segments(forced=False)
-        segments["map"] = segments_from_edges([58.0, 63.0, 68.0], (), "below")
+        segments["map"] = segments_from_edges([58.0, 62.5, 68.0], (), "below")
         with self.assertRaisesRegex(te.ThresholdEvalError,
-                                    r"control map 63.*on a bin edge in arm 'odd_deciles'"):
+                                    r"control map 62.5.*on a bin edge in arm 'odd_deciles'"):
             te.classify_edges({"clinical_soft": grid_of(clinical_segments()),
                                "odd_deciles": grid_of(segments)})
 
@@ -321,7 +321,7 @@ class RunEvaluationTest(unittest.TestCase):
         rows = {(r["threshold"], r["horizon_hours"]): r for r in result["summary"]["rows"]
                 if r["scorer"] == "rollout"}
         on = te.threshold_key("decision", "map", 65.0, "below")
-        off = te.threshold_key("control", "map", 63.0, "below")
+        off = te.threshold_key("control", "map", 62.5, "below")
         self.assertEqual(rows[(on, 48.0)]["status"], "evaluable")
         self.assertEqual(rows[(off, 48.0)]["status"], te.NOT_EVALUABLE)
         self.assertIn("straddles", rows[(off, 48.0)]["reason"])

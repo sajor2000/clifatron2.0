@@ -463,3 +463,78 @@ def test_feasibility_is_measured_without_outcomes_and_feeds_the_screen(registry,
     assert small.n_treated < 50
     screen = bm.feasibility_screen(registry, "syn_low_risk_niv_vs_oxygen", small)
     assert not screen.evaluable and any("arm size" in reason for reason in screen.reasons)
+
+
+# ---------------------------------------------------------------------------
+# product authority decisions, 2026-10-03 (items 39, 41, 44)
+# ---------------------------------------------------------------------------
+
+def _row(mimic, scenario):
+    return mimic.data.cohort["patient_id"].to_list().index(mimic.fixture.scenarios[scenario])
+
+
+def test_discharge_alive_as_a_competing_event_is_a_sensitivity_analysis(registry, mimic):
+    """Item 39: primary `event_free`; the `competing` sensitivity reads a discharge alive
+    before the horizon as a competing event; only an unknown disposition stays censored."""
+    assert registry.discharge_alive_rule.value == "event_free"
+    assert "competing" in registry.discharge_alive_rule_sensitivity
+    trial = "casey_2021_all_comers"
+    censor = em.trial_arrays(mimic.data, registry, trial, outcome="study_primary", discharge_alive_rule="censor")
+    competing = em.trial_arrays(mimic.data, registry, trial, outcome="study_primary",
+                                discharge_alive_rule="competing")
+    mask = em.eligibility_mask(mimic.data.cohort, registry, trial).to_numpy()
+    alive = int(np.flatnonzero(mask).tolist().index(_row(mimic, "out_discharged_day2_alive")))
+    assert censor.event_type[alive] == 0 and not censor.resolved[alive]
+    assert competing.event_type[alive] == 2 and competing.resolved[alive]
+    assert competing.event_time[alive] == censor.event_time[alive]
+    assert 0 < competing.n_unresolved < censor.n_unresolved
+    # Every endpoint event is unchanged.
+    assert np.array_equal(competing.event_type == 1, censor.event_type == 1)
+
+    result = run(registry, {"mimic": mimic.data}, trial, outcome="study_primary",
+                 discharge_alive_rule="competing", n_boot=30)["mimic"]
+    assert result.unresolved_handling == "discharge_alive_competing"
+    assert result.primary == "clone_censor_weight_aalen_johansen"
+    assert any("competing event" in note for note in result.notes)
+    # It is a modified comparison: only the registered protocol may run it.
+    with pytest.raises(em.EmulationRefused):
+        run(registry, {"mimic": mimic.data}, trial, discharge_alive_rule="competing", protocol_hash=None)
+
+
+def test_hospice_then_death_competes_and_the_composite_is_the_sensitivity(registry, mimic):
+    """Item 41: hospice discharge then death is a competing event (primary); the composite
+    sensitivity counts it as the endpoint."""
+    assert (registry.hospice_rule.value, registry.hospice_rule_sensitivity) == ("competing", ("composite",))
+    trial = "casey_2021_all_comers"
+    mask = em.eligibility_mask(mimic.data.cohort, registry, trial).to_numpy()
+    hospice = int(np.flatnonzero(mask).tolist().index(_row(mimic, "out_hospice_day3")))
+    primary = em.trial_arrays(mimic.data, registry, trial, outcome="study_primary")
+    composite = em.trial_arrays(mimic.data, registry, trial, outcome="study_primary", hospice_rule="composite")
+    assert primary.event_type[hospice] == 2 and composite.event_type[hospice] == 1
+    others = np.arange(primary.n_eligible) != hospice
+    assert np.array_equal((composite.event_type == 1) & others & (primary.event_type != 2),
+                          (primary.event_type == 1) & others)
+    with pytest.raises(ValueError, match="hospice_rule"):
+        em.trial_arrays(mimic.data, registry, trial, hospice_rule="ignore")
+
+
+def test_overlap_is_measured_on_the_two_compared_arms_and_trimming_is_reported(registry, mimic):
+    """Item 44: positivity is a between-arm property, so the screen fits P(treated | X)
+    among the two compared arms only and reports the share a trim would exclude."""
+    cohort_only = em.SiteData(mimic.data.cohort, None, mimic.data.device_rows)
+    trial_id = "syn_high_risk_niv_vs_oxygen"
+    inputs = em.measure_feasibility(cohort_only, registry, trial_id, config=NUISANCE)
+    assert inputs.n_compared == inputs.n_treated + inputs.n_control < inputs.n_eligible
+    assert 0.0 <= inputs.share_trimmed_of_compared <= 1.0
+    assert inputs.share_trimmed_of_eligible == pytest.approx(
+        inputs.share_trimmed_of_compared * inputs.n_compared / inputs.n_eligible)
+    assert inputs.share_below_min_probability == pytest.approx(inputs.share_trimmed_of_compared)
+    screen = bm.feasibility_screen(registry, trial_id, inputs)
+    assert screen.checks["share_trimmed_of_eligible"] == inputs.share_trimmed_of_eligible
+    # Patients on the third arm do not change the measurement.
+    third = mimic.data.cohort.filter(pl.col("arm") == "hfnc").height
+    assert third > 0
+    without_third = em.SiteData(mimic.data.cohort.filter(pl.col("arm") != "hfnc"), None, None)
+    again = em.measure_feasibility(without_third, registry, trial_id, config=NUISANCE)
+    assert (again.n_treated, again.n_control) == (inputs.n_treated, inputs.n_control)
+    assert again.share_trimmed_of_compared == pytest.approx(inputs.share_trimmed_of_compared, abs=0.02)

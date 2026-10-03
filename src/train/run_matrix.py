@@ -324,7 +324,7 @@ def format_edge_table(rows: Sequence[Mapping]) -> str:
     keys = list(dict.fromkeys((r["kind"], r["concept"], r["value"], r["direction"])
                               for r in rows))
     cell = {(r["arm"], r["kind"], r["concept"], r["value"], r["direction"]): r for r in rows}
-    width = max(12, *(len(a) for a in arms))
+    width = max([12, *(len(a) for a in arms)])
     lines = [f"{'threshold':<34}" + "".join(f"{a:>{width + 2}}" for a in arms)]
     for kind, concept, value, direction in keys:
         label = f"{kind} {concept} {'<' if direction == 'below' else '>'} {value:g}"
@@ -345,6 +345,10 @@ def format_edge_table(rows: Sequence[Mapping]) -> str:
 def _arm_vocabs(matrix: Mapping, overrides: Mapping[str, str]) -> dict[str, dict]:
     from src.data.segments import load_vocab_blob
 
+    unknown = sorted(set(overrides) - set(matrix["arm_data"]))
+    if unknown:
+        raise MatrixError(f"--vocab names unknown arm(s) {unknown}; matrix arms are "
+                          f"{sorted(matrix['arm_data'])}")
     out, missing = {}, []
     for arm, sites in matrix["arm_data"].items():
         path = Path(overrides.get(arm) or Path(next(iter(sites.values()))) / "vocab.json")
@@ -389,6 +393,10 @@ def main(argv: list[str] | None = None) -> int:
         runs = expand_matrix(matrix)
         if args.edge_check:
             vocabs = _arm_vocabs(matrix, overrides)
+            if not vocabs:
+                print("edge check NOT run: no frozen vocabulary for any matrix arm (build the "
+                      "vocabularies first, or pass --vocab ARM=PATH)", file=sys.stderr)
+                return 2
             rows = edge_distance_table(vocabs)
             print(format_edge_table(rows))
             print(f"edge check passed: no control threshold on an edge in "

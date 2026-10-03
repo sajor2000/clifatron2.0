@@ -21,6 +21,18 @@ arm's own interior bin edges: every finite segment bound of a binned target conc
 except the outer floor and ceiling (nothing lies beyond those). When two edges name the
 same bin (a gap between segments), one is kept — the largest for `below`, the smallest
 for `above` — so two label definitions never share one query embedding.
+
+RULE CAUSES. A competing-risk cause may be a label RULE instead of a fixed value (product
+authority, 2026-10-03): `rule: kdigo_aki` for creatinine is KDIGO 2012 acute kidney injury
+by creatinine (a rise of `absolute_rise` above the lowest value in the preceding
+`absolute_window_hours`, or `relative_rise` times the lowest value in the preceding
+`relative_window_hours`). It is mapped to a `RuleQuery`, labelled by
+`targets.TargetBuilder`, and has no value, so it has no bin and no edge-distance row.
+The threshold-hazard query grid is unaffected: decision, control and sampled thresholds
+stay fixed values.
+
+UNITS. `units` names the CLIF 2.1 unit of every concept a threshold uses; the loader
+refuses a registry that leaves one out (the values are only meaningful in that unit).
 """
 from __future__ import annotations
 
@@ -47,7 +59,13 @@ THRESHOLD_KINDS = ("decision", "control", "competing_risk_cause")
 THRESHOLD_STATUSES = {
     "decision": (None,),
     "control": ("candidate",),
-    "competing_risk_cause": ("contract", "proposed"),
+    "competing_risk_cause": ("contract", "confirmed", "proposed"),
+}
+# Label rules a competing-risk cause may use instead of a fixed value, with their
+# required numeric parameters.
+CAUSE_RULES = {
+    "kdigo_aki": ("absolute_rise", "absolute_window_hours", "relative_rise",
+                  "relative_window_hours"),
 }
 LABEL_RULE_KEYS = ("horizon_hours", "baseline_lookback_hours",
                    "required_measurement_within_hours_of_horizon")
@@ -65,10 +83,33 @@ class Threshold:
 
     kind: str
     concept: str
-    value: float
+    value: float | None
     direction: str
     status: str | None = None
     paired_decision: float | None = None
+    rule: str | None = None
+    rule_params: tuple[tuple[str, float], ...] = ()
+
+    @property
+    def params(self) -> dict[str, float]:
+        return dict(self.rule_params)
+
+
+@dataclass(frozen=True)
+class RuleQuery:
+    """A competing-risk cause defined by a label rule (no value, no bin). `value` and
+    `threshold_bin` are None so nothing can place it on the threshold grid."""
+
+    concept: str
+    target_idx: int
+    direction: str
+    rule: str
+    params: tuple[tuple[str, float], ...]
+    value: None = None
+    threshold_bin: None = None
+
+    def param(self, name: str) -> float:
+        return dict(self.params)[name]
 
 
 @dataclass(frozen=True)
@@ -126,6 +167,10 @@ def load_thresholds(path: str | Path = THRESHOLDS_PATH) -> dict[str, Any]:
                     f"{kind} {entry['concept']}: status must be one of "
                     f"{THRESHOLD_STATUSES[kind]}, got {status!r}")
             paired = entry.get("paired_decision")
+            rule = entry.get("rule")
+            if rule is not None:
+                parsed.append(_rule_threshold(kind, entry, direction, status))
+                continue
             parsed.append(Threshold(
                 kind, entry["concept"],
                 _finite(entry.get("value"), f"{kind} {entry['concept']} value"), direction,
@@ -147,6 +192,7 @@ def load_thresholds(path: str | Path = THRESHOLDS_PATH) -> dict[str, Any]:
     causes = [t.concept for t in registry["competing_risk_cause"]]
     if len(set(causes)) != len(causes):
         raise ThresholdGridError("a concept has more than one competing-risk cause threshold")
+    registry["units"] = _units(raw.get("units"), registry)
     rule = raw.get("label_rule")
     if not isinstance(rule, Mapping) or set(rule) != set(LABEL_RULE_KEYS):
         raise ThresholdGridError(
@@ -157,6 +203,50 @@ def load_thresholds(path: str | Path = THRESHOLDS_PATH) -> dict[str, Any]:
         if registry["label_rule"][key] <= 0:
             raise ThresholdGridError(f"label_rule {key} must be positive")
     return registry
+
+
+def _rule_threshold(kind: str, entry: Mapping, direction: str, status: str | None) -> Threshold:
+    """A rule-defined competing-risk cause: no value, every rule parameter finite and
+    positive (a relative rise must exceed 1)."""
+    concept, rule = entry["concept"], entry["rule"]
+    if kind != "competing_risk_cause":
+        raise ThresholdGridError(
+            f"{kind} {concept}: only a competing-risk cause may be a rule; decision and "
+            "control thresholds are fixed values")
+    if rule not in CAUSE_RULES:
+        raise ThresholdGridError(
+            f"{kind} {concept}: unknown rule {rule!r}; expected one of {sorted(CAUSE_RULES)}")
+    if entry.get("value") is not None:
+        raise ThresholdGridError(f"{kind} {concept}: a rule cause carries no `value`")
+    if direction != "above":
+        raise ThresholdGridError(f"{kind} {concept}: rule {rule} is a rise (direction above)")
+    params = []
+    for name in CAUSE_RULES[rule]:
+        value = _finite(entry.get(name), f"{kind} {concept} {name}")
+        if value <= 0:
+            raise ThresholdGridError(f"{kind} {concept}: {name} must be positive")
+        params.append((name, value))
+    if dict(params)["relative_rise"] <= 1.0:
+        raise ThresholdGridError(f"{kind} {concept}: relative_rise must exceed 1")
+    return Threshold(kind, concept, None, direction, status, None, rule, tuple(params))
+
+
+def _units(raw: Any, registry: Mapping[str, Any]) -> dict[str, dict[str, Any]]:
+    """`units`: concept -> {unit, clif_declared}; every concept a threshold names needs one."""
+    if not isinstance(raw, Mapping) or not raw:
+        raise ThresholdGridError("threshold registry has no `units` block (CLIF 2.1 units)")
+    units = {}
+    for concept, spec in raw.items():
+        if not isinstance(spec, Mapping) or not isinstance(spec.get("unit"), str) \
+                or not isinstance(spec.get("clif_declared"), bool):
+            raise ThresholdGridError(
+                f"units.{concept} must give `unit` (string) and `clif_declared` (bool)")
+        units[str(concept)] = {"unit": spec["unit"], "clif_declared": spec["clif_declared"]}
+    used = {t.concept for kind in THRESHOLD_KINDS for t in registry[kind]}
+    missing = sorted(used - set(units))
+    if missing:
+        raise ThresholdGridError(f"units: no CLIF 2.1 unit declared for {missing}")
+    return units
 
 
 def segment_edges(segments: Sequence[Mapping]) -> list[float]:
@@ -180,6 +270,8 @@ def _edge_rows(thresholds: Mapping[str, Any], segments: Mapping,
     rows = []
     for kind in THRESHOLD_KINDS:
         for threshold in thresholds[kind]:
+            if threshold.rule is not None:
+                continue            # a rule cause has no value, so no edge distance
             segs = segments.get(threshold.concept)
             nearest, distance, on_edge = (
                 _nearest_edge(threshold.value, segment_edges(segs)) if segs
@@ -270,11 +362,25 @@ class ThresholdGrid:
         self._pool = tuple(edges for edges in self._edges.values() if edges)
         self._thresholds = thresholds
         self._registered = {
-            kind: tuple(self.query(t.concept, t.value, t.direction) for t in thresholds[kind])
+            kind: tuple(self._rule_query(t) if t.rule is not None
+                        else self.query(t.concept, t.value, t.direction)
+                        for t in thresholds[kind])
             for kind in THRESHOLD_KINDS
         }
         self.causes = {query.target_idx: query
                        for query in self._registered["competing_risk_cause"]}
+
+    def _rule_query(self, threshold: Threshold) -> RuleQuery:
+        if threshold.concept not in self._index:
+            raise ThresholdGridError(
+                f"{threshold.concept!r} is not a target concept: only target-eligible "
+                "measurements can be competing-risk causes (hard rule 1)")
+        if threshold.direction != self._direction[threshold.concept]:
+            raise ThresholdGridError(
+                f"{threshold.concept} rule cause must use the concept's direction "
+                f"{self._direction[threshold.concept]!r}")
+        return RuleQuery(threshold.concept, self._index[threshold.concept],
+                         threshold.direction, threshold.rule, threshold.rule_params)
 
     def _own_edges(self, concept: str) -> tuple[GridQuery, ...]:
         segs = self._segments[concept]

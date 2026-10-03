@@ -35,6 +35,19 @@ the 24 h outcome contract: a value equal to the threshold is not an event. Every
 of the anchor's minute is context — availability is minute-resolution, so a same-minute
 value counts toward the lookback and never as a future event.
 
+RULE CAUSES (`threshold_grid.RuleQuery`). A competing-risk cause may be a label rule; the
+only one is ``kdigo_aki`` (creatinine; product authority, 2026-10-03; KDIGO 2012). A
+creatinine measurement MEETS the rule when it is at least ``absolute_rise`` above the
+lowest creatinine in the preceding ``absolute_window_hours``, or at least
+``relative_rise`` times the lowest creatinine in the preceding ``relative_window_hours``
+("preceding" = an earlier minute of the same stay, in availability order; both bounds
+inclusive, as KDIGO's ">="). The baseline is in-stay only (the lowest inpatient value;
+an outpatient baseline is not in the token stream). A measurement with no earlier
+creatinine inside the relative window is NOT ASSESSABLE. The statuses are the ones above
+with "beyond the threshold" read as "meets the rule", and the ascertainment check needs an
+ASSESSABLE measurement in the window before the horizon - a stay with a single creatinine
+is `not_ascertainable`, never negative. Labels are still computed on the whole stay.
+
 Label times are MINUTES since the anchor. The bin is not computed here: each head bins
 the minutes on its own grid (`src.model.heads.time_bin`, KTD4).
 """
@@ -238,6 +251,7 @@ class TargetBuilder:
             "events": {target: (np.asarray(times[target], dtype=np.int64),
                                 np.asarray(observed[target], dtype=np.float64))
                        for target in times},
+            "rule_flags": {},           # (target, rule, params) -> (meets, assessable)
         }
 
     @staticmethod
@@ -255,6 +269,8 @@ class TargetBuilder:
     def _label(self, index: Mapping[str, Any], anchor_idx: int,
                query: Any) -> tuple[str, int | None]:
         """One (anchor, query) status and its minutes since the anchor (module docstring)."""
+        if getattr(query, "rule", None) is not None:
+            return self._label_rule(index, anchor_idx, query)
         spec = self.in_stream
         horizon = round(self.horizon_hours * 60)
         anchor_min = index["pos_min"][anchor_idx]
@@ -281,6 +297,55 @@ class TargetBuilder:
         window = round(spec.required_measurement_within_hours_of_horizon * 60)
         measured_from = max(anchor_min + 1, anchor_min + horizon - window)
         if end_future > int(np.searchsorted(times, measured_from, side="left")):
+            return "negative", horizon
+        return "not_ascertainable", None
+
+    def _rule_flags(self, index: Mapping[str, Any], query: Any) -> tuple[np.ndarray, np.ndarray]:
+        """Per measurement of the rule's concept: (meets the rule, assessable). Cached per
+        stay index."""
+        key = (query.target_idx, query.rule, query.params)
+        cached = index["rule_flags"].get(key)
+        if cached is not None:
+            return cached
+        if query.rule != "kdigo_aki":
+            raise TargetContractError(f"unknown competing-risk rule {query.rule!r}")
+        times, observed = index["events"].get(query.target_idx, (_NO_TIMES, _NO_VALUES))
+        flags = kdigo_aki_flags(
+            times, observed,
+            absolute_rise=query.param("absolute_rise"),
+            absolute_window_minutes=round(query.param("absolute_window_hours") * 60),
+            relative_rise=query.param("relative_rise"),
+            relative_window_minutes=round(query.param("relative_window_hours") * 60))
+        index["rule_flags"][key] = flags
+        return flags
+
+    def _label_rule(self, index: Mapping[str, Any], anchor_idx: int,
+                    query: Any) -> tuple[str, int | None]:
+        """The label rule of the module docstring for a rule cause (RULE CAUSES)."""
+        spec = self.in_stream
+        horizon = round(self.horizon_hours * 60)
+        anchor_min = index["pos_min"][anchor_idx]
+        times, _ = index["events"].get(query.target_idx, (_NO_TIMES, _NO_VALUES))
+        meets, assessable = self._rule_flags(index, query)
+        first_future = int(np.searchsorted(times, anchor_min, side="right"))
+        if first_future:
+            last = first_future - 1
+            lookback = round(spec.baseline_lookback_hours * 60)
+            if times[last] >= anchor_min - lookback and meets[last]:
+                return "prevalent", None
+        end_future = int(np.searchsorted(times, anchor_min + horizon, side="right"))
+        crossings = np.flatnonzero(meets[first_future:end_future])
+        if crossings.size:
+            return "positive", int(times[first_future + int(crossings[0])]) - anchor_min
+        to_end = index["end_min"] - anchor_min
+        if index["expired"] and to_end <= horizon:
+            return "competing_event", to_end
+        if not index["expired"] and to_end < horizon:
+            return "censored", to_end
+        window = round(spec.required_measurement_within_hours_of_horizon * 60)
+        measured_from = max(anchor_min + 1, anchor_min + horizon - window)
+        start = int(np.searchsorted(times, measured_from, side="left"))
+        if end_future > start and assessable[start:end_future].any():
             return "negative", horizon
         return "not_ascertainable", None
 
@@ -503,6 +568,44 @@ class TargetBuilder:
 
 _NO_TIMES = np.empty(0, dtype=np.int64)
 _NO_VALUES = np.empty(0, dtype=np.float64)
+# Float tolerance for KDIGO's inclusive ">=": 1.2 - 0.9 is 0.2999... in binary.
+_RULE_TOL = 1e-9
+
+
+def kdigo_aki_flags(times: np.ndarray, values: np.ndarray, *, absolute_rise: float,
+                    absolute_window_minutes: int, relative_rise: float,
+                    relative_window_minutes: int) -> tuple[np.ndarray, np.ndarray]:
+    """KDIGO 2012 AKI by creatinine at each measurement of one stay.
+
+    `times` (minutes, nondecreasing) and `values` are the stay's finite creatinine
+    measurements in availability order. Measurement j MEETS the rule when
+    ``values[j] - min(prior in [t_j - absolute_window, t_j)) >= absolute_rise`` or
+    ``values[j] >= relative_rise * min(prior in [t_j - relative_window, t_j))``; "prior"
+    is an earlier minute (a same-minute value is not a baseline). It is ASSESSABLE when
+    the relative window holds at least one prior value (the absolute window is assumed no
+    longer than the relative one). Returns ``(meets, assessable)`` boolean arrays."""
+    times = np.asarray(times, dtype=np.int64)
+    values = np.asarray(values, dtype=np.float64)
+    if absolute_window_minutes > relative_window_minutes:
+        raise TargetContractError("the absolute-rise window must not exceed the relative one")
+    n = times.size
+    meets = np.zeros(n, dtype=bool)
+    assessable = np.zeros(n, dtype=bool)
+    for j in range(n):
+        t = int(times[j])
+        end = int(np.searchsorted(times, t, side="left"))            # strictly earlier
+        rel_lo = int(np.searchsorted(times, t - relative_window_minutes, side="left"))
+        if end <= rel_lo:
+            continue
+        assessable[j] = True
+        relative_min = float(values[rel_lo:end].min())
+        if relative_min > 0 and values[j] >= relative_rise * relative_min - _RULE_TOL:
+            meets[j] = True
+            continue
+        abs_lo = int(np.searchsorted(times, t - absolute_window_minutes, side="left"))
+        if end > abs_lo and values[j] - float(values[abs_lo:end].min()) >= absolute_rise - _RULE_TOL:
+            meets[j] = True
+    return meets, assessable
 
 
 def anchor_status_shares(builds: Iterable[Mapping[str, Any]]) -> dict[str, Any]:
