@@ -744,3 +744,15 @@ skipped (was 430; +285 new tests), clif-validate/ **34 passed** (was 32;
 working tree clean, `/output/` ignored. Artifacts unchanged (r2 sample
 arms present); viewer alive with all five sources. Launch remains gated
 on user infrastructure (20:00).
+
+### 2026-10-03 02:00 — Guardrail check: all green (first on tokenizer-v2 main)
+
+origin/main in sync at `337d784`; artifacts unchanged; viewer alive at
+127.0.0.1:8042 with all five sources; suites green — tests/ 715 passed
+4 skipped, clif-validate/ 34. Periodic data/PHI guardrail check (~12h
+since 10-02 14:00, first on the PR #16 tree): zero tracked
+`.parquet`/`.pt`/`.ckpt`/`.safetensors`/`.arrow` files; `/output/` still
+ignored (spot-verified for `sims_smoke.parquet` and the newest
+`mimic_v2_sample_r2/vocab.json`); no tracked files under `output/` or
+`data/`; working tree clean. Launch remains gated on user
+infrastructure (02:00).
