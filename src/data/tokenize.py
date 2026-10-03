@@ -80,6 +80,19 @@ import numpy as np
 import polars as pl
 import yaml
 
+from src.data.clif_conformance import (
+    bp_config,
+    bp_method_of,
+    check_conformance,
+    compliance_table,
+    flag_sql,
+    global_record,
+    harmonization_record,
+    mapped_sql,
+    parquet_source,
+    rule_columns,
+    site_harmonization,
+)
 from src.data.cohort import (
     QualificationError,
     validate_artifact_destination,
@@ -125,6 +138,7 @@ from src.data.tokenization_report import (
 from src.data.units import (
     STATUSES as DOSE_STATUSES,
     canonical_unit,
+    parse_unit,
     dose_plan,
     normalize_name,
     normalize_unit,
@@ -305,6 +319,7 @@ def validate_vocabulary_artifact(
         raise QualificationError("outcome-spec compatibility hash mismatch")
     _check_unit_repair_binding(blob["reference_units"], cfg, provenance.get("source_site"))
     _check_literature_binding(blob, hashes)
+    _check_harmonization_binding(blob, hashes, cfg)
     return blob["vocab"], blob["segments"], manifest
 
 
@@ -366,6 +381,23 @@ def validate_table_availability(tables: dict) -> dict[str, dict]:
             )
         declared[name] = {"availability": semantics, "lag_minutes": lag}
     return declared
+
+
+def with_availability_lag(cfg: dict, minutes: int) -> dict:
+    """A copy of `cfg` with every table of the declared lag-sensitivity semantics
+    (`availability_lag_sensitivities.semantics`, default `missing_storetime`) lagged
+    `minutes` - the 15 / 60 min sensitivity configurations (hard rule #4)."""
+    import copy
+
+    if isinstance(minutes, bool) or not isinstance(minutes, int) or minutes < 0:
+        raise QualificationError(f"availability lag must be a non-negative integer, got {minutes!r}")
+    block = cfg.get("availability_lag_sensitivities") or {}
+    semantics = block.get("semantics", "missing_storetime")
+    out = copy.deepcopy(cfg)
+    for spec in out["tables"].values():
+        if spec.get("availability") == semantics:
+            spec["availability_lag_minutes"] = minutes
+    return out
 
 
 def validate_gem_config(gem: object) -> dict:
@@ -489,6 +521,12 @@ def _literal(value: object, what: str) -> str:
     return f"'{value}'"
 
 
+def _from(fp: Path, spec: dict) -> str:
+    """The FROM expression of a table: its parquet, with the site's declared column
+    aliases applied (`_from_sql`, set by `_read_source`)."""
+    return spec.get("_from_sql") or f"read_parquet('{fp}')"
+
+
 def _long_sql(fp: Path, spec: dict, keep_ids: list | None) -> tuple[str, list]:
     """One event per row: concept from `concept_col` (or the literal `concept`), with an
     optional numeric `value_col`, `unit_col` and categorical `categorical_value_col`."""
@@ -501,11 +539,13 @@ def _long_sql(fp: Path, spec: dict, keep_ids: list | None) -> tuple[str, list]:
     # rows without a finite numeric value; every other table carries a typed NULL so
     # the per-table frames concatenate.
     cat = spec.get("categorical_value_col")
-    cat_sql = f"CAST({cat} AS VARCHAR)" if cat else "CAST(NULL AS VARCHAR)"
+    rules = spec.get("_category_rules") or {}
+    cat_sql = mapped_sql(cat, rules.get(cat)) if cat else "CAST(NULL AS VARCHAR)"
     time_col = spec["availability_col"]
     concept_col = spec.get("concept_col")
     if concept_col:
-        concept_sql = _name_sql(concept_col) if spec.get("normalize_concept") else concept_col
+        mapped = mapped_sql(concept_col, rules.get(concept_col))
+        concept_sql = _name_sql(mapped) if spec.get("normalize_concept") else mapped
         present = f"{concept_col} IS NOT NULL"
     else:
         # A single-concept table (position): every row is that concept, so a row
@@ -514,14 +554,17 @@ def _long_sql(fp: Path, spec: dict, keep_ids: list | None) -> tuple[str, list]:
         present = " OR ".join(f"{c} IS NOT NULL" for c in (val, cat) if c) or "FALSE"
         present = f"({present})"
     id_sql, params = _id_filter(keep_ids)
+    # BP measurement method: the site's declared source column rides along (`_bp_src`).
+    bp_src = spec.get("_bp_source_column")
+    extra = f",\n               CAST({bp_src} AS VARCHAR) AS _bp_src" if bp_src else ""
     return f"""
         SELECT CAST(hospitalization_id AS VARCHAR) AS hosp_id,
                {time_col}                AS dttm,
                {concept_sql}             AS concept,
                {val_sql}                 AS value,
                {unit_sql}                AS unit,
-               {cat_sql}                 AS cat_value
-        FROM read_parquet('{fp}')
+               {cat_sql}                 AS cat_value{extra}
+        FROM {_from(fp, spec)}
         WHERE {present}
           AND {time_col} IS NOT NULL
           {id_sql}
@@ -537,7 +580,8 @@ def _melt_sql(fp: Path, spec: dict, keep_ids: list | None, cols: list, *,
     parquet scan (UNPIVOT drops NULL cells)."""
     time_col = spec["availability_col"]
     qual = None if qualifier_absent else spec.get("concept_qualifier_col")
-    qual_sel = f"{qual} AS _qual," if qual else ""
+    rules = spec.get("_category_rules") or {}
+    qual_sel = f"{mapped_sql(qual, rules.get(qual))} AS _qual," if qual else ""
     name = "'unknown_' || lower(_col)" if qualifier_absent else "lower(_col)"
     if qual:
         name = f"coalesce(nullif({_name_sql('_qual')}, ''), 'unknown') || '_' || lower(_col)"
@@ -545,9 +589,16 @@ def _melt_sql(fp: Path, spec: dict, keep_ids: list | None, cols: list, *,
     # Declared per-site unit conversions of unit-less numeric columns, applied before the
     # melt so every downstream step (fit, binning, reference units) sees canonical units.
     factors = (spec.get("_column_factors") or {}) if numeric else {}
-    casts = ", ".join(
-        f"{_convert_sql(f'CAST({c} AS DOUBLE)', factors[c])} AS {c}" if c in factors
-        else f"CAST({c} AS {cast}) AS {c}" for c in cols)
+    flags = set(spec.get("flag_cols") or ())
+
+    def cast_sql(c: str) -> str:
+        if numeric:
+            return (_convert_sql(f"CAST({c} AS DOUBLE)", factors[c]) if c in factors
+                    else f"CAST({c} AS DOUBLE)")
+        # A 0/1 flag has one spelling at every site; a category takes the site's map.
+        return flag_sql(c) if c in flags else mapped_sql(c, rules.get(c))
+
+    casts = ", ".join(f"{cast_sql(c)} AS {c}" for c in cols)
     id_sql, params = _id_filter(keep_ids)
     value_sql, cat_sql = ("_val", "CAST(NULL AS VARCHAR)") if numeric else (
         "CAST(NULL AS DOUBLE)", "_val")
@@ -558,7 +609,7 @@ def _melt_sql(fp: Path, spec: dict, keep_ids: list | None, cols: list, *,
             UNPIVOT (
                 SELECT CAST(hospitalization_id AS VARCHAR) AS hosp_id, {time_col} AS dttm,
                        {qual_sel} {casts}
-                FROM read_parquet('{fp}')
+                FROM {_from(fp, spec)}
                 WHERE {time_col} IS NOT NULL {id_sql}
             ) ON {", ".join(cols)} INTO NAME _col VALUE _val
         )
@@ -588,8 +639,8 @@ def _patient_keyed_sql(base: Path, fp: Path, spec: dict,
     return f"""
         WITH s AS (
             SELECT CAST({pid} AS VARCHAR) AS pid, {time_col} AS t,
-                   CAST({cat} AS VARCHAR) AS v
-            FROM read_parquet('{fp}')
+                   {mapped_sql(cat, (spec.get("_category_rules") or {}).get(cat))} AS v
+            FROM {_from(fp, spec)}
             WHERE {pid} IS NOT NULL AND {time_col} IS NOT NULL AND {cat} IS NOT NULL
         ), h AS (
             SELECT CAST(hospitalization_id AS VARCHAR) AS hosp_id,
@@ -665,26 +716,63 @@ def _read_dose_table(con, base: Path, fp: Path, spec: dict, keep_ids: list | Non
                     f"THEN 0.0 ELSE {dose_sql} END")
         params += stops
     id_sql, id_params = _id_filter(keep_ids)
-    params += id_params
     lag = int(spec.get("availability_lag_minutes", 0))
+    med_sql = mapped_sql(concept_col, (spec.get("_category_rules") or {}).get(concept_col))
+    source = _from(fp, spec)
+    # Declared exact duplicates (site_harmonization.<site>.exact_duplicates): a `drop`
+    # category row identical to a `keep` category row on every `match` column is the same
+    # administration charted twice; it is flagged here and removed (counted) below.
+    dup_sql, dup_join, dup_params = "FALSE", "", []
+    rule = spec.get("_exact_duplicates")
+    if rule:
+        match = rule["match"]
+        keys = ", ".join(f"{c} AS _k{i}" for i, c in enumerate(match))
+        on = " AND ".join(f"s.{c} IS NOT DISTINCT FROM k._k{i}" for i, c in enumerate(match))
+        drop = ", ".join("?" for _ in rule["drop"])
+        dup_join = (f"LEFT JOIN (SELECT DISTINCT {keys}, TRUE AS _hit FROM {source} "
+                    f"WHERE {_name_sql(concept_col)} = ?) k ON {_name_sql('s.' + concept_col)} "
+                    f"IN ({drop}) AND {on}")
+        dup_params = [rule["keep"], *rule["drop"]]
+        dup_sql = "coalesce(k._hit, FALSE)"
+    # Column references stay unqualified: the duplicate side only carries _k*/_hit.
     doses = f"""
         SELECT CAST(hospitalization_id AS VARCHAR) AS hosp_id, {time_col} AS dttm,
-               CAST({concept_col} AS VARCHAR) AS med, {dose_sql} AS dose,
+               {med_sql} AS med, {dose_sql} AS dose,
                coalesce(CAST({unit} AS VARCHAR), '') AS unit_raw,
-               {time_col} + INTERVAL {lag} MINUTE AS avail
-        FROM read_parquet('{fp}')
+               {time_col} + INTERVAL {lag} MINUTE AS avail,
+               {dup_sql} AS _dup
+        FROM {source} s {dup_join}
         WHERE {concept_col} IS NOT NULL AND {time_col} IS NOT NULL {id_sql}
     """
-    weight = dose.get("weight_source") if kind == "continuous" else None
+    # Bound in textual order: the stop actions (SELECT), the duplicate join, the ids.
+    params = [*params, *dup_params, *id_params]
+    # Continuous doses convert per-kg rates; an intermittent table declaring a weight
+    # source converts per-kg single doses (e.g. ketamine mg/kg) to absolute mass.
+    weight = dose.get("weight_source")
     wspec = (tables or {}).get(weight["table"]) if weight else None
     wfp = base / f"{wspec['file']}.parquet" if wspec else None
     if weight and (wfp is None or not wfp.exists()):
         print(f"  [warn] {fp.name}: weight source {weight['table']!r} not found; "
               "per-kg conversions fall back to native units")
+    weight_counts: dict[str, int] = {}
     if wfp is not None and wfp.exists():
         wtime, wval = wspec["availability_col"], wspec["value_col"]
         wlag = int(wspec.get("availability_lag_minutes", 0))
         w_id_sql, w_params = _id_filter(keep_ids)
+        # A weight outside the declared plausible range (`plausible_kg`) never converts a
+        # per-kg dose (a 1 kg charting error would scale a dose x80); counted per run.
+        plausible = weight.get("plausible_kg")
+        w_value = f"CAST({wval} AS DOUBLE)"
+        w_range = ""
+        if plausible is not None:
+            lo, hi = _range_pair(plausible, f"{name_of(spec)}.dose.weight_source.plausible_kg")
+            w_range = f"AND {w_value} BETWEEN {lo!r} AND {hi!r}"
+            total, kept = con.execute(
+                f"SELECT count(*), count(*) FILTER (WHERE {w_value} BETWEEN {lo!r} AND {hi!r}) "
+                f"FROM read_parquet('{wfp}') WHERE {wspec['concept_col']} = ? "
+                f"AND {wtime} IS NOT NULL AND {w_value} IS NOT NULL {w_id_sql}",
+                [weight["concept"], *w_params]).fetchone()
+            weight_counts = {"weights": int(total), "weights_excluded": int(total - kept)}
         # One weight per (stay, availability time): ties are averaged so the ASOF match
         # is deterministic.
         sql = f"""
@@ -696,17 +784,19 @@ def _read_dose_table(con, base: Path, fp: Path, spec: dict, keep_ids: list | Non
                     FROM read_parquet('{wfp}')
                     WHERE {wspec['concept_col']} = ? AND {wtime} IS NOT NULL
                       AND isfinite(CAST({wval} AS DOUBLE)) AND CAST({wval} AS DOUBLE) > 0
-                      {w_id_sql}
+                      {w_range} {w_id_sql}
                 ) GROUP BY hosp_id, avail
             )
-            SELECT d.hosp_id, d.dttm, d.med, d.dose, d.unit_raw, w.weight_kg
+            SELECT d.hosp_id, d.dttm, d.med, d.dose, d.unit_raw, d._dup, w.weight_kg
             FROM d ASOF LEFT JOIN w ON d.hosp_id = w.hosp_id AND d.avail >= w.avail
         """
         params += [weight["concept"], *w_params]
     else:
-        sql = f"""SELECT hosp_id, dttm, med, dose, unit_raw,
+        sql = f"""SELECT hosp_id, dttm, med, dose, unit_raw, _dup,
                          CAST(NULL AS DOUBLE) AS weight_kg FROM ({doses})"""
     frame = con.execute(sql, params).pl()
+    n_duplicates = int(frame["_dup"].sum()) if len(frame) else 0
+    frame = frame.filter(~pl.col("_dup")).drop("_dup")
     frame, n_corrected = _apply_dose_corrections(frame, corrections or {})
 
     target_units = target_units or {}
@@ -715,6 +805,9 @@ def _read_dose_table(con, base: Path, fp: Path, spec: dict, keep_ids: list | Non
     for med, raw in pairs:
         target = (target_units.get(normalize_name(med)) if kind == "continuous"
                   else canonical_unit(raw))
+        if (kind == "intermittent" and weight and target and "/kg" in target
+                and parse_unit(target)["minutes"] is None):
+            target = target.replace("/kg", "")   # mg/kg single dose -> mg (x weight)
         plan = dose_plan(med, raw, target)
         if kind == "intermittent" and target is None:
             plan["status"] = "unconvertible"   # `dose`, `mL`, unrecognised (R7)
@@ -751,6 +844,9 @@ def _read_dose_table(con, base: Path, fp: Path, spec: dict, keep_ids: list | Non
     counts = dict.fromkeys(DOSE_STATUSES, 0)
     if corrections:
         counts.update(corrected=n_corrected, quarantined=0)
+    if rule:
+        counts["exact_duplicates_removed"] = n_duplicates
+    counts.update(weight_counts)
     for status, n in joined.group_by("status").len().iter_rows():
         counts[status] = int(n)
     shadows = None
@@ -763,24 +859,47 @@ def _read_dose_table(con, base: Path, fp: Path, spec: dict, keep_ids: list | Non
     return events, shadows, counts
 
 
+def name_of(spec: dict) -> str:
+    return str(spec.get("_name") or spec.get("file"))
+
+
 def _apply_dose_corrections(frame: pl.DataFrame, corrections: dict,
                             ) -> tuple[pl.DataFrame, int]:
     """Apply the declared (med_category, charted unit) corrections: ``(frame with a
     `_quarantine` flag, corrected row count)``. Pairs are resolved once, joined back."""
     rows = []
+    keys: list[tuple[str, str]] = []
     for med, raw in frame.select("med", "unit_raw").unique().iter_rows():
-        decl = corrections.get((normalize_name(med), normalize_unit(raw)))
+        key = (normalize_name(med), normalize_unit(raw))
+        decl = corrections.get(key)
         if decl is None:
             continue
+        if key not in keys:
+            keys.append(key)
         quarantine = decl.get("action") == "quarantine"
         rows.append({"med": med, "unit_raw": raw,
                      "_to": raw if quarantine else decl["to"],
                      "_factor": 1.0 if quarantine else float(decl["factor"]),
-                     "_q": quarantine})
+                     "_q": quarantine, "_key": keys.index(key)})
     plan = pl.DataFrame(rows, schema={"med": pl.String, "unit_raw": pl.String,
                                       "_to": pl.String, "_factor": pl.Float64,
-                                      "_q": pl.Boolean})
+                                      "_q": pl.Boolean, "_key": pl.Int64})
     joined = frame.join(plan, on=["med", "unit_raw"], how="left")
+    # A declaration with `when` applies only to the charted values meeting it.
+    applies = pl.lit(True)
+    for index, key in enumerate(keys):
+        when = corrections[key].get("when")
+        if not when:
+            continue
+        cond = pl.lit(True)
+        for op, value in when.items():
+            cond = cond & {"gt": pl.col("dose") > value, "ge": pl.col("dose") >= value,
+                           "lt": pl.col("dose") < value, "le": pl.col("dose") <= value}[op]
+        applies = pl.when(pl.col("_key") == index).then(cond.fill_null(False)).otherwise(applies)
+    joined = joined.with_columns(
+        pl.when(applies).then(pl.col("_to")).otherwise(None).alias("_to"),
+        pl.when(applies).then(pl.col("_q")).otherwise(None).alias("_q"),
+    ).drop("_key")
     corrected = pl.col("_to").is_not_null() & ~pl.col("_q").fill_null(False)
     n_corrected = int(joined.select(corrected.sum()).item())
     out = joined.with_columns(
@@ -792,9 +911,10 @@ def _apply_dose_corrections(frame: pl.DataFrame, corrections: dict,
     return out, n_corrected
 
 
-def _parquet_columns(con, fp: Path) -> set[str]:
+def _parquet_columns(con, fp: Path, source: str | None = None) -> set[str]:
     return {r[0] for r in con.execute(
-        f"DESCRIBE SELECT * FROM read_parquet('{fp}')").fetchall()}
+        f"DESCRIBE SELECT * FROM {source or f'read_parquet({chr(39)}{fp}{chr(39)})'}"
+    ).fetchall()}
 
 
 # Optional per-site columns of a long/wide table spec: a site's parquet may lack any of
@@ -806,8 +926,9 @@ _OPTIONAL_COLS = ("categorical_value_col", "concept_qualifier_col")
 
 def _present_columns(con, fp: Path, spec: dict) -> tuple[dict, list[str]]:
     """`spec` restricted to the optional columns `fp` actually has (DuckDB identifiers
-    are case-insensitive), plus the configured columns it lacks, in config order."""
-    present = {c.lower() for c in _parquet_columns(con, fp)}
+    are case-insensitive; the site's column aliases applied), plus the configured columns
+    it lacks, in config order."""
+    present = {c.lower() for c in _parquet_columns(con, fp, spec.get("_from_sql"))}
     spec, absent = dict(spec), []
     for key in _OPTIONAL_LIST_COLS:
         cols = list(spec.get(key) or ())
@@ -826,17 +947,22 @@ def _read_source(con, base: Path, spec: dict, keep_ids: list | None = None, *,
                  fit_shadows: bool = False, missing: list[str] | None = None,
                  column_factors: dict[str, dict] | None = None,
                  dose_corrections: dict | None = None,
+                 harmonization: dict | None = None, name: str | None = None,
                  ) -> tuple[pl.DataFrame, pl.DataFrame | None, dict | None]:
     """Read one configured table -> (events, fit-only shadows or None, dose status
     counts or None). See `_read_table`. Configured optional columns (`value_cols`,
     `categorical_value_cols`, `categorical_value_col`, `concept_qualifier_col`) the
     site's parquet lacks are skipped, logged, and appended to `missing`.
     `column_factors` / `dose_corrections`: the site's declared unit conversions for this
-    table (`column_factors`, `dose_corrections`)."""
+    table (`column_factors`, `dose_corrections`). `harmonization`: the site's declarations
+    (`clif_conformance.site_harmonization`) - column aliases, category maps, exact
+    duplicates and the BP-method source column - for table `name`. A table declaring
+    `on_missing_column: error` refuses a configured column the site lacks."""
     fp = base / f"{spec['file']}.parquet"
     if not fp.exists():
         print(f"  [skip] {fp.name} not found")
         return _empty_events(), None, None
+    spec = _harmonized_spec(con, fp, spec, harmonization, name)
     if spec.get("dose"):
         return _read_dose_table(con, base, fp, spec, keep_ids, tables, target_units,
                                 fit_shadows, dose_corrections)
@@ -859,6 +985,11 @@ def _read_source(con, base: Path, spec: dict, keep_ids: list | None = None, *,
         spec, absent = _present_columns(con, fp, spec)
         if column_factors:
             spec["_column_factors"] = dict(column_factors)
+        if absent and spec.get("on_missing_column") == "error":
+            raise QualificationError(
+                f"table {name or spec['file']!r} ({fp.name}): configured column(s) not found: "
+                f"{', '.join(absent)}; the table declares on_missing_column: error (declare "
+                "site_harmonization.<site>.column_aliases if the site names them otherwise)")
         if absent:
             print(f"  [skip] {fp.name}: configured column(s) not found: {', '.join(absent)}")
             if missing is not None:
@@ -884,6 +1015,42 @@ def _read_source(con, base: Path, spec: dict, keep_ids: list | None = None, *,
         sql = _transitions_sql(sql)
     params = [p for _, part_params in parts for p in part_params]
     return con.execute(sql, params).pl(), None, None
+
+
+def _harmonized_spec(con, fp: Path, spec: dict, harmonization: dict | None,
+                     name: str | None) -> dict:
+    """`spec` with the site's declarations for table `name` attached (private `_*`
+    keys read by the SQL builders)."""
+    spec = {**spec, "_name": name}
+    if not harmonization or name is None:
+        return spec
+    aliases = harmonization["column_aliases"].get(name) or {}
+    if aliases:
+        raw = {c.lower() for c in _parquet_columns(con, fp)}
+        spec["_from_sql"] = parquet_source(fp, aliases, raw)
+    rules = {key.split(".", 1)[1]: value
+             for key, value in harmonization["category_map"].items()
+             if key.split(".", 1)[0] == name}
+    present = {c.lower() for c in _parquet_columns(con, fp, spec.get("_from_sql"))}
+    if rules:
+        needed = sorted(c for r in rules.values() for c in rule_columns(r)
+                        if c.lower() not in present)
+        if needed:
+            raise QualificationError(
+                f"table {name!r}: category_map conditions read column(s) the site lacks: "
+                f"{', '.join(needed)}")
+        spec["_category_rules"] = rules
+    for rule in harmonization["exact_duplicates"]:
+        if rule["table"] == name:
+            spec["_exact_duplicates"] = rule
+    bp = harmonization.get("_bp_table")
+    if bp == name and harmonization.get("bp_method"):
+        source = harmonization["bp_method"]["source_column"]
+        if source.lower() not in present:
+            raise QualificationError(
+                f"table {name!r}: the declared BP-method source column {source!r} is missing")
+        spec["_bp_source_column"] = source
+    return spec
 
 
 def _read_table(con, base: Path, spec: dict,
@@ -1051,9 +1218,23 @@ def unit_mismatches(events: pl.DataFrame, cfg: dict,
         f"{concept}: expected {expected[concept]!r}, found {unit!r}"
         for concept, unit in observed.iter_rows()
         if concept in expected and unit not in (None, "")
-        and _normalized_unit(unit) != _normalized_unit(expected[concept])
+        and not units_equivalent(concept, unit, expected[concept], cfg)
     ]
     return sorted(mismatches)
+
+
+def units_equivalent(concept: str, a: str, b: str, cfg: dict) -> bool:
+    """Same spelling (`_normalized_unit`), or a declared concept-scoped equivalence
+    (`unit_normalization.equivalent_units`: e.g. mEq/L == mmol/L for monovalent ions
+    only, pH `units` == `(no units)`)."""
+    if _normalized_unit(a) == _normalized_unit(b):
+        return True
+    for entry in (cfg.get("unit_normalization") or {}).get("equivalent_units") or ():
+        units = {_normalized_unit(u) for u in entry.get("units") or ()}
+        if (concept in (entry.get("concepts") or ())
+                and {_normalized_unit(a), _normalized_unit(b)} <= units):
+            return True
+    return False
 
 
 # ---- explicit unit repair: unit-less wide-table columns and medication doses ----------
@@ -1176,15 +1357,15 @@ def site_unit_conversions(cfg: dict, site: str) -> dict[str, dict]:
             raise QualificationError(f"{where} needs `to` and a positive finite `factor`")
         when = decl.get("when")
         if when is not None:
-            if dose:
-                raise QualificationError(f"{where}: `when` applies to column conversions only")
-            if (not isinstance(when, dict) or len(when) != 1
-                    or next(iter(when)) not in _WHEN_OPS
-                    or _finite_number(next(iter(when.values()))) is None):
+            # A column conversion takes one condition; a dose correction may bound the
+            # charted value on both sides (e.g. ketamine "mg" 0.1-0.35 = mg/kg).
+            if (not isinstance(when, dict) or not when or (not dose and len(when) != 1)
+                    or any(op not in _WHEN_OPS or _finite_number(v) is None
+                           for op, v in when.items())):
                 raise QualificationError(
-                    f"{where}: `when` must be one condition {{op: value}}, op one of "
-                    f"{sorted(_WHEN_OPS)}")
-            when = {next(iter(when)): float(next(iter(when.values())))}
+                    f"{where}: `when` must be {'conditions' if dose else 'one condition'} "
+                    f"{{op: value}}, op one of {sorted(_WHEN_OPS)}")
+            when = {op: float(v) for op, v in sorted(when.items())}
         out[key] = {"from": decl["from"], "to": decl["to"], "factor": factor,
                     **({"when": when} if when else {}),
                     **({"note": str(decl["note"])} if decl.get("note") else {})}
@@ -1270,18 +1451,22 @@ def check_column_units(con, base: Path, cfg: dict, site: str,
     record: dict = {"site": site, "conversions": conversions, "columns": {},
                     "semantic_flags": {k: v["flag"] for k, v in columns.items() if v["flag"]}}
     failures = []
+    aliases = site_harmonization(cfg, site)["column_aliases"]
     for key, spec in columns.items():
         table, column = key.split(".", 1)
         tspec = cfg["tables"][table]
         fp = base / f"{tspec['file']}.parquet"
-        if not fp.exists() or column.lower() not in {
-                c.lower() for c in _parquet_columns(con, fp)}:
+        if not fp.exists():
+            continue
+        source = parquet_source(fp, aliases.get(table),
+                                {c.lower() for c in _parquet_columns(con, fp)})
+        if column.lower() not in {c.lower() for c in _parquet_columns(con, fp, source)}:
             continue
         decl = conversions.get(key)
         id_sql, params = _id_filter(keep_ids)
         raw = f"CAST({column} AS DOUBLE)"
         source = (f"SELECT {_convert_sql(raw, decl) if decl else raw} AS v "
-                  f"FROM read_parquet('{fp}') WHERE {tspec['availability_col']} IS NOT NULL "
+                  f"FROM {source} WHERE {tspec['availability_col']} IS NOT NULL "
                   f"{id_sql}")
         lo, hi = spec["range"]
         # float32 storage (0.21 -> 0.2099999...) must not read as out of range.
@@ -1423,12 +1608,37 @@ def reference_units(fit_events: pl.DataFrame, segments: dict, cfg: dict,
         concept: canonical.get(concept) or observed.get(concept) or metrics.get(concept)
         for concept in sorted(segments)
     }
+    # CLIF 2.1 units (labs: the mCIDE lab unit; vitals: the 2.1 DDL): an equivalent site
+    # spelling (mEq/L for sodium, K/uL, "units" for pH) is recorded as the CLIF unit; a
+    # non-equivalent one is kept and listed as a deviation.
+    clif = clif_unit_map(cfg)
+    deviations = {}
+    for concept, unit in units.items():
+        expected = clif.get(concept)
+        if not expected:
+            continue
+        if unit is None or units_equivalent(concept, unit, expected, cfg):
+            units[concept] = expected
+        else:
+            deviations[concept] = unit
     record = {"concepts": units, "dose_targets": dict(sorted(dose_targets.items()))}
+    if deviations:
+        record["clif_unit_deviations"] = dict(sorted(deviations.items()))
     if declared:
         record["column_units"] = declared
         record["site_conversions"] = (site_unit_conversions(cfg, site)
                                       if site is not None else {})
     return record
+
+
+def clif_unit_map(cfg: dict) -> dict[str, str]:
+    """{concept: CLIF 2.1 unit} from the mCIDE snapshot (labs, vitals), or {} when the
+    config declares no `clif_conformance`."""
+    block = cfg.get("clif_conformance")
+    if not block:
+        return {}
+    from src.data.clif_conformance import load_snapshot
+    return dict(load_snapshot(block["snapshot"]).get("units") or {})
 
 
 def _unit_plan(fit_events: pl.DataFrame, cfg: dict, dose_targets: dict[str, str],
@@ -1529,6 +1739,326 @@ def restrict_to_observation_window(
     """Join canonical episodes and retain only anchor-available ICU events."""
     return _windowed(events, episodes, treatment_sources, ("icu_admit_dttm", "anchor_dttm"),
                      "anchor_dttm")
+
+
+# ---- CLIF 2.1 harmonization: GCS not testable, BP measurement method ------------------
+
+def gcs_rule(cfg: dict) -> dict | None:
+    """The validated `gcs_not_testable` block (applied identically at every site)."""
+    rule = cfg.get("gcs_not_testable")
+    if rule is None:
+        return None
+    if not isinstance(rule, dict) or rule.get("table") not in (cfg.get("tables") or {}):
+        raise QualificationError("gcs_not_testable needs a configured `table`")
+    for key in ("verbal", "total", "token_value"):
+        if not isinstance(rule.get(key), str) or not rule[key]:
+            raise QualificationError(f"gcs_not_testable.{key} must be a name")
+    codes = rule.get("numeric_codes") or []
+    if any(_finite_number(c) is None for c in codes):
+        raise QualificationError("gcs_not_testable.numeric_codes must be numbers")
+    table = rule.get("imputation")
+    if (not isinstance(table, list) or not table or any(
+            not isinstance(r, dict) or len(r.get("eye_motor") or ()) != 2
+            or _finite_number(r.get("verbal")) is None for r in table)):
+        raise QualificationError(
+            "gcs_not_testable.imputation must list {eye_motor: [lo, hi], verbal} rows")
+    for key in ("eye", "motor", "imputed_marker_concept", "imputed_marker_value"):
+        if not isinstance(rule.get(key), str) or not rule[key]:
+            raise QualificationError(f"gcs_not_testable.{key} must be a name")
+    return rule
+
+
+def _cat_key(expr: pl.Expr) -> pl.Expr:
+    return expr.str.strip_chars().str.to_lowercase().str.replace_all(r"[\s_]+", "_")
+
+
+def gcs_imputed_verbal(eye_motor: float, table: list[dict]) -> float | None:
+    """The imputed verbal score for an eye + motor sum (`gcs_not_testable.imputation`)."""
+    for row in table:
+        lo, hi = row["eye_motor"]
+        if lo <= eye_motor <= hi:
+            return float(row["verbal"])
+    return None
+
+
+def apply_gcs_not_testable(events: pl.DataFrame, rule: dict) -> tuple[pl.DataFrame, dict]:
+    """A GCS verbal score that cannot be tested (a declared numeric or categorical code,
+    e.g. MIMIC's 0 for an intubated patient) becomes the categorical value
+    `rule.token_value` (token ``gcs_verbal=not_testable``). A total charted at the same
+    (stay, time) is not a valid score (MIMIC forces it to 15): it is REPLACED by eye +
+    motor + the imputed verbal score (`rule.imputation`, Brennan 2021) and marked by a
+    ``gcs_total_source=imputed`` token at the same time; with no single same-time eye and
+    motor value the total is dropped. Decided 2026-10-03 (product authority).
+    Returns (events, aggregate counts)."""
+    counts = {"verbal_not_testable": 0, "total_imputed": 0, "total_dropped": 0}
+    if events.is_empty():
+        return events, counts
+    verbal = pl.col("concept") == rule["verbal"]
+    numeric = [float(c) for c in rule.get("numeric_codes") or ()]
+    categorical = [re.sub(r"[\s_]+", "_", str(c).strip().lower())
+                   for c in rule.get("categorical_codes") or ()]
+    nt = verbal & (pl.col("value").is_in(numeric).fill_null(False)
+                   | _cat_key(pl.col("cat_value")).is_in(categorical).fill_null(False))
+    events = events.with_columns(nt.alias("_nt"))
+    counts["verbal_not_testable"] = int(events["_nt"].sum())
+    if not counts["verbal_not_testable"]:
+        return events.drop("_nt"), counts
+    keys = events.filter(pl.col("_nt")).select("hosp_id", "dttm").unique()
+    events = events.with_columns(
+        pl.when(pl.col("_nt")).then(pl.lit(None, pl.Float64))
+        .otherwise(pl.col("value")).alias("value"),
+        pl.when(pl.col("_nt")).then(pl.lit(rule["token_value"]))
+        .otherwise(pl.col("cat_value")).alias("cat_value"),
+    ).drop("_nt")
+    # Same-time eye + motor (exactly one distinct value each) -> imputed total.
+    parts = (events.filter(pl.col("concept").is_in([rule["eye"], rule["motor"]])
+                           & pl.col("value").is_finite().fill_null(False))
+             .join(keys, on=["hosp_id", "dttm"], how="semi")
+             .group_by("hosp_id", "dttm", "concept")
+             .agg(pl.col("value").min().alias("v"), pl.col("value").n_unique().alias("n"))
+             .filter(pl.col("n") == 1))
+    eye = parts.filter(pl.col("concept") == rule["eye"]).select(
+        "hosp_id", "dttm", pl.col("v").alias("_e"))
+    motor = parts.filter(pl.col("concept") == rule["motor"]).select(
+        "hosp_id", "dttm", pl.col("v").alias("_m"))
+    table = rule["imputation"]
+    em = eye.join(motor, on=["hosp_id", "dttm"], how="inner").with_columns(
+        (pl.col("_e") + pl.col("_m")).alias("_em"))
+    imputed_verbal = pl.lit(None, pl.Float64)
+    for row in reversed(table):
+        lo, hi = row["eye_motor"]
+        imputed_verbal = (pl.when(pl.col("_em").is_between(lo, hi))
+                          .then(pl.lit(float(row["verbal"]))).otherwise(imputed_verbal))
+    em = em.with_columns((pl.col("_em") + imputed_verbal).alias("_imputed")).select(
+        "hosp_id", "dttm", "_imputed")
+    marked = (events.join(keys.with_columns(pl.lit(True).alias("_k")),
+                          on=["hosp_id", "dttm"], how="left")
+              .join(em, on=["hosp_id", "dttm"], how="left"))
+    total = (pl.col("concept") == rule["total"]) & pl.col("_k").fill_null(False)
+    counts["total_imputed"] = int(marked.select(
+        (total & pl.col("_imputed").is_not_null()).sum()).item())
+    counts["total_dropped"] = int(marked.select(
+        (total & pl.col("_imputed").is_null()).sum()).item())
+    replaced = total & pl.col("_imputed").is_not_null()
+    markers = marked.filter(replaced).select("hosp_id", "dttm").unique().select(
+        "hosp_id", "dttm", pl.lit(rule["imputed_marker_concept"]).alias("concept"),
+        pl.lit(None, pl.Float64).alias("value"), pl.lit(None, pl.String).alias("unit"),
+        pl.lit(rule["imputed_marker_value"]).alias("cat_value"))
+    events = (marked.filter(~(total & pl.col("_imputed").is_null()))
+              .with_columns(pl.when(replaced).then(pl.col("_imputed"))
+                            .otherwise(pl.col("value")).alias("value"))
+              .drop("_k", "_imputed"))
+    return pl.concat([events, markers], how="diagonal_relaxed"), counts
+
+
+def apply_bp_method(events: pl.DataFrame, glob: dict, decl: dict | None,
+                    site: str) -> tuple[pl.DataFrame, dict]:
+    """Emit one ``bp_method=<method>`` token per (stay, time, method) of the declared BP
+    concepts, ordered immediately before that method's readings (`_okey` / `_osub` sort
+    keys, `_event_sort`). The readings themselves are unchanged. The method comes from the
+    site's declared source column (`_bp_src`); an unmapped name, or BP rows at a site with
+    no declaration, fail. Returns (events, {method: readings, "tokens": n})."""
+    concepts = glob["concepts"]
+    is_bp = pl.col("concept").is_in(concepts)
+    if events.is_empty() or not len(events.filter(is_bp)):
+        return events.drop("_bp_src", strict=False), {}
+    if decl is None or "_bp_src" not in events.columns:
+        if not glob["require_site_declaration"]:
+            return events.drop("_bp_src", strict=False), {}
+        raise QualificationError(
+            f"site {site!r} charts {', '.join(concepts)} but declares no BP measurement "
+            f"method (site_harmonization.{site}.bp_method)")
+    names = (events.filter(is_bp).group_by("_bp_src").len()
+             .sort("_bp_src", nulls_last=True).iter_rows())
+    mapping, unmapped, null_method = {}, [], None
+    for name, n in names:
+        method = bp_method_of(name, decl)
+        if method is None:
+            unmapped.append(f"{'<null>' if name is None else name!r} ({n:,} rows)")
+        elif name is None:
+            null_method = method
+        else:
+            mapping[name] = method
+    if unmapped:
+        raise QualificationError(
+            f"site {site!r}: BP source name(s) map to no measurement method: "
+            f"{'; '.join(unmapped)}. Add a pattern (or map them to `unknown` explicitly) in "
+            f"site_harmonization.{site}.bp_method")
+    method = (pl.when(pl.col("_bp_src").is_null()).then(pl.lit(null_method, pl.String))
+              .otherwise(pl.col("_bp_src").replace_strict(
+                  mapping, default=None, return_dtype=pl.String)))
+    events = events.with_columns(
+        pl.when(is_bp).then(method).otherwise(pl.lit(None, pl.String)).alias("_bp_method")
+    ).drop("_bp_src")
+    readings = events.filter(is_bp & pl.col("value").is_finite().fill_null(False))
+    tokens = readings.select("hosp_id", "dttm", "_bp_method").unique().select(
+        "hosp_id", "dttm", pl.lit(glob["token_concept"]).alias("concept"),
+        pl.lit(None, pl.Float64).alias("value"), pl.lit(None, pl.String).alias("unit"),
+        pl.col("_bp_method").alias("cat_value"),
+        ("bp|" + pl.col("_bp_method")).alias("_okey"), pl.lit(0, pl.Int8).alias("_osub"))
+    counts = {m: int(n) for m, n in readings.group_by("_bp_method").len().iter_rows()}
+    counts["tokens"] = len(tokens)
+    events = events.with_columns(
+        pl.when(is_bp).then("bp|" + pl.col("_bp_method")).otherwise(None).alias("_okey"),
+        pl.lit(1, pl.Int8).alias("_osub"),
+    ).drop("_bp_method")
+    return pl.concat([events, tokens], how="diagonal_relaxed"), dict(sorted(counts.items()))
+
+
+def _event_sort(events: pl.DataFrame) -> pl.DataFrame:
+    """KTD6 order. With BP-method tokens, a BP method token and its readings share the
+    sort key ``bp|<method>`` (token first); every other row sorts exactly as before."""
+    if "_okey" not in events.columns:
+        order = [key for key in EVENT_ORDER if key in events.columns]
+        return events.sort(order, nulls_last=True, maintain_order=True)
+    keys: list = []
+    for key in EVENT_ORDER:
+        if key not in events.columns:
+            continue
+        if key == "concept":
+            keys += [pl.coalesce("_okey", "concept"), pl.col("_osub").fill_null(1)]
+        keys.append(pl.col(key))
+    return events.sort(keys, nulls_last=True, maintain_order=True).drop("_okey", "_osub")
+
+
+def harmonization_tokens(cfg: dict) -> list[str]:
+    """Config-defined categorical tokens every vocabulary carries whether or not the
+    reference site charts them (another site's are then never `<unk>`): every BP method,
+    the GCS not-testable verbal, and both values of every 0/1 flag column."""
+    tokens: list[str] = []
+    bp = bp_config(cfg)
+    if bp is not None:
+        tokens += [categorical_token(bp["token_concept"], m) for m in bp["methods"]]
+    gcs = gcs_rule(cfg)
+    if gcs is not None:
+        tokens.append(categorical_token(gcs["verbal"], gcs["token_value"]))
+        tokens.append(categorical_token(gcs["imputed_marker_concept"],
+                                        gcs["imputed_marker_value"]))
+    for spec in (cfg.get("tables") or {}).values():
+        for col in spec.get("flag_cols") or ():
+            tokens += [categorical_token(col.lower(), v) for v in ("0", "1")]
+    return [t for t in tokens if t]
+
+
+def apply_dose_floors(events: pl.DataFrame, cfg: dict) -> tuple[pl.DataFrame, dict]:
+    """Remove running doses below their declared single-dose floor
+    (`dose_plausibility.floors`, in the concept's converted unit): charting errors,
+    counted per concept, never binned. A 0 (stop) dose is never below a floor."""
+    floors = (cfg.get("dose_plausibility") or {}).get("floors") or {}
+    if not floors or events.is_empty():
+        return events, {}
+    for concept, floor in floors.items():
+        if _positive_number(floor) is None:
+            raise QualificationError(f"dose_plausibility.floors.{concept} must be positive")
+    floor = pl.col("concept").replace_strict(
+        {c: float(v) for c, v in floors.items()}, default=None, return_dtype=pl.Float64)
+    below = ((pl.col("value") > 0) & (pl.col("value") < floor)).fill_null(False)
+    flagged = events.filter(below)
+    counts = {c: int(n) for c, n in flagged.group_by("concept").len().iter_rows()}
+    return events.filter(~below), dict(sorted(counts.items()))
+
+
+def apply_concept_renames(events: pl.DataFrame, renames: dict[str, str]) -> pl.DataFrame:
+    """A site's declared token-concept renames (`site_harmonization.<site>.concept_renames`,
+    e.g. MIMIC's conventional cTnT -> `troponin_t_conventional`, so its assay never shares
+    the high-sensitivity `troponin_t` bins). The CLIF category itself is unchanged."""
+    if not renames or events.is_empty():
+        return events
+    return events.with_columns(pl.col("concept").replace(renames))
+
+
+def derived_concept_specs(cfg: dict) -> dict[str, dict]:
+    """The validated `derived_concepts` block (non-CLIF concepts computed from CLIF
+    columns): ``{name: {table, sum_of, divide_by_weight, unit}}``."""
+    out = {}
+    for name, spec in sorted((cfg.get("derived_concepts") or {}).items()):
+        if (not isinstance(spec, dict) or spec.get("table") not in (cfg.get("tables") or {})
+                or not spec.get("sum_of") or not spec.get("unit")):
+            raise QualificationError(f"derived_concepts.{name} needs table, sum_of and unit")
+        if spec.get("clif_concept", False):
+            raise QualificationError(f"derived_concepts.{name} must declare clif_concept: false")
+        out[name] = spec
+    return out
+
+
+def derive_concepts(events: pl.DataFrame, table: str, cfg: dict, con, base: Path,
+                    keep_ids: list | None) -> tuple[pl.DataFrame, dict]:
+    """Append each derived concept of `table`: the sum of its `sum_of` concepts charted on
+    the same row (same stay and time; every component required), divided by the latest
+    plausible weight available at or before that time (`divide_by_weight`; the weight
+    table's lag applied, as for per-kg doses). Returns (events, {name: counts})."""
+    counts: dict[str, dict] = {}
+    for name, spec in derived_concept_specs(cfg).items():
+        if spec["table"] != table or events.is_empty():
+            continue
+        parts = [c.lower() for c in spec["sum_of"]]
+        rows = (events.filter(pl.col("concept").is_in(parts)
+                              & pl.col("value").is_finite().fill_null(False))
+                .group_by("hosp_id", "dttm")
+                .agg(pl.col("value").sum().alias("_sum"),
+                     pl.col("concept").n_unique().alias("_n"), pl.len().alias("_rows")))
+        complete = rows.filter((pl.col("_n") == len(parts)) & (pl.col("_rows") == len(parts)))
+        entry = {"rows_with_any_component": len(rows), "rows_complete": len(complete),
+                 "emitted": 0, "no_weight": 0}
+        weight = spec.get("divide_by_weight")
+        derived = complete.select("hosp_id", "dttm", pl.col("_sum").alias("value"))
+        if weight:
+            wspec = cfg["tables"][weight["table"]]
+            fp = base / f"{wspec['file']}.parquet"
+            lo, hi = _range_pair(weight.get("plausible_kg", [25.0, 400.0]),
+                                 f"derived_concepts.{name}.divide_by_weight.plausible_kg")
+            lag = int(cfg["tables"][table].get("availability_lag_minutes", 0))
+            wlag = int(wspec.get("availability_lag_minutes", 0))
+            id_sql, params = _id_filter(keep_ids)
+            weights = con.execute(f"""
+                SELECT CAST(hospitalization_id AS VARCHAR) AS hosp_id,
+                       {wspec['availability_col']} + INTERVAL {wlag} MINUTE AS _avail,
+                       avg(CAST({wspec['value_col']} AS DOUBLE)) AS _w
+                FROM read_parquet('{fp}')
+                WHERE {wspec['concept_col']} = ? AND {wspec['availability_col']} IS NOT NULL
+                  AND CAST({wspec['value_col']} AS DOUBLE) BETWEEN {lo!r} AND {hi!r} {id_sql}
+                GROUP BY 1, 2""", [weight["concept"], *params]).pl() if fp.exists() else \
+                pl.DataFrame(schema={"hosp_id": pl.String, "_avail": pl.Datetime("us", "UTC"),
+                                     "_w": pl.Float64})
+            derived = (derived.with_columns(
+                (pl.col("dttm") + pl.duration(minutes=lag)).alias("_avail"))
+                .sort("hosp_id", "_avail")
+                # Both sides are sorted by (stay, time) above, which `by` requires.
+                .join_asof(weights.sort("hosp_id", "_avail"), on="_avail", by="hosp_id",
+                           strategy="backward", check_sortedness=False))
+            entry["no_weight"] = int(derived["_w"].is_null().sum())
+            derived = derived.filter(pl.col("_w").is_not_null()).select(
+                "hosp_id", "dttm", (pl.col("value") / pl.col("_w")).alias("value"))
+        derived = derived.select("hosp_id", "dttm", pl.lit(name).alias("concept"), "value",
+                                 pl.lit(spec["unit"]).alias("unit"),
+                                 pl.lit(None, pl.String).alias("cat_value"))
+        entry["emitted"] = len(derived)
+        counts[name] = entry
+        if len(derived):
+            events = pl.concat([events, derived], how="diagonal_relaxed")
+    return events, counts
+
+
+def _check_harmonization_binding(blob: dict, hashes: dict, cfg: dict) -> None:
+    """The harmonization record (mCIDE snapshot, GCS / BP / flag / weight / unit rules,
+    the reference site's declarations) is hashed; a vocabulary built under other global
+    rules, or before them, does not bind."""
+    record = blob.get("harmonization")
+    current = global_record(cfg)
+    if record is None and "harmonization" not in hashes:
+        if current:
+            raise QualificationError(
+                "vocabulary predates the CLIF 2.1 harmonization rules this config declares "
+                f"(mCIDE gate, GCS, BP method, flags); {RETOKENIZE}")
+        return
+    if not isinstance(record, dict) or "harmonization" not in hashes:
+        raise QualificationError(f"vocabulary lacks its hashed harmonization record; {RETOKENIZE}")
+    if hashes["harmonization"] != json_sha256(record):
+        raise QualificationError("harmonization hash mismatch")
+    if record.get("global") != json.loads(json.dumps(current)):
+        raise QualificationError(
+            "vocabulary was built under different CLIF harmonization rules (mCIDE snapshot, "
+            f"GCS, BP method, flags, weights or unit equivalences) than this config; {RETOKENIZE}")
 
 
 def build_value_bins(events: pl.DataFrame, n_bins: int,
@@ -1755,7 +2285,7 @@ def literature_segments(edges: list[float], closure: str, *, dose: bool = False,
 
 
 def _plan_literature(loaded: dict, values: dict, csv_named: set[str],
-                     concept_units: dict) -> tuple[dict, dict]:
+                     concept_units: dict, include_absent: bool = False) -> tuple[dict, dict]:
     """Which fragment concepts apply, after the CSV-wins and unit rules: ``(plan
     {concept: spec}, record)``. A CSV concept is ignored with a warning; a concept with
     no fitting value is skipped with a warning; a unit that differs from the concept's
@@ -1770,6 +2300,12 @@ def _plan_literature(loaded: dict, values: dict, csv_named: set[str],
             ignored.append(concept)
             continue
         if concept not in values:
+            if include_absent and spec["decision"] == "segments":
+                # `literature_coverage: all_segments`: published edges need no fit data, so
+                # another site's events of a concept the reference site lacks are binned.
+                plan[concept] = {**spec, "unit_check": "not_fit",
+                                 "reference_unit": concept_units.get(concept)}
+                continue
             absent.append(concept)
             continue
         expected = concept_units.get(concept)
@@ -1999,11 +2535,20 @@ def build_segments(bin_cfg: dict, fit_events: pl.DataFrame,
         .select("concept", "value").iter_rows()
     }
     doses = dose_concepts(fit_events, bin_cfg, tables)
+    all_csv = bin_cfg.get("csv_coverage", "targets_only") == "all_measurements"
+    if bin_cfg.get("csv_coverage", "targets_only") not in ("targets_only", "all_measurements"):
+        raise ValueError("value_binning.csv_coverage must be targets_only or all_measurements")
     csv_segments = (
-        build_clinical_segment_bins(ROOT / csv_source, sorted(set(values) | set(target_concepts)),
-                                    forced, directions)
+        build_clinical_segment_bins(
+            ROOT / csv_source,
+            None if all_csv else sorted(set(values) | set(target_concepts)),
+            forced, directions)
         if csv_source else {}
     )
+    if all_csv and csv_source:
+        # A CSV medication the reference site never charts is still a dose concept: its
+        # running doses never bin as stopped at another site (policy step 8).
+        doses |= _csv_medications(ROOT / csv_source)
     literature: dict[str, dict] = {}
     if csv_source and bin_cfg.get("literature_source"):
         loaded = load_literature_segments(bin_cfg["literature_source"])
@@ -2011,7 +2556,11 @@ def build_segments(bin_cfg: dict, fit_events: pl.DataFrame,
             ROOT / csv_source, sorted(loaded["concepts"])))
         literature, record = _plan_literature(
             loaded, values, csv_named,
-            _observed_units(fit_events) if concept_units is None else concept_units)
+            _observed_units(fit_events) if concept_units is None else concept_units,
+            include_absent=bin_cfg.get("literature_coverage") == "all_segments")
+        # A medication fragment concept absent from the fit is still a dose concept.
+        doses |= {c for c, spec in literature.items()
+                  if c not in values and spec["fragment"] == "medications.yaml"}
         if literature_out is not None:
             literature_out.update(record)
 
@@ -2033,7 +2582,7 @@ def build_segments(bin_cfg: dict, fit_events: pl.DataFrame,
 
     segments: dict[str, list[dict]] = {}
     sources: dict[str, str] = {}
-    for concept in sorted(set(values) | set(csv_segments)):
+    for concept in sorted(set(values) | set(csv_segments) | set(literature)):
         is_dose = concept in doses
         concept_forced = forced.get(concept, ())
         direction = directions.get(concept)
@@ -2095,6 +2644,17 @@ def build_segments(bin_cfg: dict, fit_events: pl.DataFrame,
         # Clinical-arm concepts with no fitting value (CSV targets absent from the fit).
         granularity["not_fit"] = sorted(set(reference) - set(segments))
     return segments, sources
+
+
+def _csv_medications(csv_path: Path) -> set[str]:
+    """The physician CSV's medication measurements (aliased, policy step 7)."""
+    import csv as _csv
+
+    from src.data.segments import alias_measurement
+    with open(csv_path, newline="") as fh:
+        return {alias_measurement((row.get("measurement") or "").strip())
+                for row in _csv.DictReader(fh)
+                if (row.get("category") or "").strip() == "medications"}
 
 
 def fused_token(concept: str, b: int | None) -> str:
@@ -2320,7 +2880,7 @@ _GEM_STREAM_FIELDS = ("token", "soft_token", "soft_weight", "pos_min", "value",
 
 def _gem_records(shards: pl.DataFrame, stays: pl.DataFrame, vocab: dict, gem_cfg: dict,
                  max_tokens: int, soft_width: int, binding: dict,
-                 stats: dict | None) -> pl.DataFrame:
+                 stats: dict | None, continuation_header: bool = False) -> pl.DataFrame:
     """Frame each eligible stay `<bos> ADMISSION//a <events> DISCHARGE//d <eos>` and split
     it into windows (one row each) of at most `max_tokens`.
 
@@ -2389,8 +2949,21 @@ def _gem_records(shards: pl.DataFrame, stays: pl.DataFrame, vocab: dict, gem_cfg
         (1 + pl.col("_n_le_anchor").fill_null(0)).alias("anchor_idx"),
     )
     stay_rows, starts, ends, index, n_windows = [], [], [], [], []
+    header_ids = None
+    if continuation_header:
+        # CONTINUATION HEADER (src/data/dataset.py): every continuation window of a stay
+        # is cut max_tokens - header_len long, so the loader can re-insert the stay's
+        # header (<bos>, ADMISSION//, static tokens) within max_tokens.
+        from src.data.dataset import gem_window_bounds_with_header, header_token_ids, \
+            stay_header_length
+        header_ids = header_token_ids(vocab)
+        heads64 = framed["token"].list.head(64).to_list()
     for row, n in enumerate(framed["token"].list.len().to_list()):
-        bounds = gem_window_bounds(n, max_tokens)
+        if header_ids is None:
+            bounds = gem_window_bounds(n, max_tokens)
+        else:
+            bounds = gem_window_bounds_with_header(
+                n, max_tokens, stay_header_length(heads64[row], header_ids))
         for i, (lo, hi) in enumerate(bounds):
             stay_rows.append(row)
             starts.append(lo)
@@ -2419,6 +2992,16 @@ def _gem_records(shards: pl.DataFrame, stays: pl.DataFrame, vocab: dict, gem_cfg
         stats["gem"] = {"stays": frame.height, "windows": len(records),
                         **{k: dict(sorted(v.items())) for k, v in counts.items()}}
     return records.with_columns(binding_expr(binding))
+
+
+def model_continuation_header(path: Path | None = None) -> bool:
+    """`trunk.continuation_header` of the model config (configs/model.yaml): when true, GEM
+    continuation windows are cut with room for the stay's header."""
+    fp = path or ROOT / "configs/model.yaml"
+    if not fp.exists():
+        return False
+    return bool(((yaml.safe_load(fp.read_text()) or {}).get("trunk") or {})
+                .get("continuation_header", False))
 
 
 def _soft_width(bin_cfg: dict) -> int:
@@ -2712,7 +3295,8 @@ def tokenize_site(cfg: dict, site: str, base: Path, out: Path,
                   sample_episodes: int | None = None,
                   report: bool = True,
                   workers: int = 1,
-                  encode_chunk_events: int | None = None):
+                  encode_chunk_events: int | None = None,
+                  continuation_header: bool | None = None):
     """Tokenize one site.
 
     `vocab_artifact` None builds the frozen tokenizer-v2 vocabulary (reference site);
@@ -2822,7 +3406,24 @@ def tokenize_site(cfg: dict, site: str, base: Path, out: Path,
     # Explicit unit repair (per site, fail closed): unit-less wide-table columns are
     # validated AFTER this site's declared conversions, before anything is read for
     # binning; dose plausibility is checked after conversion, below.
+    # CLIF 2.1 / mCIDE conformance gate (per site, after the site's alias maps), before a
+    # vocabulary is built or imported: fails closed on an undeclared non-permissible value
+    # or a missing required column. Aggregate record -> the report's data-quality section.
+    conformance = check_conformance(con, base, cfg, site, keep_ids, min_cell=min_cell)
+    harmonization = site_harmonization(cfg, site)
+    bp_glob = bp_config(cfg)
+    gcs = gcs_rule(cfg)
+    if bp_glob is not None:
+        harmonization["_bp_table"] = bp_glob["table"]
     data_quality = check_column_units(con, base, cfg, site, keep_ids)
+    if conformance:
+        data_quality["conformance"] = {
+            "mcide_version": conformance["mcide_version"],
+            "snapshot_sha256": conformance["snapshot_sha256"],
+            "by_table": compliance_table(conformance, 1),
+            "columns": conformance["columns"],
+            "missing_optional_columns": conformance["missing_optional_columns"]}
+    harmonized: dict[str, dict] = {}
     dose_frames: dict[str, pl.DataFrame] = {}
     # Configured columns a site's parquet lacks, per table (report: `missing_columns`).
     missing_columns: dict[str, list[str]] = {}
@@ -2833,12 +3434,29 @@ def tokenize_site(cfg: dict, site: str, base: Path, out: Path,
             fit_shadows=building, missing=absent,
             column_factors=column_factors(cfg, site, name),
             dose_corrections=dose_corrections(cfg, site, name) if spec.get("dose") else None,
+            harmonization=harmonization, name=name,
         )
         if absent:
             missing_columns[name] = absent
         if counts is not None:
+            extra = {k: counts.pop(k) for k in ("exact_duplicates_removed", "weights",
+                                                "weights_excluded") if k in counts}
+            if extra:
+                harmonized.setdefault("dose_tables", {})[name] = extra
+            df, below = apply_dose_floors(df, cfg)
+            if below:
+                harmonized.setdefault("dose_below_floor", {})[name] = below
             dose_stats[name] = counts
             dose_frames[name] = df.select("concept", "value")
+        if gcs is not None and name == gcs["table"]:
+            df, harmonized["gcs"] = apply_gcs_not_testable(df, gcs)
+        if bp_glob is not None and name == bp_glob["table"]:
+            df, harmonized["bp_method"] = apply_bp_method(
+                df, bp_glob, harmonization["bp_method"], site)
+        df = apply_concept_renames(df, harmonization["concept_renames"].get(name) or {})
+        df, derived = derive_concepts(df, name, cfg, con, base, keep_ids)
+        if derived:
+            harmonized.setdefault("derived_concepts", {}).update(derived)
         lag = availability[name]["lag_minutes"]
         for frame, sink in ((df, frames), (shadows, shadow_frames)):
             if frame is None or not len(frame):
@@ -2851,6 +3469,8 @@ def tokenize_site(cfg: dict, site: str, base: Path, out: Path,
                 frame = frame.with_columns(pl.col("dttm") + pl.duration(minutes=lag))
             sink.append(frame.with_columns(source=pl.lit(name)))
     data_quality.update(check_dose_plausibility(dose_frames, cfg, site))
+    if harmonized:
+        data_quality["harmonization"] = harmonized
     dose_frames.clear()
     if stats is not None:
         stats["dose_conversion"] = dose_stats
@@ -2908,8 +3528,7 @@ def tokenize_site(cfg: dict, site: str, base: Path, out: Path,
     # keys through a join or an unmaintained sort). Nulls sort last so a missing value
     # or categorical result has one fixed place; `group_by(maintain_order=True)` below
     # hands `encode` each stay's rows in exactly this order.
-    order = [key for key in EVENT_ORDER if key in events.columns]
-    events = events.sort(order, nulls_last=True, maintain_order=True)
+    events = _event_sort(events)
 
     # Guard: verify single-hospital consistency for reference-site vocab.
     # hospital_id is a CLIF 2.1 column that distinguishes hospitals within
@@ -2966,6 +3585,8 @@ def tokenize_site(cfg: dict, site: str, base: Path, out: Path,
             literature_out=literature,
         )
         vocab = build_vocab(fit_events, edges, min_category_stays=min_cell)
+        for token in harmonization_tokens(cfg):   # config allowlist, after data tokens
+            vocab.setdefault(token, max(vocab.values()) + 1)
         units = reference_units(fit_events, edges, cfg, target_units, site)
         sources = concept_sources(fit_events, treatment_sources)
         if gem_cfg is not None:
@@ -3002,6 +3623,12 @@ def tokenize_site(cfg: dict, site: str, base: Path, out: Path,
             # Fragment file hashes + applied edges/closures/source ids: a changed
             # fragment changes the vocabulary manifest.
             hashes["literature_segments"] = json_sha256(literature)
+        harmonization_rec = harmonization_record(cfg, site)
+        if harmonization_rec:
+            # mCIDE snapshot version + hash, GCS / BP / flag / weight / unit rules and
+            # this reference site's alias maps, duplicates and BP mapping.
+            harmonization_rec = json.loads(json.dumps(harmonization_rec))
+            hashes["harmonization"] = json_sha256(harmonization_rec)
         vocab_manifest = {
             "artifact_family": "experimental_representation",
             "tokenizer_version": TOKENIZER_VERSION,
@@ -3053,6 +3680,8 @@ def tokenize_site(cfg: dict, site: str, base: Path, out: Path,
         }
         if literature:
             vocab_artifact["literature_segments"] = literature
+        if harmonization_rec:
+            vocab_artifact["harmonization"] = harmonization_rec
 
     # The unknown-concept fallback below emits SPECIAL["<unk>"] for a concept+bin the
     # frozen vocab does not cover (cross-site coverage). That is only safe if the vocab
@@ -3074,9 +3703,12 @@ def tokenize_site(cfg: dict, site: str, base: Path, out: Path,
         if keep_ids is not None:
             stays = stays.filter(pl.col("hospitalization_id").is_in(keep_ids))
         gem_stats: dict = {}
+        if continuation_header is None:
+            continuation_header = model_continuation_header()
         gem = _gem_records(shards, stays, vocab, gem_cfg, max_tokens, soft_width,
                            artifact_binding(vocab_artifact),
-                           stats if stats is not None else gem_stats)
+                           stats if stats is not None else gem_stats,
+                           continuation_header=bool(continuation_header))
         out.mkdir(parents=True, exist_ok=True)
         gem.write_parquet(events_path)
         # DATA-CLASSIFICATION: PHI (hosp_id + per-stay sequences + timing), like

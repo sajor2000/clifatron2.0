@@ -8,6 +8,8 @@
 *.csv
 # ...except the physician-designed bin definitions the tokenizer reads (configs/data.yaml segment_source)
 !external/clifatron/tokenETL/config/critical_illness_tokenization_final_with_intervals.csv
+# ...and the public CLIF v2.1.1 mCIDE permissible-value snapshot (spec files, no patient data)
+!configs/clif_mcide_2.1.1/**/*.csv
 *.pt
 *.bin
 *.ckpt

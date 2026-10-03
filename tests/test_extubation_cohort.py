@@ -25,6 +25,7 @@ from src.data.extubation_cohort import (
     main as extubation_main,
 )
 from src.data.splits import assign_grouped_splits
+from src.data.tokenize import with_availability_lag
 from tests.fixtures_extubation import (
     PARTITIONS,
     SPLIT_SEED,
@@ -35,10 +36,20 @@ from tests.fixtures_extubation import (
 )
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def single_row_config():
+    """The repo contract with the single-row look-forward rule: the fixture's hand-built
+    scenario patients chart ONE non-invasive row after extubation (the primary since
+    2026-10-03 requires two; see test_primary_requires_two_non_invasive_rows)."""
+    config = load_extubation_config(ROOT / "configs/extubation.yaml")
+    config["detection"]["look_forward"]["min_non_invasive_rows"] = 1
+    return config
 SPLIT = {"partitions": PARTITIONS, "split_seed": SPLIT_SEED}
 REASONS = [
     "missing_age",
     "underage",
+    "death_record_inconsistent",
     "lookback_insufficient",
     "lookforward_insufficient",
     "tracheostomy",
@@ -52,9 +63,12 @@ class ExtubationCohortTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.fixture = build_extubation_fixture()
-        cls.config = load_extubation_config(ROOT / "configs/extubation.yaml")
+        cls.config = single_row_config()
+        # The fixture's scenario hours assume no availability lag; the repo's 30-minute
+        # lag (decided 2026-10-03) is tested in test_availability_lag_shifts_time_zero.
         cls.availability = table_availability(
-            cls.config, yaml.safe_load((ROOT / "configs/data.yaml").read_text())
+            cls.config,
+            with_availability_lag(yaml.safe_load((ROOT / "configs/data.yaml").read_text()), 0),
         )
         cls.result = cls.build()
         cls.rows = {row["patient_id"]: row for row in cls.result.cohort.to_dicts()}
@@ -69,6 +83,7 @@ class ExtubationCohortTest(unittest.TestCase):
         episodes="fixture",
         calendar_periods="fixture",
         grace_hours=None,
+        null_device_rows=None,
     ):
         return build_extubation_cohort(
             cls.fixture.tables if tables is None else tables,
@@ -83,6 +98,7 @@ class ExtubationCohortTest(unittest.TestCase):
                 else calendar_periods
             ),
             grace_hours=grace_hours,
+            null_device_rows=null_device_rows,
         )
 
     def row(self, name, result=None):
@@ -478,6 +494,172 @@ class ExtubationCohortTest(unittest.TestCase):
         self.assertEqual(self.row("ae1_rescue_niv")["unit_at_time_zero"], "medical_icu")
         self.assertEqual(self.row("absent_from_artifact")["unit_at_time_zero"], "general_ward")
 
+    def test_unmapped_icu_type_stays_its_own_unit(self):
+        # With no declared map, a site label is never folded into another ICU type.
+        adt = self.fixture.tables["adt"].with_columns(
+            pl.when(pl.col("hospitalization_id") == hospitalization_id("ae1_rescue_niv"))
+            .then(pl.lit("cvicu_icu"))
+            .otherwise(pl.col("location_type"))
+            .alias("location_type")
+        )
+        result = self.build(tables=self.with_table("adt", adt))
+        self.assertEqual(self.row("ae1_rescue_niv", result)["unit_at_time_zero"], "cvicu_icu")
+        units = set(result.cohort["unit_at_time_zero"].drop_nulls())
+        self.assertIn("cvicu_icu", units)
+        self.assertIn("medical_icu", units)
+
+    def test_availability_lag_shifts_time_zero(self):
+        data = yaml.safe_load((ROOT / "configs/data.yaml").read_text())
+        self.assertEqual(data["tables"]["resp_support"]["availability_lag_minutes"], 30)
+        lagged = build_extubation_cohort(
+            self.fixture.tables, self.config, availability=table_availability(self.config, data),
+            split=SPLIT, site="mimic", episodes=self.fixture.episodes,
+            calendar_periods=self.fixture.calendar_periods)
+        row = self.row("dnr_only", lagged)
+        self.assertEqual(row["time_zero_dttm"] - self.row("dnr_only")["time_zero_dttm"],
+                         timedelta(minutes=30))
+
+    def test_primary_requires_two_non_invasive_rows(self):
+        # decided 2026-10-03 (product authority): >= 2 non-invasive rows after the last
+        # IMV row in the primary; the single-row rule is a sensitivity cohort.
+        repo = load_extubation_config(ROOT / "configs/extubation.yaml")
+        self.assertEqual(repo["detection"]["look_forward"]["min_non_invasive_rows"], 2)
+        result = self.build(config=repo)
+        row = self.row("dnr_only", result)          # one Nasal Cannula row after IMV
+        self.assertEqual(row["eligibility_status"], "lookforward_insufficient")
+        self.assertEqual(row["eligibility_status_single_non_invasive_row"], "eligible")
+        # A two-row extubation (rescue NIV patient: Face Mask, Nasal Cannula, NIPPV) passes.
+        self.assertEqual(self.row("ae1_rescue_niv", result)["eligibility_status"], "eligible")
+        self.assertGreater(result.waterfall["single_non_invasive_row_patient_eligible"],
+                           result.waterfall["patient_eligible"])
+
+    def _no_device_row(self, name, hours_after_t0, **settings):
+        t0 = self.row(name)["time_zero_dttm"]
+        resp = self.fixture.tables["respiratory_support"]
+        extra = pl.DataFrame([{
+            "hospitalization_id": hospitalization_id(name),
+            "recorded_dttm": t0 + timedelta(hours=hours_after_t0),
+            "device_category": None, "tracheostomy": False, **settings}],
+            schema={k: v for k, v in resp.schema.items()
+                    if k in {"hospitalization_id", "recorded_dttm", "device_category",
+                             "tracheostomy", *settings}})
+        return pl.concat([resp, extra], how="diagonal_relaxed")
+
+    def test_no_device_row_without_settings_is_room_air(self):
+        repo = load_extubation_config(ROOT / "configs/extubation.yaml")
+        resp = self._no_device_row("dnr_only", 2.0)
+        result = self.build(tables=self.with_table("respiratory_support", resp), config=repo)
+        # The room-air row is the confirming second non-invasive row.
+        self.assertEqual(self.row("dnr_only", result)["eligibility_status"], "eligible")
+        self.assertEqual(result.waterfall["resp_rows_room_air_from_no_device"], 1)
+        # Sensitivity: no-device rows ignored.
+        ignored = self.build(tables=self.with_table("respiratory_support", resp), config=repo,
+                             null_device_rows="ignore")
+        self.assertEqual(self.row("dnr_only", ignored)["eligibility_status"],
+                         "lookforward_insufficient")
+        self.assertEqual(ignored.waterfall["resp_rows_room_air_from_no_device"], 0)
+
+    def test_no_device_row_with_ventilator_settings_is_not_room_air(self):
+        repo = load_extubation_config(ROOT / "configs/extubation.yaml")
+        resp = self._no_device_row("dnr_only", 2.0, fio2_set=0.4)
+        result = self.build(tables=self.with_table("respiratory_support", resp), config=repo)
+        self.assertEqual(self.row("dnr_only", result)["eligibility_status"],
+                         "lookforward_insufficient")
+
+    def test_unit_covariate_maps_cvicu_and_keeps_the_raw_label(self):
+        # decided 2026-10-03 (product authority): cvicu_icu -> cardiothoracic_surgical_icu
+        # (the mCIDE type described "aka CTICU/CVICU"); the raw label is kept.
+        from src.data.extubation_cohort import _location_type_map
+
+        data = yaml.safe_load((ROOT / "configs/data.yaml").read_text())
+        unit_map = _location_type_map(data, "mimic")
+        self.assertEqual(unit_map, {"cvicu_icu": "cardiothoracic_surgical_icu"})
+        adt = self.fixture.tables["adt"].with_columns(
+            pl.when(pl.col("hospitalization_id") == hospitalization_id("ae1_rescue_niv"))
+            .then(pl.lit("cvicu_icu"))
+            .otherwise(pl.col("location_type"))
+            .alias("location_type")
+        )
+        result = build_extubation_cohort(
+            self.with_table("adt", adt), self.config, availability=self.availability,
+            split=SPLIT, site="mimic", episodes=self.fixture.episodes,
+            calendar_periods=self.fixture.calendar_periods, unit_map=unit_map)
+        row = self.row("ae1_rescue_niv", result)
+        self.assertEqual(row["unit_at_time_zero"], "cardiothoracic_surgical_icu")
+        self.assertEqual(row["unit_at_time_zero_raw"], "cvicu_icu")
+        other = self.row("dnr_only", result)
+        self.assertEqual(other["unit_at_time_zero"], other["unit_at_time_zero_raw"])
+
+    def test_dni_only_is_a_do_not_reintubate_status(self):
+        codes = self.fixture.tables["code_status"].with_columns(
+            pl.when(pl.col("patient_id") == patient_id("dnr_only"))
+            .then(pl.lit("DNI_only"))
+            .otherwise(pl.col("code_status_category"))
+            .alias("code_status_category")
+        )
+        result = self.build(tables=self.with_table("code_status", codes))
+        row = self.row("dnr_only", result)
+        self.assertEqual(row["eligibility_status"], "do_not_reintubate")
+        self.assertTrue(row["do_not_reintubate_at_time_zero"])
+
+    def _with_death(self, name, offset_hours, *, midnight=False):
+        admission = (
+            self.fixture.tables["hospitalization"]
+            .filter(pl.col("patient_id") == patient_id(name))["admission_dttm"]
+            .min()
+        )
+        death = admission + timedelta(hours=offset_hours)
+        if midnight:
+            death = death.replace(hour=0, minute=0, second=0, microsecond=0)
+        patient = self.fixture.tables["patient"].with_columns(
+            pl.when(pl.col("patient_id") == patient_id(name))
+            .then(pl.lit(death).cast(pl.Datetime("us", "UTC")))
+            .otherwise(pl.col("death_dttm"))
+            .alias("death_dttm")
+        )
+        return self.build(tables=self.with_table("patient", patient))
+
+    def test_death_before_an_admission_is_an_inconsistent_record(self):
+        result = self._with_death("dnr_only", -48.0)
+        row = self.row("dnr_only", result)
+        self.assertTrue(row["death_record_inconsistent"])
+        self.assertEqual(row["eligibility_status"], "death_record_inconsistent")
+        self.assertFalse(row["eligible"])
+        self.assertEqual(result.waterfall["patient_excluded_death_record_inconsistent"], 1)
+        self.assertEqual(result.waterfall["patient_death_record_inconsistent"], 1)
+        # The fixture's own patients are consistent.
+        self.assertEqual(self.result.waterfall["patient_death_record_inconsistent"], 0)
+
+    def test_date_resolution_death_on_the_admission_day_is_consistent(self):
+        # A death floored to midnight of the admission day (date resolution) is not a
+        # death before admission; one more than 24 h before is.
+        same_day = self.row("dnr_only", self._with_death("dnr_only", 0.0, midnight=True))
+        self.assertFalse(same_day["death_record_inconsistent"])
+        days_before = self.row("dnr_only", self._with_death("dnr_only", -72.0, midnight=True))
+        self.assertTrue(days_before["death_record_inconsistent"])
+
+    def test_death_record_can_be_flagged_without_excluding(self):
+        config = copy.deepcopy(self.config)
+        config["exclusions"]["death_record"]["action"] = "flag"
+        admission = (
+            self.fixture.tables["hospitalization"]
+            .filter(pl.col("patient_id") == patient_id("dnr_only"))["admission_dttm"]
+            .min()
+        )
+        patient = self.fixture.tables["patient"].with_columns(
+            pl.when(pl.col("patient_id") == patient_id("dnr_only"))
+            .then(pl.lit(admission - timedelta(days=3)).cast(pl.Datetime("us", "UTC")))
+            .otherwise(pl.col("death_dttm"))
+            .alias("death_dttm")
+        )
+        result = self.build(tables=self.with_table("patient", patient), config=config)
+        row = self.row("dnr_only", result)
+        self.assertTrue(row["death_record_inconsistent"])
+        self.assertTrue(row["eligible"])
+        config["exclusions"]["death_record"]["action"] = "drop"
+        with self.assertRaisesRegex(QualificationError, "death_record.action"):
+            self.build(config=config)
+
     # ------------------------------------------------------------ waterfall, hashes
 
     def test_waterfall_accounts_for_every_first_extubation(self):
@@ -631,6 +813,18 @@ class ExtubationConfigTest(unittest.TestCase):
             self.config["exclusions"]["tracheostomy"]["device_categories"], ["Trach Collar"]
         )
         self.assertIsNone(self.config["sites"]["rush"]["calendar_period_source"])
+        # Every CLIF 2.1 code status is declared (a site charting DNI_only must not fail).
+        mcide = {
+            line.split(",")[0]
+            for line in (ROOT / "configs/clif_mcide_2.1.1/mCIDE/code_status/"
+                         "clif_code_status_categories.csv").read_text().splitlines()[1:]
+            if line.strip()
+        }
+        rules = self.config["exclusions"]["code_status"]
+        declared = {c for key, cats in rules.items() if key.endswith("_categories") for c in cats}
+        self.assertEqual(mcide - declared, set())
+        self.assertIn("DNI_only", rules["do_not_reintubate_categories"])
+        self.assertEqual(self.config["exclusions"]["death_record"]["action"], "exclude")
         self.assertEqual(
             self.config["sites"]["mimic"]["calendar_period_source"]["period_col"],
             "anchor_year_group",

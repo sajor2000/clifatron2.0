@@ -105,6 +105,8 @@ concepts:
         verified: true
     notes: CLIF 2.1 unit mL/hr (0-10000); staged quantiles 200 (p1-p75) to 1300 (p99).
 
+  # NET ultrafiltration (fluid removed from the patient), as CLIF 2.1 defines the column;
+  # labelled so by the product authority 2026-10-03.
   ultrafiltration_out:
     unit: mL/hr
     decision: segments
@@ -136,6 +138,42 @@ concepts:
       events fall in the top bin; it is not total effluent (that would be ~1600-2000 mL/h), but it
       may include charting of gross patient fluid removal. Confirm the MIMIC item mapping; a
       physician may want one more upper edge (no source found for one).
+
+  # DERIVED, NOT A CLIF 2.1 COLUMN (decided 2026-10-03, product authority): delivered CRRT
+  # effluent dose = (dialysate + pre-filter + post-filter replacement + net ultrafiltration,
+  # mL/hr) / weight kg, emitted by the tokenizer (configs/data.yaml derived_concepts) only
+  # when all four components are charted on the same CRRT row and a plausible weight
+  # (25-400 kg) is available at that time.
+  crrt_effluent_dose_ml_kg_h:
+    unit: mL/kg/hr
+    decision: segments
+    edges: [13.0, 20.0, 25.0, 35.0]
+    closure: left
+    rationale: >-
+      < 13 mL/kg/h very-low delivered dose (a charting or delivery-failure flag); 20 = ATN
+      less-intensive arm and the KDIGO lower bound (20-25 delivered); 25 = RENAL lower-intensity arm
+      and the KDIGO upper bound; 35 = ATN intensive arm (no survival benefit above it).
+    sources:
+      - id: "PMID:18492867"   # VA/NIH ATN, Palevsky 2008 NEJM (doi 10.1056/NEJMoa0802639)
+        supports: [20.0, 35.0]
+        quote: "continuous venovenous hemodiafiltration at 35 ml per kilogram of body weight per hour; for patients receiving the less-intensive treatment strategy ... at 20 ml per kilogram per hour"
+        verified: true
+      - id: "PMID:19846848"   # RENAL, Bellomo 2009 NEJM (doi 10.1056/NEJMoa0902413)
+        supports: [25.0]
+        quote: "postdilution continuous venovenous hemodiafiltration with an effluent flow of either 40 ml per kilogram of body weight per hour (higher intensity) or 25 ml per kilogram per hour (lower intensity)"
+        verified: true
+      - id: "PMID:22890468"   # Khwaja 2012 KDIGO AKI guideline summary (doi 10.1159/000339789)
+        supports: [20.0, 25.0]
+        quote: "(no abstract in PubMed; KDIGO recommendation 5.8.4 'effluent volume of 20-25 ml/kg/h for CRRT' not read from the full text here)"
+        verified: false
+      - id: "decision:product-authority-2026-10-03"
+        supports: [13.0]
+        quote: "13 mL/kg/h = very-low-dose flag (no PubMed source retrieved)"
+        verified: false
+    notes: >-
+      Not a CLIF 2.1 concept: derived, unit mL/kg/hr. Component semantics follow CLIF 2.1 (dialysate
+      and replacement rates mL/hr; ultrafiltration_out = NET ultrafiltration mL/hr). If MIMIC's
+      ultrafiltration_out is gross removal (see ultrafiltration_out notes) the dose is overstated.
 
   # ------------------------------------------------------------------ ECMO / MCS (clif_ecmo_mcs)
   ecmo_flow:
@@ -196,7 +234,8 @@ concepts:
         quote: "Stepwise reduction in FDO2 from 1.0 to 0.21 in decrements of approximately 20% ... Sweep gas typically ranges from 1–9+ LPM, and for VV is typically 100% O2."
         verified: true
     notes: >-
-      0.22 is a numeric separator meaning "above 0.21", not a clinical value. UNIT MISMATCH: CLIF
+      0.22 is a numeric separator meaning "above 0.21", not a clinical value (kept by the product
+      authority 2026-10-03; verify it is not a placeholder before the first L40 run). CLIF
       2.1 says fraction 0-1 (clifpy outlier range 0.21-1.0) but the staged MIMIC table stores percent
       (p1 21, p50 100). Divide by 100 before binning (or use edges [22, 100] in percent).
 
@@ -243,22 +282,11 @@ concepts:
 
   rvad_flow:
     unit: L/min
-    decision: segments
-    edges: [2.0, 4.0]
-    closure: left
+    decision: keep_quantile
     rationale: >-
-      Below 2 L/min = minimal/weaning-level support; 2-4 partial; 4 L/min or more is about full
-      cardiac output (CI 2.2 L/min/m2 at a 1.9 m2 reference adult), since RVAD flow is pulmonary
-      blood flow.
-    sources:
-      - id: "PMID:32513218"
-        supports: [2.0, 4.0]
-        quote: "At each incremental drop in blood flow to a minimum of 2 LPM ... We generally target a cardiac index > 2.2 L/min/m2"
-        verified: true
-    notes: >-
-      Weak evidence: no RVAD-specific flow threshold was found; the 2 LPM floor comes from VA-ECMO
-      weaning and 4.0 is derived from a cardiac-index target. Staged p5 2.67 / p50 4.1 / p99 5.81.
-      Consider keep_quantile if the physician reviewer prefers.
+      No RVAD-specific flow threshold was found (the 2 L/min floor came from VA-ECMO weaning and
+      4 L/min from a cardiac-index target): data-driven bins, decided 2026-10-03 (product authority).
+    notes: Staged p5 2.67 / p50 4.1 / p99 5.81 L/min.
 
   unknown_flow:
     unit: L/min

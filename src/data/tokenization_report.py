@@ -13,7 +13,11 @@ for the full-hospitalization GEM artifact. A report holds ONLY aggregates:
 - ``binning``: per binning source (csv, literature, ordinal, quantile, single) the
   concept count and this run's binned events and event share; ``literature``: the
   literature-grounded concepts and those whose sources or edges are unverified;
-- ``data_quality``: the site's declared unit conversions and, per unit-less column
+- ``data_quality``: the CLIF 2.1 / mCIDE conformance summary (rows compliant / aliased /
+  declared exception per table and column), the harmonization counts (GCS verbal
+  recoded / totals dropped / eye+motor emitted, BP readings and shares per measurement
+  method, exact duplicates removed and implausible weights excluded per dose table), the
+  site's declared unit conversions and, per unit-less column
   (`column_units`), values outside the plausible range after conversion (quantiles only
   for cells of at least the minimum size), semantic flags (e.g. CRRT ultrafiltration),
   and per dose concept the implausible running doses and applied unit corrections;
@@ -218,6 +222,13 @@ def suppress_small_cells(report: dict, min_cell: int | None = None) -> dict:
            for k, v in report.items()}
     for path in complementary:
         _set(out, path, COMPLEMENTARY)
+    # A share times a published total recovers its count: withhold every binning share
+    # when the binned total is withheld, and each share whose own count is not released.
+    total_hidden = ("token_kinds", "binned") in hidden
+    for row in ((out.get("binning") or {}).get("by_source") or {}).values():
+        if isinstance(row, dict) and (total_hidden or not _is_count(row.get("events"))):
+            row["event_share"] = None
+    _withhold_bp_method(report, out, min_cell)
 
     def withhold_rates(node: Any, path: CellPath) -> None:
         if not isinstance(node, dict):
@@ -231,6 +242,27 @@ def suppress_small_cells(report: dict, min_cell: int | None = None) -> dict:
 
     withhold_rates(out.get("unk"), ("unk",))
     return out
+
+
+def _withhold_bp_method(report: Mapping, out: dict, min_cell: int) -> None:
+    """BP readings per measurement method (data_quality.harmonization): the shares imply
+    the readings total, and the per-concept placements can give it too, so one small
+    method count would be recoverable from the others. When any method count is small
+    (1 to min_cell-1), every share is withheld and the smallest released method count
+    is withheld as its complement."""
+    raw = ((report.get("data_quality") or {}).get("harmonization") or {}).get("bp_method")
+    harm = ((out.get("data_quality") or {}).get("harmonization") or {})
+    if not raw or "bp_method" not in harm:
+        return
+    counts = {m: n for m, n in raw.items() if m != "tokens" and _is_count(n)}
+    small = [m for m, n in counts.items() if 0 < n < min_cell]
+    if not small:
+        return
+    if harm.get("bp_method_shares"):
+        harm["bp_method_shares"] = {m: None for m in harm["bp_method_shares"]}
+    released = sorted((n, m) for m, n in counts.items() if n >= min_cell)
+    if len(small) == 1 and released:
+        harm["bp_method"][released[0][1]] = COMPLEMENTARY
 
 
 def _walk(node: Any):
@@ -443,6 +475,14 @@ def _data_quality(quality: Mapping | None, min_cell: int) -> dict:
                 for q in ("p01", "p50", "p99"):
                     if q in entry:
                         entry[q] = None
+    # BP measurement method (configs/data.yaml bp_method): the share of BP readings per
+    # method, withheld for a small cell like every other rate.
+    methods = (out.get("harmonization") or {}).get("bp_method")
+    if methods:
+        readings = {m: int(n) for m, n in methods.items() if m != "tokens"}
+        total = sum(readings.values())
+        out["harmonization"]["bp_method_shares"] = {
+            m: _rate(n, total, min_cell) for m, n in sorted(readings.items())}
     return out
 
 

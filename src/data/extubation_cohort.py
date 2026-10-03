@@ -39,11 +39,18 @@ INVASIVE = "invasive"
 TRACHEOSTOMY = "tracheostomy"
 UNMAPPED = "unmapped"
 ASSIGNMENT_RULES = ("first_device", "highest_support")
+# detection.null_device_rows: how a respiratory row with no device category is read.
+# `room_air_without_settings` (primary, decided 2026-10-03, product authority): a row with
+# no device and no ventilator setting or observation is room air (conventional oxygen);
+# `ignore` (sensitivity): no-device rows are never device evidence.
+NULL_DEVICE_RULES = ("ignore", "room_air_without_settings")
+ROOM_AIR = "Room Air"
 COMORBIDITY_SOURCES = ("prior_hospitalization_codes", "index_stay_poa_codes", "index_stay_codes")
 # Exclusion reasons in the order they are applied; the first that holds is recorded.
 REASONS = (
     "missing_age",
     "underage",
+    "death_record_inconsistent",
     "lookback_insufficient",
     "lookforward_insufficient",
     "tracheostomy",
@@ -137,15 +144,26 @@ def _validate_config(config: Mapping[str, Any]) -> None:
     expected = {
         ("time_zero", "covariate_boundary"): "strictly_before",
         ("time_zero", "first_extubation_per"): "patient",
-        ("detection", "null_device_rows"): "ignore",
         ("detection", "unmapped_device_rows"): "ignore",
         ("grace_window", "right_closed"): True,
     }
     for (section, key), value in expected.items():
         if config[section].get(key) != value:
             raise QualificationError(f"{section}.{key} must be {value!r}")
+    if config["detection"].get("null_device_rows") not in NULL_DEVICE_RULES:
+        raise QualificationError(
+            f"detection.null_device_rows must be one of {NULL_DEVICE_RULES}")
+    if config["detection"].get("null_device_rows") == "room_air_without_settings" and not (
+        config["detection"].get("room_air_setting_columns")
+    ):
+        raise QualificationError(
+            "detection.room_air_setting_columns must list the setting columns that rule out "
+            "room air on a no-device row")
     if config["exclusions"]["code_status"].get("missing") != "keep_and_flag":
         raise QualificationError("exclusions.code_status.missing must be 'keep_and_flag'")
+    death_rule = config["exclusions"].get("death_record") or {}
+    if death_rule.get("action", "exclude") not in ("exclude", "flag"):
+        raise QualificationError("exclusions.death_record.action must be 'exclude' or 'flag'")
     arms = config["arms"]
     if set(arms["order"]) != set(arms["device_categories"]):
         raise QualificationError("arms.order must list exactly the arms in arms.device_categories")
@@ -278,11 +296,23 @@ def _device_rows(
     else:
         raise QualificationError(f"respiratory_support.{flag} must be boolean or 0/1")
     classes = _device_classes(config)
+    room_air = pl.lit(False)
+    if config["detection"].get("null_device_rows") == "room_air_without_settings":
+        settings = [c for c in config["detection"]["room_air_setting_columns"]
+                    if c in resp.columns]
+        room_air = pl.col("device_category").is_null() & pl.all_horizontal(
+            [pl.col(c).is_null() for c in settings] or [pl.lit(True)])
+    resp = resp.with_columns(
+        room_air.alias("_room_air"),
+        pl.when(room_air).then(pl.lit(ROOM_AIR))
+        .otherwise(pl.col("device_category").cast(pl.String)).alias("device_category"),
+    )
     category = _norm_expr("device_category")
     return resp.select(
         "hospitalization_id",
         pl.col("_at").alias("device_dttm"),
         pl.col("device_category").cast(pl.String),
+        pl.col("_room_air").alias("room_air_from_no_device"),
         pl.when(category.is_not_null())
         .then(category.replace_strict(classes, default=UNMAPPED, return_dtype=pl.String))
         .alias("device_class"),
@@ -761,6 +791,52 @@ def _add_comorbidities(
     )
 
 
+def death_record_flags(
+    hospitalization: pl.DataFrame, patient: pl.DataFrame | None, config: Mapping[str, Any]
+) -> pl.DataFrame:
+    """Per patient, `death_record_inconsistent`: the death timestamp precedes the
+    admission of one of the patient's hospitalizations. A death charted exactly at
+    midnight is a date-resolution timestamp and is inconsistent only when an admission is
+    more than `exclusions.death_record.date_resolution_tolerance_hours` later."""
+    schema = {"patient_id": pl.String, "death_record_inconsistent": pl.Boolean}
+    if patient is None:
+        return pl.DataFrame(schema=schema)
+    _require_columns(patient, "patient", {"patient_id", "death_dttm"})
+    _require_string(patient, "patient", ["patient_id"])
+    if patient.schema["death_dttm"] == pl.Null:
+        return pl.DataFrame(schema=schema)
+    _require_utc(patient, "patient", ["death_dttm"])
+    rule = (config["exclusions"].get("death_record") or {})
+    tolerance = timedelta(hours=float(rule.get("date_resolution_tolerance_hours", 24.0)))
+    death = pl.col("death_dttm")
+    midnight = (death.dt.hour() == 0) & (death.dt.minute() == 0) & (death.dt.second() == 0) & (
+        death.dt.microsecond() == 0
+    )
+    limit = pl.when(midnight).then(death + tolerance).otherwise(death)
+    return (
+        hospitalization.select("patient_id", "admission_dttm")
+        .join(
+            patient.filter(death.is_not_null()).select("patient_id", "death_dttm"),
+            on="patient_id",
+            how="inner",
+        )
+        .group_by("patient_id")
+        .agg((pl.col("admission_dttm") > limit).any().alias("death_record_inconsistent"))
+    )
+
+
+def _add_death_record(
+    cohort: pl.DataFrame,
+    hospitalization: pl.DataFrame,
+    tables: Mapping[str, pl.DataFrame],
+    config: Mapping[str, Any],
+) -> pl.DataFrame:
+    flags = death_record_flags(hospitalization, _table(tables, "patient"), config)
+    return cohort.join(flags, on="patient_id", how="left").with_columns(
+        pl.col("death_record_inconsistent").fill_null(False)
+    )
+
+
 def _add_calendar_period(
     cohort: pl.DataFrame, source: Mapping[str, Any] | None, periods: pl.DataFrame | None
 ) -> pl.DataFrame:
@@ -783,16 +859,34 @@ def _add_unit(
     cohort: pl.DataFrame,
     tables: Mapping[str, pl.DataFrame],
     availability: Mapping[str, Availability],
+    unit_map: Mapping[str, str] | None = None,
 ) -> pl.DataFrame:
+    """Unit at time zero: the CLIF 2.1 ICU type (a site's non-mCIDE label mapped by its
+    declared category map, e.g. MIMIC cvicu_icu -> cardiothoracic_surgical_icu, decided
+    2026-10-03, product authority), with the raw label kept in `unit_at_time_zero_raw`."""
     frame = _table(tables, "adt")
     if frame is None:
-        return cohort.with_columns(pl.lit(None, dtype=pl.String).alias("unit_at_time_zero"))
+        return cohort.with_columns(
+            pl.lit(None, dtype=pl.String).alias("unit_at_time_zero"),
+            pl.lit(None, dtype=pl.String).alias("unit_at_time_zero_raw"),
+        )
     column = "location_type" if "location_type" in frame.columns else "location_category"
     frame = _available(frame, "adt", availability["adt"], {column}, "hospitalization_id").select(
-        "hospitalization_id", "_at", pl.col(column).cast(pl.String).alias("unit_at_time_zero")
+        "hospitalization_id", "_at", pl.col(column).cast(pl.String).alias("unit_at_time_zero_raw")
     )
-    latest = _latest_before(cohort, frame, on="hospitalization_id", values=["unit_at_time_zero"])
-    return cohort.join(latest, on="hospitalization_id", how="left")
+    latest = _latest_before(
+        cohort, frame, on="hospitalization_id", values=["unit_at_time_zero_raw"]
+    )
+    mapping = {_norm(k): v for k, v in (unit_map or {}).items()}
+    raw = pl.col("unit_at_time_zero_raw")
+    mapped = (
+        raw.str.strip_chars().str.to_lowercase().replace_strict(
+            mapping, default=raw, return_dtype=pl.String)
+        if mapping else raw
+    )
+    return cohort.join(latest, on="hospitalization_id", how="left").with_columns(
+        mapped.alias("unit_at_time_zero")
+    )
 
 
 def _add_partition(
@@ -856,17 +950,26 @@ def _statuses(config: Mapping[str, Any]) -> dict[str, pl.Expr]:
     """Eligibility status per cohort: `primary` plus each sensitivity cohort."""
     look_back = config["detection"]["look_back"]
     look_forward = config["detection"]["look_forward"]
-    minimums = {"primary": config["cohorts"]["primary"]["min_invasive_hours"]}
+    primary = config["cohorts"]["primary"]
+    default_rows = look_forward["min_non_invasive_rows"]
+    minimums = {"primary": (primary["min_invasive_hours"],
+                            primary.get("min_non_invasive_rows", default_rows))}
     for name, cohort in (config["cohorts"].get("sensitivity") or {}).items():
-        minimums[name] = cohort["min_invasive_hours"]
+        minimums[name] = (cohort.get("min_invasive_hours", primary["min_invasive_hours"]),
+                          cohort.get("min_non_invasive_rows",
+                                     primary.get("min_non_invasive_rows", default_rows)))
     age = pl.col("age_at_admission")
+    death_rule = config["exclusions"].get("death_record") or {}
+    exclude_death_record = pl.lit(death_rule.get("action", "exclude") == "exclude")
 
-    def status(min_hours: float) -> pl.Expr:
+    def status(min_hours: float, min_rows: int) -> pl.Expr:
         return (
             pl.when(age.is_null())
             .then(pl.lit("missing_age"))
             .when(age < config["exclusions"]["minimum_age"])
             .then(pl.lit("underage"))
+            .when(pl.col("death_record_inconsistent") & exclude_death_record)
+            .then(pl.lit("death_record_inconsistent"))
             .when(
                 (pl.col("n_invasive_rows") < look_back["min_invasive_rows"])
                 | (
@@ -875,7 +978,7 @@ def _statuses(config: Mapping[str, Any]) -> dict[str, pl.Expr]:
                 )
             )
             .then(pl.lit("lookback_insufficient"))
-            .when(pl.col("_look_forward_rows") < look_forward["min_non_invasive_rows"])
+            .when(pl.col("_look_forward_rows") < int(min_rows))
             .then(pl.lit("lookforward_insufficient"))
             .when(pl.col("tracheostomy_at_time_zero"))
             .then(pl.lit("tracheostomy"))
@@ -888,7 +991,7 @@ def _statuses(config: Mapping[str, Any]) -> dict[str, pl.Expr]:
             .otherwise(pl.lit("eligible"))
         )
 
-    return {name: status(hours) for name, hours in minimums.items()}
+    return {name: status(hours, rows) for name, (hours, rows) in minimums.items()}
 
 
 def _waterfall(
@@ -908,6 +1011,7 @@ def _waterfall(
         "patient_source": hospitalization["patient_id"].n_unique(),
         "resp_rows_without_device": devices.filter(pl.col("device_class").is_null()).height,
         "resp_rows_unmapped_device": devices.filter(pl.col("device_class") == UNMAPPED).height,
+        "resp_rows_room_air_from_no_device": int(devices["room_air_from_no_device"].sum()),
         "hospitalization_with_invasive_ventilation": invasive.join(
             hospitalization, on="hospitalization_id"
         ).height,
@@ -919,6 +1023,7 @@ def _waterfall(
         "hospitalization_with_extubation": events["hospitalization_id"].n_unique(),
         "extubation_excluded_not_first": events.height - cohort.height,
         "patient_first_extubation": cohort.height,
+        "patient_death_record_inconsistent": int(cohort["death_record_inconsistent"].sum()),
     }
     arms = list(config["arms"]["order"])
     sensitivity = list(config["cohorts"].get("sensitivity") or {})
@@ -971,18 +1076,26 @@ def build_extubation_cohort(
     episodes: pl.DataFrame | None = None,
     calendar_periods: pl.DataFrame | None = None,
     grace_hours: float | None = None,
+    null_device_rows: str | None = None,
+    unit_map: Mapping[str, str] | None = None,
 ) -> ExtubationCohort:
     """Build one first-extubation row per patient without dropping exclusion states.
 
     `tables` maps the names in `config["source_tables"]` to CLIF frames;
     `hospitalization` and `respiratory_support` are required, the rest optional.
     `split` is the train config's `data_contract` (`partitions`, `split_seed`).
-    `grace_hours` overrides the configured grace window for a sensitivity build.
+    `grace_hours` overrides the configured grace window for a sensitivity build;
+    `null_device_rows` overrides `detection.null_device_rows` (the `ignore` sensitivity).
+    `unit_map` (raw ADT location_type -> CLIF 2.1 location_type, the site's declared
+    category map) maps the unit covariate; the raw label stays in `unit_at_time_zero_raw`.
 
     Covariate columns use only rows available strictly before `time_zero_dttm`. The
     exposure columns (`arm*`, `escalated_in_grace`, `n_device_rows_in_grace`) and the
     descriptive `rescue_*` flags are read after it by design and are never covariates.
     """
+    if null_device_rows is not None:
+        config = {**config, "detection": {**config["detection"],
+                                          "null_device_rows": null_device_rows}}
     _validate_config(config)
     period_source = _period_source(config, site)
     grace = float(config["grace_window"]["hours"] if grace_hours is None else grace_hours)
@@ -1006,7 +1119,8 @@ def build_extubation_cohort(
     cohort = _add_bmi(cohort, hospitalization, tables, config, availability)
     cohort = _add_comorbidities(cohort, hospitalization, tables, config)
     cohort = _add_calendar_period(cohort, period_source, calendar_periods)
-    cohort = _add_unit(cohort, tables, availability)
+    cohort = _add_unit(cohort, tables, availability, unit_map)
+    cohort = _add_death_record(cohort, hospitalization, tables, config)
     risk = config["risk_factors"]
     cohort = cohort.with_columns(
         (pl.col("age_at_admission") > risk["age_over_65"]["threshold"]).alias("age_over_65"),
@@ -1106,7 +1220,9 @@ def _read_tables(
     categories = [_norm(risk["bmi"]["weight_category"]), _norm(risk["bmi"]["height_category"])]
     narrow = {
         "respiratory_support": lambda scan, at: scan.select(
-            "hospitalization_id", at, "device_category", flag
+            "hospitalization_id", at, "device_category", flag,
+            *[c for c in config["detection"].get("room_air_setting_columns") or ()
+              if c in scan.collect_schema().names()],
         ),
         "labs": lambda scan, at: scan.filter(
             _norm_expr("lab_category") == _norm(risk["hypercapnia"]["lab_category"])
@@ -1114,6 +1230,7 @@ def _read_tables(
         "vitals": lambda scan, at: scan.filter(
             _norm_expr("vital_category").is_in(categories)
         ).select("hospitalization_id", at, "vital_category", "vital_value"),
+        "patient": lambda scan, at: scan.select("patient_id", "death_dttm"),
     }
     tables: dict[str, pl.DataFrame] = {}
     provenance: dict[str, str] = {}
@@ -1144,6 +1261,7 @@ def build_extubation_artifact(
     episode_artifact: str | Path | None = None,
     allow_missing_episode_artifact: bool = False,
     grace_hours: float | None = None,
+    null_device_rows: str | None = None,
 ) -> dict[str, int]:
     """Build, validate and persist a site's extubation cohort; return only the waterfall."""
     config = load_extubation_config(extubation_config)
@@ -1152,7 +1270,9 @@ def build_extubation_artifact(
     device_destination = destination.with_name(f"{destination.stem}_device_rows.parquet")
     for path in (destination, device_destination):
         validate_artifact_destination(path, "patient_level_phi", policy)
-    availability = table_availability(config, yaml.safe_load(Path(data_config).read_text()))
+    data = yaml.safe_load(Path(data_config).read_text())
+    availability = table_availability(config, data)
+    unit_map = _location_type_map(data, site)
     split = yaml.safe_load(Path(train_config).read_text())["data_contract"]
     period_source = _period_source(config, site)
     base = Path(data_dir)
@@ -1184,6 +1304,8 @@ def build_extubation_artifact(
         episodes=episodes,
         calendar_periods=periods,
         grace_hours=grace_hours,
+        null_device_rows=null_device_rows,
+        unit_map=unit_map,
     )
     cohort = result.cohort.with_columns(
         pl.lit(json.dumps(provenance, sort_keys=True)).alias("source_provenance_json"),
@@ -1194,6 +1316,20 @@ def build_extubation_artifact(
     cohort.write_parquet(destination)
     result.device_rows.write_parquet(device_destination)
     return result.waterfall
+
+
+def _location_type_map(data_config: Mapping[str, Any], site: str) -> dict[str, str]:
+    """The site's unconditional ADT location_type map (configs/data.yaml
+    site_harmonization.<site>.category_map["adt.location_type"])."""
+    from src.data.clif_conformance import site_harmonization
+
+    rules = site_harmonization(data_config, site)["category_map"].get("adt.location_type") or {}
+    out = {}
+    for raw, value_rules in rules.items():
+        if len(value_rules) != 1 or value_rules[0]["when"]:
+            raise QualificationError("adt.location_type maps must be unconditional")
+        out[raw] = value_rules[0]["to"]
+    return out
 
 
 def _equations(waterfall: Mapping[str, int]) -> list[list[str]]:
@@ -1255,6 +1391,8 @@ def main() -> None:
     parser.add_argument("--episodes", default=None)
     parser.add_argument("--allow-missing-episode-artifact", action="store_true")
     parser.add_argument("--grace-hours", type=float, default=None)
+    parser.add_argument("--null-device-rows", choices=NULL_DEVICE_RULES, default=None,
+                        help="override detection.null_device_rows (sensitivity: ignore)")
     args = parser.parse_args()
     config = load_extubation_config(args.config)
     artifact_policy = args.artifact_policy or config["artifact_policy"]
@@ -1269,6 +1407,7 @@ def main() -> None:
         episode_artifact=args.episodes,
         allow_missing_episode_artifact=args.allow_missing_episode_artifact,
         grace_hours=args.grace_hours,
+        null_device_rows=args.null_device_rows,
     )
     policy = yaml.safe_load(Path(artifact_policy).read_text())
     min_cell = policy["classes"]["aggregate_no_phi"]["minimum_cell_size"]

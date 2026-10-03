@@ -207,7 +207,15 @@ class ThresholdHazardHead(nn.Module):
         )
 
     def _logits(self, h_last, target_idx, tau_bin, direction) -> torch.Tensor:
-        if tau_bin.numel():
+        if tau_bin.numel() and tau_bin.is_cuda:
+            # No host sync on the GPU: the check runs on the device and fails the next
+            # kernel launch (a device-side assert) instead of stalling every forward.
+            lo, hi = torch.aminmax(tau_bin)
+            torch._assert_async(
+                (lo >= 0) & (hi < self.thr_emb.num_embeddings),
+                "threshold value bin out of range: n_value_bins must be derived from the "
+                "vocabulary the query's tau_bin was computed against")
+        elif tau_bin.numel():
             lo, hi = torch.stack(torch.aminmax(tau_bin)).tolist()   # one host sync
             if int(lo) < 0 or int(hi) >= self.thr_emb.num_embeddings:
                 raise ValueError(

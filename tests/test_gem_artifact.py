@@ -321,6 +321,46 @@ class GemArtifactTest(unittest.TestCase):
         self.assertTrue(last[0].startswith("DISCHARGE//"))
         self.assertEqual(last[1], "<eos>")
 
+    def test_continuation_header_leaves_room_for_the_stay_header(self):
+        # trunk.continuation_header (configs/model.yaml): continuation windows are cut
+        # max_tokens - header_len long so the loader can re-insert the header; with the
+        # flag off the windows are byte-identical to gem_window_bounds.
+        from src.data.dataset import header_token_ids, stay_header_length
+        from src.data.tokenize import tokenize_site
+        from src.eval.synthetic_bundle import SYNTHETIC_SITE
+
+        old_cwd = os.getcwd()
+        os.chdir(self.work)
+        try:
+            out = {}
+            for flag in (False, True):
+                target = self.work / f"output/intermediate_phi/header_{flag}"
+                target.mkdir(parents=True, exist_ok=True)
+                (target / "vocab.json").write_text((self.both / "vocab.json").read_text())
+                tokenize_site(self.cfg, SYNTHETIC_SITE, self.site, target, self.blob,
+                              trajectory="hospitalization", max_tokens=MAX_TOKENS,
+                              continuation_header=flag, **self.kw)
+                out[flag] = target / "gem_events.parquet"
+        finally:
+            os.chdir(old_cwd)
+        from src.data.tokenize import gem_window_bounds
+        off = pl.read_parquet(out[False]).filter(pl.col("hosp_id") == LONG_STAY) \
+            .sort("continuation_index")
+        total = int(off["n_events"].sum())
+        self.assertEqual(list(zip(off["source_start"], off["source_end"])),
+                         gem_window_bounds(total, MAX_TOKENS))
+        on = pl.read_parquet(out[True]).filter(pl.col("hosp_id") == LONG_STAY) \
+            .sort("continuation_index")
+        header = header_token_ids(self.vocab)
+        h = stay_header_length(on["token"][0].to_list(), header)
+        self.assertEqual(h, 2 + len(STATIC))          # <bos>, ADMISSION//, statics
+        lengths = on["n_events"].to_list()
+        self.assertEqual(lengths[0], MAX_TOKENS)
+        for n in lengths[1:]:
+            self.assertLessEqual(n + h, MAX_TOKENS)
+        self.assertEqual(sum(lengths), total)
+        self.assertGreater(len(lengths), off.height)
+
     def test_short_stays_are_one_window(self):
         rows = self._windows("synth-001")
         self.assertEqual(len(rows), 1)

@@ -1,0 +1,7 @@
+lab_order_category,description,example labs
+blood_gas,includes abg/vbg/mixed venous/etc,"pCO2, pO2, pH"
+bmp,Basic Metabolic Panel,"sodium, potassium, chloride"
+cbc,Complete Blood Count,"WBC, hemoglobin, platelets"
+coags,Coagulation studies,"PT, PTT, INR"
+lft,Liver Function Tests,"AST, ALT, alkaline phosphatase"
+misc,includes lactate,"CRP, ESR, ferritin"

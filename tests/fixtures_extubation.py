@@ -82,7 +82,8 @@ Scenario patients (hours are since that patient's admission; IMV rows every 4 h)
 
 Outcome scenario patients (only with ``outcome_scenarios=True``; added after the
 background, so the default fixture is unchanged). Each is ventilated 2-40 and extubated
-to Nasal Cannula at 40 (time zero), full code, discharged Home at 300 unless stated.
+to Nasal Cannula at 40 (time zero) with a confirming Nasal Cannula row at 41, full code,
+discharged Home at 300 unless stated.
 ------------------------------------------------------------------------------
 - ``out_reintubated_80h``: IMV again from 120 (80 h after time zero).
 - ``out_reintubated_72h``: IMV again from 112 (exactly 72 h after time zero).
@@ -448,6 +449,9 @@ def _add_outcome_scenarios(b: _Builder) -> list[str]:
     def extubated(name: str, **stay) -> None:
         _scenario(b, name, **stay)
         b.device(name, 40, "Nasal Cannula")
+        # A confirming second non-invasive row (the primary cohort requires >= 2 since
+        # 2026-10-03); inside the 3 h grace window and before every planted event.
+        b.device(name, 41, "Nasal Cannula")
 
     extubated("out_reintubated_80h")
     b.ventilate("out_reintubated_80h", 120, 150)

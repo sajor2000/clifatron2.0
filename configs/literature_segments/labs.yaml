@@ -11,7 +11,8 @@
 # Concepts named in the task brief but ABSENT from the TSV (they are already in the physician CSV,
 # so are out of scope here): inr, ptt, so2_central_venous, bilirubin_conjugated, crp, ferritin, esr,
 # ldh, total_protein, phosphate, magnesium, pco2_venous, ph_venous, so2_arterial, height_cm, weight_kg.
-# magnesium_mg / magnesium_ml in the TSV are medication doses (medications group), not the lab.
+# magnesium_mg / magnesium_ml in the TSV are medication doses (medications group, now
+# magnesium_sulfate_mg / magnesium_sulfate_ml after the mCIDE alias), not the lab.
 group: labs
 reviewed: 2026-10-03
 status: literature_proposed
@@ -46,11 +47,17 @@ concepts:
         quote: "(original scale paper; no abstract in PubMed, full text not retrieved)"
         verified: false
     notes: >-
-      Intubated patients cannot give a verbal response; sites chart them as verbal = 1 (or 'T'), which
-      pulls gcs_total down to <= 10 regardless of true consciousness (Marehbian notes confounding by
-      'sedation, and intubation'). The model sees ventilation as an input, but physicians should decide
-      whether a separate intubated-verbal token is needed. Teasdale 2014 (PMID 25030516) recommends
-      describing individuals by the three components rather than the total.
+      Intubated patients cannot give a verbal response. Sites encode it differently: staged MIMIC
+      stores verbal = 0 (outside the 1-5 scale) and then forces gcs_total = 15 whatever eye and
+      motor are (788,437 rows, 36% of GCS); others chart 'T' or verbal = 1, which pulls the total
+      down (Marehbian notes confounding by 'sedation, and intubation'). Decided 2026-10-03
+      (product authority): the tokenizer (configs/data.yaml gcs_not_testable) turns a
+      not-testable verbal into the token gcs_verbal=not_testable and REPLACES a gcs_total charted
+      at the same time by eye + motor + an imputed verbal (Brennan 2021, J Neurosurg 135:214;
+      validated in MIMIC-IV, Zhang 2025: eye+motor 2-6 -> 1, 7 -> 2, 8-9 -> 4, 10 -> 5), marked by
+      the token gcs_total_source=imputed; without same-time eye and motor the total is dropped.
+      The 3-15 levels here hold tested and imputed totals. Teasdale 2014 (PMID 25030516)
+      recommends describing individuals by the three components rather than the total.
 
   gcs_eye:
     unit: points (1-4)
@@ -84,7 +91,10 @@ concepts:
         quote: "verbal response from 1 point to 5 points"
         verified: true
     notes: >-
-      Level 1 conflates 'no response' with 'intubated, not testable' at most sites; see gcs_total notes.
+      Levels 1-5 are tested responses only. 'Intubated, not testable' (MIMIC verbal = 0, 'T' or 'NT'
+      elsewhere) is the separate token gcs_verbal=not_testable, never a level; a site that charts
+      intubated patients as verbal = 1 must declare it to be recoded. The total charted with a
+      not-testable verbal is imputed (Brennan 2021); see gcs_total notes.
 
   gcs_motor:
     unit: points (1-6)
@@ -268,10 +278,12 @@ concepts:
       abnormal; the difference is one 0.01 step. MIMIC: p05 3.84, median 4.48, p95 5.20 mg/dL.
 
   # ---------------------------------------------------------------- Mixed venous saturation
+  # SvO2 (pulmonary-artery blood). Edges 60/65/75 decided 2026-10-03 (product authority);
+  # so2_central_venous (ScvO2, about 5 points higher) is binned by the physician CSV.
   so2_mixed_venous:
     unit: "%"
     decision: segments
-    edges: [60.0, 65.0, 80.0]
+    edges: [60.0, 65.0, 75.0]
     closure: left
     rationale: >-
       65% is the Surviving Sepsis SvO2 resuscitation target; < 60% is the low-SvO2 threshold that triggers
@@ -286,13 +298,18 @@ concepts:
         supports: [60.0]
         quote: "SvO2 values < 60% at ICU admission and 4 h after admission are associated with increased 30-day and 1-year mortality after cardiac surgery. ... SvO2 values < 60% are considered low and constitute a threshold for initiating the local GDT protocol"
         verified: true
+      - id: "PMID:21177882"      # Walley 2011 AJRCCM 184:514, SvO2/ScvO2 review (doi 10.1164/rccm.201010-1584CI)
+        supports: [75.0]
+        quote: "(abstract read 2026-10-03 does not state the normal SvO2 range; the 75% upper-normal value needs the full text)"
+        verified: false
       - id: "PMID:21791065"      # Textoris 2011 Crit Care
         supports: [80.0]
         quote: "According to this cut-off, the rates of mortality were 30% (ScvO2max < 80%) and 48% (ScvO2max >= 80%) ... In our study, we used an arbitrary cut-off at 80%."
         verified: true
     notes: >-
-      The 80% edge comes from ScvO2, not SvO2, and the authors call it arbitrary; weaker evidence than
-      60/65. ScvO2 is about 5 points higher than SvO2 (hence SSC's 70 vs 65). MIMIC so2_mixed_venous
+      75% is the upper end of the normal SvO2 range (replaces the earlier ScvO2-derived 80% edge,
+      which the Textoris authors called arbitrary; that source is kept for the record). The physician
+      CSV concept so2_central_venous is ScvO2, a different site and scale; do not merge them. ScvO2 is about 5 points higher than SvO2 (hence SSC's 70 vs 65). MIMIC so2_mixed_venous
       (p05 48, median 65, p95 82) may include central-venous samples labelled as mixed venous; a site-level
       label audit is advised. No well-sourced lower edge (e.g. < 50%) was found, so none was added.
 
@@ -312,8 +329,9 @@ concepts:
         quote: "biomarker-positive and -negative exacerbations (blood eosinophil count > and <= 2%, respectively) ... In biomarker-negative exacerbations, treatment failures occurred in 15% given prednisolone and 2% of those given placebo"
         verified: true
     notes: >-
-      Single edge, so this concept goes from about 10 quantile bins to 2. If physicians prefer more
-      resolution, keep_quantile is the fallback. GOLD now uses absolute counts (100 / 300 cells/uL), which
+      Single edge, so this concept goes from about 10 quantile bins to 2 (kept at 2% by the product
+      authority, 2026-10-03). The absolute eosinophil count GOLD now uses is not available in MIMIC
+      (eosinophils_absolute has no staged rows). GOLD now uses absolute counts (100 / 300 cells/uL), which
       CLIF does not carry as an eosinophils_absolute concept in this TSV.
 
   lymphocytes_percent:
@@ -353,10 +371,14 @@ concepts:
     sources: []
 
   # ---------------------------------------------------------------- Troponin T
+  # HIGH-SENSITIVITY cTnT only (decided 2026-10-03, product authority): a site declaring a
+  # conventional (non-hs) assay - MIMIC - emits `troponin_t_conventional` instead
+  # (configs/data.yaml site_harmonization.<site>.concept_renames), binned on its own data.
+  # The URL edge moved 14 -> 15 ng/L by that decision.
   troponin_t:
     unit: ng/L
     decision: segments
-    edges: [5.0, 14.0, 52.0, 140.0]
+    edges: [5.0, 15.0, 52.0, 140.0]
     closure: left
     rationale: >-
       5 ng/L = hs-cTnT limit of detection / single-sample rule-out; 14 ng/L = Roche hs-cTnT 99th-percentile
@@ -379,6 +401,16 @@ concepts:
         supports: [5.0, 52.0]
         quote: "AMI was ruled out in patients with very low levels of hs-cTnT upon presentation (hs-cTnT < 5 ng/L) ... AMI was ruled in when patients demonstrated high levels of hs-cTnT upon presentation (hs-cTnT >= 52 ng/L)"
         verified: true
+      - id: "PMID:24530665"      # Gore 2014 J Am Coll Cardiol 63:1441 (doi 10.1016/j.jacc.2013.12.032)
+        supports: [15.0]
+        quote: "The 99th percentile values for the hs-cTnT assay in DHS, ARIC, and CHS were 18, 22, and 36 ng/l (subcohort 1) and 14, 21, and 28 ng/l (subcohort 2) ... Use of a uniform 14 ng/l cutoff for the hs-cTnT assay may lead to over-diagnosis"
+        # PubMed abstract read 2026-10-03: it gives 14 (recommended) and 14-36 by cohort, not 15.
+        verified: false
+      - id: "PMID:32001233"      # Fitzgerald 2020 Clin Chim Acta 504:172 (doi 10.1016/j.cca.2020.01.027)
+        supports: [15.0]
+        quote: "overall 99th percentile URL was 19.2 ng/l (females, 13.5-13.6 ng/l; males, 21.4-22.2 ng/l) ... Applying additional exclusion criteria ... (overall, 16.9 ng/l; females, 11.8 ng/l; males, 18.5 ng/l)"
+        # PubMed abstract read 2026-10-03: US Gen 5 URLs 11.8-22.2 ng/l; 15 is not stated.
+        verified: false
       - id: "PMID:32860058"      # Collet 2021 ESC NSTE-ACS guideline (primary source for 5 / 52)
         supports: [5.0, 52.0]
         quote: "(guideline full text not retrieved; cut-offs read via the secondary sources above)"
@@ -388,6 +420,9 @@ concepts:
         quote: "it is suggested to apply a cTn value >10 times 99th percentile URL as the cut-point during the first 48 h following CABG ... sex specific 99th percentile URLs are recommended for hs-cTn assays"
         verified: true
     notes: >-
+      15 ng/L (decided 2026-10-03, product authority) sits between the abstracts' URLs (Gore 2014:
+      14 recommended; Fitzgerald 2020 US Gen 5: 13.5 women, ~22 men, 19.2 overall); neither abstract
+      states 15, so both sources stay verified: false pending full-text review.
       ASSAY CAVEAT: MIMIC troponin_t is the conventional 4th-generation cTnT reported in ng/mL on a
       0.01 grid and converted x1000 (values 10, 20, 30 ... ng/L; 114k of 244k rows are exactly 10 =
       '<0.01 ng/mL'). At MIMIC the [5,14) bin therefore holds every 'undetectable/0.01' result and the

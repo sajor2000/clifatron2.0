@@ -49,7 +49,11 @@ concepts:
       The 166 mL/h edge is an operational resuscitation-vs-replacement split from one ICU
       study, not a guideline threshold.
 
-  dextrose_ml_hr:
+  # Renamed 2026-10-03 (CLIF mCIDE med_category alias, configs/data.yaml
+  # site_harmonization.mimic.category_map): was `dextrose_ml_hr`. After the exact-duplicate
+  # D5W rows are removed, the old concept's rows are mostly Dextrose 10% (mCIDE
+  # dextrose_10_water); edges and sources carried unchanged.
+  dextrose_10_water_ml_hr:
     unit: mL/hr
     decision: segments
     edges: [30.0, 166.0]
@@ -68,13 +72,14 @@ concepts:
         quote: "we opted to consider these solutions resuscitation fluids when they were administered at a rate above 166 mL/h (equal to 1 L over 6 h) and replacement solutions when administered at lower rates."
         verified: true
     notes: >-
-      The dextrose concentration (D5 vs D10 vs D50) is not in the concept, so mL/h is not a
-      glucose dose. Same edges as sodium_chloride_ml_hr minus the bolus edge, for
-      comparability. In the local MIMIC-IV-Ext-CLIF build `dextrose_ml_hr` and
-      `dextrose_in_water_d5w_ml_hr` have near-identical counts and quantiles, which suggests
-      the same rows are mapped to both categories; check the mCIDE mapping before training.
+      mL/h is not a glucose dose. Same edges as sodium_chloride_ml_hr minus the bolus edge,
+      for comparability. The near-identical `dextrose` / `dextrose_in_water_d5w` counts seen
+      in the local MIMIC-IV-Ext-CLIF build were one administration charted under both
+      categories; the duplicate is now removed (site_harmonization exact_duplicates).
+      Higher concentrations (D20-D50) are dextrose_other_ml_hr (quantile bins).
 
-  dextrose_in_water_d5w_ml_hr:
+  # Renamed 2026-10-03 (mCIDE dextrose_5_water): was `dextrose_in_water_d5w_ml_hr`.
+  dextrose_5_water_ml_hr:
     unit: mL/hr
     decision: segments
     edges: [30.0, 166.0]
@@ -91,7 +96,7 @@ concepts:
         supports: [166.0]
         quote: "we opted to consider these solutions resuscitation fluids when they were administered at a rate above 166 mL/h (equal to 1 L over 6 h) and replacement solutions when administered at lower rates."
         verified: true
-    notes: See dextrose_ml_hr (possible duplicate mapping).
+    notes: See dextrose_10_water_ml_hr (the duplicate mapping is resolved).
 
   sodium_chloride_ml:
     unit: mL
@@ -122,30 +127,36 @@ concepts:
       Too sparse and too contaminated for clinical edges; the mL/h concept carries the signal.
     notes: Converting mL/min to mL/hr at ETL would merge this into sodium_chloride_ml_hr.
 
-  dextrose_ml:
+  # Renamed 2026-10-03 (mCIDE dextrose_other): was `dextrose_ml`; after the D5W duplicate
+  # rows are removed the remaining rows are Dextrose 50% boluses.
+  dextrose_other_ml:
     unit: mL
     decision: keep_quantile
     rationale: >-
       Volume of a dextrose-containing vehicle whose concentration (D5 vs D50) is not
       encoded, so the volume has no fixed glucose dose or clinical threshold.
-    notes: Same apparent duplicate mapping as dextrose_ml_hr (see dextrose_in_water_d5w_ml).
+    notes: The apparent duplicate mapping is resolved (see dextrose_10_water_ml_hr).
 
-  dextrose_in_water_d5w_ml:
+  # Renamed 2026-10-03 (mCIDE dextrose_5_water): was `dextrose_in_water_d5w_ml`.
+  dextrose_5_water_ml:
     unit: mL
     decision: keep_quantile
     rationale: >-
       D5W intermittent volumes are mostly drug diluent bags (50-250 mL); no clinical decision
       threshold applies to a diluent volume.
-    notes: Near-identical counts/quantiles to dextrose_ml in the local build.
+    notes: The near-identical dextrose duplicate rows are removed before tokenization.
 
-  dextrose_g_min:
+  # Renamed 2026-10-03 (mCIDE dextrose_other: dextrose in parenteral nutrition): was
+  # `dextrose_g_min`.
+  dextrose_other_g_min:
     unit: g/min
     decision: keep_quantile
     rationale: >-
       376 events of dextrose infusion expressed as g/min; no verified glucose-delivery
       threshold was retrieved in this review, and the concept is sparse.
 
-  albumin_infusion_ml_hr:
+  # Renamed 2026-10-03 (mCIDE albumin): was `albumin_infusion_ml_hr`.
+  albumin_ml_hr:
     unit: mL/hr
     decision: keep_quantile
     rationale: >-
@@ -161,13 +172,15 @@ concepts:
       formulation energy density varies by order, so mL/h does not map to a nutrition
       target without the formula.
 
-  magnesium_ml:
+  # Renamed 2026-10-03 (mCIDE magnesium_sulfate): the three magnesium_* dose concepts were
+  # `magnesium_ml`, `magnesium_mg`, `magnesium_g_hr`; edges and sources unchanged.
+  magnesium_sulfate_ml:
     unit: mL
     decision: keep_quantile
     rationale: >-
-      Diluent volume of a magnesium minibag (50-100 mL); the dose lives in magnesium_mg.
+      Diluent volume of a magnesium minibag (50-100 mL); the dose lives in magnesium_sulfate_mg.
 
-  magnesium_mg:
+  magnesium_sulfate_mg:
     unit: mg
     decision: segments
     edges: [2000.0, 4000.0]
@@ -189,7 +202,7 @@ concepts:
       Unit pitfall: CLIF records grams; the tokenizer converts to mg, so 2 g = 2000 mg.
       The 4 g edge rests on a review plus one single-centre protocol (weak).
 
-  magnesium_g_hr:
+  magnesium_sulfate_g_hr:
     unit: g/hr
     decision: keep_quantile
     rationale: 31 events; too sparse for clinical edges.
@@ -365,7 +378,8 @@ concepts:
     decision: keep_quantile
     rationale: 93 events; mixes catheter-directed low-dose (about 1 mg/h) and systemic thrombolysis rates; too sparse.
 
-  aminocaproic_g_hr:
+  # Renamed 2026-10-03 (mCIDE aminocaproic_acid): was `aminocaproic_g_hr`.
+  aminocaproic_acid_g_hr:
     unit: g/hr
     decision: keep_quantile
     rationale: 56 events; too sparse.

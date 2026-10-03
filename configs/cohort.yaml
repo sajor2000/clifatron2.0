@@ -71,6 +71,21 @@ outcomes:
     baseline_lookback_hours: 6
     required_measurement_within_hours_of_horizon: 12
 
+# Optional per-outcome measurement filters, kept OUTSIDE `outcomes` on purpose: tokenize.py
+# hashes `outcomes` into every vocabulary and bundle (`outcome_spec`, pinned by
+# tests/test_data_config.py), and a key added inside it would change that hash for every
+# existing artifact even with the filter off. `bp_method: null` = every method (default,
+# today's behaviour). A list (e.g. [arterial]) restricts the MAP readings that can define
+# the outcome to the BP-method tokens configs/data.yaml `bp_method` emits; it changes the
+# outcome definition, so it needs outcome approval (prerequisites.outcome_approval).
+# Not yet read by the label derivation (src/data/targets.py): an open item.
+# decided 2026-10-03 (product authority): all readings primary, arterial-only sensitivity.
+outcome_measurement_filters:
+  map_below_65_48h:
+    bp_method: null
+    sensitivity:
+      arterial_only: {bp_method: [arterial]}
+
 treatment_sources:
   - meds
   - resp_support

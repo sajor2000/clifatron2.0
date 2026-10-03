@@ -786,7 +786,10 @@ def _build_u4_site(work, name, *, static_tokens=None, drop_columns=None, out_dir
     cfg = copy.deepcopy(FIXTURE_DATA_CONFIG)
     cfg["cohort_contract"] = str((work / "cohort.yaml").resolve())
     cfg["artifact_policy"] = str((work / "artifact_policy.yaml").resolve())
-    cfg["tables"] = copy.deepcopy(data_cfg["tables"])
+    # Fixture hours assume no availability lag (the repo lags missing-storetime tables
+    # 30 min since 2026-10-03); a test needing a lag sets it via `table_overrides`.
+    from src.data.tokenize import with_availability_lag
+    cfg["tables"] = copy.deepcopy(with_availability_lag(data_cfg, 0)["tables"])
     for table, patch in (table_overrides or {}).items():
         cfg["tables"][table].update(patch)
     cfg["static_source"] = copy.deepcopy(data_cfg["static_source"])
@@ -1105,14 +1108,14 @@ class DoseWeightAvailabilityLagTest(unittest.TestCase):
 
 
 class MissingWideColumnsTest(unittest.TestCase):
-    """A site whose parquet lacks configured wide-table columns (synthetic CLIF releases
-    omit 11 resp_support columns, assessments.categorical_value and ecmo.fdO2) is
-    tokenized with those columns skipped, never a DuckDB binder error, and the skipped
-    columns are listed per table in the tokenization report."""
+    """A site whose parquet lacks configured optional wide-table columns (synthetic CLIF
+    releases omit 11 resp_support columns and assessments.categorical_value) is tokenized
+    with those columns skipped, never a DuckDB binder error, and the skipped columns are
+    listed per table in the tokenization report. ECMO/MCS declares
+    `on_missing_column: error` (2026-10-03): a missing ECMO column fails loudly instead."""
 
     DROPPED = {"clif_respiratory_support": ["lpm_set", "mean_airway_pressure_obs"],
-               "clif_patient_assessments": ["categorical_value"],
-               "clif_ecmo_mcs": ["fdO2", "mcs_group"]}
+               "clif_patient_assessments": ["categorical_value"]}
 
     @classmethod
     def setUpClass(cls):
@@ -1141,7 +1144,6 @@ class MissingWideColumnsTest(unittest.TestCase):
         self.assertEqual(self.report["missing_columns"], {
             "resp_support": ["lpm_set", "mean_airway_pressure_obs"],
             "assessments": ["categorical_value"],
-            "ecmo": ["fdO2", "mcs_group"],
         })
 
     def test_present_columns_still_melt(self):
@@ -1150,9 +1152,22 @@ class MissingWideColumnsTest(unittest.TestCase):
                         "blood_flow_rate"):
             self.assertIn(concept, concepts)
         self.assertNotIn("lpm_set", self.blob["segments"])
-        # No qualifier column: device metrics fall under the `unknown` group.
-        self.assertIn("unknown_device_rate", concepts)
-        self.assertNotIn("ecmo_device_rate", concepts)
+        self.assertIn("ecmo_device_rate", concepts)
+
+    def test_missing_ecmo_columns_fail_loudly(self):
+        from src.data.cohort import QualificationError
+
+        with tempfile.TemporaryDirectory() as td:
+            work = Path(td)
+            old_cwd = os.getcwd()
+            os.chdir(work)
+            try:
+                with self.assertRaisesRegex(QualificationError,
+                                            "fdO2, mcs_group.*on_missing_column"):
+                    _build_u4_site(work, "ecmo_missing",
+                                   drop_columns={"clif_ecmo_mcs": ["fdO2", "mcs_group"]})
+            finally:
+                os.chdir(old_cwd)
 
 
 if __name__ == "__main__":

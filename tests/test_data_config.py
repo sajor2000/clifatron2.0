@@ -268,7 +268,18 @@ class DataConfigTest(unittest.TestCase):
         self.assertEqual(declared["labs"]["availability"], "result")
         self.assertEqual(declared["meds"]["availability"], "recorded")
         self.assertEqual(declared["adt"]["availability"], "recorded")
-        self.assertTrue(all(d["lag_minutes"] == 0 for d in declared.values()))
+        # decided 2026-10-03 (product authority): 30 min on every table without a real
+        # store time; labs (result time) and charted administration/state tables keep 0.
+        for name, d in declared.items():
+            expected = 30 if d["availability"] == "missing_storetime" else 0
+            self.assertEqual(d["lag_minutes"], expected, name)
+        cfg = yaml.safe_load((root / "configs/data.yaml").read_text())
+        self.assertEqual(cfg["availability_lag_sensitivities"]["minutes"], [15, 60])
+        from src.data.tokenize import with_availability_lag
+        lagged = validate_table_availability(with_availability_lag(cfg, 60)["tables"])
+        self.assertEqual(lagged["vitals"]["lag_minutes"], 60)
+        self.assertEqual(lagged["labs"]["lag_minutes"], 0)
+        self.assertEqual(cfg["tables"]["vitals"]["availability_lag_minutes"], 30)
 
         missing = {**tables, "labs": {k: v for k, v in tables["labs"].items()
                                       if k != "availability"}}
@@ -356,6 +367,10 @@ class DataConfigTest(unittest.TestCase):
                            "column_units": column_units(cfg),
                            "site_conversions": site_unit_conversions(cfg, "synthetic-reference")}
         concept_sources = {"tables": {"map": ["vitals"]}, "treatment_sources": []}
+        # The config declares CLIF harmonization rules (mCIDE gate, GCS, BP method, ...),
+        # so the vocabulary carries their hashed record.
+        from src.data.clif_conformance import harmonization_record
+        harmonization = json.loads(json.dumps(harmonization_record(cfg, "synthetic-reference")))
 
         def digest(value):
             payload = json.dumps(value, sort_keys=True, separators=(",", ":"))
@@ -376,6 +391,7 @@ class DataConfigTest(unittest.TestCase):
                 "target_map": digest(cfg["target_concepts"]),
                 "outcome_spec": digest(cohort_cfg["outcomes"]),
                 "clif_version": digest(cfg["schema_version"]),
+                "harmonization": digest(harmonization),
             },
             "provenance": {
                 "source_site": "synthetic-reference",
@@ -388,7 +404,8 @@ class DataConfigTest(unittest.TestCase):
         def artifact(**over):
             blob = {"vocab": vocab, "segments": segments, "manifest": manifest,
                     "binning_sources": binning_sources, "reference_units": reference_units,
-                    "concept_sources": concept_sources, "precedence_policy": POLICY_VERSION}
+                    "concept_sources": concept_sources, "precedence_policy": POLICY_VERSION,
+                    "harmonization": harmonization}
             blob.update(over)
             return blob
 
@@ -548,10 +565,11 @@ class NewSourceConfigTest(unittest.TestCase):
         cls.cfg = yaml.safe_load((root / "configs/data.yaml").read_text())
         cls.tables = cls.cfg["tables"]
 
-    def test_new_tables_are_declared_with_availability_and_zero_lag(self):
+    def test_new_tables_are_declared_with_availability_and_lag(self):
         for name, file in NEW_TABLE_FILES.items():
             self.assertEqual(self.tables[name]["file"], file, name)
-            self.assertEqual(self.tables[name]["availability_lag_minutes"], 0, name)
+            expected = 30 if self.tables[name]["availability"] == "missing_storetime" else 0
+            self.assertEqual(self.tables[name]["availability_lag_minutes"], expected, name)
         semantics = {name: self.tables[name]["availability"] for name in NEW_TABLE_FILES}
         self.assertEqual(semantics, {
             "meds_intermittent": "recorded", "assessments": "missing_storetime",
@@ -583,7 +601,13 @@ class NewSourceConfigTest(unittest.TestCase):
     def test_dose_blocks_and_static_tokens(self):
         meds = self.tables["meds"]["dose"]
         self.assertEqual(meds["kind"], "continuous")
-        self.assertEqual(meds["weight_source"], {"table": "vitals", "concept": "weight_kg"})
+        # Plausible weights for per-kg conversion match the extubation BMI rule.
+        self.assertEqual(meds["weight_source"], {"table": "vitals", "concept": "weight_kg",
+                                                 "plausible_kg": [25.0, 400.0]})
+        extubation = yaml.safe_load((Path(__file__).parents[1] / "configs/extubation.yaml")
+                                    .read_text())
+        self.assertEqual(meds["weight_source"]["plausible_kg"],
+                         extubation["risk_factors"]["bmi"]["plausible_weight_kg"])
         self.assertEqual(self.tables["meds_intermittent"]["dose"]["kind"], "intermittent")
         self.assertEqual(self.tables["ecmo"]["concept_qualifier_col"], "mcs_group")
         self.assertEqual(self.tables["code_status"]["key"], "patient")

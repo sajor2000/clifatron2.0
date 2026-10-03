@@ -75,6 +75,7 @@ from src.data.extubation_cohort import (
     _norm,
     _norm_expr,
     _table,
+    death_record_flags,
     load_extubation_config,
     table_availability,
     validate_extubation_artifact,
@@ -375,6 +376,23 @@ def build_extubation_labels(
     # Binds the labels to the cohort build they were derived from.
     passthrough = [name for name in ("extubation_sha256",) if name in cohort.columns]
     index = cohort.select("hospitalization_id", "patient_id", "time_zero_dttm", *passthrough)
+    # Death-record consistency (exclusions.death_record): the cohort's flag (every stay of
+    # the patient) OR this table's own check (the stays it was given). Flagged, not removed.
+    stays = _table(tables, "hospitalization", required=True)
+    own = (death_record_flags(stays.select("patient_id", "admission_dttm"),
+                              _table(tables, "patient"), config)
+           if {"patient_id", "admission_dttm"} <= set(stays.columns)
+           else pl.DataFrame(schema={"patient_id": pl.String,
+                                     "death_record_inconsistent": pl.Boolean}))
+    cohort_flag = (cohort.select("patient_id", pl.col("death_record_inconsistent")
+                                 .alias("_cohort_flag"))
+                   if "death_record_inconsistent" in cohort.columns
+                   else cohort.select("patient_id", pl.lit(False).alias("_cohort_flag")))
+    death_flags = cohort_flag.join(own, on="patient_id", how="left").select(
+        "patient_id",
+        (pl.col("_cohort_flag").fill_null(False)
+         | pl.col("death_record_inconsistent").fill_null(False))
+        .alias("death_record_inconsistent"))
     frame = (
         index.join(
             _index_stays(tables, data_config),
@@ -383,6 +401,7 @@ def build_extubation_labels(
             maintain_order="left",
         )
         .join(_death_times(tables), on="patient_id", how="left", maintain_order="left")
+        .join(death_flags, on="patient_id", how="left", maintain_order="left")
         .join(
             _event_rows(
                 index, _device_rows(tables, config, availability["respiratory_support"]), config
@@ -464,6 +483,7 @@ def build_extubation_labels(
         "followup_end_reason",
         "death_within_24h_without_reintubation",
         "times_clamped_to_time_zero",
+        "death_record_inconsistent",
         *passthrough,
     )
 
@@ -619,11 +639,15 @@ def label_counts(
         "eligible_tracheostomy_without_reintubation": pl.col("tracheostomy_hours").is_not_null()
         & pl.col("reintubation_hours").is_null(),
         "eligible_times_clamped_to_time_zero": pl.col("times_clamped_to_time_zero"),
+        "eligible_death_record_inconsistent": pl.col("death_record_inconsistent"),
         "eligible_discharged_expired": expired,
         "eligible_discharged_expired_with_death_dttm": expired & timestamp.fill_null(False),
         "eligible_discharged_expired_without_death_dttm": expired & ~timestamp.fill_null(False),
     }
-    counts = {"patient_first_extubation": labels.height, "patient_eligible": eligible.height}
+    counts = {"patient_first_extubation": labels.height, "patient_eligible": eligible.height,
+              "patient_death_record_inconsistent": int(
+                  labels["death_record_inconsistent"].sum())
+              if "death_record_inconsistent" in labels.columns else 0}
     counts.update({key: eligible.filter(flag).height for key, flag in flags.items()})
     for horizon in horizons:
         prefix = f"h{_horizon(horizon):g}"
@@ -714,7 +738,8 @@ def _read_tables(
         "hospitalization": (
             config["source_tables"]["hospitalization"]["file"],
             lambda scan: scan.join(stays, on="hospitalization_id", how="semi").select(
-                "hospitalization_id", "discharge_dttm", "discharge_category"
+                "hospitalization_id", "patient_id", "admission_dttm", "discharge_dttm",
+                "discharge_category"
             ),
         ),
         "patient": (

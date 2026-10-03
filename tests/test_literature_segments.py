@@ -140,10 +140,18 @@ class LiteratureSegmentsTest(unittest.TestCase):
         self.assertEqual(segments["lactate"], baseline["lactate"])   # byte-identical
 
     def test_a_fragment_concept_absent_from_the_data_is_skipped_with_a_warning(self):
-        segments, _, record = self._build()
+        segments, _, record = self._build(literature_coverage=None)
         self.assertNotIn("absent_lab", segments)
         self.assertIn("absent_lab", record["absent"])
         self.assertTrue(any("absent_lab" in w for w in self.warnings))
+
+    def test_all_segments_coverage_bins_a_concept_the_reference_site_lacks(self):
+        # decided 2026-10-03: literature edges need no fit data, so another site's events
+        # of a concept absent from the reference site are binned, not <unk>.
+        segments, sources, record = self._build(literature_coverage="all_segments")
+        self.assertEqual(sources["absent_lab"], "literature")
+        self.assertEqual(record["concepts"]["absent_lab"]["unit_check"], "not_fit")
+        self.assertNotIn("absent_lab", record["absent"])
 
     def test_a_unit_mismatch_is_refused(self):
         bad = copy.deepcopy(FRAGMENT)

@@ -33,6 +33,7 @@ source_tables:
   code_status: {data_table: "code_status"}
   adt: {data_table: "adt"}
   hospital_diagnosis: {file: "clif_hospital_diagnosis"}
+  patient: {file: "clif_patient"}              # death_dttm, for the death-record check only
 
 # ---------------------------------------------------------------- time zero (R2)
 time_zero:
@@ -49,10 +50,20 @@ time_zero:
 # ---------------------------------------------------------------- detection (R1)
 detection:
   invasive_categories: ["IMV"]
-  # Rows with no device_category carry no device evidence (on MIMIC about half of them
-  # are ventilator-setting rows): they are dropped from the device sequence. Their
-  # tracheostomy flag is still read. Only value implemented.
-  null_device_rows: "ignore"
+  # Rows with no device_category (decided 2026-10-03, product authority): a row with no
+  # device AND no ventilator setting or observation (every room_air_setting_columns value
+  # null) is room air - device "Room Air", the conventional-oxygen arm (CLIF 2.1 mCIDE
+  # device_category). On MIMIC about half the no-device rows are ventilator-setting rows;
+  # those carry settings and stay ignored. Sensitivity: `ignore` (no-device rows are never
+  # device evidence; `--null-device-rows ignore`).
+  null_device_rows: "room_air_without_settings"
+  null_device_sensitivity: ["ignore"]
+  room_air_setting_columns: [mode_category, mode_name, fio2_set, lpm_set, tidal_volume_set,
+                             resp_rate_set, pressure_control_set, pressure_support_set,
+                             flow_rate_set, peak_inspiratory_pressure_set,
+                             inspiratory_time_set, peep_set, tidal_volume_obs, resp_rate_obs,
+                             plateau_pressure_obs, peak_inspiratory_pressure_obs, peep_obs,
+                             minute_vent_obs, mean_airway_pressure_obs]
   # Rows whose category maps to no class below (e.g. "Other": T-piece, bag-mask) are
   # not evidence of extubation either; kept in the device-row artifact as `unmapped`.
   unmapped_device_rows: "ignore"
@@ -70,7 +81,9 @@ detection:
   look_forward:
     # Non-invasive rows required in [time zero, time zero + window_hours] before any
     # return to IMV. 1 = the time-zero row itself; 2 asks for a confirming row.
-    min_non_invasive_rows: 1
+    # PRIMARY requires 2 (decided 2026-10-03, product authority); the single-row rule is
+    # the `single_non_invasive_row` sensitivity cohort below.
+    min_non_invasive_rows: 2
     window_hours: 24.0
 
 # Minimum invasive-ventilation duration (first IMV row of the stitched episode to time
@@ -81,6 +94,10 @@ cohorts:
   sensitivity:
     ventilation_12h:
       min_invasive_hours: 12.0
+    # decided 2026-10-03 (product authority): one non-invasive row suffices.
+    single_non_invasive_row:
+      min_invasive_hours: 24.0
+      min_non_invasive_rows: 1
 
 # ---------------------------------------------------------------- arms (R3, KTD8)
 grace_window:
@@ -90,6 +107,8 @@ grace_window:
   # "the grace window holds one decision step"). Shorter windows usually hold the
   # time-zero row alone; longer ones let rescue support count as prophylaxis (median
   # time from palliative extubation to death is 118 min, section 10).
+  # First device in a 3-h grace window is primary; 1/2/6 h and highest-support are
+  # sensitivities (decided 2026-10-03, product authority).
   hours: 3.0
   sensitivity_hours: [1.0, 2.0, 6.0]
   # Rows with time zero <= t <= time zero + hours are inside the window.
@@ -102,8 +121,10 @@ arms:
   device_categories:
     niv: ["NIPPV", "CPAP"]                    # BiPAP and CPAP
     hfnc: ["High Flow NC"]
-    # "Face Mask" may include aerosol face tents (open question in the plan); "Room Air"
-    # is no supplemental support, i.e. neither NIV nor HFNC.
+    # Face tents and aerosol masks are conventional oxygen / "Face Mask" (decided
+    # 2026-10-03, product authority; MIMIC already charts "Face tent" and "Aerosol-cool"
+    # under Face Mask). "Room Air" is no supplemental support (including no-device rows,
+    # detection.null_device_rows).
     conventional_oxygen: ["Nasal Cannula", "Face Mask", "Room Air"]
   assignment:
     # first_device    - the device at the actual extubation: the first arm device row
@@ -139,7 +160,12 @@ exclusions:
     # Status in effect at time zero = latest row available strictly before it.
     # A category outside these five lists fails closed.
     comfort_care_categories: ["AND"]                       # terminal / comfort-care extubation
-    do_not_reintubate_categories: ["DNR/DNI", "DNAR/DNI"]  # documented do-not-(re)intubate
+    # The comfort-care PROXY (death < 24 h after extubation without reintubation,
+    # labels `death_within_24h_without_reintubation`) is a sensitivity exclusion only, never
+    # primary (decided 2026-10-03, product authority).
+    # DNI_only (do not intubate, resuscitation allowed) is permissible in CLIF 2.1 mCIDE;
+    # MIMIC never charts it, but a site that does would otherwise fail closed.
+    do_not_reintubate_categories: ["DNR/DNI", "DNAR/DNI", "DNI_only"]  # documented do-not-(re)intubate
     # DNR without DNI does not forbid reintubation: kept, recorded, and available as a
     # sensitivity exclusion (most trials excluded DNR as well).
     dnr_only_categories: ["DNR", "DNAR", "UDNR"]
@@ -149,6 +175,15 @@ exclusions:
     # extubations are in patients admitted full code, so missing status never excludes:
     # the patient is kept and `code_status_missing` is set.
     missing: "keep_and_flag"
+  death_record:
+    # A patient whose death timestamp precedes the admission of any of their
+    # hospitalizations has an inconsistent death record (staged MIMIC: 61 stays of 54
+    # patients; 23 of them Expired stays). Their death label cannot be trusted, so they are
+    # excluded (reason `death_record_inconsistent`) and flagged in the labels.
+    # A death charted exactly at midnight is a date-resolution timestamp (MIMIC date of
+    # death): it is inconsistent only when an admission is more than this many hours later.
+    date_resolution_tolerance_hours: 24.0
+    action: "exclude"
 
 # ---------------------------------------------------------------- risk factors (R5)
 # Each trial risk factor has a documented proxy; coverage is reported in the waterfall.
@@ -182,6 +217,8 @@ risk_factors:
     # discharge, so index-stay codes LEAK post-extubation information. The default
     # uses only sources that are safe before time zero; the comorbidity is NULL (not
     # false) for a patient with no usable history.
+    # Prior-admission codes are primary; index-stay codes are the labelled leakage
+    # sensitivity (decided 2026-10-03, product authority).
     sources: ["prior_hospitalization_codes", "index_stay_poa_codes"]
     allow_leaky_sources: false
     available_sources:

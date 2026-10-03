@@ -56,6 +56,7 @@ VENDOR_FILES = (
     "src/data/segments.py",
     "src/data/units.py",
     "src/data/tokenization_report.py",
+    "src/data/clif_conformance.py",
     "src/data/tokenize.py",
     "src/model/heads.py",
     "src/model/varlen_attention.py",

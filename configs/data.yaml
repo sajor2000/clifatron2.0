@@ -15,12 +15,18 @@ episode_artifact: "output/intermediate_phi/episodes.parquet"
 #   missing_storetime - CLIF carries no store time; recorded_dttm stands in
 # `availability_lag_minutes` (optional, default 0, non-negative integer) shifts the
 # table's timestamps later before the observation window is applied (conservative).
+# Decided 2026-10-03 (product authority; hard rule #4): every `missing_storetime` table
+# (vitals, respiratory support, patient assessments, CRRT, ECMO/MCS, position) is lagged
+# 30 minutes in the primary configuration; 15 and 60 minutes are the declared sensitivity
+# configurations (`availability_lag_sensitivities`, applied with
+# `tokenize.with_availability_lag`). Labs keep their real result time; MAR / ADT / code
+# status are charted administration or state times (0).
 tables:
   vitals:
     file: "clif_vitals"
     availability_col: "recorded_dttm"     # CLIF has no separate vital storetime
     availability: "missing_storetime"
-    availability_lag_minutes: 0
+    availability_lag_minutes: 30
     concept_col: "vital_category"        # mCIDE controlled vocab
     value_col: "vital_value"
   labs:
@@ -35,7 +41,7 @@ tables:
     file: "clif_respiratory_support"
     availability_col: "recorded_dttm"
     availability: "missing_storetime"
-    availability_lag_minutes: 0
+    availability_lag_minutes: 30
     # Wide table (R8): every numeric setting/observation column is melted to its own
     # event (concept = column name = the physician CSV measurement name), and every
     # categorical column to a fused `column=value` token (KTD4). Nulls emit nothing.
@@ -45,6 +51,9 @@ tables:
                  plateau_pressure_obs, peak_inspiratory_pressure_obs, peep_obs,
                  minute_vent_obs, mean_airway_pressure_obs]
     categorical_value_cols: [device_category, mode_category, tracheostomy]
+    # CLIF 2.1 `tracheostomy` is INT 0/1; MIMIC stores Boolean. A flag column is spelled one
+    # way at every site (`tracheostomy=cat_1` / `=cat_0`), whatever the storage type.
+    flag_cols: [tracheostomy]
     input_only: true
   meds:                                   # INPUT ONLY (not a target)
     file: "clif_medication_admin_continuous"
@@ -65,7 +74,10 @@ tables:
       kind: "continuous"
       action_col: "mar_action_category"
       stop_actions: [stop]
-      weight_source: {table: vitals, concept: weight_kg}
+      # Weights outside plausible_kg (configs/extubation.yaml risk_factors.bmi, the same
+      # [25, 400] kg) are never used to convert a per-kg dose (staged MIMIC: 815 zero
+      # weights, 369 in (0, 20) kg, 72 above 400 kg); excluded counts are reported.
+      weight_source: {table: vitals, concept: weight_kg, plausible_kg: [25.0, 400.0]}
     input_only: true
   meds_intermittent:                      # INPUT ONLY
     file: "clif_medication_admin_intermittent"
@@ -76,15 +88,18 @@ tables:
     value_col: "med_dose"
     unit_col: "med_dose_unit"
     # R7: one canonical unit per kind (mass -> mg, units -> u); only `dose` / `mL` (and
-    # unrecognised units) fall back to `{med_category}_{unit}`.
+    # unrecognised units) fall back to `{med_category}_{unit}`. A per-kg single dose
+    # (e.g. ketamine declared mg/kg below) converts to absolute mg with the latest
+    # plausible charted weight (the same ASOF join and [25, 400] kg filter as `meds`).
     dose:
       kind: "intermittent"
+      weight_source: {table: vitals, concept: weight_kg, plausible_kg: [25.0, 400.0]}
     input_only: true
   assessments:                            # TARGET-ELIGIBLE (R9): measurements, not treatments
     file: "clif_patient_assessments"
     availability_col: "recorded_dttm"
     availability: "missing_storetime"
-    availability_lag_minutes: 0
+    availability_lag_minutes: 30
     concept_col: "assessment_category"   # gcs_*, RASS -> rass, braden_*, cam_*, sbt_*
     normalize_concept: true               # lowercase concept names (RASS -> rass)
     value_col: "numerical_value"          # numeric scales -> binned (ordinal for GCS/RASS/Braden)
@@ -93,7 +108,7 @@ tables:
     file: "clif_crrt_therapy"
     availability_col: "recorded_dttm"
     availability: "missing_storetime"
-    availability_lag_minutes: 0
+    availability_lag_minutes: 30
     value_cols: [blood_flow_rate, pre_filter_replacement_fluid_rate,
                  post_filter_replacement_fluid_rate, dialysate_flow_rate, ultrafiltration_out]
     categorical_value_cols: [crrt_mode_category]
@@ -102,12 +117,17 @@ tables:
     file: "clif_ecmo_mcs"
     availability_col: "recorded_dttm"
     availability: "missing_storetime"
-    availability_lag_minutes: 0
+    availability_lag_minutes: 30
     # R10: concepts are `{mcs_group}_{column}` (normalized; a missing group -> unknown),
     # so an ECMO pump speed and an LVAD pump speed are different concepts.
     concept_qualifier_col: "mcs_group"
+    # Column names follow clifpy 2.1's ecmo_mcs layout (pinned in clif_conformance
+    # .table_variants); a site staged on the CLIF 2.1 DDL layout declares
+    # site_harmonization.<site>.column_aliases.ecmo (e.g. sweep: sweep_set, fdO2: fdO2_set).
+    # A configured column the site lacks fails the build (never silently skipped).
     value_cols: [device_rate, flow, sweep, fdO2]
     categorical_value_cols: [device_category]
+    on_missing_column: error
     input_only: true
   code_status:                            # INPUT ONLY (R21)
     file: "clif_code_status"
@@ -131,7 +151,7 @@ tables:
     file: "clif_position"
     availability_col: "recorded_dttm"
     availability: "missing_storetime"
-    availability_lag_minutes: 0
+    availability_lag_minutes: 30
     concept: "position"                   # fused position=prone|not_prone
     categorical_value_col: "position_category"
     emit: "transitions"
@@ -145,6 +165,10 @@ tables:
     concept_col: "location_category"
     value_col: null
     input_only: true
+
+availability_lag_sensitivities:
+  semantics: missing_storetime          # every table declared with this semantics
+  minutes: [15, 60]
 
 # Static admission tokens (R21, KTD11; BBJ CLIF GEM): emitted once at the stay start,
 # before any other event, in this fixed order. `age_decile` bins age_at_admission (years)
@@ -186,6 +210,18 @@ gem:
     other: other
     missing: unknown
     unknown: unknown
+    # CLIF 2.1 discharge categories MIMIC never charts, mapped explicitly (decided
+    # 2026-10-03, product authority; the granular discharge_category stays in the
+    # hospitalization table and the episode artifact, only the GEM token is grouped):
+    # group home is supervised residential care, like assisted living -> facility;
+    # chemical dependency is a treatment facility -> facility; a shelter or a correctional
+    # facility is neither the patient's home nor a care facility -> other; still admitted
+    # is the end of observation -> unknown.
+    group home: facility
+    chemical dependency: facility
+    shelter: other
+    jail: other
+    still admitted: unknown
   admission_types: [ed, elective, direct, transfer, other, unknown]
   admission_map:                           # CLIF admission_type_category (MIMIC: ed/elective/direct)
     ed: ed
@@ -230,6 +266,12 @@ unit_normalization:
     heart_rate: "beats per minute"
     sbp: mmHg
     temp_c: celsius
+  # Unit spellings that are the same quantity for the named concepts only (factor 1), so a
+  # CLIF-conformant site passes the unit check against a MIMIC-fit vocabulary: mEq/L is
+  # mmol/L for monovalent ions only; pH has no unit (MIMIC "units", CLIF "(no units)").
+  equivalent_units:
+    - {units: ["mEq/L", "mmol/L"], concepts: [sodium, potassium, chloride, bicarbonate]}
+    - {units: ["units", "(no units)"], concepts: [ph_arterial, ph_venous]}
 
 # Unit-less wide-table value columns (CRRT, ECMO/MCS carry no unit column): canonical
 # unit and plausible range per `table.column`, from the CLIF 2.1 data dictionary
@@ -255,9 +297,11 @@ column_units:
     unit: mL/hr
     range: [0, 500]
     on_out_of_range: report
+    # NET ultrafiltration (fluid removed from the patient), as CLIF 2.1 defines it - labelled
+    # so by the product authority 2026-10-03; a component of crrt_effluent_dose_ml_kg_h.
     flag: >-
-      CLIF defines net ultrafiltration (0-500 mL/hr) but the staged values sit high for
-      net removal and may be total effluent; not converted, physician review needed
+      NET ultrafiltration (CLIF 2.1, 0-500 mL/hr); the staged MIMIC values sit high for net
+      removal (median ~352 mL/hr) - confirm the source item with the data provider
   ecmo.device_rate: {unit: RPM, range: [0, 15000]}     # pump speed; HeartMate II tops out ~15000 RPM
   ecmo.flow: {unit: L/min, range: [0, 10]}
   ecmo.sweep: {unit: L/min, range: [0, 20]}            # 0 = sweep off (trial off); clifpy floor 0.5 is for running ECMO
@@ -283,10 +327,29 @@ site_unit_conversions:
     # ~300 propofol boluses charted "mcg" with values 10-60: mg doses with a wrong unit.
     meds_intermittent.propofol[mcg]: {from: mcg, to: mg, factor: 1.0,
                                       note: "bolus values 10-60 are mg; charted unit is wrong"}
-    # ~400 ketamine rows charted "mcg" with values ~0.1-0.2 (likely mg/kg): true unit
-    # unknown, so kept apart as `ketamine_mcg` rather than converted to mg.
+    # ~400 ketamine rows charted "mcg" with values ~0.1-0.2: kept apart as `ketamine_mcg`
+    # pending manual review (decided 2026-10-03, product authority).
     meds_intermittent.ketamine[mcg]: {from: mcg, action: quarantine,
-                                      note: "values ~0.2 look weight-based; unit unknown"}
+                                      note: "values ~0.2 look weight-based; manual review pending"}
+    # decided 2026-10-03 (product authority): ketamine "mg" boluses of 0.1-0.35 are mg/kg
+    # (weight-based analgesic dosing); converted to absolute mg with the charted weight.
+    meds_intermittent.ketamine[mg]: {from: mg, to: mg/kg, factor: 1.0,
+                                     when: {ge: 0.1, le: 0.35},
+                                     note: "0.1-0.35 'mg' is mg/kg; x weight -> mg"}
+
+# DERIVED, NON-CLIF concepts (decided 2026-10-03, product authority), computed from CLIF 2.1
+# columns of one table row. crrt_effluent_dose_ml_kg_h = (dialysate + pre-filter +
+# post-filter replacement + NET ultrafiltration, mL/hr) / weight kg: emitted only when all
+# four are charted on the same CRRT row and a plausible weight (25-400 kg) is available at
+# or before it. Bins: configs/literature_segments/support.yaml (13 / 20 / 25 / 35).
+derived_concepts:
+  crrt_effluent_dose_ml_kg_h:
+    table: crrt
+    sum_of: [dialysate_flow_rate, pre_filter_replacement_fluid_rate,
+             post_filter_replacement_fluid_rate, ultrafiltration_out]
+    divide_by_weight: {table: vitals, concept: weight_kg, plausible_kg: [25.0, 400.0]}
+    unit: mL/kg/hr
+    clif_concept: false
 
 # Plausible running-dose range per converted dose concept (value > 0; 0 is the stop bin),
 # checked per site after conversion and corrections. More than max_implausible_share
@@ -303,9 +366,205 @@ dose_plausibility:
     fentanyl_mg: {unit: mg, range: [0.001, 0.5]}
     hydromorphone_mg: {unit: mg, range: [0.05, 4]}
     lorazepam_mg: {unit: mg, range: [0.1, 10]}
-    # MIMIC charts ~38% of ketamine "mg" boluses at 0.1-0.3 (weight-based analgesic
-    # dosing written as mg?): reported, not refused, pending physician review.
+    # MIMIC charted ~38% of ketamine "mg" boluses at 0.1-0.3: now converted from mg/kg
+    # (site_unit_conversions); the remainder is reported, not refused.
     ketamine_mg: {unit: mg, range: [1, 500], on_implausible: report}
+  # Single-dose FLOORS (decided 2026-10-03, product authority): a running intermittent
+  # dose below its floor is a charting error. It is removed from the token stream and
+  # counted per concept in the report (never silently binned). ketamine: 0.1 mg/kg at a
+  # 70 kg reference adult = 7 mg.
+  floors:
+    fentanyl_mg: 0.025
+    hydromorphone_mg: 0.2
+    morphine_mg: 1.0
+    midazolam_mg: 0.5
+    lorazepam_mg: 0.5
+    propofol_mg: 10.0
+    ketamine_mg: 7.0
+
+# GLASGOW COMA SCALE, intubated patients (applied identically at every site). A verbal score
+# that cannot be tested (endotracheal tube) is not a score: MIMIC stores it as 0 (valid 1-5)
+# and forces gcs_total to 15 whatever eye and motor are (788,437 rows, 36% of GCS). Decided
+# 2026-10-03 (product authority): such a verbal row becomes the categorical token
+# `gcs_verbal=not_testable`; a gcs_total charted at the same time is REPLACED by eye + motor
+# + the verbal score imputed from eye + motor (Brennan 2021, J Neurosurg 135:214; validated
+# in MIMIC-IV, Zhang 2025 J Clin Nurs): eye+motor 2-6 -> verbal 1, 7 -> 2, 8-9 -> 4,
+# 10 -> 5, and marked `gcs_total_source=imputed` at the same time. With no single same-time
+# eye and motor value the total is dropped. Counts are reported.
+gcs_not_testable:
+  table: assessments
+  verbal: gcs_verbal
+  total: gcs_total
+  eye: gcs_eye
+  motor: gcs_motor
+  numeric_codes: [0]                      # outside the 1-5 verbal scale
+  categorical_codes: ["T", "NT", "not testable", "intubated"]
+  token_value: not_testable
+  imputation:
+    - {eye_motor: [2, 6], verbal: 1}
+    - {eye_motor: [7, 7], verbal: 2}
+    - {eye_motor: [8, 9], verbal: 4}
+    - {eye_motor: [10, 10], verbal: 5}
+  imputed_marker_concept: gcs_total_source
+  imputed_marker_value: imputed
+
+# BLOOD-PRESSURE MEASUREMENT METHOD. CLIF 2.1 sbp/dbp/map hold arterial-line and cuff
+# readings alike ("specify in meas_site_name", free text). Each site declares how its rows
+# identify the method (site_harmonization.<site>.bp_method); the tokenizer emits one
+# `bp_method=<method>` token per (stay, time, method), immediately before that method's
+# readings. sbp/dbp/map and their physician bins are unchanged (the MAP 65 edge and every
+# threshold target stay as they are); same-time arterial and cuff readings are both kept.
+# An unmapped source name fails the build unless it is mapped to `unknown` explicitly; a
+# site with BP rows and no declaration fails too. Decided 2026-10-03 (product authority):
+# every reading (arterial and cuff) is primary; arterial-only is the sensitivity arm
+# (configs/cohort.yaml outcome_measurement_filters).
+bp_method:
+  table: vitals
+  concepts: [sbp, dbp, map]
+  token_concept: bp_method
+  methods: [arterial, noninvasive_auto, noninvasive_manual, unknown]
+  require_site_declaration: true
+
+# CLIF 2.1 / mCIDE CONFORMANCE GATE (src/data/clif_conformance.py), run per site before a
+# vocabulary is built or imported: every configured column must be a CLIF 2.1 column of its
+# table (or of the pinned variant); every value of a `checked` column, after the site's
+# category_map, must be a permissible mCIDE value (spelling compared lowercase with
+# whitespace/underscore runs folded) or a declared exception. Snapshot: public CLIF v2.1.1
+# files (configs/clif_mcide_2.1.1/README.md); its version and hash are in every vocabulary.
+clif_conformance:
+  snapshot: "configs/clif_mcide_2.1.1"
+  on_violation: error
+  # ecmo_mcs: CLIF 2.1 ships the DDL layout but no released ECMO mCIDE; staged data and
+  # data.yaml follow clifpy 2.1 (device_rate, sweep, fdO2), pinned here.
+  table_variants: {ecmo_mcs: clifpy_2.1}
+  checked:                                 # data.yaml table.column -> snapshot list
+    vitals.vital_category: vitals.vital_category
+    labs.lab_category: labs.lab_category
+    resp_support.device_category: respiratory_support.device_category
+    resp_support.mode_category: respiratory_support.mode_category
+    meds.med_category: medication_admin_continuous.med_category
+    meds.mar_action_category: medication_admin_continuous.mar_action_category
+    meds_intermittent.med_category: medication_admin_intermittent.med_category
+    meds_intermittent.mar_action_category: medication_admin_intermittent.mar_action_category
+    assessments.assessment_category: patient_assessments.assessment_category
+    crrt.crrt_mode_category: crrt_therapy.crrt_mode_category
+    ecmo.mcs_group: ecmo_mcs.mcs_group
+    ecmo.device_category: ecmo_mcs.device_category
+    code_status.code_status_category: code_status.code_status_category
+    position.position_category: position.position_category
+    adt.location_category: adt.location_category
+    adt.location_type: adt.location_type   # read by the extubation unit covariate
+    hospitalization.admission_type_category: hospitalization.admission_type_category
+    hospitalization.discharge_category: hospitalization.discharge_category
+    patient.sex_category: patient.sex_category
+    patient.race_category: patient.race_category
+    patient.ethnicity_category: patient.ethnicity_category
+  extensions:
+    meds_intermittent.med_category:
+      # Documented extension (every site): drugs given both ways (insulin, heparin,
+      # furosemide, ...) chart intermittent doses under their continuous-list category.
+      also_permit: [medication_admin_continuous.med_category]
+  flag_domains:
+    resp_support.tracheostomy: [0, 1]
+
+# PER-SITE HARMONIZATION (applied before concept naming; the reference site's declarations
+# are hashed into the vocabulary `harmonization` record):
+#   category_map.<table.column>: raw value -> mCIDE value, or a list of rules
+#       [{when: {column: value}, to: value}, ..., {to: fallback}] (values compared lowercase,
+#       non-alphanumerics folded; `<null>` = a missing value; unmatched values are kept)
+#   exact_duplicates: one administration charted under two categories -> the `drop`
+#       rows identical to a `keep` row on every `match` column are removed (counted)
+#   column_aliases.<table>: {config column: site column}
+#   declared_exceptions.<table.column>: {value: reason} - non-permissible values kept as
+#       their own category, pending the product authority
+#   bp_method: {source_column, patterns: [{pattern (regex, case-insensitive), method}],
+#       null: <method>} - unmapped names fail
+# Aggregate evidence: output/final_no_phi/clif21_audit_structure.md (F5, F6, F9-F11) and
+# clif21_audit_values.md (#8, #21), staged MIMIC-IV-Ext-CLIF, 2026-10-03.
+site_harmonization:
+  mimic:
+    category_map:
+      # decided 2026-10-03 (product authority): MIMIC's CVICU (17.7% of ICU rows) is the
+      # CLIF 2.1 cardiothoracic_surgical_icu, whose mCIDE description reads "aka
+      # CTICU/CVICU". location_type is not tokenized; the extubation unit covariate uses
+      # the mapped type and keeps the raw label (unit_at_time_zero_raw).
+      adt.location_type:
+        cvicu_icu: cardiothoracic_surgical_icu
+      meds.med_category: &mimic_meds
+        # Every dextrose_in_water_d5w row also appears as a `dextrose` row (removed by
+        # exact_duplicates below); the remaining `dextrose` rows are other concentrations.
+        dextrose_in_water_d5w: dextrose_5_water
+        dextrose:
+          - {when: {med_name: "Dextrose 5%"}, to: dextrose_5_water}
+          - {when: {med_name: "Dextrose 10%"}, to: dextrose_10_water}
+          - {to: dextrose_other}               # D20-D50 and dextrose in PN
+        albumin_infusion: albumin
+        aminocaproic: aminocaproic_acid
+        magnesium: magnesium_sulfate
+      meds_intermittent.med_category: *mimic_meds
+      ecmo.mcs_group:
+        ECMO: ECMO
+        RVAD: RVAD
+        LVAD:
+          - {when: {device_category: HeartMate}, to: durable_LVAD}   # all "HM II"
+          - {when: {device_name: "2.5 / CP"}, to: temporary_LVAD}     # Impella 2.5 / CP
+          - {to: LVAD}                         # no device: declared exception below
+        "<null>":
+          - {when: {device_name: "5.5"}, to: temporary_LVAD}          # Impella 5.5
+          - {when: {device_name: "5.0"}, to: temporary_LVAD}          # Impella 5.0
+      ecmo.device_category:
+        HeartMate: HMII                        # every HeartMate row is device "HM II"
+        Other:
+          - {when: {device_name: VV}, to: VV_ECMO}
+          - {when: {device_name: VA}, to: VA_ECMO}
+          - {when: {device_name: VAV}, to: VAV_ECMO}
+          - {when: {device_name: "5.5"}, to: Impella_5.5}
+          - {when: {device_name: "5.0"}, to: Impella_5.0}
+          - {when: {device_name: RP}, to: Impella_RP}
+          - {to: Other}                        # no or ambiguous device: declared below
+    exact_duplicates:
+      - table: meds
+        drop: [dextrose]
+        keep: dextrose_in_water_d5w
+        match: [hospitalization_id, med_order_id, admin_dttm, med_name, med_dose,
+                med_dose_unit, mar_action_category]
+      - table: meds_intermittent
+        drop: [dextrose]
+        keep: dextrose_in_water_d5w
+        match: [hospitalization_id, med_order_id, admin_dttm, med_name, med_dose,
+                med_dose_unit, mar_action_category]
+    column_aliases: {}                         # MIMIC is staged on the pinned layouts
+    # decided 2026-10-03 (product authority): MIMIC troponin_t is the conventional
+    # (4th-generation, non-hs) cTnT assay, so its tokens are a separate data-driven concept;
+    # troponin_t keeps the high-sensitivity literature edges for hs sites.
+    concept_renames:
+      labs: {troponin_t: troponin_t_conventional}
+    declared_exceptions:
+      ecmo.mcs_group:
+        LVAD: >-
+          LVAD rows with no device category or name (10,546): durable vs temporary unknown.
+      ecmo.device_category:
+        Other: >-
+          MCS rows with no device name, or "2.5 / CP" (Impella 2.5 or CP, not separable).
+      meds.med_category:
+        acetaminophen: "IV acetaminophen charted as an infusion; mCIDE lists it intermittent only."
+        alteplase: "Alteplase infusion; not in the continuous mCIDE list."
+      meds_intermittent.med_category:
+        adenosine: "Adenosine boluses; in neither mCIDE medication list."
+    bp_method:
+      source_column: vital_name                # MIMIC leaves meas_site_name null
+      patterns:
+        - {pattern: "^Non Invasive Blood Pressure (systolic|diastolic|mean)$", method: noninvasive_auto}
+        - {pattern: "^Arterial Blood Pressure (systolic|diastolic|mean)$", method: arterial}
+        - {pattern: "^ART BP (Systolic|Diastolic|Mean)$", method: arterial}
+        - {pattern: "^Manual Blood Pressure (Systolic|Diastolic) (Left|Right)$", method: noninvasive_manual}
+  # A CLIF-conformant site identifies the method in meas_site_name, e.g.:
+  # rush:
+  #   bp_method:
+  #     source_column: meas_site_name
+  #     patterns: [{pattern: "arterial|a-?line", method: arterial},
+  #                {pattern: "cuff|non.?invasive", method: noninvasive_auto}]
+  #     null: unknown        # only if the site really cannot tell
 
 value_binning:
   # PRIMARY SCHEME: physician-designed clinical-segment bins with measurement-density
@@ -327,6 +586,15 @@ value_binning:
   # single; a CSV concept is never overridden. Clinical arm only (the decile arms take the
   # literature bin count under matched_granularity). Fragments are hashed into vocab.json.
   literature_source: "configs/literature_segments"
+  # Every physician-CSV measurement gets its segments and tokens, also when the reference
+  # site charts none of it (MIMIC: glucose_fingerstick, neutrophils_absolute, procalcitonin,
+  # troponin_i), so another site's events are not `<unk>` (`targets_only`: the old rule,
+  # CSV concepts present in the fit data or named as targets).
+  csv_coverage: "all_measurements"
+  # Literature `segments` concepts get their tokens even when the reference site charts none
+  # (e.g. hs troponin_t, absent from MIMIC once its conventional assay is renamed), so an
+  # hs site's events are binned, not `<unk>`.
+  literature_coverage: "all_segments"
   # COVERAGE (U2, R4/KTD3): `all` bins EVERY numeric concept in the reference-site train
   # partition. Source priority per concept: (1) physician CSV segments; (1b) literature
   # fragment edges (above); (2) one point bin

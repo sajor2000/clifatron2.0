@@ -30,7 +30,7 @@ trunk:
   # continuation window (src/data/dataset.py). Off until the tokenizer cuts continuation
   # windows at max_tokens - header length (dataset.gem_window_bounds_with_header);
   # with full-length windows the dataset refuses an over-budget sample.
-  continuation_header: false
+  continuation_header: true
   rope_position: "admission_minutes"   # {admission_minutes | token_index(ablation)}
   rope_time_alibi: false               # optional log-Δt ALiBi bias for severe irregular sampling (HealthFormer)
   # UNVERIFIED (2026-10-03, notes/ai-novelty-audit.md §6): an earlier comment here said untied

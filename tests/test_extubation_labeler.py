@@ -21,6 +21,7 @@ from src.data.extubation_cohort import (
     table_availability,
 )
 from src.data.targets import OUTCOME_STATUSES
+from src.data.tokenize import with_availability_lag
 from src.eval.causal.estimators import cumulative_incidence
 from src.eval.extubation_labeler import (
     CAUSE_CODES,
@@ -48,6 +49,15 @@ from tests.fixtures_extubation import (
 )
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def single_row_config():
+    """The repo contract with the single-row look-forward rule: the fixture's hand-built
+    scenario patients chart ONE non-invasive row after extubation (the primary since
+    2026-10-03 requires two; see test_primary_requires_two_non_invasive_rows)."""
+    config = load_extubation_config(ROOT / "configs/extubation.yaml")
+    config["detection"]["look_forward"]["min_non_invasive_rows"] = 1
+    return config
 SPLIT = {"partitions": PARTITIONS, "split_seed": SPLIT_SEED}
 COMPOSITE = "reintubation_or_death"
 
@@ -56,10 +66,13 @@ class ExtubationLabelerTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.fixture = build_extubation_fixture(outcome_scenarios=True)
-        cls.config = load_extubation_config(ROOT / "configs/extubation.yaml")
+        cls.config = single_row_config()
         cls.data_config = yaml.safe_load((ROOT / "configs/data.yaml").read_text())
         cls.cohort_config = yaml.safe_load((ROOT / "configs/cohort.yaml").read_text())
-        cls.availability = table_availability(cls.config, cls.data_config)
+        # Scenario hours assume no availability lag (the repo lags respiratory support
+        # 30 min since 2026-10-03; the shift is tested in test_extubation_cohort).
+        cls.availability = table_availability(cls.config, with_availability_lag(
+            cls.data_config, 0))
         cls.cohort = build_extubation_cohort(
             cls.fixture.tables,
             cls.config,
@@ -221,6 +234,40 @@ class ExtubationLabelerTest(unittest.TestCase):
         self.assertAlmostEqual(comfort["death_hours"], 6.0)
         self.assertTrue(comfort["death_within_24h_without_reintubation"])
         self.assertEqual(self.labels.height, self.cohort.height)
+
+    def test_inconsistent_death_record_is_flagged_in_the_labels(self):
+        # Consistent fixture: nobody is flagged.
+        self.assertFalse(self.labels["death_record_inconsistent"].any())
+        name = "out_death_day3"
+        admission = (
+            self.fixture.tables["hospitalization"]
+            .filter(pl.col("patient_id") == patient_id(name))["admission_dttm"]
+            .min()
+        )
+        # A death three days before the admission: the labeler's own check flags it,
+        # even for a cohort built before the check existed (no cohort column).
+        patient = self.fixture.tables["patient"].with_columns(
+            pl.when(pl.col("patient_id") == patient_id(name))
+            .then(pl.lit(admission - timedelta(days=3)).cast(pl.Datetime("us", "UTC")))
+            .otherwise(pl.col("death_dttm"))
+            .alias("death_dttm")
+        )
+        tables = {**self.fixture.tables, "patient": patient}
+        labels = self.build(cohort=self.cohort.drop("death_record_inconsistent"), tables=tables)
+        flagged = labels.filter(pl.col("death_record_inconsistent"))["patient_id"].to_list()
+        self.assertEqual(flagged, [patient_id(name)])
+        # The cohort's flag is carried when the cohort has it.
+        cohort = self.cohort.with_columns(
+            (pl.col("patient_id") == patient_id("out_niv_day1")).alias("death_record_inconsistent")
+        )
+        labels = self.build(cohort=cohort)
+        self.assertEqual(
+            labels.filter(pl.col("death_record_inconsistent"))["patient_id"].to_list(),
+            [patient_id("out_niv_day1")],
+        )
+        counts = label_counts(cohort, labels, [168])
+        self.assertEqual(counts["patient_death_record_inconsistent"], 1)
+        self.assertEqual(counts["eligible_death_record_inconsistent"], 1)
 
     # ------------------------------------------------------------ reintubation
 
