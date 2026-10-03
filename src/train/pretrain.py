@@ -6,6 +6,9 @@ Loss = w_A*next_event + w_B*competing_risk + w_C*threshold_hazard + w_D*value_re
 Run:
     torchrun --nproc_per_node=2 -m src.train.pretrain --config configs/train.yaml \
         --model-config configs/model.yaml --data data/mimic --site mimic
+
+A torchrun launch without CUDA is refused unless `--allow-cpu-ddp` is passed (a CPU / gloo
+rehearsal); a single process (no torchrun) runs on CUDA, MPS or CPU as before.
 """
 from __future__ import annotations
 
@@ -20,7 +23,6 @@ import torch
 import torch.distributed as dist
 import polars as pl
 import yaml
-from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, DistributedSampler
 from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 
@@ -42,7 +44,15 @@ from src.data.segments import (
     n_value_bins,
 )
 from src.data.targets import TargetBuilder
-from src.train.engine import setup_ddp, is_distributed, TrainConfig, train
+from src.train.engine import (
+    ALLOW_CPU_DDP_FLAG,
+    TrainConfig,
+    is_distributed,
+    select_device,
+    setup_ddp,
+    train,
+    wrap_ddp,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -156,6 +166,19 @@ def objective_weights(mcfg: dict) -> dict[str, float]:
     return weights
 
 
+def zero_touch(head: torch.nn.Module | None, like: torch.Tensor) -> torch.Tensor:
+    """The loss of a skipped head: zero-valued, but reaching every trainable parameter.
+
+    A head is skipped when its weight is zero or the batch has no supervised sample for
+    it. Returning a bare constant would leave its parameters without a gradient on that
+    rank, and DDP raises on the next step. This term gives them a zero gradient instead,
+    so the parameters receiving gradients are the same on every rank and step (KTD2)."""
+    params = [] if head is None else [p for p in head.parameters() if p.requires_grad]
+    if not params:
+        return like.new_tensor(0.0)
+    return (sum(p.sum() for p in params) * 0.0).to(like.dtype)
+
+
 class Model(torch.nn.Module):
     def __init__(self, vocab_size, n_targets, mcfg, *, n_value_bins: int,
                  encoder: torch.nn.Module | None = None):
@@ -217,10 +240,10 @@ class Model(torch.nn.Module):
         """CR loss; 0 when the head is disabled/unweighted or the batch carries no CR
         targets (pure-NTP batches from shards without an outcome join)."""
         if self.w["competing_risk"] == 0.0 or "cr_type" not in batch or "cr_bin" not in batch:
-            return H.new_tensor(0.0)
+            return zero_touch(self.cr, H)
         cr_mask = batch.get("cr_mask")
         if cr_mask is not None and not bool(cr_mask.any()):
-            return H.new_tensor(0.0)
+            return zero_touch(self.cr, H)
         cr_h = h_last[cr_mask] if cr_mask is not None else h_last
         cr_type = batch["cr_type"][cr_mask] if cr_mask is not None else batch["cr_type"]
         cr_bin = batch["cr_bin"][cr_mask] if cr_mask is not None else batch["cr_bin"]
@@ -229,10 +252,10 @@ class Model(torch.nn.Module):
     def _th_loss(self, batch, h_last, H):
         """Threshold-hazard loss with the same fail-to-zero guard as _cr_loss."""
         if self.w["threshold_hazard"] == 0.0 or "th_target" not in batch:
-            return H.new_tensor(0.0)
+            return zero_touch(self.th, H)
         th_mask = batch.get("th_mask")
         if th_mask is not None and not bool(th_mask.any()):
-            return H.new_tensor(0.0)
+            return zero_touch(self.th, H)
         th_h = h_last[th_mask] if th_mask is not None else h_last
         return self.th.loss(
             th_h,
@@ -246,9 +269,9 @@ class Model(torch.nn.Module):
     def _val_loss(self, batch, H):
         """Value-regression (ORA mark) loss; 0 when disabled or no values present."""
         if self.vr is None or self.w["value_regression"] == 0.0:
-            return H.new_tensor(0.0)
+            return zero_touch(self.vr, H)
         if "value" not in batch or "val_mask" not in batch:
-            return H.new_tensor(0.0)
+            return zero_touch(self.vr, H)
         return self.vr.loss_aligned(
             H,
             batch.get("ntp_target", batch["token"]),
@@ -506,18 +529,15 @@ def main():
                          "schedule would pin LR at its tail value)")
     ap.add_argument("--dry-run", action="store_true", help="print model + loader info and exit")
     ap.add_argument("--value-stats", default=None, help="JSON token_id -> [center, scale] for value-head normalization")
+    ap.add_argument(ALLOW_CPU_DDP_FLAG, action="store_true",
+                    help="let a distributed (torchrun) launch run on CPU over gloo when "
+                         "CUDA is unavailable; without it such a launch is refused")
     args = ap.parse_args()
 
-    local, is_main = setup_ddp()
-    # CUDA for the L40 box; MPS for Mac smoke tests (AGENTS.md dev workflow); CPU last.
-    if torch.cuda.is_available():
-        dev = torch.device(f"cuda:{local}")
-    elif torch.backends.mps.is_available():
-        dev = torch.device("mps")
-        if is_main:
-            print("device: mps (Mac smoke-test path)")
-    else:
-        dev = torch.device("cpu")
+    local, is_main = setup_ddp(allow_cpu=args.allow_cpu_ddp)
+    dev = select_device(local)
+    if is_main and dev.type == "mps":
+        print("device: mps (Mac smoke-test path)")
     tcfg = yaml.safe_load(Path(args.config).read_text())
     mcfg = yaml.safe_load(Path(args.model_config).read_text())
     dcfg = yaml.safe_load(Path("configs/data.yaml").read_text())
@@ -561,7 +581,7 @@ def main():
     if compile_enabled and torch.cuda.is_available():
         model = torch.compile(model, dynamic=True)
     if is_distributed():
-        model = DDP(model, device_ids=[local])
+        model = wrap_ddp(model, dev, local)
 
     opt = torch.optim.AdamW(
         model.parameters(), lr=tcfg["optimizer"]["lr"],

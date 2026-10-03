@@ -6,6 +6,7 @@ and records a provenance manifest.
 """
 from __future__ import annotations
 
+import contextlib
 import os
 import time
 from pathlib import Path
@@ -14,23 +15,79 @@ from typing import Any
 
 import torch
 import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel
 
 from src.data.segments import compare_binding
 from src.train.checkpoint import load_checkpoint, save_checkpoint, unwrap_compiled
 from src.train.manifest import Manifest
 
 
-def setup_ddp() -> tuple[int, bool]:
-    if "RANK" in os.environ:
+ALLOW_CPU_DDP_FLAG = "--allow-cpu-ddp"
+
+
+def is_distributed_launch() -> bool:
+    """A launcher (torchrun) sets RANK per process; WORLD_SIZE > 1 asks for several."""
+    return "RANK" in os.environ or int(os.environ.get("WORLD_SIZE") or 1) > 1
+
+
+def setup_ddp(*, allow_cpu: bool = False) -> tuple[int, bool]:
+    """Join the process group of a distributed launch; (local rank, is rank 0).
+
+    Fails closed when a distributed launch finds no CUDA: the 2x L40 recipe would
+    otherwise crawl on CPU. `allow_cpu` (`--allow-cpu-ddp`) opts into a CPU rehearsal
+    over gloo. Single-process CPU / MPS runs are not distributed launches and pass."""
+    if not is_distributed_launch():
+        return 0, True
+    if not torch.cuda.is_available() and not allow_cpu:
+        raise RuntimeError(
+            "distributed launch (RANK / WORLD_SIZE set) but CUDA is unavailable: refusing "
+            "to run the multi-GPU recipe on CPU. Restore CUDA (driver mismatch: reboot), "
+            "launch a single process without torchrun, or pass "
+            f"{ALLOW_CPU_DDP_FLAG} for a CPU (gloo) rehearsal."
+        )
+    if "RANK" not in os.environ:
+        return 0, True
+    local = int(os.environ["LOCAL_RANK"])
+    if torch.cuda.is_available():
         dist.init_process_group("nccl")
-        local = int(os.environ["LOCAL_RANK"])
         torch.cuda.set_device(local)
-        return local, dist.get_rank() == 0
-    return 0, True
+    else:
+        dist.init_process_group("gloo")
+    return local, dist.get_rank() == 0
 
 
 def is_distributed() -> bool:
     return dist.is_available() and dist.is_initialized()
+
+
+def select_device(local: int) -> torch.device:
+    """CUDA for the L40 box; CPU for a `--allow-cpu-ddp` rehearsal (DDP does not run on
+    MPS); MPS for Mac smoke tests (AGENTS.md dev workflow); CPU last."""
+    if torch.cuda.is_available():
+        return torch.device(f"cuda:{local}")
+    if is_distributed() or not torch.backends.mps.is_available():
+        return torch.device("cpu")
+    return torch.device("mps")
+
+
+def wrap_ddp(model, dev: torch.device, local: int) -> DistributedDataParallel:
+    """DDP over `model`. `find_unused_parameters` stays off (KTD2): every head touches
+    its parameters on every step, so a parameter left without a gradient is a real bug
+    and raises. `device_ids` is a CUDA-only argument."""
+    return DistributedDataParallel(model, device_ids=[local] if dev.type == "cuda" else None)
+
+
+def precision_note(dev: torch.device) -> str | None:
+    """What the engine's bf16 autocast really does off CUDA (every train config sets
+    `runtime.precision: bf16`, including the smoke and MPS ones)."""
+    dev = torch.device(dev)
+    if dev.type == "cuda":
+        return None
+    if dev.type == "cpu" and not torch.cuda.is_available():
+        return ("precision: bf16 on cpu is CPU autocast, not the CUDA bf16 kernels of the "
+                "L40 recipe")
+    return (f"precision: bf16 is inert on {dev.type} (engine autocast is cuda/cpu-scoped) "
+            "— training runs in fp32")
 
 
 def _all_gather(obj: Any) -> list[Any]:
@@ -172,28 +229,42 @@ def _train_one_epoch(
     started_at = time.monotonic()
     samples_seen, tokens_seen, ntp_tokens = 0, 0, 0
 
+    # KTD2: under DDP only the microstep that precedes an optimizer update exchanges
+    # gradients — an accumulation boundary, or the epoch's last microbatch (the partial
+    # update below). A stop at max_updates always lands on a boundary. The gradients
+    # accumulated under no_sync are reduced by that synchronized step, so every rank
+    # applies the same update. no_sync must enclose the forward as well as the backward.
+    ddp = model if isinstance(model, DistributedDataParallel) else None
+    last_batch_idx = len(dl) - 1 if ddp is not None else None
+
     for batch_idx, batch in enumerate(dl):
         batch = _prepare_batch(batch, dev)
 
-        with torch.autocast("cuda" if torch.cuda.is_available() else "cpu", dtype=torch.bfloat16):
-            losses = model(batch)
-            loss = losses["total"]
+        synchronized = (
+            ddp is None
+            or (micro + 1) % tcfg.grad_accum == 0
+            or batch_idx == last_batch_idx
+        )
+        with contextlib.nullcontext() if synchronized else ddp.no_sync():
+            with torch.autocast("cuda" if torch.cuda.is_available() else "cpu", dtype=torch.bfloat16):
+                losses = model(batch)
+                loss = losses["total"]
 
-        nonfinite = [
-            name for name, value in losses.items()
-            if isinstance(value, torch.Tensor) and not bool(torch.isfinite(value).all())
-        ]
-        failed = torch.tensor(bool(nonfinite), dtype=torch.int32, device=dev)
-        if is_distributed():
-            dist.all_reduce(failed, op=dist.ReduceOp.MAX)
-        if failed.item():
-            detail = ", ".join(nonfinite) if nonfinite else "another rank"
-            raise FloatingPointError(
-                f"non-finite training loss at epoch {epoch}, batch {batch_idx}, "
-                f"rank {rank}: {detail}"
-            )
+            nonfinite = [
+                name for name, value in losses.items()
+                if isinstance(value, torch.Tensor) and not bool(torch.isfinite(value).all())
+            ]
+            failed = torch.tensor(bool(nonfinite), dtype=torch.int32, device=dev)
+            if is_distributed():
+                dist.all_reduce(failed, op=dist.ReduceOp.MAX)
+            if failed.item():
+                detail = ", ".join(nonfinite) if nonfinite else "another rank"
+                raise FloatingPointError(
+                    f"non-finite training loss at epoch {epoch}, batch {batch_idx}, "
+                    f"rank {rank}: {detail}"
+                )
 
-        loss.backward()
+            loss.backward()
         micro += 1
         samples_seen += batch["input_ids"].size(0)
         batch_tokens = int(batch.get("attention_mask", batch["input_ids"] > 0).sum().item())
@@ -258,6 +329,9 @@ def train(model, train_dl, val_dl, opt, scheduler, tcfg: TrainConfig, dev, *,
                          "training vocab.json): every checkpoint is bound to it")
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
     is_main = local_rank == 0
+    note = precision_note(dev)
+    if is_main and note:
+        print(note, flush=True)
 
     manifest = Manifest(
         model_name="clifatron2",

@@ -38,7 +38,6 @@ from pathlib import Path
 import torch
 import torch.distributed as dist
 import yaml
-from torch.nn.parallel import DistributedDataParallel as DDP
 
 from src.data.segments import (
     artifact_binding,
@@ -58,7 +57,15 @@ from src.model.encoder import count_params
 from src.model.encoder_continuous import ContinuousFusedEncoder
 from src.model.encoder_textcode import TextCodeEncoder
 from src.train.checkpoint import load_checkpoint
-from src.train.engine import TrainConfig, is_distributed, setup_ddp, train
+from src.train.engine import (
+    ALLOW_CPU_DDP_FLAG,
+    TrainConfig,
+    is_distributed,
+    select_device,
+    setup_ddp,
+    train,
+    wrap_ddp,
+)
 from src.train.pretrain import Loaders, Model, build_loaders, build_scheduler
 
 TOKENIZERS = ("fused", CONTINUOUS_FUSED, "textcode")
@@ -233,7 +240,7 @@ def train_arm(run: ArmRun, *, tcfg: dict, mcfg: dict, device, total_steps=None, 
     if tcfg["runtime"].get("compile", mcfg.get("compile", False)) and torch.cuda.is_available():
         model = torch.compile(model, dynamic=True)
     if is_distributed():
-        model = DDP(model, device_ids=[local])
+        model = wrap_ddp(model, torch.device(device), local)
     opt = torch.optim.AdamW(
         [p for p in model.parameters() if p.requires_grad], lr=lr,
         weight_decay=tcfg["optimizer"]["weight_decay"], betas=tcfg["optimizer"]["betas"],
@@ -274,15 +281,13 @@ def main():
     ap.add_argument("--out", default="results/tokenization_ablation")
     ap.add_argument("--dry-run", action="store_true",
                     help="build the arm's model and loaders, print shapes, and exit")
+    ap.add_argument(ALLOW_CPU_DDP_FLAG, action="store_true",
+                    help="let a distributed (torchrun) launch run on CPU over gloo when "
+                         "CUDA is unavailable; without it such a launch is refused")
     args = ap.parse_args()
 
-    local, is_main = setup_ddp()
-    if torch.cuda.is_available():
-        dev = torch.device(f"cuda:{local}")
-    elif torch.backends.mps.is_available():
-        dev = torch.device("mps")
-    else:
-        dev = torch.device("cpu")
+    local, is_main = setup_ddp(allow_cpu=args.allow_cpu_ddp)
+    dev = select_device(local)
 
     abl = yaml.safe_load(Path(args.ablation_config).read_text())
     mcfg = yaml.safe_load(Path(args.model_config).read_text())

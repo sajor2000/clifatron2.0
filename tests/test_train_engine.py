@@ -1,14 +1,29 @@
+import contextlib
+import io
 import math
+import os
+import socket
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import torch
 
+from src.train import engine
 from src.train.engine import _prepare_batch, _train_one_epoch, _restore_rng_states, TrainConfig
 from src.train.pretrain import _has_supervised_outcomes, _load_decile_records
 from src.train.manifest import Manifest
 from src.train.checkpoint import save_checkpoint, load_checkpoint
+
+try:  # pytest puts tests/ on sys.path (rootdir-less test modules)
+    from test_ddp_multihead import build_model, synthetic_batch, tiny_mcfg, tiny_tcfg
+except ImportError:  # pragma: no cover - run from the repo root as a package
+    from tests.test_ddp_multihead import build_model, synthetic_batch, tiny_mcfg, tiny_tcfg
+
+ROOT = Path(__file__).resolve().parents[1]
 
 # engine.train requires the training vocabulary binding (segments.artifact_binding);
 # these data-free tests bind every run (and resume checkpoint) to one fixed binding.
@@ -277,8 +292,8 @@ class TestTrainingEngine(unittest.TestCase):
         model = Model(vocab_size=16, n_targets=2, mcfg=cfg, n_value_bins=4)
         losses = model(batch)
         self.assertTrue(torch.isfinite(losses["total"]))
-        self.assertEqual(float(losses["cr"]), 0.0)
-        self.assertEqual(float(losses["th"]), 0.0)
+        self.assertEqual(float(losses["cr"].detach()), 0.0)
+        self.assertEqual(float(losses["th"].detach()), 0.0)
 
     def test_pretrain_model_handles_anchorless_packed_chunk(self):
         from src.train.pretrain import Model
@@ -320,8 +335,8 @@ class TestTrainingEngine(unittest.TestCase):
         }
         losses = Model(vocab_size=16, n_targets=2, mcfg=cfg, n_value_bins=4)(batch)
         self.assertTrue(torch.isfinite(losses["total"]))
-        self.assertEqual(float(losses["cr"]), 0.0)
-        self.assertEqual(float(losses["th"]), 0.0)
+        self.assertEqual(float(losses["cr"].detach()), 0.0)
+        self.assertEqual(float(losses["th"].detach()), 0.0)
 
     def test_pretrain_model_rejects_multi_document_dense_path(self):
         from src.train.pretrain import Model
@@ -424,6 +439,279 @@ class TestTrainingEngine(unittest.TestCase):
             resume_ckpt=ckpt,
         )
         self.assertGreaterEqual(resumed_manifest.ledger.get("samples_seen", 0), 10)
+
+
+class SkippedHeadObjectiveTest(unittest.TestCase):
+    """KTD2: a skipped head adds a zero-valued term that reaches its parameters, so the
+    loss VALUES are what they were before and only the gradient bookkeeping changes."""
+
+    # fp32 `pretrain.Model` losses on `synthetic_batch(11)`, model seed 0, captured on the
+    # commit before the zero-valued touch term was added (torch 2.13.0).
+    BASELINE_LOSSES = {
+        "full": {"ntp": 3.525213, "cr": 1.809082, "th": 1.886438, "val": 0.445222,
+                 "total": 4.623174},
+        "no_anchor": {"ntp": 3.525213, "cr": 0.0, "th": 0.0, "val": 0.445222,
+                      "total": 0.927654},
+        "tte_zero": {"ntp": 3.525213, "cr": 0.0, "th": 0.0, "val": 0.445222,
+                     "total": 0.927654},
+        "all_heads_zero": {"ntp": 3.525213, "cr": 0.0, "th": 0.0, "val": 0.0,
+                           "total": 0.705043},
+    }
+    # Total loss over four AdamW (lr 1e-2, weight decay 0.1) steps on batches 0..3, same
+    # commit. Every head is either supervised or skipped on EVERY step in these runs.
+    BASELINE_TRAJECTORIES = {
+        "full": [5.227314, 4.269813, 3.331987, 6.591049],
+        "tte_zero": [0.804643, 1.152664, 1.010028, 0.84273],
+        "all_heads_zero": [0.705037, 0.689857, 0.723751, 0.717308],
+        "no_anchor": [0.804643, 1.152664, 1.010028, 0.84273],
+    }
+
+    @staticmethod
+    def _case(name):
+        mcfg = {
+            "full": tiny_mcfg(),
+            "no_anchor": tiny_mcfg(),
+            "tte_zero": tiny_mcfg(competing_risk=0.0, threshold_hazard=0.0),
+            "all_heads_zero": tiny_mcfg(competing_risk=0.0, threshold_hazard=0.0,
+                                        value_regression=0.0),
+        }[name]
+        return mcfg, name != "no_anchor"
+
+    def test_single_process_losses_match_the_pre_change_baseline(self):
+        for name, expected in self.BASELINE_LOSSES.items():
+            mcfg, supervised = self._case(name)
+            batch = _prepare_batch(synthetic_batch(11, supervised=supervised),
+                                   torch.device("cpu"))
+            losses = build_model(mcfg)(batch)
+            for key, value in expected.items():
+                with self.subTest(case=name, loss=key):
+                    self.assertAlmostEqual(float(losses[key].detach()), value, delta=1e-4)
+            # A skipped head reports exactly zero, not a small number.
+            for key in ("cr", "th", "val"):
+                if expected[key] == 0.0:
+                    self.assertEqual(float(losses[key].detach()), 0.0, f"{name} {key}")
+
+    def test_single_process_training_losses_match_the_pre_change_baseline(self):
+        for name, expected in self.BASELINE_TRAJECTORIES.items():
+            mcfg, supervised = self._case(name)
+            model = build_model(mcfg)
+            opt = torch.optim.AdamW(model.parameters(), lr=1e-2, weight_decay=0.1,
+                                    betas=(0.9, 0.95))
+            observed = []
+            for seed in range(4):
+                batch = _prepare_batch(synthetic_batch(seed, supervised=supervised),
+                                       torch.device("cpu"))
+                losses = model(batch)
+                opt.zero_grad(set_to_none=True)
+                losses["total"].backward()
+                opt.step()
+                observed.append(float(losses["total"].detach()))
+            for step, (got, want) in enumerate(zip(observed, expected, strict=True)):
+                with self.subTest(case=name, step=step):
+                    self.assertAlmostEqual(got, want, delta=1e-4)
+
+    def test_every_trainable_parameter_gets_a_gradient_whatever_is_skipped(self):
+        """The DDP invariant, checked in one process: the set of parameters with a
+        gradient is the full trainable set for every weight / supervision combination,
+        and a skipped head's gradient is exactly zero."""
+        skipped_heads = {
+            "full": (),
+            "no_anchor": ("cr.", "th."),
+            "tte_zero": ("cr.", "th."),
+            "all_heads_zero": ("cr.", "th.", "vr."),
+        }
+        for name, prefixes in skipped_heads.items():
+            mcfg, supervised = self._case(name)
+            model = build_model(mcfg)
+            batch = _prepare_batch(synthetic_batch(11, supervised=supervised),
+                                   torch.device("cpu"))
+            model(batch)["total"].backward()
+            for pname, param in model.named_parameters():
+                with self.subTest(case=name, parameter=pname):
+                    self.assertIsNotNone(param.grad, "parameter received no gradient")
+                    if pname.startswith(prefixes) and prefixes:
+                        self.assertEqual(float(param.grad.abs().max()), 0.0)
+            if not prefixes:
+                for head in (model.cr, model.th, model.vr):
+                    self.assertGreater(
+                        max(float(p.grad.abs().max()) for p in head.parameters()), 0.0)
+
+    def test_batch_without_head_target_keys_still_touches_the_heads(self):
+        """A context-only shard (no outcome join) carries no CR / threshold / value keys."""
+        batch = _prepare_batch(synthetic_batch(11), torch.device("cpu"))
+        for key in [k for k in batch if k.startswith(("cr_", "th_"))] + ["value", "val_mask",
+                                                                         "value_target",
+                                                                         "value_mask"]:
+            del batch[key]
+        model = build_model(tiny_mcfg())
+        losses = model(batch)
+        self.assertEqual([float(losses[k].detach()) for k in ("cr", "th", "val")], [0.0, 0.0, 0.0])
+        losses["total"].backward()
+        self.assertTrue(all(p.grad is not None for p in model.parameters()))
+
+    def test_zero_touch_is_a_plain_constant_without_trainable_parameters(self):
+        from src.train.pretrain import zero_touch
+
+        like = torch.ones(2, dtype=torch.bfloat16)
+        head = torch.nn.Linear(3, 2)
+        touched = zero_touch(head, like)
+        self.assertEqual((float(touched.detach()), touched.dtype), (0.0, torch.bfloat16))
+        self.assertTrue(touched.requires_grad)
+        for param in head.parameters():
+            param.requires_grad_(False)
+        for constant in (zero_touch(head, like), zero_touch(None, like)):
+            self.assertEqual((float(constant), constant.dtype), (0.0, torch.bfloat16))
+            self.assertFalse(constant.requires_grad)
+
+    def test_disabled_value_head_adds_no_parameters_and_reports_zero(self):
+        mcfg = tiny_mcfg()
+        mcfg["heads"]["value_regression"]["enabled"] = False
+        model = build_model(mcfg)
+        self.assertIsNone(model.vr)
+        losses = model(_prepare_batch(synthetic_batch(11), torch.device("cpu")))
+        self.assertEqual(float(losses["val"].detach()), 0.0)
+        losses["total"].backward()
+        self.assertTrue(all(p.grad is not None for p in model.parameters()))
+
+
+class DistributedLaunchGuardTest(unittest.TestCase):
+    """A distributed launch without CUDA fails closed unless `--allow-cpu-ddp` is given;
+    single-process CPU / MPS runs stay allowed."""
+
+    LAUNCH_ENV = {"RANK": "0", "LOCAL_RANK": "0", "WORLD_SIZE": "2"}
+
+    def _environment(self, **env):
+        patcher = mock.patch.dict(os.environ, env)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        for key in self.LAUNCH_ENV:
+            if key not in env:
+                os.environ.pop(key, None)
+
+    def _no_cuda(self):
+        patcher = mock.patch("torch.cuda.is_available", return_value=False)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_distributed_launch_without_cuda_is_refused(self):
+        self._environment(**self.LAUNCH_ENV)
+        self._no_cuda()
+        with mock.patch.object(engine.dist, "init_process_group") as init:
+            with self.assertRaisesRegex(RuntimeError, "CUDA is unavailable.*--allow-cpu-ddp"):
+                engine.setup_ddp()
+        init.assert_not_called()
+
+    def test_world_size_above_one_without_a_rank_is_refused_too(self):
+        self._environment(WORLD_SIZE="2")
+        self._no_cuda()
+        with self.assertRaisesRegex(RuntimeError, "CUDA is unavailable"):
+            engine.setup_ddp()
+
+    def test_cpu_flag_joins_a_gloo_group(self):
+        self._environment(RANK="1", LOCAL_RANK="1", WORLD_SIZE="2")
+        self._no_cuda()
+        with mock.patch.object(engine.dist, "init_process_group") as init, \
+                mock.patch.object(engine.dist, "get_rank", return_value=1):
+            self.assertEqual(engine.setup_ddp(allow_cpu=True), (1, False))
+        init.assert_called_once_with("gloo")
+
+    def test_cuda_launch_still_uses_nccl(self):
+        self._environment(**self.LAUNCH_ENV)
+        with mock.patch("torch.cuda.is_available", return_value=True), \
+                mock.patch("torch.cuda.set_device") as set_device, \
+                mock.patch.object(engine.dist, "init_process_group") as init, \
+                mock.patch.object(engine.dist, "get_rank", return_value=0):
+            self.assertEqual(engine.setup_ddp(), (0, True))
+        init.assert_called_once_with("nccl")
+        set_device.assert_called_once_with(0)
+
+    def test_single_process_launch_needs_no_flag_and_no_process_group(self):
+        self._environment()
+        self._no_cuda()
+        with mock.patch.object(engine.dist, "init_process_group") as init:
+            self.assertEqual(engine.setup_ddp(), (0, True))
+        init.assert_not_called()
+        self.assertIn(engine.select_device(0).type, ("cpu", "mps"))
+
+    def test_cpu_rehearsal_trains_on_cpu_not_mps(self):
+        self._no_cuda()
+        with mock.patch.object(engine, "is_distributed", return_value=True):
+            self.assertEqual(engine.select_device(1), torch.device("cpu"))
+        with mock.patch("torch.cuda.is_available", return_value=True):
+            self.assertEqual(engine.select_device(1), torch.device("cuda:1"))
+
+    def test_precision_note_says_what_bf16_does_off_cuda(self):
+        self.assertIsNone(engine.precision_note(torch.device("cuda:0")))
+        self.assertIn("inert on mps", engine.precision_note(torch.device("mps")))
+        self._no_cuda()
+        self.assertIn("CPU autocast", engine.precision_note(torch.device("cpu")))
+        with mock.patch("torch.cuda.is_available", return_value=True):
+            # The engine's autocast is cuda-scoped there, so a CPU model runs fp32.
+            self.assertIn("inert on cpu", engine.precision_note(torch.device("cpu")))
+
+    def _cli(self, module, *args, **env):
+        """Run a training CLI as one rank of a distributed launch on a CUDA-less node."""
+        child_env = dict(os.environ, CUDA_VISIBLE_DEVICES="", **env)
+        return subprocess.run(
+            [sys.executable, "-m", module, *args], cwd=ROOT, env=child_env,
+            capture_output=True, text=True, timeout=180)
+
+    def test_training_clis_refuse_a_cpu_distributed_launch(self):
+        for module, args in (
+            ("src.train.pretrain", ("--data", "/nonexistent", "--site", "synthetic")),
+            ("src.train.run_tokenization_ablation", ("--arm", "clinical_soft")),
+        ):
+            with self.subTest(module=module):
+                done = self._cli(module, *args, **self.LAUNCH_ENV)
+                self.assertNotEqual(done.returncode, 0)
+                self.assertIn("CUDA is unavailable", done.stderr)
+                self.assertIn("--allow-cpu-ddp", done.stderr)
+
+    @unittest.skipUnless(engine.dist.is_available() and engine.dist.is_gloo_available(),
+                         "torch.distributed gloo backend is not built on this platform")
+    def test_pretrain_cli_flag_passes_the_guard(self):
+        """With the flag, a one-rank CPU launch gets past the guard and stops at the next
+        gate (the vocabulary it was pointed at does not exist)."""
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.bind(("127.0.0.1", 0))
+            port = sock.getsockname()[1]
+        done = self._cli("src.train.pretrain", "--data", "/nonexistent", "--site", "synthetic",
+                         "--allow-cpu-ddp", RANK="0", LOCAL_RANK="0", WORLD_SIZE="1",
+                         MASTER_ADDR="127.0.0.1", MASTER_PORT=str(port))
+        self.assertNotEqual(done.returncode, 0)
+        self.assertNotIn("CUDA is unavailable", done.stderr)
+        self.assertIn("vocab.json is required", done.stderr)
+
+
+class SingleProcessBf16Test(unittest.TestCase):
+    def test_single_process_cpu_run_with_bf16_configured_still_trains(self):
+        """Every train config sets `runtime.precision: bf16`; a single-process CPU run
+        trains with it and says what bf16 means there."""
+        from src.train.pretrain import build_scheduler
+
+        dev = torch.device("cpu")
+        mcfg = tiny_mcfg()
+        model = build_model(mcfg)
+        initial = {k: v.detach().clone() for k, v in model.state_dict().items()}
+        batches = [synthetic_batch(i, supervised=i != 1) for i in range(4)]
+        loader = torch.utils.data.DataLoader(batches, batch_size=None, shuffle=False)
+        opt = torch.optim.AdamW(model.parameters(), lr=1e-2, weight_decay=0.1)
+        with tempfile.TemporaryDirectory() as td:
+            tcfg = tiny_tcfg(td, grad_accum=2)
+            self.assertEqual(tcfg["runtime"]["precision"], "bf16")
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                trained, manifest = engine.train(
+                    model, loader, None, opt, build_scheduler(opt, 2, 1),
+                    TrainConfig({}, tcfg, mcfg, total_steps=2), dev, vocab_binding=BINDING)
+        self.assertIs(trained, model)   # no DDP wrapper in a single process
+        self.assertEqual(manifest.ledger["optimizer_updates"], 2)
+        self.assertIn(engine.precision_note(dev), out.getvalue())
+        self.assertIn("precision: bf16", out.getvalue())
+        for name, value in model.state_dict().items():
+            self.assertTrue(bool(torch.isfinite(value).all()), name)
+        self.assertFalse(torch.equal(initial["th.mlp.0.weight"],
+                                     model.state_dict()["th.mlp.0.weight"]))
 
 
 class _DropoutModel(torch.nn.Module):
