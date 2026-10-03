@@ -4,11 +4,45 @@ Global memory: ~/.claude/CLAUDE.md (rules) + ~/.claude/memory/memory.md (index).
 
 ## What this is
 Compact (~30M-param) multimodal ICU foundation model on **federated CLIF 2.1**
-(dev cohort = Site 1 + Site 2 + Site 3; **only Site 1 is currently staged on the L40
+(dev cohort = Site 1 + Site 2, external validation = Site 3 — revised 2026-10-03, was
+"dev cohort = Site 1 + Site 2 + Site 3"; **only Site 1 is currently staged on the L40
 box** — see LOCKED DECISIONS G2), pretrained with a **threshold-conditioned
 time-to-event** objective. Thesis: one small model → many outcomes → many
 hospitals → one node (2× L40, no cluster). Nature-Medicine framing: efficiency +
 federated-fairness + CLIF-native + deployable multimodal SLM.
+
+## THREE-CLAIM FRAMING — LOCKED 2026-10-03 (current headline)
+Plan: `docs/plans/2026-10-03-0845-feat-icu-gem-rct-recovery-plan.md`. Evidence:
+`notes/ai-novelty-audit.md`, `notes/extubation-evidence-review.md`. This is the current framing;
+where an older section below disagrees, this section and LOCKED DECISIONS §A3 win.
+- **Paper 1 = three falsifiable claims about ONE from-scratch CLIF-native model**, each with a
+  pre-specified test that can fail:
+  1. **Threshold-aligned tokenization** — bin edges at clinical decision thresholds, shared with
+     the training objective, improve prediction and calibration at those thresholds. Rejected if
+     deciles match the primary arm within the interval on the on-edge thresholds, or the gain
+     disappears at matched bin count.
+  2. **Combined time-to-event objective** beats next-token training at equal compute. Rejected if
+     next-token with a linear probe, or generated rollouts, match it on discrimination and calibration.
+  3. **Extubation application** — with the post-extubation device token injected at the real
+     extubation, the model reproduces the randomized-trial pattern of who benefits from NIV and
+     HFNC at least as well as a classical emulation. The claim is agreement with the trials'
+     pattern, not proof of cause.
+- **Paper 2 = an externally validated extubation-failure risk model.** Site 3 validation belongs
+  to Paper 2. Per-device risks are exploratory; no device recommendation.
+- **Sites:** development on Site 1 + Site 2, trained together on the Site 2 L40 node; Site 3 is
+  external validation now, by model-to-data; a fourth CLIF site joins later and is not active scope.
+- **Extubation study:** one foundation model, separate downstream study (trunk reused unchanged).
+  The decision is the device at the actual extubation, not extubation timing. Reintubation is read
+  from a dedicated study head; respiratory support stays input-only (hard rule 1 + its scoped
+  amendment). A go/no-go design audit comes first; Site 1 is exploratory, Site 2 confirmatory.
+  "Best" device = lowest predicted 7-day reintubation or death. Estimation = injected-token head
+  plus a doubly robust cross-check on the frozen model state, each compared with a classical
+  emulation. Rollouts are descriptive only. The device-choice (propensity) model is an estimator
+  nuisance, never a model target. No reward-based post-training.
+- **Reported, not headline:** event order vs admission-relative time positions; language-grounded
+  codes vs the frozen vocabulary; model size at about 3M / 10M / 30M (the reported size is the
+  measured one); the CLIFATRON 0.5B checkpoint as a larger frozen comparator when available.
+- A null result on any claim is reported as such. Still NOT a new method (§A1).
 
 ## PIVOT 2026-08-27 — build ON CLIFATRON (see notes/INTEGRATION.md)
 > **⚠️ HISTORICAL — partly superseded.** The "SUPERSEDED = our encoder.py + tokenize.py" line below was
@@ -33,6 +67,12 @@ on cost/calibration, on their own benchmark.
 > **⚠️ HISTORICAL.** Binning reversed 2026-09-02 (clinical segments primary, deciles = ablation — §E1a);
 > from-scratch backbone settled as Qwen2-arch 2026-09-07 (§B). The tokenizer as built is specified in
 > `website/docs/data-tokenization.md`. Bullets below are the 2026-08-27 record, not current truth.
+> **Citation corrections 2026-10-03** (`notes/ai-novelty-audit.md` §6) — three figures in the bullets
+> below do not match the retrieved sources: (1) ORA "+33-38% on physiology tasks" — the source gives
+> 10.7% (Transformer) and 11.4% (Mamba) average gains over next-token across 14 tasks; (2) "untied
+> +4-7% AUPRC, gap widens under federation" — **unverified**, the cited medRxiv 2026.04.24.26351503 is
+> an LLM-vs-clinical-foundation-model comparison and the claim could not be confirmed there; (3) soft
+> discretization "wins the dangerous tails" (Lee) — a point-estimate result from unfused arms only.
 Five-thread deep research + 2 focused 2026-preprint threads (tokenization a76bb9 / architecture aeb4d2) → these changes:
 - **Tokenizer:** FUSED single token `concept=bin` (settled: Lee 0.891→0.915, Guo 73/74 tasks −39.5% FLOPs);
   DECILE bins frozen from reference site (NOT clinical bins — Lee: no gain from ref-range anchoring);
@@ -67,6 +107,11 @@ Five-thread deep research + 2 focused 2026-preprint threads (tokenization a76bb9
 - **Cadence** (medRxiv 2026) — small-beats-big; temperature scaling; dual-sex TRIPOD+AI reporting.
 
 ## Sites & federated design (2026-08-27) — DEVELOP on 3, VALIDATE on the whole CLIF federation
+> **⚠️ SITE ROLES REVISED 2026-10-03 — see THREE-CLAIM FRAMING above.** Development = Site 1 + Site 2;
+> Site 3 = external validation by model-to-data (Paper 2); other consortium sites later. The
+> model-to-data rules below (aggregates only, nothing raw leaves a node, auto-derived labels as a
+> validity dependency) are unchanged. The 3×3 internal matrix and the N-site headline figure are the
+> 2026-08-27 record, not current scope.
 DEVELOPMENT cohort (data we hold): Site 1 + Site 2 + Site 3. EXTERNAL VALIDATION:
 ALL OTHER CLIF consortium sites via model-to-data — ship the frozen model + a turnkey clifpy/
 tokenETL eval script; each site runs it on its LOCAL CLIF tables and returns ONLY aggregate
@@ -88,7 +133,10 @@ metrics. No raw data, labels, or gradients ever leave any node. This IS the thes
   `src/eval/clif_auto_labeler.py → derive_outcome_states`). Each is a `{concept, direction, threshold,
   horizon}` crossing, aligning outcomes with the threshold-hazard head's zero-shot query. **Treatments
   (IMV, vasopressors) are NOT outcomes — inputs only (Rule 1); `tests/test_data_config.py` asserts it.
-  Mortality enters only as the competing-risk death event.** Roadmap: add more organ-failure cutpoints
+  Mortality enters only as the competing-risk death event.** (2026-10-03: this holds for the trunk and
+  the `outcomes` contract. Extubation study endpoints — reintubation, death, the composite — are
+  label-only declarations in `configs/cohort.yaml → study_endpoints`, never trunk targets.)
+  Roadmap: add more organ-failure cutpoints
   (creatinine/KDIGO, bilirubin, platelets) as coverage allows. These derived labels are noisy phenotypes
   that vary by site coding; report each outcome's definition + provenance alongside its metrics.
 - **Vocab:** frozen mCIDE-concept fused vocab built once by `src/data/tokenize.py` on the Site 1 train
@@ -121,7 +169,12 @@ clinical bins are NOT how you achieve it. CORRECTED tokenization decision (SUPER
   DIRECTIONAL (crossing into danger); eval headline = net benefit/DCA (clinical good/bad, not just AUROC).
 
 ## Hard rules (do not violate) — numbering matches AGENTS.md
-1. Treatments = model inputs, NEVER prediction targets.
+1. Treatments are model inputs, NEVER prediction targets of the trunk. Scoped amendment (2026-10-03):
+   study heads downstream of the frozen trunk may use trial endpoints defined by a treatment event
+   (for example reintubation) as labels; the trunk itself never trains on treatment targets, and such
+   endpoints must be declared label-only study endpoints. Declared in `configs/cohort.yaml →
+   study_endpoints` (never under `outcomes`, whose hash binds every vocabulary and bundle); enforced
+   by `tests/test_data_config.py`. *(Was: "Treatments = model inputs, NEVER prediction targets.")*
 2. Vocab = frozen mCIDE-concept vocab (built once on the reference site, hash-verified), applied
    identically to all sites — no cross-site pooling of raw data.
 3. Retrospective reports/discharge summaries = LABEL source only; only pre-anchor notes may be features.
@@ -144,11 +197,18 @@ These resolve every open design question as of this date. Change only with new e
   which is the stronger axis for a Nature-Medicine clinical framing. Do NOT claim method invention.
   (2026-08-28: "first-mover" replaced by "open tooling" as the middle pillar — the timing window closed; the
   priority claim in bold above is retained.)
+  (2026-10-03: the priority claim is superseded AS THE HEADLINE by the three-claim framing — §A3. Generic
+  and federated CLIF GEMs and a CLIF tokenization benchmark are published (Burkhart 2026, arXiv 2608.02939;
+  Lee 2026, arXiv 2604.16775), so the AI contribution has to lead. "NOT a new method" is unchanged.)
 - A2. The `clif-validate/` open shippable package is the deliverable that distinguishes us from DUA-gated
   ICareFM — treat it as a headline artifact, not plumbing. **2026-08-28 — what "open" means:** the package,
   its source, and its bundle-compatibility contract are publicly obtainable with NO DUA and NO per-site
   approval; trained-weight bundles stay signed and governed. Without the first half the differentiator does
   not exist, because a signed, approval-gated distribution channel is operationally what ICareFM already has.
+- A3. **Three-claim framing (LOCKED 2026-10-03)** — the THREE-CLAIM FRAMING section above is the locked
+  text: Paper 1 = three falsifiable claims about one from-scratch model; Paper 2 = the externally
+  validated extubation-failure risk model. What is ours = the pairing of published components, the
+  controlled tests, and the CLIF-native execution.
 
 **B. Backbone & pretraining (LOCKED)**
 - B1. Backbone = Qwen-family transformer; it is a **footnote, not novelty** (ORA: objective>backbone,
@@ -162,11 +222,15 @@ These resolve every open design question as of this date. Change only with new e
   no upstream dependency.** Run it as a LADDER: (1) frozen-probe Method-3 wedge on a CLIFATRON Qwen2 ckpt
   (cheap, de-risks the objective, first result) → (2) from-scratch Qwen2-arch pretrain (novel headline) →
   (3) the two together ARE the finetune-vs-scratch ablation.
+  *(2026-10-03: the three claims are tested on the from-scratch model. The wedge is the larger frozen
+  comparator row, reported when a checkpoint is available; it does not gate the claims.)*
 
 **C. Size coherence (LOCKED)**
 - C1. Our own model genuinely targets **~30M** (d512×8L×8H ≈ 30–37M) — that is the compact/one-node thesis.
   When we attach to CLIFATRON's **Qwen2-0.5B** for the wedge, state explicitly it is a LARGER comparator,
   not our compact claim. Never imply the 0.5B is "our ~30M model." (Fixes the 16× coherence gap.)
+  *(2026-10-03: the primary arm is also trained at about 3M and 10M; the reported size is the measured
+  one, not the design target.)*
 
 **D. Objective (LOCKED — where the novelty lives)**
 - D1. Loss weights CR 1.0 · threshold 1.0 · value 0.5 · NTP 0.2 (in code). D2. NTP→TTE curriculum
@@ -180,8 +244,10 @@ These resolve every open design question as of this date. Change only with new e
 - E1. Fused `code=bin`, soft discretization, forced clinical-threshold edges, storetime ordering,
   untied embeddings, 8192 context.
 - **E1a. PRIMARY binning = physician-designed CLINICAL SEGMENTS (revised 2026-09-02).** The CLIF
-  consortium's `critical_illness_tokenization_final_with_intervals.csv` (1268 clinician-designed
-  segments across labs/vitals) is the default (`configs/data.yaml → value_binning.scheme:
+  consortium's `critical_illness_tokenization_final_with_intervals.csv` (1267 clinician-designed
+  segment rows, 92 measurements, across labs / vitals / medications / respiratory support; count
+  corrected 2026-10-03 from "1268", which included the header line) is the default
+  (`configs/data.yaml → value_binning.scheme:
   clinical_segment`; `src/data/tokenize.py::build_clinical_segment_bins`). These encode measurement-density
   granularity — tighter intervals in decision zones, extreme-value quintiles at the tails — that
   the team judges **more clinically relevant** than data-driven deciles, and it is what differentiates
@@ -217,6 +283,8 @@ These resolve every open design question as of this date. Change only with new e
   language-grounded recovers 97.1% AUROC without vocab mapping. Frozen mCIDE stays PRIMARY (turnkey, matches
   CLIFATRON); TextCode is the ablation that shows whether language-grounding buys cross-site robustness — the
   one 2026 result that helps OUR federation metric.
+  *(2026-10-03: reported as an ablation, not a headline claim. PORTER's 69% was on an unharmonized
+  transfer; under mCIDE harmonization the question is whether language grounding adds anything.)*
 
 **F. Federation (LOCKED)**
 - F1. Model-to-data, aggregate + subgroup metrics only, nothing raw leaves a node (settled).
@@ -229,6 +297,18 @@ These resolve every open design question as of this date. Change only with new e
 - G1. Locate a CLIFATRON checkpoint (needed for the Method-3 wedge). G2. Site 2 + Site 3 data not staged
   on the L40 box (only Site 1: 546,028 stays / ~134M events) — the 3-site claim needs them. G3. Verify
   `head_adapter.anchor_state` against a real checkpoint on transformers v5 (output_hidden_states API drift).
+- **Revised 2026-10-03** (plan `docs/plans/2026-10-03-0845-feat-icu-gem-rct-recovery-plan.md`):
+  - G1: the checkpoint is needed only for the larger-comparator row; it does not gate the three claims.
+  - G2: **Site 2 data not staged on the L40 box** — still open; claim 3 is confirmed at Site 2. Site 3 is
+    external validation by model-to-data and is not staged there (supersedes "Site 2 + Site 3").
+  - **Training-readiness fixes from the 2026-10-03 audit — IN PROGRESS under the plan:** the multi-GPU
+    (DDP) crash when a head is skipped, the full-hospitalization loader, curriculum wiring, and the
+    threshold-head time grid. No base checkpoint exists until they land.
+  - **Written approval to transfer Site 2-derived weights to Site 3 not yet obtained** (project-status
+    gate G5, transfer approval — not this section's numbering).
+  - **`clif-validate` is not partner-ready** for the Site 3 run.
+  - **Site 1 calendar period is not evaluable** without the MIMIC-IV `anchor_year_group` table (dates are
+    shifted per patient); the by-unit table is unaffected.
 
 > **Site ID mapping (public docs use these IDs):** Site 1 = MIMIC-IV-Ext-CLIF (PhysioNet), Site 2 = Rush
 > (institutional), Site 3 = UChicago (institutional, CLIF origin site). Website docs refer to sites by
@@ -240,6 +320,19 @@ Full agent-handoff written: finalized token+arch decisions (with the 2026 eviden
 from research threads a76bb9/aeb4d2), ordered file-level next steps (config↔code reconcile → run Method-3
 on real ckpt → phase-2 head pretrain → tokenization ablation → clif-validate/ → notes modality), open
 items to verify, hard rules, env mechanics. A fresh agent should read notes/NEXT_STEPS.md first.
+
+## Status (2026-10-03)
+Supersedes the NEXT list of the 2026-09-26 status below; the rest of that status stands as the record.
+- **Three-claim framing locked** (section above); plan
+  `docs/plans/2026-10-03-0845-feat-icu-gem-rct-recovery-plan.md` is in implementation.
+- **Hard rule 1 scoped amendment recorded** in AGENTS.md, here, `configs/cohort.yaml → study_endpoints`
+  and `tests/test_data_config.py`. The `outcomes` block and its `outcome_spec` hash are unchanged.
+- **GEM plan unit G6 superseded** by the plan above; its gate on reward-based post-training (G5) is
+  dropped — no reward-based post-training. `docs/plans/l40-g2-runbook.md` is superseded by
+  `docs/plans/l40-runbook.md`.
+NEXT: (1) land the training-readiness fixes, then the first L40 base run per `docs/plans/l40-runbook.md`.
+(2) Extubation design audit on Site 1 (classical estimator only) before registration. (3) Stage Site 2
+on the L40 box. (4) Transfer approval and `clif-validate` partner readiness for the Site 3 run.
 
 ## Status (2026-09-26)
 Supersedes the 2026-08-27 status (wedge built; that detail lives in git history and the U-charter).

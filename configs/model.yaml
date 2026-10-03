@@ -19,7 +19,11 @@ trunk:
   rope_base: 10000.0
   rope_position: "admission_minutes"   # {admission_minutes | token_index(ablation)}
   rope_time_alibi: false               # optional log-Δt ALiBi bias for severe irregular sampling (HealthFormer)
-  # Untied emb beat tied by +4-7% AUPRC, gap WIDENS under federation (medRxiv 2026.04.24, 31.6M GPT).
+  # UNVERIFIED (2026-10-03, notes/ai-novelty-audit.md §6): an earlier comment here said untied
+  # embeddings beat tied by +4-7% AUPRC, with the gap widening under federation, and cited
+  # medRxiv 2026.04.24.26351503. The retrieved paper is an LLM-vs-clinical-foundation-model
+  # comparison and the claim could not be confirmed there. Untied stays the locked choice
+  # (MEMORY.md §E1); the size of any gain is unmeasured.
   # BUDGET TENSION: untied + large vocab blows the ~30M budget. At untied, vocab*d*2 lives in the
   # embedding tables — so cap fused vocab ~8-12k (untied => ~8-12M emb + ~25M trunk ~= 33-37M).
   # A ~30k vocab would force tied. Chosen: untied + ~10k vocab.
@@ -43,7 +47,9 @@ heads:
     direction_embed: true           # learned direction (above/below) embedding
     threshold_embed_dim: 32         # learned threshold embedding
   # (D) value regression — the ORA "mark" (arXiv:2602.00541). NOW ENABLED:
-  #     predicting the continuous value lifts physiology/regression tasks +33-38% vs NTP.
+  #     ORA reports marked time-to-event beating NTP by 10.7% (Transformer) and 11.4% (Mamba)
+  #     on average over 14 tasks. (Corrected 2026-10-03: the earlier "+33-38% vs NTP" here did
+  #     not match the source — notes/ai-novelty-audit.md §6.)
   value_regression: {enabled: true, weight: 0.5}
 
 # Multi-task loss balancing (RESEARCH.md §3): uncertainty (Kendall 1/2σ²) + grad-norm,

@@ -1,5 +1,13 @@
 # L40 G2 runbook — pure-NTP GEM base pretraining on the full MIMIC restage
 
+> **Superseded 2026-10-03 — use `docs/plans/l40-runbook.md`** (written under
+> `docs/plans/2026-10-03-0845-feat-icu-gem-rct-recovery-plan.md`, unit U19). This runbook
+> describes the pure-NTP base run and predates tokenizer v2 (2026-10-02), the
+> full-hospitalization training path, the combined time-to-event objective and the
+> training-readiness fixes from the 2026-10-03 audit. Tokenizer v2 rejects every v1 artifact
+> and checkpoint, including the ones this runbook's numbers came from. It is kept as the
+> 2026-09-26 record. Do not launch an L40 run from it.
+
 Everything below was proven on the Mac (MPS) against the staged 64.9k-stay MIMIC
 extract on 2026-09-26 (see `gem-overnight-log.md` for the full dated record and
 the numbers to beat). This is the operational handoff for `rudu-hpcg004`

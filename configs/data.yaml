@@ -227,8 +227,9 @@ unit_normalization:
 
 value_binning:
   # PRIMARY SCHEME: physician-designed clinical-segment bins with measurement-density
-  # granularity (critical_illness_tokenization_final_with_intervals.csv, 1268 segments
-  # across labs/vitals). These bins were designed by CLIF consortium clinicians who defined
+  # granularity (critical_illness_tokenization_final_with_intervals.csv, 1267 segment rows,
+  # 92 measurements across labs, vitals, medications and respiratory support). These bins
+  # were designed by CLIF consortium clinicians who defined
   # both the clinical thresholds AND the sub-segment density: tighter intervals in decision
   # zones, wider above/below ranges, and extreme-value quintiles at the tails.
   # THIS is the default — it encodes clinical domain expertise that data-driven binning

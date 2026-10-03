@@ -4,7 +4,8 @@
 # configs/model.yaml heads.*.weight objective weights. Only the input representation varies.
 # Primary scheme is physician clinical segments + soft discretization (MEMORY.md §E1a, revised
 # 2026-09-02); see website/docs/data-tokenization.md §9.
-# Evidence: Lee 2026 (arxiv:2604.16775) — deciles+soft wins tails; McCann 2026
+# Evidence: Lee 2026 (arxiv:2604.16775) — soft discretization helped on selected tail outcomes
+# as a point estimate, in UNFUSED arms only (fused + soft was not tested); McCann 2026
 # (medRxiv 2026.08.04) — continuous-fused better numeric, worse calibration;
 # Al Attrach 2025 (arxiv:2512.05217) — frozen text encoders beat trainable.
 #
@@ -90,8 +91,11 @@ arms:
     total_steps: 20000
     tags: [tokenization, decile, lee-2026]
 
-  # (4) Deciles + soft discretization — Lee's best encoder on dangerous tails. Same shard as (3).
-  # Wins on severe hypokalemia / hypernatremia / hypotension / CRRT / K-extremes.
+  # (4) Deciles + soft discretization. Same shard as (3).
+  # Lee 2026: ahead on selected tail outcomes (severe hypokalemia / hypernatremia / hypotension /
+  # CRRT / K-extremes) as a point estimate, from unfused arms only — not a tested result for
+  # fused tokens. (Corrected 2026-10-03 from "Lee's best encoder on dangerous tails. Wins on ...";
+  # notes/ai-novelty-audit.md §6.)
   deciles_plus_soft:
     description: "Deciles with soft discretization (kernel=1) + forced clinical edges"
     scheme: decile_ablation
@@ -153,12 +157,15 @@ report:
     note: "Compare ECE, Brier, slope, ICI across arms. McCann predicts continuous-fused loses here."
     metrics: [ece, brier, calib_slope, ici]
   tail_sensitivity:
+    # Corrected reading (2026-10-03): Lee's tail result is a point estimate from unfused arms only.
+    # The note string below is a config value and is left as written.
     note: "Lee predicts deciles+soft wins dangerous tails (severe hypotension, hyperlactatemia, hypoxemia)."
     outcomes: [map_below_65_48h, lactate_above_4_48h, spo2_below_88_48h]
   evidence_table:
     clinical_soft: "Physician clinical segments + soft discretization (primary; MEMORY.md §E1a)"
     clinical_hard: "CLIFATRON vendor — physician clinical-segment bins, hard"
     global_deciles: "Lee 2026 arxiv:2604.16775 — deciles ≈ clinical at matched granularity"
+    # deciles_plus_soft: same correction — point estimate, unfused arms only (value left as written).
     deciles_plus_soft: "Lee 2026 — soft discretization wins dangerous tails"
     continuous_fused: "McCann 2026 medRxiv 2026.08.04 — +30% numeric, worse calibration"
     textcode: "Al Attrach 2025 arxiv:2512.05217 — frozen encoders beat trainable"

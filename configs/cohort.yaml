@@ -77,6 +77,42 @@ treatment_sources:
   - adt
 treatment_target_policy: context_only
 
+# Hard rule #1, scoped amendment (2026-10-03): the trunk never trains on treatment
+# targets, so nothing here may appear under `outcomes` or in a trunk task list. Study
+# heads downstream of the frozen trunk may use trial endpoints defined by a treatment
+# event as labels; each such endpoint is declared here as `use: label_only`.
+# This block is outside `outcomes` on purpose: tokenize.py hashes `outcomes` into every
+# vocabulary and bundle (`outcome_spec`), and that hash must not change.
+# Enforced by tests/test_data_config.py (TreatmentTargetRuleTest).
+study_endpoints:
+  reintubation_72h:
+    study: extubation
+    use: label_only
+    source: resp_support          # read as a label source only; stays input-only for the trunk
+    event: reintubation           # return to invasive ventilation after time zero
+    time_zero: extubation
+    horizon_hours: 72
+  reintubation_7d:
+    study: extubation
+    use: label_only
+    source: resp_support
+    event: reintubation
+    time_zero: extubation
+    horizon_hours: 168
+  death_7d:
+    study: extubation
+    use: label_only
+    source: patient               # death timestamp; discharge category from hospitalization
+    event: death
+    time_zero: extubation
+    horizon_hours: 168
+  reintubation_or_death_7d:       # primary study outcome; death competes with reintubation
+    study: extubation
+    use: label_only
+    composite_of: [reintubation_7d, death_7d]
+    time_zero: extubation
+    horizon_hours: 168
+
 prerequisites:
   data_qa:
     owner: site_data_lead
