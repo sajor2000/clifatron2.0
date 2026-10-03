@@ -6,7 +6,8 @@ timestamp hangs off an arbitrary base date in 2031.
 
 Public shape
 ------------
-``build_extubation_fixture(n_background=300, seed=20261003) -> ExtubationFixture``
+``build_extubation_fixture(n_background=300, seed=20261003, *, outcome_scenarios=False)
+-> ExtubationFixture``
 
 ``ExtubationFixture`` fields:
 
@@ -78,6 +79,32 @@ Scenario patients (hours are since that patient's admission; IMV rows every 4 h)
   time zero 40).
 - ``copd_history``: an earlier hospitalization coded J449 and I5022.
 - ``index_code_only``: no earlier hospitalization; the index stay is coded I5022.
+
+Outcome scenario patients (only with ``outcome_scenarios=True``; added after the
+background, so the default fixture is unchanged). Each is ventilated 2-40 and extubated
+to Nasal Cannula at 40 (time zero), full code, discharged Home at 300 unless stated.
+------------------------------------------------------------------------------
+- ``out_reintubated_80h``: IMV again from 120 (80 h after time zero).
+- ``out_reintubated_72h``: IMV again from 112 (exactly 72 h after time zero).
+- ``out_death_day3``: dies in hospital at 100 (60 h), discharge Expired.
+- ``out_discharged_day2_died_day5``: discharged Home at 88 (48 h), death timestamp at
+  160 (120 h).
+- ``out_discharged_day2_alive``: discharged Home at 88 (48 h), no death timestamp.
+- ``out_discharge_unknown``: discharge category Missing at 88 (48 h).
+- ``out_niv_day1``: NIPPV at 60 and 64, High Flow NC at 68, Nasal Cannula at 72; never
+  back on IMV.
+- ``out_reintubated_then_died``: IMV again 70-100 (30 h), dies at 130 (90 h), Expired.
+- ``out_reintubated_at_death``: one IMV row at 90, the instant of death (50 h), Expired.
+- ``out_hospice_day3``: discharged to Hospice at 100 (60 h), death timestamp at 140.
+- ``out_died_10h``: dies at 50 (10 h), Expired, never back on IMV.
+- ``out_reintubated_died_20h``: IMV again 46-60 (6 h), dies at 60 (20 h), Expired.
+- ``out_trach_collar_day3``: Trach Collar with the tracheostomy flag at 100 (60 h); no
+  IMV row after time zero.
+- ``out_reintubated_via_trach``: IMV again 90-120 (50 h) with the tracheostomy flag set.
+- ``out_expired_no_timestamp``: discharge Expired at 100 (60 h), no death timestamp.
+- ``out_death_date_floor``: discharged Home at 88 (48 h); death timestamp at 80 (a
+  day-resolution timestamp floored to before the discharge).
+- ``out_charted_after_discharge``: discharge recorded at 39.75, before the time-zero row.
 
 Background patients (``n_background``) -- the planted structure
 ----------------------------------------------------------------
@@ -414,6 +441,69 @@ def _add_scenarios(b: _Builder) -> list[str]:
     return list(b.origin)
 
 
+def _add_outcome_scenarios(b: _Builder) -> list[str]:
+    """Hand-built outcome patients for the label tests; time zero is hour 40 for each."""
+    before = set(b.origin)
+
+    def extubated(name: str, **stay) -> None:
+        _scenario(b, name, **stay)
+        b.device(name, 40, "Nasal Cannula")
+
+    extubated("out_reintubated_80h")
+    b.ventilate("out_reintubated_80h", 120, 150)
+
+    extubated("out_reintubated_72h")
+    b.ventilate("out_reintubated_72h", 112, 140)
+
+    extubated("out_death_day3", los=100, discharge="Expired")
+    b.death("out_death_day3", 100)
+
+    extubated("out_discharged_day2_died_day5", los=88)
+    b.death("out_discharged_day2_died_day5", 160)
+
+    extubated("out_discharged_day2_alive", los=88)
+
+    extubated("out_discharge_unknown", los=88, discharge="Missing")
+
+    extubated("out_niv_day1")
+    b.device("out_niv_day1", 60, "NIPPV")
+    b.device("out_niv_day1", 64, "NIPPV")
+    b.device("out_niv_day1", 68, "High Flow NC")
+    b.device("out_niv_day1", 72, "Nasal Cannula")
+
+    extubated("out_reintubated_then_died", los=130, discharge="Expired")
+    b.ventilate("out_reintubated_then_died", 70, 100)
+    b.death("out_reintubated_then_died", 130)
+
+    extubated("out_reintubated_at_death", los=90, discharge="Expired")
+    b.device("out_reintubated_at_death", 90, "IMV")
+    b.death("out_reintubated_at_death", 90)
+
+    extubated("out_hospice_day3", los=100, discharge="Hospice")
+    b.death("out_hospice_day3", 140)
+
+    extubated("out_died_10h", los=50, discharge="Expired")
+    b.death("out_died_10h", 50)
+
+    extubated("out_reintubated_died_20h", los=60, discharge="Expired")
+    b.ventilate("out_reintubated_died_20h", 46, 60)
+    b.death("out_reintubated_died_20h", 60)
+
+    extubated("out_trach_collar_day3")
+    b.device("out_trach_collar_day3", 100, "Trach Collar", trach=True)
+
+    extubated("out_reintubated_via_trach")
+    b.ventilate("out_reintubated_via_trach", 90, 120, trach_from=90)
+
+    extubated("out_expired_no_timestamp", los=100, discharge="Expired")
+
+    extubated("out_death_date_floor", los=88)
+    b.death("out_death_date_floor", 80)
+
+    extubated("out_charted_after_discharge", los=39.75)
+    return [name for name in b.origin if name not in before]
+
+
 def _sigmoid(x: float) -> float:
     return 1.0 / (1.0 + math.exp(-x))
 
@@ -536,10 +626,14 @@ def episode_artifact(tables: dict[str, pl.DataFrame]) -> pl.DataFrame:
     )
 
 
-def build_extubation_fixture(n_background: int = 300, seed: int = 20261003) -> ExtubationFixture:
+def build_extubation_fixture(n_background: int = 300, seed: int = 20261003, *,
+                             outcome_scenarios: bool = False) -> ExtubationFixture:
     builder = _Builder()
     names = _add_scenarios(builder)
     truth = _add_background(builder, n_background, random.Random(seed))
+    if outcome_scenarios:
+        # After the background, so no existing patient's rows or admission time move.
+        names += _add_outcome_scenarios(builder)
     tables = builder.frames()
     return ExtubationFixture(
         tables=tables,
