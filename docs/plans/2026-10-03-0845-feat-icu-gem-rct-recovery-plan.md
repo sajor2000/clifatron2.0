@@ -11,6 +11,8 @@ execution: code
 
 # CLIFATRON 2.0 Three-Claim Paper and Extubation Risk Model - Plan
 
+> **Revision 2026-10-03 (product authority):** the goal was re-confirmed — see the "GOAL RE-CONFIRMED" section of `AGENTS.md`. Claim 3 is now the injected-device check against the trial *pattern* with a classical comparison and negative controls as the only safeguards; the registered agreement-margin rubric (R10, R25, R27, R29, R32 stop rules) is frozen as optional and off the critical path. Paper 2 = extubation-failure risk plus exploratory per-device risks. Context stays at 8,192 tokens. Clinical decisions: `docs/decisions/2026-10-03-clinical-decisions.md`.
+
 ## Goal Capsule
 
 - **Objective:** ICU researchers have an open, CLIF-native ICU foundation model whose AI contribution is shown by tests that could have failed: what threshold-aligned tokenization adds, what the combined time-to-event training objective adds, and whether the model, with the device injected at extubation, reproduces what randomized trials established about who benefits from high-flow nasal cannula (HFNC) and noninvasive ventilation (NIV). A second, clinical paper gives an externally validated extubation-failure risk model. Everything is evaluated retrospectively; a clinician-facing tool is not part of this work.

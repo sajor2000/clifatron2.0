@@ -11,6 +11,41 @@ time-to-event** objective. Thesis: one small model → many outcomes → many
 hospitals → one node (2× L40, no cluster). Nature-Medicine framing: efficiency +
 federated-fairness + CLIF-native + deployable multimodal SLM.
 
+## GOAL RE-CONFIRMED 2026-10-03 (product authority) — read this first
+
+**Why we train the foundation model:** one CLIF-native model, trained once on whole
+hospitalizations, that predicts many ICU outcomes better than hand-built features and transfers
+to other hospitals. The AI contribution is Paper 1, claims 1–2 (threshold-aligned tokenization;
+the combined time-to-event objective vs next-token at equal compute), tested on the CLIF task
+suite and zero-shot threshold questions, with external validation. This is the reason the model
+exists; it does not depend on any RCT statistics.
+
+**What we do with it for extubation (Paper 2, built on the frozen trunk):**
+1. **Failure risk at extubation** — calibrated 7-day reintubation-or-death risk from the full
+   pre-extubation trajectory, placed on the ATS guideline low/high-risk axis. It must beat the
+   guideline rule, the trial risk-factor count, a published score and gradient boosting;
+   externally validated at UChicago.
+2. **Injected-device risk** — cut the history at extubation, inject one device token (NIV, HFNC,
+   nasal cannula / conventional O2), read the 7-day risk under each: "patients like this one do
+   worse on nasal cannula than on NIV". Checked against the trial pattern (NIV's advantage over
+   HFNC grows with baseline risk; HFNC beats conventional O2 in low-risk; NIV in hypercapnic).
+3. **Safeguards only:** a classical confounding-adjusted comparison on the same patients and a few
+   negative controls. The registered agreement-margin rubric (margins, pooling, feasibility
+   floor, stop rules) is **frozen as optional** — code kept, off the critical path
+   (pooled-margin work saved at `output/patches/pooled-margins-wip.patch`, local only).
+4. **No device recommendation.** Per-device risks stay exploratory. Rollouts are illustrations,
+   never evidence.
+
+**Context length:** stay at 8,192 tokens (97% of MIMIC hospitalizations and 98.8% of
+pre-extubation histories fit; ICU literature shows no gain past 8K — METHOD peaks near 3–6K,
+Wornow 2025 8K→16K within noise). Long stays use continuation windows with the admission header
+re-inserted; RoPE base raised for minute positions; per-site context-length report at
+pre-flight; a 4K-vs-8K inference check after training. Revisit 16K only if Rush is much denser.
+
+Clinical decisions: `docs/decisions/2026-10-03-clinical-decisions.md`.
+
+---
+
 ## THREE-CLAIM FRAMING — LOCKED 2026-10-03 (current headline)
 Plan: `docs/plans/2026-10-03-0845-feat-icu-gem-rct-recovery-plan.md`. Evidence:
 `notes/ai-novelty-audit.md`, `notes/extubation-evidence-review.md`. This is the current framing;
