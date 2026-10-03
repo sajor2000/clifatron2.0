@@ -16,6 +16,6 @@
   "src/eval/synthetic_bundle.py": "7fef07d126bb06035e0a01c00c7625a5316bee49eb0f3a3313e35c7eb027a156",
   "src/eval/trust.py": "ca206619aa6e019f90e957e99b265f984aa3a1a585f0a8ac8d760d9ce9807325",
   "src/model/head_adapter.py": "5e6af9605fff448d847b519677cb4c3f536153336629bedb4e4779e74290dc18",
-  "src/model/heads.py": "e84ca829b9614c739d7a34c5c1684f850127d695d2bb433cd75ec660ba35f706",
+  "src/model/heads.py": "0dbec228fb840a6ffe186939388fcaee79251d63bf23ee05d2551f3dd4e7ae28",
   "src/model/varlen_attention.py": "60cf5cf782f6500472c51644f9132b2f97a2754f51b1795cc4cce3e7d5a086d6"
 }

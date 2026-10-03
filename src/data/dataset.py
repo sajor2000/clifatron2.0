@@ -10,6 +10,16 @@ source spans, consistent continuation flags); next-event targets are built ONCE 
 whole stay by a `TargetBuilder(mode="gem")` and sliced per window — the packed-segment
 contract — so a window's last eligible event still predicts the first eligible event
 of the next window. GEM samples carry no TTE labels.
+
+With `TargetBuilder(mode="gem_tte")` (U3, KTD1) the same windows also carry in-stream
+time-to-event labels: anchors are sampled and labelled on the whole stay, so a label
+uses events from later windows, and each window keeps the anchors that fall inside it.
+
+ANCHORS. Every segment that can be supervised lists its anchors under ``"anchors"``:
+``{"offset": position in the packed row, "cr": competing-risk label or None,
+"queries": [threshold query, ...]}`` with label times in minutes since the anchor
+(`TargetBuilder._sample_anchors` / `outcome_anchor`). The 24 h representations have one
+anchor per episode; ``gem_tte`` windows have several; ``gem`` windows have no such key.
 """
 
 from __future__ import annotations
@@ -26,7 +36,7 @@ from torch.utils.data import DataLoader, Dataset, Sampler
 import logging
 
 from src.data.segments import RETOKENIZE, TOKENIZER_VERSION
-from src.data.targets import TargetBuilder, TargetContractError
+from src.data.targets import GEM_MODES, TargetBuilder, TargetContractError
 from src.data.tokenize_continuous import normalize_value
 
 try:
@@ -59,9 +69,10 @@ class ModelDataset(Dataset):
             raise ValueError("representation must be 'decile', 'clifatron_packed' or 'gem'")
         if value_channel and representation != "decile":
             raise ValueError("the input value channel is defined for canonical shards only")
-        if (representation == "gem") != (getattr(target_builder, "mode", "icu_24h") == "gem"):
+        if (representation == "gem") != (getattr(target_builder, "mode", "icu_24h") in GEM_MODES):
             raise TargetContractError(
-                "the gem representation requires TargetBuilder(mode='gem'), and only it"
+                "the gem representation requires TargetBuilder(mode='gem') or "
+                "mode='gem_tte', and only those"
             )
         if isinstance(records, (str, Path)):
             records = pl.read_parquet(records).to_dicts()
@@ -72,8 +83,12 @@ class ModelDataset(Dataset):
         self.episode_targets = dict(episode_targets or {})
         self.epoch = int(epoch)
         self.value_channel = bool(value_channel)
+        in_stream = getattr(target_builder, "in_stream", None)
         for record in self.records:
             self._validate_hashes(record)
+            if in_stream is not None:
+                # The threshold grid's bins and token map are this vocabulary's (KTD3).
+                in_stream.grid.check_binding(record["artifact_hashes"], what="GEM shard row")
             is_gem = record.get("trajectory") == "hospitalization"
             if representation != "clifatron_packed" and is_gem != (representation == "gem"):
                 raise TargetContractError(
@@ -154,6 +169,10 @@ class ModelDataset(Dataset):
                     "anchor_offset": built["anchor_idx"],
                     "outcome_labels": built["outcome_labels"],
                     "threshold_query": built["threshold_query"],
+                    "anchors": [{
+                        "offset": built["anchor_idx"],
+                        **self.target_builder.outcome_anchor(record, built, epoch=self.epoch),
+                    }],
                 }
             ],
         }
@@ -202,6 +221,14 @@ class ModelDataset(Dataset):
         }
         for field in ("ntp_target", "ntp_mask", "ntp_delta_min", "value_target", "value_mask"):
             sample[field] = built[field][start:end]
+        if "anchors" in built:
+            # In-stream labels were computed on the whole stay; this window keeps the
+            # anchors sampled inside it.
+            sample["segments"][0]["anchors"] = [
+                {"offset": item["anchor_idx"] - start, "cr": item["cr"],
+                 "queries": item["queries"]}
+                for item in built["anchors"] if start <= item["anchor_idx"] < end
+            ]
         return sample
 
     def _packed_sample(self, record: dict[str, Any]) -> dict[str, Any]:
@@ -269,6 +296,11 @@ class ModelDataset(Dataset):
             segment["anchor_offset"] = packed_start + anchor - source_start if contains_anchor else None
             segment["outcome_labels"] = built["outcome_labels"] if contains_anchor else []
             segment["threshold_query"] = built["threshold_query"] if contains_anchor else None
+            segment["anchors"] = [{
+                "offset": segment["anchor_offset"],
+                **self.target_builder.outcome_anchor(self.episode_targets[key], built,
+                                                     epoch=self.epoch),
+            }] if contains_anchor else []
             output["segments"].append(segment)
         if not output["segments"]:
             raise TargetContractError("packed row contains no document segments")
@@ -326,6 +358,7 @@ def _gem_streams(
             "anchor_idx": None if anchor is None else int(anchor),
             "anchor_min": windows[0].get("anchor_min"),
             "outcomes": [],
+            "windows": [(int(w["source_start"]), int(w["source_end"])) for w in windows],
         }
         ordered.extend(windows)
     return ordered, streams

@@ -173,36 +173,39 @@ class TestTrainingEngine(unittest.TestCase):
         self.assertEqual(updates, 1)
 
     def test_prepare_batch_bridges_collate_output_to_model_contract(self):
-        batch = {
-            "input_ids": torch.tensor([[3, 4, 0]]),
-            "attention_mask": torch.tensor([[1, 1, 0]], dtype=torch.bool),
-            "anchor_idx": torch.tensor([1]),
-            "value_target": torch.tensor([[0.0, 1.5, 0.0]]),
-            "value_mask": torch.tensor([[False, True, False]]),
-            "document_labels": [[{
-                "tte_mask": True,
-                "event_cause": 2,
-                "event_bin": 4,
-                "observed_bins": 5,
-                "censored": False,
-            }]],
-            "threshold_queries": [{
-                "target_idx": 1,
-                "threshold_bin": 6,
-                "direction": 0,
-                "threshold_crossed_bin": 4,
-            }],
+        from src.data.collate import collate_model_samples
+        from src.data.dataset import ModelDataset
+        from src.data.targets import TargetBuilder
+
+        record = {
+            "episode_key": "stay-a",
+            "artifact_hashes": {"tokenizer_version": "2", "vocabulary": "v",
+                                "numeric_edges": "s"},
+            "token": [3, 4], "pos_min": [0, 30], "value": [None, 1.5],
+            "target_eligible": [True, True], "anchor_idx": 1, "anchor_min": 30,
+            "outcomes": [{"target_idx": 1, "status": "positive",
+                          "time_from_anchor_hours": 12.5, "threshold_bin": 6,
+                          "direction": "below"}],
         }
+        ds = ModelDataset([record], representation="decile",
+                          target_builder=TargetBuilder(16, 16, 48, {4: (1.0, 1.0)}),
+                          expected_hashes={})
+        batch = collate_model_samples([ds[0]])
         prepared = _prepare_batch(batch, self.dev)
         self.assertTrue(torch.equal(prepared["token"], batch["input_ids"]))
         self.assertTrue(torch.equal(prepared["last_idx"], batch["anchor_idx"]))
-        self.assertEqual(prepared["cr_type"].tolist(), [2])
-        self.assertEqual(prepared["cr_bin"].tolist(), [4])
-        self.assertEqual(prepared["th_target"].tolist(), [1])
-        self.assertEqual(prepared["th_tau"].tolist(), [6])
-        self.assertEqual(prepared["th_crossed"].tolist(), [4])
         self.assertTrue(torch.equal(prepared["value"], batch["value_target"]))
         self.assertTrue(torch.equal(prepared["val_mask"], batch["value_mask"]))
+        self.assertEqual(prepared["cr_type"].tolist(), [1])
+        self.assertEqual(prepared["th_target"].tolist(), [1])
+        self.assertEqual(prepared["th_tau"].tolist(), [6])
+        # KTD4: the engine passes label times through as minutes since the anchor and
+        # bins nothing; it used to hand the hourly threshold head a bin of the
+        # competing-risk grid (`th_crossed` 4 for this 12.5 h crossing).
+        self.assertEqual(prepared["cr_time_min"].tolist(), [750])
+        self.assertEqual(prepared["th_time_min"].tolist(), [750])
+        for binned in ("cr_bin", "th_crossed", "th_observed_bin"):
+            self.assertNotIn(binned, prepared)
 
     def test_load_decile_records_normalizes_tokenizer_output(self):
         import polars as pl
@@ -447,9 +450,13 @@ class SkippedHeadObjectiveTest(unittest.TestCase):
 
     # fp32 `pretrain.Model` losses on `synthetic_batch(11)`, model seed 0, captured on the
     # commit before the zero-valued touch term was added (torch 2.13.0).
+    # U3 (KTD4) then changed ONE number on purpose: the competing-risk loss of a censored
+    # sample no longer credits the partially observed bin (`full` cr was 1.809082, total
+    # 4.623174; batch 11 holds one censored sample). Event-only batches, and the ntp / th
+    # / val columns, are unchanged — see tests/test_cr_invariants.py.
     BASELINE_LOSSES = {
-        "full": {"ntp": 3.525213, "cr": 1.809082, "th": 1.886438, "val": 0.445222,
-                 "total": 4.623174},
+        "full": {"ntp": 3.525213, "cr": 0.920133, "th": 1.886438, "val": 0.445222,
+                 "total": 3.734225},
         "no_anchor": {"ntp": 3.525213, "cr": 0.0, "th": 0.0, "val": 0.445222,
                       "total": 0.927654},
         "tte_zero": {"ntp": 3.525213, "cr": 0.0, "th": 0.0, "val": 0.445222,
@@ -459,8 +466,10 @@ class SkippedHeadObjectiveTest(unittest.TestCase):
     }
     # Total loss over four AdamW (lr 1e-2, weight decay 0.1) steps on batches 0..3, same
     # commit. Every head is either supervised or skipped on EVERY step in these runs.
+    # `full` moved with the censored-credit fix above (batches 0-2 each hold a censored
+    # sample; it was [5.227314, 4.269813, 3.331987, 6.591049]).
     BASELINE_TRAJECTORIES = {
-        "full": [5.227314, 4.269813, 3.331987, 6.591049],
+        "full": [4.600975, 3.906291, 2.90259, 6.548203],
         "tte_zero": [0.804643, 1.152664, 1.010028, 0.84273],
         "all_heads_zero": [0.705037, 0.689857, 0.723751, 0.717308],
         "no_anchor": [0.804643, 1.152664, 1.010028, 0.84273],

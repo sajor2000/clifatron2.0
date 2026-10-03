@@ -126,6 +126,11 @@ def _get_step(opt) -> int:
 
 
 def _prepare_batch(batch: dict, dev) -> dict:
+    """Move a collated batch to `dev` and add the names `pretrain.Model` reads.
+
+    The per-anchor time-to-event tensors come from the collator as they are
+    (`src.data.collate`): label times stay MINUTES since the anchor, and each head bins
+    them on its own grid inside the model (KTD4). Nothing is binned here."""
     b = {}
     for k, v in batch.items():
         if isinstance(v, torch.Tensor):
@@ -140,58 +145,7 @@ def _prepare_batch(batch: dict, dev) -> dict:
         b["value"] = b["value_target"]
     if "val_mask" not in b and "value_mask" in b:
         b["val_mask"] = b["value_mask"]
-    if "cr_type" not in b and "document_labels" in b:
-        labels = [_select_tte_label(group) for group in b["document_labels"]]
-        b["cr_mask"] = torch.tensor([label is not None for label in labels], dtype=torch.bool, device=dev)
-        b["cr_type"] = torch.tensor(
-            [int(label["event_cause"]) if label is not None else -1 for label in labels],
-            dtype=torch.long,
-            device=dev,
-        )
-        b["cr_bin"] = torch.tensor(
-            [int(label["observed_bins"] if label.get("censored") or label.get("event_cause", -1) < 0 else label["event_bin"]) if label is not None else 0 for label in labels],
-            dtype=torch.long,
-            device=dev,
-        )
-    if "th_target" not in b and "threshold_queries" in b:
-        queries = b["threshold_queries"]
-        b["th_mask"] = torch.tensor([query is not None for query in queries], dtype=torch.bool, device=dev)
-        b["th_target"] = torch.tensor(
-            [int(query["target_idx"]) if query is not None else 0 for query in queries],
-            dtype=torch.long,
-            device=dev,
-        )
-        b["th_tau"] = torch.tensor(
-            [int(query["threshold_bin"]) if query is not None else 0 for query in queries],
-            dtype=torch.long,
-            device=dev,
-        )
-        b["th_dir"] = torch.tensor(
-            [int(query["direction"]) if query is not None else 0 for query in queries],
-            dtype=torch.long,
-            device=dev,
-        )
-        b["th_crossed"] = torch.tensor(
-            [int(query["threshold_crossed_bin"]) if query is not None else -1 for query in queries],
-            dtype=torch.long,
-            device=dev,
-        )
-        b["th_observed_bin"] = torch.tensor(
-            [int(query.get("observed_bins", 0)) if query is not None else 0 for query in queries],
-            dtype=torch.long,
-            device=dev,
-        )
     return b
-
-
-def _select_tte_label(group):
-    supervised = [label for label in group if label.get("tte_mask")]
-    events = [label for label in supervised if label.get("event_cause", -1) >= 0]
-    if events:
-        return min(events, key=lambda label: int(label.get("event_bin", label.get("observed_bins", 0))))
-    if supervised:
-        return max(supervised, key=lambda label: int(label.get("observed_bins", 0)))
-    return None
 
 
 def _restore_rng_states(rng_states) -> None:

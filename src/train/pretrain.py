@@ -32,6 +32,7 @@ from src.model.heads import (
     ThresholdHazardHead,
     ValueRegressionHead,
     next_event_loss,
+    time_bin,
 )
 from src.data.dataset import LengthGroupedSampler, ModelDataset, TokenBudgetBatchSampler
 from src.data.collate import collate_model_samples
@@ -43,7 +44,8 @@ from src.data.segments import (
     load_vocab_blob,
     n_value_bins,
 )
-from src.data.targets import TargetBuilder
+from src.data.targets import InStreamTargets, TargetBuilder
+from src.data.threshold_grid import ThresholdGrid
 from src.train.engine import (
     ALLOW_CPU_DDP_FLAG,
     TrainConfig,
@@ -166,6 +168,47 @@ def objective_weights(mcfg: dict) -> dict[str, float]:
     return weights
 
 
+def in_stream_target_builder(
+    *,
+    vocab_blob: Mapping,
+    mcfg: dict,
+    dcfg: dict,
+    thresholds: Mapping,
+    vocab_size: int,
+    value_stats: Mapping[int, tuple[float, float]],
+    run_seed: int = 42,
+) -> TargetBuilder:
+    """The `gem_tte` TargetBuilder for one vocabulary (KTD1, KTD3).
+
+    `thresholds` is `threshold_grid.load_thresholds()`: its `label_rule` gives the label
+    horizon, lookback and ascertainment window, and its competing-risk causes the CR
+    labels. `mcfg["heads"]["threshold_hazard"]["tau_sampling"]` selects how training
+    thresholds are drawn (a missing or unknown value is refused), and
+    `mcfg["in_stream"]` how many anchors and queries each window gets. No time grid is
+    read here: the heads bin label minutes themselves (KTD4)."""
+    rule = thresholds["label_rule"]
+    grid = ThresholdGrid(
+        vocab_blob, dcfg["target_concepts"], thresholds,
+        tau_sampling=mcfg["heads"]["threshold_hazard"].get("tau_sampling"),
+    )
+    return TargetBuilder(
+        vocab_size=vocab_size,
+        n_time_bins=mcfg["heads"]["threshold_hazard"]["n_time_bins"],
+        horizon_hours=rule["horizon_hours"],
+        value_stats=value_stats,
+        run_seed=run_seed,
+        mode="gem_tte",
+        in_stream=InStreamTargets(
+            grid=grid,
+            anchors_per_window=int(mcfg["in_stream"]["anchors_per_window"]),
+            queries_per_anchor=int(mcfg["in_stream"]["queries_per_anchor"]),
+            baseline_lookback_hours=rule["baseline_lookback_hours"],
+            required_measurement_within_hours_of_horizon=rule[
+                "required_measurement_within_hours_of_horizon"],
+        ),
+    )
+
+
 def zero_touch(head: torch.nn.Module | None, like: torch.Tensor) -> torch.Tensor:
     """The loss of a skipped head: zero-valued, but reaching every trainable parameter.
 
@@ -194,6 +237,9 @@ class Model(torch.nn.Module):
         h = mcfg["heads"]
         self.w = objective_weights(mcfg)
         self.cr = CompetingRiskHead(d, n_causes, h["competing_risk"]["n_time_bins"])
+        # Each head's own horizon: label minutes are binned per head (KTD4).
+        self.cr_horizon_hours = float(h["competing_risk"].get("horizon_hours", 48))
+        self.th_horizon_hours = float(h["threshold_hazard"].get("horizon_hours", 48))
         self.th = ThresholdHazardHead(
             d, n_targets, h["threshold_hazard"]["n_time_bins"],
             n_value_bins=n_value_bins, thr_dim=h["threshold_hazard"]["threshold_embed_dim"],
@@ -221,6 +267,8 @@ class Model(torch.nn.Module):
         else:
             encoder_token = batch.get("soft_token", batch["token"])
             H = self.enc(encoder_token, batch["pos_min"], batch.get("soft_weight"))
+        # One hidden state per ANCHOR (several per row on the full-hospitalization
+        # representation), read at the anchor's own position, not at the last token.
         if "anchor_batch_idx" in batch:
             if len(batch["anchor_batch_idx"]):
                 h_last = H[batch["anchor_batch_idx"], batch["last_idx"]]
@@ -236,35 +284,62 @@ class Model(torch.nn.Module):
         total = w["next_event"] * ntp + w["competing_risk"] * cr + w["threshold_hazard"] * th + w["value_regression"] * val
         return {"ntp": ntp, "cr": cr, "th": th, "val": val, "total": total}
 
+    @staticmethod
+    def _on_grid(minutes, event, n_bins: int, horizon_hours: float):
+        """Label minutes -> (event, slot) on ONE head's grid (KTD4). `slot` is
+        `time_bin`: the event's bin, or the count of fully observed bins. An event
+        after this head's horizon is not an event for it: the horizon was survived."""
+        event = event & (minutes <= round(horizon_hours * 60))
+        return event, time_bin(minutes, n_bins, horizon_hours).clamp(min=0, max=n_bins)
+
     def _cr_loss(self, batch, h_last, H):
         """CR loss; 0 when the head is disabled/unweighted or the batch carries no CR
         targets (pure-NTP batches from shards without an outcome join)."""
-        if self.w["competing_risk"] == 0.0 or "cr_type" not in batch or "cr_bin" not in batch:
+        timed = "cr_time_min" in batch
+        if self.w["competing_risk"] == 0.0 or "cr_type" not in batch or not (
+                timed or "cr_bin" in batch):
             return zero_touch(self.cr, H)
+        cr_type = batch["cr_type"]
         cr_mask = batch.get("cr_mask")
+        if timed:
+            event, cr_bin = self._on_grid(batch["cr_time_min"], cr_type >= 0,
+                                          self.cr.n_bins, self.cr_horizon_hours)
+            cr_type = torch.where(event, cr_type, torch.full_like(cr_type, -1))
+            # Censored before one full bin of this grid: nothing was observed.
+            observed = event | (cr_bin > 0)
+            cr_mask = observed if cr_mask is None else cr_mask & observed
+        else:
+            cr_bin = batch["cr_bin"]
         if cr_mask is not None and not bool(cr_mask.any()):
             return zero_touch(self.cr, H)
-        cr_h = h_last[cr_mask] if cr_mask is not None else h_last
-        cr_type = batch["cr_type"][cr_mask] if cr_mask is not None else batch["cr_type"]
-        cr_bin = batch["cr_bin"][cr_mask] if cr_mask is not None else batch["cr_bin"]
-        return self.cr.loss(cr_h, cr_type, cr_bin)
+        if cr_mask is not None:
+            h_last, cr_type, cr_bin = h_last[cr_mask], cr_type[cr_mask], cr_bin[cr_mask]
+        return self.cr.loss(h_last, cr_type, cr_bin)
 
     def _th_loss(self, batch, h_last, H):
         """Threshold-hazard loss with the same fail-to-zero guard as _cr_loss."""
         if self.w["threshold_hazard"] == 0.0 or "th_target" not in batch:
             return zero_touch(self.th, H)
         th_mask = batch.get("th_mask")
+        if "th_time_min" in batch:
+            event, slot = self._on_grid(batch["th_time_min"], batch["th_event"],
+                                        self.th.n_bins, self.th_horizon_hours)
+            crossed = torch.where(event, slot.clamp(max=self.th.n_bins - 1),
+                                  torch.full_like(slot, -1))
+            observed_bin = slot
+            observed = event | (slot > 0)
+            th_mask = observed if th_mask is None else th_mask & observed
+        else:
+            crossed, observed_bin = batch["th_crossed"], batch.get("th_observed_bin")
         if th_mask is not None and not bool(th_mask.any()):
             return zero_touch(self.th, H)
-        th_h = h_last[th_mask] if th_mask is not None else h_last
-        return self.th.loss(
-            th_h,
-            batch["th_target"][th_mask] if th_mask is not None else batch["th_target"],
-            batch["th_tau"][th_mask] if th_mask is not None else batch["th_tau"],
-            batch["th_dir"][th_mask] if th_mask is not None else batch["th_dir"],
-            batch["th_crossed"][th_mask] if th_mask is not None else batch["th_crossed"],
-            batch["th_observed_bin"][th_mask] if th_mask is not None and "th_observed_bin" in batch else batch.get("th_observed_bin"),
-        )
+        # Several threshold queries can share one anchor's hidden state.
+        th_h = h_last[batch["th_anchor"]] if "th_anchor" in batch else h_last
+        fields = [th_h, batch["th_target"], batch["th_tau"], batch["th_dir"], crossed]
+        if th_mask is not None:
+            fields = [field[th_mask] for field in fields]
+            observed_bin = None if observed_bin is None else observed_bin[th_mask]
+        return self.th.loss(*fields, observed_bin)
 
     def _val_loss(self, batch, H):
         """Value-regression (ORA mark) loss; 0 when disabled or no values present."""

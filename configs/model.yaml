@@ -43,7 +43,10 @@ heads:
     weight: 1.0
     horizon_hours: 48
     n_time_bins: 48                 # hourly discrete hazard over 48h
-    tau_sampling: "empirical_bins"  # sample τ from each concept's frozen bin edges at train time
+    # How in-stream training thresholds are drawn (src/data/threshold_grid.py; an unknown
+    # value is refused): empirical_bins = uniformly from each target concept's own frozen
+    # bin edges under the arm's vocabulary. Evaluation uses configs/thresholds.yaml.
+    tau_sampling: "empirical_bins"
     direction_embed: true           # learned direction (above/below) embedding
     threshold_embed_dim: 32         # learned threshold embedding
   # (D) value regression — the ORA "mark" (arXiv:2602.00541). NOW ENABLED:
@@ -51,6 +54,14 @@ heads:
   #     on average over 14 tasks. (Corrected 2026-10-03: the earlier "+33-38% vs NTP" here did
   #     not match the source — notes/ai-novelty-audit.md §6.)
   value_regression: {enabled: true, weight: 0.5}
+
+# In-stream time-to-event supervision on the full-hospitalization representation (KTD1):
+# anchors are sampled per (seed, epoch, stay) in every context window and labelled from
+# the stay's own future. The label rule (horizon, lookback, ascertainment window) and the
+# competing-risk cause thresholds live in configs/thresholds.yaml.
+in_stream:
+  anchors_per_window: 8      # each carries one competing-risk label
+  queries_per_anchor: 4      # threshold-hazard queries per anchor (tau_sampling above)
 
 # Multi-task loss balancing (RESEARCH.md §3): uncertainty (Kendall 1/2σ²) + grad-norm,
 # so dense mortality signal doesn't starve sparse auxiliaries. Fallback: fixed weights above.
