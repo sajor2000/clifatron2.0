@@ -17,7 +17,6 @@ dependencies = [
     "sentence-transformers>=3.0",  # leakage-safe note embeddings (small clinical model)
     "tqdm>=4.66",
     "cryptography>=44.0.1",    # U11 Ed25519 releaser->site bundle signing (trust.py)
-    "xformers>=0.0.32",          # memory-efficient attention (flash-attn fallback; flash-attn lacks cu13+cp313 wheel)
 ]
 
 # Test runner, grouped for reproducible CI installs (`uv run --frozen --group dev pytest`).
@@ -30,8 +29,19 @@ dev = [
 ]
 
 [tool.uv]
-# 2x L40 box is Linux/CUDA; pin CUDA wheels there via `uv sync --extra cuda` if needed.
-# flash-attn lacks cu13+cp313 prebuilt wheel; source build ~36h. Use xformers + torch SDPA instead.
+# One NCCL on Linux: torch (CUDA 13 build from PyPI) ships nvidia-nccl-cu13, while older
+# xgboost releases (3.2.x, picked under Python 3.11) pull nvidia-nccl-cu12; both wheels
+# write nvidia/nccl/lib/libnccl.so.2, so whichever installs last silently replaces the
+# library torch's DDP loads. xgboost is only used on CPU here (src/eval/method3.py, no
+# `device=` argument) and loads NCCL lazily for multi-GPU training only, so the cu12 wheel
+# is dropped everywhere (a never-true marker). The pre-flight prints torch.cuda.nccl.version().
+# Attention is torch SDPA (flash / memory-efficient kernels; src/model/encoder.py); no
+# flash-attn or xformers dependency. torch resolves from PyPI (the CUDA 13 build on Linux,
+# needs NVIDIA driver >= 580): the cu126 fallback for an older driver is documented in
+# docs/plans/l40-runbook.md ("CUDA build and driver"), not applied here.
+override-dependencies = [
+    "nvidia-nccl-cu12; sys_platform == 'never'",
+]
 
 [build-system]
 requires = ["hatchling"]

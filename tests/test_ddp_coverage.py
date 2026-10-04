@@ -37,11 +37,12 @@ class DistributedSamplerPartitionTest(unittest.TestCase):
     def test_non_divisible_length_pads_and_duplicates_one_sample(self):
         """The 'no overlap' guarantee holds only for a divisible length (or drop_last).
 
-        `src/train/pretrain.py` uses DistributedSampler with the default
-        drop_last=False, so for an ODD dataset length over two ranks the sampler PADS
-        the index list to make it even — meaning one sample is seen twice across ranks.
+        With the default drop_last=False, an ODD dataset length over two ranks makes
+        DistributedSampler PAD the index list — one sample is seen twice across ranks.
         This documents that reality so the divisible-N tests above are not mistaken for
-        a universal guarantee (CodeRabbit).
+        a universal guarantee (CodeRabbit). `src/train/pretrain.py` now batches DDP
+        ranks with `DistributedTokenBudgetBatchSampler` (U5), which repeats whole
+        batches instead (next test).
         """
         odd = 7
         data = list(range(odd))
@@ -52,6 +53,25 @@ class DistributedSamplerPartitionTest(unittest.TestCase):
         self.assertEqual(len(r0) + len(r1), odd + 1)
         self.assertEqual(len(set(r0) & set(r1)), 1,
                          "padding should duplicate exactly one sample across ranks")
+
+    def test_rank_aware_batch_sampler_repeats_at_most_world_minus_one_batches(self):
+        """U5: batches are formed globally and dealt to ranks; an uneven batch count is
+        evened by repeating whole batches (at most world-size minus one), so every rank
+        yields the same number and the rest of the data is seen exactly once."""
+        from src.data.dataset import DistributedTokenBudgetBatchSampler
+
+        lengths = [3, 9, 1, 4, 7, 2, 8]           # 7 samples, 4 per batch -> 2 batches
+        for world in (2, 3):
+            per_rank = [list(DistributedTokenBudgetBatchSampler(
+                lengths, num_replicas=world, rank=r, max_batch_size=4, seed=0))
+                for r in range(world)]
+            sampler = DistributedTokenBudgetBatchSampler(lengths, num_replicas=world, rank=0,
+                                                         max_batch_size=4, seed=0)
+            with self.subTest(world=world):
+                self.assertEqual({len(b) for b in per_rank}, {1})
+                self.assertEqual(sampler.padding_batches, -2 % world)
+                flat = sorted(i for batches in per_rank for b in batches for i in b)
+                self.assertEqual(set(flat), set(range(len(lengths))))
 
     def test_set_epoch_reshuffles_deterministically(self):
         data = list(range(N))

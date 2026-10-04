@@ -7,8 +7,16 @@ optimizer:
   grad_clip: 1.0
 
 schedule:
-  warmup_steps: 2000
+  # Warm-up scales with the run (engine.resolve_schedule): floor(warmup_frac x updates).
+  # A fixed 2000 outlasted every matrix run (a pass of full MIMIC is ~180-300 updates at
+  # an effective batch of 256), so the LR never left linear warm-up. An absolute
+  # warmup_steps still wins when set; one >= the run's updates is refused.
+  warmup_steps: null
+  warmup_frac: 0.05
   total_steps: 60000
+  # Run length in passes over the training data (U5). When set, it replaces total_steps:
+  # updates = ceil(passes x ceil(batches per pass per rank / grad_accum)).
+  passes: null
   cosine_decay: true
 
 batch:
@@ -21,9 +29,24 @@ runtime:
   ddp: true
   num_workers: 0         # Avoid extra per-rank dataset copies on this shared node.
   log_every: 10          # Rank-0 optimizer updates between progress messages.
-  ckpt_every: 2000
+  # Checkpoint interval scales with the run: every max(1, updates // checkpoints_per_run)
+  # updates, plus a final checkpoint at the end (and on a clean SIGTERM/SIGINT stop). A
+  # fixed 2000 wrote NO checkpoint in a 0.05-pass screening or 1-pass full run. An
+  # absolute ckpt_every still wins when set; one longer than the run is refused.
+  ckpt_every: null
+  checkpoints_per_run: 5
   ckpt_dir: "checkpoints"
   # trunk saved separately from heads so probes/finetune reuse it
+
+eval_schedule:
+  # Validation interval scales with the run (engine.resolve_schedule): every
+  # max(1, updates // validations_per_run) updates. The old fixed val_every 2000 never
+  # validated a 9-300-update run. Every rank validates its share of the validation batches
+  # and the ranks combine their sums (no rank-0-only pass behind a barrier). A validation
+  # pass reads the whole validation partition (15% of stays, forward only), so keep the
+  # count low for 0.05-pass screening runs. An absolute val_every still wins when set.
+  val_every: null
+  validations_per_run: 2
 
 data_contract:
   cohort: "configs/cohort.yaml"
@@ -35,6 +58,23 @@ data_contract:
     calibration: 0.10
     internal_test: 0.15
   required_partitions: [train, validation, calibration, internal_test]
+  # Item 46 (product authority, J.C. Rojas, 2026-10-03): the held-out partitions are
+  # enlarged for the scarce extubation arms by a stratified split (src/data/splits.py):
+  # patients whose FIRST post-extubation device is NIV or HFNC are over-sampled into the
+  # held-out partitions (every partition except `train`) until each arm holds
+  # `held_out_share` of its patients there; as many other patients move the other way,
+  # partition by partition, so the proportions above are kept. Deterministic by
+  # split_seed. The stratum comes from the extubation cohort's pre-registered, outcome-blind
+  # membership only (patient_id, eligible, arm_column). It changes the training data's
+  # composition and is baked into every checkpoint: the product authority chose it, and it
+  # is switched on at the split-freeze step (docs/plans/l40-runbook.md step 7), not before.
+  held_out_stratification:
+    enabled: false
+    strata_source: extubation_cohort
+    arm_column: arm_first_device
+    arms: [niv, hfnc]
+    held_out_share: 0.5
+    held_out_partitions: [validation, calibration, internal_test]
   artifact_fit_partition: train
   sealed_partitions: [internal_test, external_confirmation]
   sealed_access_log: "output/intermediate_phi/sealed_access.parquet"

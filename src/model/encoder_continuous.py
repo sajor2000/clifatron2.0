@@ -10,7 +10,7 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 
-from src.model.encoder import CLIFEncoder as BaseEncoder, build_rope_cache
+from src.model.encoder import CLIFEncoder as BaseEncoder, build_rope_cache, residual_input
 
 
 class ContinuousFusedEncoder(BaseEncoder):
@@ -45,6 +45,7 @@ class ContinuousFusedEncoder(BaseEncoder):
             feats = torch.stack([value, present.to(value.dtype)], dim=-1)
             x = x + self.value_proj(feats.to(self.value_proj.weight.dtype))
 
+        x = residual_input(x)
         cos, sin = build_rope_cache(pos_min, self.head_dim, self.rope_base)
         for blk in self.blocks:
             x = blk(x, cos, sin)

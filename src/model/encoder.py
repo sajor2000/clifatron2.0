@@ -20,8 +20,14 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.nn.attention import SDPBackend, sdpa_kernel
 
 from src.model.heads import NextEventHead
+
+# Training attention on CUDA: the flash and memory-efficient kernels only. Without this a
+# shape or dtype they refuse falls back silently to the math kernel, which materializes
+# [B, heads, T, T] scores (an OOM at 8192 tokens); with it that case raises instead.
+TRAINING_SDPA_BACKENDS = [SDPBackend.FLASH_ATTENTION, SDPBackend.EFFICIENT_ATTENTION]
 
 
 class RMSNorm(nn.Module):
@@ -35,11 +41,20 @@ class RMSNorm(nn.Module):
         return n * self.weight
 
 
+def residual_input(x: torch.Tensor) -> torch.Tensor:
+    """The residual stream starts (and so stays) fp32 in every arm. Under bf16 autocast an
+    nn.Embedding returns fp32 but an nn.Linear (the TextCode projection, the continuous
+    value channel) returns bf16, and `x + block(x)` would then carry a bf16 residual
+    through every layer."""
+    return x.float()
+
+
 def build_rope_cache(pos: torch.Tensor, head_dim: int, base: float = 10000.0):
     """RoPE cos/sin from explicit position ids (admission-relative, 1-min resolution).
 
     pos: [B, T] integer minutes-since-admission per token (NOT sequence index).
-    Returns cos, sin each [B, T, head_dim].
+    Returns cos, sin each [B, T, head_dim], in fp32 (angles of large minute positions
+    lose their phase in bf16); `apply_rope` casts them to q/k's dtype.
     """
     half = head_dim // 2
     inv_freq = 1.0 / (base ** (torch.arange(0, half, device=pos.device).float() / half))
@@ -49,9 +64,10 @@ def build_rope_cache(pos: torch.Tensor, head_dim: int, base: float = 10000.0):
 
 
 def apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
-    # x: [B, nh, T, hd]; cos/sin: [B, T, hd]
-    cos = cos[:, None]
-    sin = sin[:, None]
+    # x: [B, nh, T, hd]; cos/sin: [B, T, hd] fp32 -> x's dtype (bf16 under autocast), so
+    # q/k are not promoted to fp32 next to a bf16 v.
+    cos = cos[:, None].to(x.dtype)
+    sin = sin[:, None].to(x.dtype)
     half = x.shape[-1] // 2
     x_rot = torch.cat([-x[..., half:], x[..., :half]], dim=-1)
     return x * cos + x_rot * sin
@@ -80,7 +96,11 @@ class Block(nn.Module):
         k = k.view(B, T, self.n_heads, self.hd).transpose(1, 2)
         v = v.view(B, T, self.n_heads, self.hd).transpose(1, 2)
         q, k = apply_rope(q, cos, sin), apply_rope(k, cos, sin)
-        o = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+        if q.is_cuda and self.training:
+            with sdpa_kernel(TRAINING_SDPA_BACKENDS):
+                o = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+        else:
+            o = F.scaled_dot_product_attention(q, k, v, is_causal=True)
         o = o.transpose(1, 2).reshape(B, T, D)
         x = x + self.drop(self.proj(o))
         g = self.ln2(x)
@@ -131,6 +151,7 @@ class CLIFEncoder(nn.Module):
         x = self.embed_tokens(token)
         if token_weight is not None:
             x = (x * token_weight.unsqueeze(-1)).sum(-2)
+        x = residual_input(x)
         cos, sin = build_rope_cache(pos_min, self.head_dim, self.rope_base)
         for blk in self.blocks:
             x = blk(x, cos, sin)

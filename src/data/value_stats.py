@@ -27,7 +27,6 @@ from pathlib import Path
 import numpy as np
 
 from src.data.segments import json_sha256, segments_hash, vocab_segments
-from src.data.splits import fit_partition
 
 # 1.349 = IQR of a standard normal (Φ⁻¹(0.75) − Φ⁻¹(0.25)); makes robust scale
 # comparable to a standard deviation for well-behaved concepts.
@@ -70,13 +69,20 @@ def compute_value_stats(
             if not math.isfinite(v):
                 continue
             buckets.setdefault(int(tok), []).append(v)
+    return _stats_from_buckets(
+        {token: np.asarray(observed, dtype=np.float64) for token, observed in buckets.items()},
+        min_count=min_count, robust=robust)
 
+
+def _stats_from_buckets(buckets: dict[int, np.ndarray], *, min_count: int,
+                        robust: bool) -> dict[int, tuple[float, float]]:
+    """(center, scale) per token from its finite values, in observation order (the
+    estimators below are order-sensitive in the last bits: `np.mean` sums pairwise)."""
     stats: dict[int, tuple[float, float]] = {}
-    for token_id, observed in buckets.items():
-        arr = np.asarray(observed, dtype=np.float64)
+    for token_id, arr in buckets.items():
         # A token seen too few times for a stable robust estimate still gets stats
         # (coverage contract) — we just widen the fallback so its NLL isn't overconfident.
-        under_min = len(observed) < min_count
+        under_min = len(arr) < min_count
         if robust and not under_min:
             center = float(np.median(arr))
             q75, q25 = np.percentile(arr, [75, 25])
@@ -97,27 +103,181 @@ def compute_value_stats(
     return stats
 
 
+# Rows per streamed chunk of the events shard (each row is one stay / window).
+_STREAM_ROWS = 4096
+
+
+def _partition_row_groups(shard, partition: str) -> list[int]:
+    """Row groups of `shard` that may hold `partition` rows: a group whose `partition`
+    statistics say it holds one other partition only is skipped (the tokenizer writes
+    shards grouped by partition in small row groups)."""
+    meta = shard.metadata
+    names = shard.schema_arrow.names
+    if "partition" not in names:
+        return list(range(meta.num_row_groups))
+    column = names.index("partition")
+    keep = []
+    for i in range(meta.num_row_groups):
+        stats = meta.row_group(i).column(column).statistics
+        if (stats is not None and stats.has_min_max and stats.min == stats.max
+                and stats.null_count == 0 and stats.min != partition):
+            continue
+        keep.append(i)
+    return keep
+
+
+def _collect_finite(events_path: str | Path, partition: str, chunk_rows: int,
+                    pieces: dict[int, list[np.ndarray]]) -> int:
+    """Append the finite (token, value) pairs of `partition` rows of one shard to
+    `pieces` (per token, in file order); returns the rows read."""
+    import polars as pl
+    import pyarrow.parquet as pq
+
+    shard = pq.ParquetFile(events_path)
+    columns = shard.schema_arrow.names
+    for col in ("token", "value"):
+        if col not in columns:
+            raise ValueError(f"{events_path} missing required column {col!r}")
+    if "partition" not in columns:
+        raise ValueError("partition column is required before fitting artifacts")
+    rows = 0
+    groups = _partition_row_groups(shard, partition)
+    if not groups:
+        return 0
+    for batch in shard.iter_batches(batch_size=chunk_rows, row_groups=groups,
+                                    columns=["token", "value", "partition"]):
+        chunk = (pl.from_arrow(batch).filter(pl.col("partition") == partition)
+                 .select("token", "value"))
+        rows += chunk.height
+        if not chunk.height:
+            continue
+        aligned = chunk.select(pl.col("token").list.len().fill_null(0)
+                               == pl.col("value").list.len().fill_null(0)).to_series()
+        if not aligned.all():
+            raise ValueError("token and value sequences must align within a stay")
+        flat = (chunk.explode(["token", "value"], empty_as_null=False)
+                .drop_nulls("value")
+                .filter(pl.col("value").cast(pl.Float64).is_finite()))
+        if not flat.height:
+            continue
+        tokens = flat["token"].cast(pl.Int64).to_numpy()
+        values = flat["value"].cast(pl.Float64).to_numpy()
+        order = np.argsort(tokens, kind="stable")
+        tokens, values = tokens[order], values[order]
+        starts = np.flatnonzero(np.r_[True, tokens[1:] != tokens[:-1]])
+        ends = np.r_[starts[1:], len(tokens)]
+        for token, a, b in zip(tokens[starts].tolist(), starts, ends):
+            pieces.setdefault(token, []).append(values[a:b].copy())
+    return rows
+
+
+def compute_value_stats_from_sites(
+    events: "dict[str, str | Path]",
+    *,
+    partition: str = "train",
+    min_count: int = _MIN_COUNT,
+    robust: bool = True,
+    chunk_rows: int = _STREAM_ROWS,
+) -> tuple[dict[int, tuple[float, float]], dict[str, int]]:
+    """Value stats fit on the `partition` rows of SEVERAL sites' shards together
+    (decided 2026-10-03, product authority: MIMIC + Rush train), in the given site order:
+    ``(stats, {site: rows read})``. Every shard must already be tokenized with the same
+    frozen vocabulary (checked by the caller); a site with no `partition` rows is refused."""
+    pieces: dict[int, list[np.ndarray]] = {}
+    rows: dict[str, int] = {}
+    for site, path in events.items():
+        rows[site] = _collect_finite(path, partition, chunk_rows, pieces)
+        if not rows[site]:
+            raise ValueError(f"site {site!r}: artifact fit partition {partition!r} has zero rows")
+    buckets = {token: np.concatenate(parts) for token, parts in pieces.items()}
+    del pieces
+    return _stats_from_buckets(buckets, min_count=min_count, robust=robust), rows
+
+
 def compute_value_stats_from_events(
     events_path: str | Path,
     *,
     partition: str = "train",
     min_count: int = _MIN_COUNT,
     robust: bool = True,
+    chunk_rows: int = _STREAM_ROWS,
 ) -> dict[int, tuple[float, float]]:
     """Compute value stats from a reference-site tokenized `events.parquet`.
 
     Expects the tokenizer schema: parallel `token` (list[int]) and `value`
-    (list[float|null]) columns per stay (see `src/data/tokenize.py`)."""
-    import polars as pl
+    (list[float|null]) columns per stay (see `src/data/tokenize.py`).
 
-    df = pl.read_parquet(events_path)
-    for col in ("token", "value"):
-        if col not in df.columns:
-            raise ValueError(f"{events_path} missing required column {col!r}")
-    df = fit_partition(df, partition)
-    tokens = df["token"].to_list()
-    values = df["value"].to_list()
-    return compute_value_stats(tokens, values, min_count=min_count, robust=robust)
+    Streams the shard (`pyarrow.parquet.ParquetFile.iter_batches`, file order) in chunks
+    of `chunk_rows` stays: only the finite (token, value) pairs are kept, as two flat
+    numpy columns, never Python lists of every event — the full MIMIC shard would
+    otherwise need ~20-25 GB. (Polars' streaming `collect_batches` buffered ~450 MB of
+    row groups on an 8.8M-event sample; the arrow batch reader stays near one chunk.)
+    The result is identical to `compute_value_stats` over the same rows (each token's
+    values keep their observation order). Row groups that hold only other partitions are
+    skipped by their statistics (`_partition_row_groups`)."""
+    pieces: dict[int, list[np.ndarray]] = {}
+    rows = _collect_finite(events_path, partition, chunk_rows, pieces)
+    if not rows:
+        raise ValueError(f"artifact fit partition {partition!r} has zero rows")
+    buckets = {token: np.concatenate(parts) for token, parts in pieces.items()}
+    del pieces
+    return _stats_from_buckets(buckets, min_count=min_count, robust=robust)
+
+
+# Partitions a training launch reads (train for the fit, validation for the mid-run
+# losses): a numeric token there without stats aborts the run at its first target.
+LOADED_PARTITIONS = ("train", "validation")
+
+
+def numeric_tokens(events_path: str | Path, partitions=LOADED_PARTITIONS,
+                   chunk_rows: int = _STREAM_ROWS) -> set[int]:
+    """Token ids carrying at least one finite value at a TARGET-ELIGIBLE position of
+    `partitions` rows (streamed): the value targets `TargetBuilder` normalizes (an
+    input-only token's value, e.g. a static age, is never a value target)."""
+    import polars as pl
+    import pyarrow.parquet as pq
+
+    shard = pq.ParquetFile(events_path)
+    found: set[int] = set()
+    groups = sorted({g for part in partitions for g in _partition_row_groups(shard, part)})
+    if not groups:
+        return found
+    names = shard.schema_arrow.names
+    eligible = "target_eligible" in names
+    columns = ["token", "value", "partition", *(["target_eligible"] if eligible else [])]
+    lists = ["token", "value", *(["target_eligible"] if eligible else [])]
+    for batch in shard.iter_batches(batch_size=chunk_rows, row_groups=groups,
+                                    columns=columns):
+        flat = (pl.from_arrow(batch).filter(pl.col("partition").is_in(list(partitions)))
+                .select(lists).explode(lists, empty_as_null=False)
+                .drop_nulls("value").filter(pl.col("value").cast(pl.Float64).is_finite()))
+        if eligible:
+            flat = flat.filter(pl.col("target_eligible").fill_null(False))
+        found.update(flat["token"].unique().cast(pl.Int64).to_list())
+    return found
+
+
+def coverage_gaps(shards: "dict[str, str | Path]", stats: dict) -> dict[str, list[int]]:
+    """Per site, the numeric token ids of its loaded partitions that have NO value stats
+    (sorted; empty lists omitted). Every site is checked, not only the first."""
+    gaps = {}
+    for site, path in shards.items():
+        missing = sorted(numeric_tokens(path) - {int(t) for t in stats})
+        if missing:
+            gaps[site] = missing
+    return gaps
+
+
+def describe_gaps(gaps: dict[str, list[int]], id_to_token: dict | None = None,
+                  limit: int = 10) -> str:
+    """One aggregate line per site: the count and the first `limit` tokens lacking stats."""
+    parts = []
+    for site, ids in gaps.items():
+        names = [str((id_to_token or {}).get(i, i)) for i in ids[:limit]]
+        more = f" (+{len(ids) - limit} more)" if len(ids) > limit else ""
+        parts.append(f"site {site}: {len(ids)} numeric token(s) have no stats: "
+                     f"{', '.join(names)}{more}")
+    return "; ".join(parts)
 
 
 def vocab_hash(vocab: dict) -> str:
@@ -140,6 +300,7 @@ def write_value_stats(
     fit_partition_name: str | None = None,
     min_count: int = _MIN_COUNT,
     robust: bool = True,
+    sites: dict | None = None,
 ) -> Path:
     """Write frozen stats as a self-describing artifact bound to its vocabulary.
 
@@ -162,6 +323,8 @@ def write_value_stats(
         "fit_partition": fit_partition_name,
         "min_count": int(min_count),
         "robust": bool(robust),
+        # The sites whose fit-partition rows were pooled (site -> rows read), in order.
+        **({"sites": dict(sites)} if sites else {}),
         "stats": {str(tok): [center, scale] for tok, (center, scale) in sorted(stats.items())},
     }
     out.write_text(json.dumps(blob, indent=2))
@@ -221,17 +384,43 @@ def load_value_stats(
     return {int(k): (float(v[0]), float(v[1])) for k, v in raw.items()}
 
 
+def _site_events(items: list[str]) -> dict[str, Path]:
+    """``SITE=PATH`` entries (a bare PATH is the single unnamed site ``reference``)."""
+    out: dict[str, Path] = {}
+    for item in items:
+        site, sep, path = item.partition("=")
+        if not sep:
+            site, path = "reference", item
+        if site in out:
+            raise SystemExit(f"--events names site {site!r} twice")
+        out[site] = Path(path)
+    return out
+
+
+def _shard_vocabularies(path: Path) -> set[str]:
+    import polars as pl
+
+    lf = pl.scan_parquet(path)
+    if "artifact_hashes" not in lf.collect_schema().names():
+        return set()
+    return set(lf.select(pl.col("artifact_hashes").struct.field("vocabulary"))
+               .unique().collect().to_series().to_list())
+
+
 def _main() -> None:
     import argparse
 
     ap = argparse.ArgumentParser(
-        description="Freeze per-token value-head normalization stats from a reference site."
+        description="Freeze per-token value-head normalization stats (train partition; one "
+                    "or several sites pooled)."
     )
-    ap.add_argument("--events", required=True,
-                    help="reference-site tokenized events.parquet (freeze stats here)")
+    ap.add_argument("--events", required=True, action="append", metavar="[SITE=]PATH",
+                    help="a site's tokenized shard (repeat per site: mimic=... rush=...); "
+                         "every shard must be bound to the --vocab vocabulary")
     ap.add_argument("--out", required=True, help="output value_stats.json path")
     ap.add_argument("--vocab", default=None,
-                    help="vocab.json to bind stats to (defaults to a sibling of --events)")
+                    help="vocab.json to bind stats to (defaults to a sibling of the first "
+                         "--events)")
     ap.add_argument("--min-count", type=int, default=_MIN_COUNT,
                     help="observations below which a token uses a wider fallback scale "
                           "(NOT a drop threshold — every numeric token still gets stats)")
@@ -242,19 +431,23 @@ def _main() -> None:
     args = ap.parse_args()
 
     robust = not args.mean_std
-    stats = compute_value_stats_from_events(
-        args.events, partition=args.partition, min_count=args.min_count, robust=robust
-    )
-
+    events = _site_events(args.events)
+    first = next(iter(events.values()))
     # Bind to the fused vocabulary so a stale/cross-vocab artifact is detectable.
-    vocab_path = Path(args.vocab) if args.vocab else Path(args.events).with_name("vocab.json")
+    vocab_path = Path(args.vocab) if args.vocab else first.with_name("vocab.json")
     if not vocab_path.exists():
         raise SystemExit(f"no vocab.json at {vocab_path}: value stats must be bound to the "
                          "tokenizer-v2 vocabulary and segments they were fit under")
     blob = json.loads(vocab_path.read_text())
     vsha = vocab_hash(blob["vocab"]) if isinstance(blob.get("vocab"), dict) else None
     ssha = segments_hash(vocab_segments(blob))  # refuses a pre-v2 vocabulary
-
+    for site, path in events.items():
+        bound = _shard_vocabularies(path)
+        if bound and bound != {vsha}:
+            raise SystemExit(f"site {site!r}: {path.name} is not tokenized with {vocab_path} "
+                             "(vocabulary hash differs): pool only shards of one vocabulary")
+    stats, rows = compute_value_stats_from_sites(
+        events, partition=args.partition, min_count=args.min_count, robust=robust)
     path = write_value_stats(
         stats,
         args.out,
@@ -263,9 +456,10 @@ def _main() -> None:
         fit_partition_name=args.partition,
         min_count=args.min_count,
         robust=robust,
+        sites=rows if len(events) > 1 or "reference" not in events else None,
     )
     print(f"wrote {len(stats):,} per-token value stats -> {path} "
-          f"(vocab {str(vsha)[:12]}…, segments {ssha[:12]}…)")
+          f"(sites {', '.join(events)}; vocab {str(vsha)[:12]}…, segments {ssha[:12]}…)")
 
 
 if __name__ == "__main__":

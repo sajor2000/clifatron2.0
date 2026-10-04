@@ -1,0 +1,132 @@
+# The ONE registry of thresholds (KTD3). Every entry is (target concept, threshold value,
+# direction); labels are always computed at the exact value. The model sees a threshold as
+# (concept, value-bin index under the arm's own segments, direction) — the mapping is
+# `src/data/threshold_grid.py`, bound to the vocabulary hash. Read by the in-stream target
+# builder (U3), the experiment matrix (U6) and the claims evaluation panel (U8).
+#
+# Competing-risk causes were decided by the product authority (J.C. Rojas) on 2026-10-03
+# (docs/decisions/2026-10-03-clinical-decisions.md, items 1-7): `status: confirmed`.
+# `status: contract` entries repeat the threshold the `outcomes` block of
+# configs/cohort.yaml already fixes (that block is hash-bound and is not edited here).
+# A `proposed` cause would still be a pre-flight warning.
+#
+# CLIF 2.1 (mCIDE 2.1.1): every concept below is a CLIF 2.1 lab_category or
+# vital_category, and every value is in the unit declared under `units` (test-locked
+# against the snapshot in configs/clif_mcide_2.1.1/: lab reference_unit from
+# mCIDE/labs/clif_lab_categories.csv; vital units from the vitals DDL comment).
+#
+# Direction is strict, as in the 24 h outcome contract: `below` is value < threshold,
+# `above` is value > threshold. A value equal to the threshold is not an event.
+
+schema_version: "1.1.0"
+
+# The CLIF 2.1 unit of every concept a threshold names. `clif_declared: true` means the
+# CLIF 2.1.1 snapshot states this unit (lab reference_unit, or the vitals DDL); `false`
+# means CLIF 2.1 declares "no unit" for the vital and the value is used as charted, in
+# the conventional unit given here.
+units:
+  map:              {unit: mmHg,      clif_declared: true}    # vitals DDL: map = mmHg
+  spo2:             {unit: "%",       clif_declared: true}    # vitals DDL: spo2 = %
+  temp_c:           {unit: Celsius,   clif_declared: true}    # vitals DDL: temp_c = Celsius
+  respiratory_rate: {unit: "breaths/min", clif_declared: false}
+  heart_rate:       {unit: "beats/min",   clif_declared: false}
+  sbp:              {unit: mmHg,      clif_declared: false}   # DDL: "no unit for ... sbp"
+  lactate:          {unit: mmol/L,    clif_declared: true}    # lab reference_unit
+  creatinine:       {unit: mg/dL,     clif_declared: true}
+  bilirubin_total:  {unit: mg/dL,     clif_declared: true}
+  platelet_count:   {unit: "10^3/uL", clif_declared: true}    # mCIDE writes 10^3/µL
+
+# How an anchor on the full-hospitalization stream is labelled (KTD1). The lookback and
+# the ascertainment window are the 24 h outcome contract's own values
+# (configs/cohort.yaml outcomes.*.baseline_lookback_hours and
+# .required_measurement_within_hours_of_horizon).
+label_rule:
+  horizon_hours: 48
+  # prevalent: the last value of the concept in [anchor - lookback, anchor] is already
+  # beyond the threshold.
+  baseline_lookback_hours: 6
+  # A horizon that elapses with no crossing is `negative` only if the concept is measured
+  # within this many hours before the horizon end; otherwise `not_ascertainable`.
+  required_measurement_within_hours_of_horizon: 12
+
+# Claim 1, on-edge: each equals a `value_binning.forced_edges` entry in configs/data.yaml
+# (test-locked), so it is a bin boundary in the clinical arm and in the forced-edge
+# decile arm.
+decision:
+  - {concept: lactate,    value: 2.0,  direction: above}   # mmol/L
+  - {concept: lactate,    value: 4.0,  direction: above}
+  - {concept: map,        value: 65.0, direction: below}   # mmHg
+  - {concept: spo2,       value: 88.0, direction: below}   # %
+  - {concept: spo2,       value: 90.0, direction: below}
+  - {concept: creatinine, value: 1.5,  direction: above}   # mg/dL
+  - {concept: creatinine, value: 2.0,  direction: above}
+  - {concept: creatinine, value: 3.0,  direction: above}
+
+# Claim 1, off-edge: CANDIDATES. Each is strictly inside a physician segment (test-locked
+# against the segment CSV) and is paired with a decision threshold of the same concept.
+# Whether a candidate is also off-edge in the decile arms depends on the data: the
+# edge-distance table (`threshold_grid.edge_distance`) decides, per frozen vocabulary,
+# before any training. A control is registered for a claim only where it is off-edge in
+# every arm.
+control:
+  - {concept: lactate,    value: 2.5,  direction: above, paired_decision: 2.0, status: candidate}  # inside (2.2, 2.7]
+  - {concept: lactate,    value: 3.0,  direction: above, paired_decision: 4.0, status: candidate}  # inside (2.7, 3.4]
+  # MAP 62.5 and creatinine 1.35 (were 63 and 1.3): product authority item 8, 2026-10-03,
+  # PROVISIONAL - re-verify against the production vocabulary's edge-distance table
+  # (`run_matrix --edge-check`) before any claim-bearing run; never hard-coded past it.
+  - {concept: map,        value: 62.5, direction: below, paired_decision: 65.0, status: candidate} # inside (61, 65); 60 and 61 are edges
+  - {concept: spo2,       value: 85.0, direction: below, paired_decision: 88.0, status: candidate} # inside [49.9, 88)
+  - {concept: spo2,       value: 89.0, direction: below, paired_decision: 90.0, status: candidate} # inside [88, 90)
+  - {concept: creatinine, value: 1.35, direction: above, paired_decision: 1.5, status: candidate}  # inside (1.2, 1.42]
+  - {concept: creatinine, value: 2.3,  direction: above, paired_decision: 2.0, status: candidate}  # inside (2, 2.63]
+  - {concept: creatinine, value: 3.5,  direction: above, paired_decision: 3.0, status: candidate}  # inside (3, 4.87]
+
+# The competing-risk head's cause for each target concept: exactly one threshold per entry
+# of `target_concepts` in configs/data.yaml (test-locked). The head's last cause slot is
+# death (`DISCHARGE//expired`). Anchors (product authority, 2026-10-03): the organ labs sit
+# on the SOFA score-2 boundary; respiratory rate, heart rate and SBP on the NEWS2 score-3
+# band; temperature on the NEWS2 top high-temperature band (score 2), snapped to a CSV edge.
+#
+# Creatinine is a RULE, not a fixed value (`rule: kdigo_aki`, item 2): the event is the
+# first creatinine that has risen >= 0.3 mg/dL above the lowest value in the preceding
+# rolling 48 h, OR is >= 1.5x the lowest value in the preceding rolling 7 days (KDIGO
+# 2012). Baseline: the attachment's tier 1 (outpatient creatinine 7-365 days before
+# admission) is not in the token stream, so tier 2 is used - the lowest in-stay value
+# inside the window. Back-calculation from an assumed eGFR (tier 3) is a documented future
+# sensitivity analysis, not implemented. A measurement with no earlier creatinine in the
+# 7-day window cannot be assessed. The threshold-hazard QUERY grid for creatinine keeps its
+# fixed decision thresholds (1.5 / 2.0 / 3.0 above); only this cause changes.
+competing_risk_cause:
+  - {concept: map,              value: 65.0,  direction: below, status: contract}   # cohort.yaml map_below_65_48h
+  - {concept: lactate,          value: 4.0,   direction: above, status: contract}   # cohort.yaml lactate_above_4_48h
+  - {concept: spo2,             value: 88.0,  direction: below, status: contract}   # cohort.yaml spo2_below_88_48h
+  # RR > 24 confirmed for the first L40 screen (product authority, 2026-10-03). Secondary
+  # sensitivity value: >= 25 (NEWS2 top band), registered as `sensitivity_value` (strict
+  # `above`, so 24.9; identical to > 24 for integer-charted rates). Charted RR is noisy and
+  # clusters at 18/20 (Badawy 2017, doi:10.1136/bmjqs-2017-006671; Latten 2019,
+  # doi:10.1371/journal.pone.0223155), so a cause may require a SUSTAINED crossing, off by
+  # default: add `sustained: {min_readings: 2, within_minutes: 60}` to this entry (or to
+  # sbp, or any fixed-value cause). Event time = the reading completing the run; see
+  # src/data/targets.py "SUSTAINED CROSSING" (Aagaard 2026, doi:10.3390/s26175399, on
+  # threshold duration in monitoring).
+  - {concept: respiratory_rate, value: 24.0,  direction: above, status: confirmed, sensitivity_value: 24.9}  # NEWS2 score 3: >= 25 breaths/min
+  - concept: creatinine
+    direction: above
+    status: confirmed
+    rule: kdigo_aki                                                                 # KDIGO 2012 AKI by creatinine
+    absolute_rise: 0.3            # mg/dL above the lowest value in the preceding window
+    absolute_window_hours: 48
+    relative_rise: 1.5            # times the lowest value in the preceding window
+    relative_window_hours: 168
+  - {concept: bilirubin_total,  value: 2.0,   direction: above, status: confirmed}  # SOFA liver score 2 (2.0 mg/dL)
+  - {concept: platelet_count,   value: 100.0, direction: below, status: confirmed}  # SOFA coagulation score 2 (< 100 x10^3/uL)
+  - {concept: heart_rate,       value: 130.0, direction: above, status: confirmed}  # NEWS2 score 3: >= 131 beats/min
+  - {concept: sbp,              value: 90.0,  direction: below, status: confirmed}  # NEWS2 score 3: <= 90 mmHg (strict < 90 here)
+  # Item 7 (product authority, final, 2026-10-03; supersedes the interim 39.1): above
+  # 39.166 C (102.5 F). Anchored to NEWS2's top high-temperature band (>= 39.1 C, which
+  # scores 2 - not 3: on the temperature axis only <= 35.0 C scores 3) and snapped to the
+  # physician-CSV edge 39.166, so "above 39.166" is exactly the top bin (39.166, 44.0] and
+  # the crossing is readable from the token stream, like MAP 65 and lactate 2 / 4.
+  # Fever-framing alternative noted, not used: 38.333 C (101 F; SCCM/IDSA ICU fever,
+  # O'Grady 2023, doi:10.1097/CCM.0000000000006022). Test-locked to the CSV edge.
+  - {concept: temp_c,           value: 39.166, direction: above, status: confirmed}

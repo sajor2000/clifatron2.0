@@ -74,6 +74,31 @@ class NextEventHeadTest(unittest.TestCase):
 
         self.assertTrue(torch.isfinite(loss))
 
+    def test_threshold_censoring_credits_only_the_observed_bins(self):
+        """KTD4: `observed_bin` is the number of FULLY observed bins; a query censored
+        after ten of them contributes survival for hours 0..9 and nothing later."""
+        torch.manual_seed(5)
+        head = ThresholdHazardHead(4, 1, 48, 2)
+        h = torch.randn(1, 4)
+        zeros = torch.zeros(1, dtype=torch.long)
+        logits = head._logits(h, zeros, zeros, zeros).float()
+
+        loss = head.loss(h, zeros, zeros, zeros, torch.tensor([-1]), torch.tensor([10]))
+        expected = -torch.nn.functional.logsigmoid(-logits[0, :10]).sum()
+        self.assertAlmostEqual(float(loss), float(expected), places=5)
+
+    def test_threshold_event_in_hour_bin_5_is_survival_then_the_event(self):
+        torch.manual_seed(5)
+        head = ThresholdHazardHead(4, 1, 48, 2)
+        h = torch.randn(1, 4)
+        zeros = torch.zeros(1, dtype=torch.long)
+        logits = head._logits(h, zeros, zeros, zeros).float()
+
+        loss = head.loss(h, zeros, zeros, zeros, torch.tensor([5]), torch.tensor([5]))
+        logsig = torch.nn.functional.logsigmoid
+        expected = -(logsig(-logits[0, :5]).sum() + logsig(logits[0, 5]))
+        self.assertAlmostEqual(float(loss), float(expected), places=5)
+
 
 if __name__ == "__main__":
     unittest.main()

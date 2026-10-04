@@ -1,4 +1,23 @@
-"""CPU-only collation and document-isolated reference execution."""
+"""CPU-only collation and document-isolated reference execution.
+
+ANCHOR CONTRACT (U3). A batch has A anchors and N threshold-query rows, flattened over
+every sample and segment in order:
+
+    anchor_batch_idx [A]  row of the padded batch          anchor_idx [A]  position in it
+    flash_anchor_idx [A]  position in the flattened (flash) stream
+    cr_mask [A] bool      the anchor has a competing-risk label
+    cr_type [A]           cause index of the event, -1 for a censored / event-free label
+    cr_time_min [A]       minutes from the anchor to the event, censoring or horizon
+    th_anchor [N]         which anchor (0..A-1) each threshold query belongs to
+    th_target / th_tau / th_dir [N]   concept index, threshold value bin, direction (0/1)
+    th_mask [N] bool      the query has a supervised status
+    th_event [N] bool     the threshold was crossed (status ``positive``)
+    th_time_min [N]       minutes from the anchor to the crossing, censoring or horizon
+
+Times are minutes, never bins: each head bins them on its own grid (KTD4). A segment
+lists its anchors under ``"anchors"`` (`src.data.dataset`); a segment without that key
+contributes its ``anchor_offset`` (if any) as one unlabelled anchor.
+"""
 
 from __future__ import annotations
 
@@ -6,6 +25,15 @@ from dataclasses import dataclass
 from typing import Any, Sequence
 
 import torch
+
+from src.data.targets import SUPERVISED_STATUSES
+
+# Threshold-query rows of a batch (module docstring) and their dtypes.
+_QUERY_FIELDS = {
+    "th_anchor": torch.long, "th_mask": torch.bool, "th_target": torch.long,
+    "th_tau": torch.long, "th_dir": torch.long, "th_event": torch.bool,
+    "th_time_min": torch.long,
+}
 
 
 def _pad_2d(samples: Sequence[dict[str, Any]], field: str, length: int, value: Any, dtype):
@@ -67,8 +95,10 @@ def collate_model_samples(
     anchor_batch_idx: list[int] = []
     anchor_idx: list[int] = []
     flash_anchor_idx: list[int] = []
-    document_labels: list[list[dict[str, Any]]] = []
-    threshold_queries: list[dict[str, Any] | None] = []
+    cr_mask: list[bool] = []
+    cr_type: list[int] = []
+    cr_time_min: list[int] = []
+    queries: dict[str, list] = {name: [] for name in _QUERY_FIELDS}
     episode_keys: list[str] = []
     for row, sample in enumerate(samples):
         for segment in sample["segments"]:
@@ -82,13 +112,31 @@ def collate_model_samples(
             cu_seqlens.append(cu_seqlens[-1] + end - start)
             segment_map.append([row, start, end])
             episode_keys.append(segment["episode_key"])
-            if segment.get("anchor_offset") is not None:
-                local_anchor = int(segment["anchor_offset"])
+            anchors = segment.get("anchors")
+            if anchors is None:
+                offset = segment.get("anchor_offset")
+                anchors = [] if offset is None else [{"offset": offset, "cr": None,
+                                                      "queries": []}]
+            for anchor in anchors:
+                local_anchor = int(anchor["offset"])
+                if not start <= local_anchor < end:
+                    raise ValueError("anchor lies outside its document segment")
+                cr = anchor["cr"]
+                for query in anchor["queries"]:
+                    supervised = query["status"] in SUPERVISED_STATUSES
+                    queries["th_anchor"].append(len(anchor_idx))
+                    queries["th_mask"].append(supervised)
+                    queries["th_target"].append(int(query["target_idx"]))
+                    queries["th_tau"].append(int(query["threshold_bin"]))
+                    queries["th_dir"].append(int(query["direction"]))
+                    queries["th_event"].append(query["status"] == "positive")
+                    queries["th_time_min"].append(int(query["minutes"]) if supervised else 0)
                 anchor_batch_idx.append(row)
                 anchor_idx.append(local_anchor)
                 flash_anchor_idx.append(cu_seqlens[-2] + local_anchor - start)
-                document_labels.append(segment["outcome_labels"])
-                threshold_queries.append(segment["threshold_query"])
+                cr_mask.append(cr is not None)
+                cr_type.append(-1 if cr is None else int(cr["cause"]))
+                cr_time_min.append(0 if cr is None else int(cr["minutes"]))
     batch.update(
         {
             "document_ids": document_ids,
@@ -101,8 +149,11 @@ def collate_model_samples(
             "anchor_batch_idx": torch.tensor(anchor_batch_idx, dtype=torch.long),
             "anchor_idx": torch.tensor(anchor_idx, dtype=torch.long),
             "flash_anchor_idx": torch.tensor(flash_anchor_idx, dtype=torch.long),
-            "document_labels": document_labels,
-            "threshold_queries": threshold_queries,
+            "cr_mask": torch.tensor(cr_mask, dtype=torch.bool),
+            "cr_type": torch.tensor(cr_type, dtype=torch.long),
+            "cr_time_min": torch.tensor(cr_time_min, dtype=torch.long),
+            **{name: torch.tensor(queries[name], dtype=dtype)
+               for name, dtype in _QUERY_FIELDS.items()},
         }
     )
     if any(tensor.is_cuda for tensor in batch.values() if isinstance(tensor, torch.Tensor)):

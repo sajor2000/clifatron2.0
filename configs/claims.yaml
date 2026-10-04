@@ -1,0 +1,117 @@
+# Claims evaluation panel (plan U8; R31, R35, R39; KTD12, KTD13). Registered BEFORE any
+# claim-bearing run: the primary metrics, the multiplicity correction, the bootstrap, the
+# minimum seeds and the decision rules of claims 1 and 2. Read by src/eval/claims_report.py
+# (and src/eval/threshold_eval.py for the horizons, partitions and objective arms).
+#
+# Thresholds are NOT registered here: the decision (on-edge) and control (off-edge)
+# thresholds, their pairing and the label rule are configs/thresholds.yaml (KTD3).
+
+schema_version: "1.0.0"
+
+# Primary metrics (R39). Discrimination: higher is better. Calibration: lower is better;
+# `ici` is metrics.integrated_calibration_index (isotonic ICI). Every comparison is
+# oriented so a positive difference favours the arm the claim says should win.
+primary_metrics:
+  discrimination: [auroc, auprc]
+  calibration: [ici]
+
+# Benjamini-Hochberg step-up across the registered comparisons of ONE claim (`family:
+# per_claim`). A comparison is significant only when BH rejects it at `alpha` AND its
+# FCR-adjusted interval (Benjamini & Yekutieli 2005: level 1 - R * alpha / m, R = number
+# of BH rejections in the family, m = family size; 1 - alpha / m when R = 0) excludes zero
+# on the favourable side. Descriptive rows (ablations, other tokenization arms, the
+# attribution arm when it is not in the rule) are outside the family and carry intervals
+# at the unadjusted `confidence` level.
+multiplicity:
+  method: benjamini_hochberg
+  alpha: 0.05
+  family: per_claim
+
+# Paired, two-level bootstrap. Each replicate (1) resamples stays (the cluster of every
+# (anchor, threshold) pair of one hospitalization) with replacement, ONCE, shared by every
+# arm, seed, threshold and horizon, so comparisons are paired on the same evaluation
+# pairs; and (2) resamples each arm's seeds with replacement, independently per arm. An
+# arm's metric in a replicate is the mean over its resampled seeds. Replicates in which a
+# difference is undefined (a single-class resample) are dropped and counted.
+# The p value of a difference is two-sided from the bootstrap distribution:
+# min(1, 2 * (min(#{d <= 0}, #{d >= 0}) + 1) / (B + 1)).
+bootstrap:
+  n_resamples: 2000
+  seed: 20261003
+  confidence: 0.95
+
+# An arm with fewer full-budget, claim-bearing seeds than this is `incomplete`: never
+# averaged, never compared (R34).
+min_seeds_per_arm: 3
+
+# Evaluation pairs (src/eval/threshold_eval.py). Anchors are sampled per stay from its
+# event minutes, deterministically from (seed, stay), identically in every arm.
+evaluation:
+  anchors_per_stay: 2
+  seed: 20261003
+  # Time-to-event evaluation: crossing within each horizon, labelled by the same in-stream
+  # rule at that horizon (TargetBuilder.label_anchor). The zero-shot threshold evaluation
+  # is the label_rule horizon of configs/thresholds.yaml, which must be listed here. Each
+  # horizon must be a bin boundary of the threshold head's time grid.
+  horizons_hours: [12, 24, 48]
+  # Rollout comparator: rollouts per evaluation anchor when a sampler can date events.
+  n_rollouts: 32
+  max_new_tokens: 256
+
+# Probe roles: the configs/tasks.yaml partitions (fit, selection, calibration) and the
+# scored partition. `internal_test` is sealed: threshold_eval scores it only with
+# --final-evaluation.
+partitions:
+  fit: train
+  selection: validation
+  calibration: calibration
+  evaluation: internal_test
+sealed_partitions: [internal_test]
+
+# Objective arms (configs/objective_arms.yaml names). An arm in `without_threshold_head`
+# never trained the threshold head, so it is scored by the frozen-trunk probe only
+# (KTD13); every other arm gets a head row (zero-shot) and a probe row.
+objective_arms:
+  combined: full
+  next_token: next_token_only
+  ablations: [minus_value, minus_competing_risk, minus_threshold, no_curriculum]
+  without_threshold_head: [next_token_only, minus_threshold]
+
+# Claim 1 (R35, AE6). Scored by the threshold head, zero-shot, on the combined objective.
+# SUPPORTED only if, against EVERY comparator arm, some primary metric has
+#   (a) a significant on-edge gain: mean over the on-edge decision thresholds (on-edge in
+#       the primary arm, at matched bin count, with at least one evaluable paired control)
+#       of (primary - comparator), and
+#   (b) a significant edge-specific gain on the same metric: that on-edge mean minus the
+#       mean of the same difference over their paired off-edge controls.
+# NOT SUPPORTED if, against some comparator, no metric has (a) (the comparator matches
+# on-edge within the interval), or (a) holds but (b) does not (the gain is not specific to
+# the edges), or no concept is at matched bin count (the gain cannot be shown at matched
+# granularity). INCOMPLETE if an arm needed by the rule has fewer than
+# `min_seeds_per_arm` seeds, is missing, or no comparison is evaluable.
+claim_1:
+  scorer: head
+  objective_arm: full
+  primary_arm: clinical_soft
+  comparator_arms: [global_deciles]
+  # Optional attribution control arm (decile input tokens, threshold head trained and
+  # queried on the clinical grid). Its rows are reported whenever its runs are present.
+  # Whether it enters the rejection rule is an OPEN decision for the product authority
+  # (plan: "Claim 1 attribution"); `true` adds it to `comparator_arms` for the rule.
+  attribution_arm: deciles_clinical_query
+  attribution_in_rule: false
+
+# Claim 2 (R31, KTD13). Same tokenization arm for every row.
+# SUPPORTED only if, on BOTH evaluations - `threshold` (the label_rule horizon) and
+# `time_to_event` (the mean over `evaluation.horizons_hours`), each pooled as the mean over
+# every evaluable registered threshold (decision and control) - the combined arm scored by
+# its head beats (a) the next-token arm scored by the frozen-trunk probe and (b) the
+# rollout comparator, when the rollout is evaluable, with a significant difference on at
+# least one primary metric. NOT SUPPORTED if, on either evaluation, the probe or an
+# evaluable rollout matches it on every primary metric (no significant difference).
+# INCOMPLETE if an arm needed by the rule has too few seeds, is missing, or nothing is
+# evaluable. A rollout row that is not evaluable stays in the table and its comparison is
+# reported as not evaluable (outside the family). Ablation rows (combined vs each
+# ablation, all scored by the probe so every row is scored the same way) are descriptive.
+claim_2:
+  tokenization_arm: clinical_soft

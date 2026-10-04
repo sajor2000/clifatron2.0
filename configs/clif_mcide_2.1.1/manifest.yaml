@@ -1,0 +1,72 @@
+# CLIF 2.1 permissible-value snapshot read by src/data/clif_conformance.py.
+# Public specification files only (no patient data). See README.md for provenance.
+#
+# `permissible`: CLIF `table.column` -> where its permissible values come from
+#   {csv: <path>, column: <header>}  - a mCIDE category CSV (blank lines skipped)
+#   {yaml: <path>, column: <name>}   - a clifpy schema column's `permissible_values`
+# `tables`: the CLIF 2.1 column list per table is parsed from `ddl`; a table whose staged
+# layout follows another published variant lists it under `variants` (columns from that
+# variant's schema file), and a site config must pin which variant it uses.
+spec: CLIF
+version: "2.1.1"
+source: https://github.com/Common-Longitudinal-ICU-data-Format/CLIF
+tag: v2.1.1
+commit: 356e3f3de5e1c8b687044956d6be4988a6f365dd
+ddl: ddl/CLIF2.1_MYSQL_ddl.sql
+variants:
+  ecmo_mcs:
+    clifpy_2.1:
+      source: https://github.com/Common-Longitudinal-ICU-data-Format/clifpy
+      release: v2.1.0
+      schema: clifpy_2.1.0/ecmo_mcs_schema.yaml
+permissible:
+  vitals.vital_category: {csv: mCIDE/vitals/clif_vitals_categories.csv, column: vital_category}
+  labs.lab_category: {csv: mCIDE/labs/clif_lab_categories.csv, column: lab_category}
+  respiratory_support.device_category:
+    {csv: mCIDE/respiratory_support/clif_respiratory_support_device_categories.csv, column: device_category}
+  respiratory_support.mode_category:
+    {csv: mCIDE/respiratory_support/clif_respiratory_support_mode_categories.csv, column: mode_category}
+  medication_admin_continuous.med_category:
+    {csv: mCIDE/medication_admin_continuous/clif_medication_admin_continuous_med_categories.csv, column: med_category}
+  medication_admin_continuous.mar_action_category:
+    {csv: mCIDE/medication_admin_continuous/clif_medication_admin_continuous_action_categories.csv, column: mar_action_category}
+  medication_admin_intermittent.med_category:
+    {csv: mCIDE/medication_admin_intermittent/clif_medication_admin_intermittent_med_categories.csv, column: med_category}
+  medication_admin_intermittent.mar_action_category:
+    {csv: mCIDE/medication_admin_intermittent/clif_medication_admin_intermittent_action_categories.csv, column: mar_action_category}
+  patient_assessments.assessment_category:
+    {csv: mCIDE/patient_assessments/clif_patient_assessment_categories.csv, column: assessment_category}
+  crrt_therapy.crrt_mode_category:
+    {csv: mCIDE/crrt_therapy/clif_crrt_therapy_mode_categories.csv, column: crrt_mode_category}
+  code_status.code_status_category:
+    {csv: mCIDE/code_status/clif_code_status_categories.csv, column: code_status_category}
+  position.position_category: {csv: mCIDE/postion/clif_position_categories.csv, column: position_category}
+  adt.location_category: {csv: mCIDE/adt/clif_adt_location_categories.csv, column: location_category}
+  adt.location_type: {csv: mCIDE/adt/clif_adt_location_type.csv, column: location_type}
+  hospitalization.admission_type_category:
+    {csv: mCIDE/hospitalization/clif_hospitalization_admission_type_categories.csv, column: admission_type_category}
+  hospitalization.discharge_category:
+    {csv: mCIDE/hospitalization/clif_hospitalization_discharge_categories.csv, column: discharge_category}
+  patient.sex_category: {csv: mCIDE/patient/clif_patient_sex_categories.csv, column: sex_category}
+  patient.race_category: {csv: mCIDE/patient/clif_patient_race_categories.csv, column: race_category}
+  patient.ethnicity_category: {csv: mCIDE/patient/clif_patient_ethinicity_categories.csv, column: ethnicity_category}
+  # CLIF 2.1 ships no released ECMO mCIDE (only mCIDE/2_2_0_WIP, kept here for reference);
+  # the staged layout follows clifpy 2.1, so its permissible lists are clifpy's.
+  ecmo_mcs.mcs_group: {yaml: clifpy_2.1.0/ecmo_mcs_schema.yaml, column: mcs_group}
+  ecmo_mcs.device_category: {yaml: clifpy_2.1.0/ecmo_mcs_schema.yaml, column: device_category}
+# CLIF 2.1 units. Labs: the mCIDE lab CSV's reference_unit per lab_category. Vitals: the
+# 2.1 DDL vital_value comment ("temp_c = Celsius, height_cm = Centimeters, weight_kg = Kg,
+# map = mmHg, spo2 = %. No unit for heart_rate, sbp, dbp, respiratory_rate"); the four
+# "no unit" vitals carry their conventional unit, as configs/data.yaml unit_normalization.
+units:
+  labs.lab_category: {csv: mCIDE/labs/clif_lab_categories.csv, key: lab_category, unit: reference_unit}
+  vitals.vital_category:
+    temp_c: celsius
+    height_cm: cm
+    weight_kg: kg
+    map: mmHg
+    spo2: "%"
+    sbp: mmHg
+    dbp: mmHg
+    heart_rate: "beats per minute"
+    respiratory_rate: "breaths per minute"

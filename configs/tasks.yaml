@@ -1,0 +1,207 @@
+# Standard post-24-hour CLIF prediction tasks (plan U7; R24, R38).
+#
+# The task set is the published CLIF GEM task table, recorded task by task with the
+# published definition, ours, and whether ours is `matched`, `approximated` or `excluded`.
+# Loaded and validated by src/eval/clif_tasks.py; run by src/eval/baselines.py.
+#
+# HARD RULE #1: treatments are inputs, never prediction targets. A task that predicts
+# treatment initiation is recorded here so the comparison can say it was left out, and
+# the loader REFUSES the suite if such a task (or any task whose source is an
+# input-only table in configs/data.yaml) is marked `active: true`.
+
+suite_version: "1.0.0"
+
+source:
+  citation: >-
+    Burkhart MC, Solo L, Lee I, et al. Federated generative event models for tokenized
+    electronic health records. arXiv:2608.02939 (2026).
+  arxiv: "2608.02939"
+  table: "Table 2 (outcomes); Methods: Inference, Metrics, Baselines"
+  status: retrieved            # retrieved | unverified
+  retrieved_via: "Paperclip full text (arx_2608.02939), read 2026-10-03"
+  n_published_tasks: 12
+  task_rule: >-
+    Each task predicts whether the outcome occurs after 24 hours given that it did not
+    occur within the first 24 hours. All patients are alive at the 24-hour mark; for
+    every other outcome, patients who already had it before the mark are left out of
+    that outcome's metric.
+  published_baselines: >-
+    Logistic regression (L2) on one-hot indicators of each token from the first 24 h;
+    LightGBM on token-count vectors; GEM = logistic regression (L2) on the final hidden
+    state of the sequence truncated at 24 h.
+
+# `status` on each task below describes the OUTCOME definition (concept, cut-off,
+# comparator, incidence rule, horizon). The clock is a suite-level difference that
+# applies to every task, stated once here.
+anchor:
+  published: >-
+    24 hours after hospital admission. Cohort: first hospitalization per patient,
+    longer than 24 hours, transferred to the ICU within 24 hours of admission.
+  ours: >-
+    24 hours after the first ICU admission (configs/cohort.yaml anchor). Cohort: first
+    eligible ICU episode per patient, in the ICU and in hospital at the anchor.
+  alignment: approximated
+  how: >-
+    Time zero is ICU admission, not hospital admission, so the observation window is
+    the first 24 ICU hours; ward and emergency-department events before ICU admission
+    count toward the prior-occurrence exclusion but are not model features.
+
+windows:
+  # Ordering is by availability time (the table's `availability_col` in
+  # configs/data.yaml plus its declared lag), never by chart or collection time.
+  features: "availability time <= anchor"
+  labels: "anchor < availability time <= hospital discharge"
+  prior_occurrence: "availability time <= anchor (stay left out of that task)"
+
+partitions:
+  fit: train                   # predictors and probes
+  selection: validation        # hyperparameters, early stopping
+  calibration: calibration     # temperature only
+  evaluation: internal_test    # sealed: reported only with --final-evaluation
+
+tasks:
+  anemia:
+    status: matched
+    active: true
+    kind: threshold
+    published: "lab result: hemoglobin < 7.0 g/dL"
+    ours: "labs hemoglobin < 7.0 g/dL"
+    any_of:
+      - {source: labs, concept: hemoglobin, op: lt, threshold: 7.0, units: [g/dL]}
+  crrt:
+    status: excluded
+    active: false
+    kind: treatment_initiation
+    published: "use of Continuous Renal Replacement Therapy"
+    reason: >-
+      Predicts the start of a treatment (new CRRT). Hard rule #1: treatments are
+      inputs, never prediction targets.
+  expired:
+    status: matched
+    active: true
+    kind: death
+    published: "death prior to discharge"
+    ours: "hospitalization discharge_category = expired"
+  hyperkalemia:
+    status: matched
+    active: true
+    kind: threshold
+    published: "lab result: potassium >= 6.5 mEq/L"
+    ours: "labs potassium >= 6.5 mmol/L (= mEq/L for potassium)"
+    any_of:
+      - {source: labs, concept: potassium, op: ge, threshold: 6.5, units: [mmol/L, mEq/L]}
+  hypernatremia:
+    status: matched
+    active: true
+    kind: threshold
+    published: "lab result: sodium >= 160 mEq/L"
+    ours: "labs sodium >= 160 mmol/L (= mEq/L for sodium)"
+    any_of:
+      - {source: labs, concept: sodium, op: ge, threshold: 160.0, units: [mmol/L, mEq/L]}
+  hypertension:
+    status: matched
+    active: true
+    kind: threshold
+    published: "blood pressure: systolic >= 180 mmHg or diastolic >= 120 mmHg"
+    ours: "vitals sbp >= 180 mmHg or dbp >= 120 mmHg"
+    any_of:
+      - {source: vitals, concept: sbp, op: ge, threshold: 180.0, units: [mmHg]}
+      - {source: vitals, concept: dbp, op: ge, threshold: 120.0, units: [mmHg]}
+  hypokalemia:
+    status: matched
+    active: true
+    kind: threshold
+    published: "lab result: potassium < 2.5 mEq/L"
+    ours: "labs potassium < 2.5 mmol/L (= mEq/L for potassium)"
+    any_of:
+      - {source: labs, concept: potassium, op: lt, threshold: 2.5, units: [mmol/L, mEq/L]}
+  hyponatremia:
+    status: matched
+    active: true
+    kind: threshold
+    published: "lab result: sodium < 120 mEq/L"
+    ours: "labs sodium < 120 mmol/L (= mEq/L for sodium)"
+    any_of:
+      - {source: labs, concept: sodium, op: lt, threshold: 120.0, units: [mmol/L, mEq/L]}
+  hypotension:
+    status: matched
+    active: true
+    kind: threshold
+    published: "mean arterial pressure < 65 mmHg or systolic < 90 mmHg"
+    ours: "vitals map < 65 mmHg or sbp < 90 mmHg"
+    any_of:
+      - {source: vitals, concept: map, op: lt, threshold: 65.0, units: [mmHg]}
+      - {source: vitals, concept: sbp, op: lt, threshold: 90.0, units: [mmHg]}
+  imv:
+    status: excluded
+    active: false
+    kind: treatment_initiation
+    published: "use of Invasive Mechanical Ventilation"
+    reason: >-
+      Predicts the start of a treatment (new invasive ventilation). Hard rule #1:
+      treatments are inputs, never prediction targets.
+  tachycardia:
+    status: matched
+    active: true
+    kind: threshold
+    published: "heart rate >= 130 beats per minute"
+    ours: "vitals heart_rate >= 130 beats per minute"
+    any_of:
+      - {source: vitals, concept: heart_rate, op: ge, threshold: 130.0,
+         units: [beats per minute, bpm]}
+  vasopressors:
+    status: excluded
+    active: false
+    kind: treatment_initiation
+    published: >-
+      administration of vasopressors (angiotensin, dopamine, epinephrine,
+      norepinephrine, phenylephrine, vasopressin)
+    reason: >-
+      Predicts the start of a treatment (new vasopressor). Hard rule #1: treatments
+      are inputs, never prediction targets.
+
+# R38 baselines. Fit on `partitions.fit` only; every choice below is made on
+# `partitions.selection` only. The published paper chose the L2 strength by 5-fold
+# cross-validation inside its training split; we use the validation partition so all
+# rows of the table are tuned on the same rows.
+# `grid` is searched on the selection partition; `default` is used, with no search,
+# when that partition has a single class for a task.
+baselines:
+  seed: 42
+  lightgbm:                    # gradient-boosted trees on token counts
+    n_estimators: 2000         # upper bound; early stopping picks the round
+    default_n_estimators: 200  # used when there is no selection partition to stop on
+    early_stopping_rounds: 50
+    learning_rate: 0.05
+    min_child_samples: 20
+    colsample_bytree: 0.8
+    n_jobs: 4
+    default: {num_leaves: 15}
+    grid:
+      num_leaves: [15, 63]
+  logistic:                    # L2 logistic regression on token indicators
+    features: indicators       # indicators (published) | counts
+    max_iter: 2000
+    default: {C: 0.1}
+    grid:
+      C: [0.001, 0.01, 0.1, 1.0]
+  probe:                       # linear head on a frozen trunk's hour-24 state
+    epochs: 200
+    lr: 1.0e-2
+    default: {wd: 1.0e-4}
+    grid:
+      wd: [1.0e-4, 1.0e-2]
+
+# Comparator rows the report always carries (R38). A row is filled when BOTH paths
+# exist: `checkpoint` (a transformers-format trunk directory) and `shards` (that
+# model's own 24 h token sequences: a parquet with hosp_id + token, in its own
+# vocabulary). Otherwise the row reads "not available" and the report still builds.
+comparators:
+  decile_ntp_probe:
+    label: "Decile fused tokens, next-token only, linear probe (published CLIF GEM replica)"
+    checkpoint: null
+    shards: null
+  clifatron_0p5b_probe:
+    label: "CLIFATRON 0.5B frozen probe (larger comparator)"
+    checkpoint: null
+    shards: null

@@ -3,7 +3,12 @@ import unittest
 import polars as pl
 
 from src.data.splits import (
+    HeldOutStratification,
     assign_grouped_splits,
+    held_out_shares,
+    held_out_stratification,
+    load_held_out_strata,
+    strata_from_cohort,
     fit_partition,
     validate_grouped_splits,
     validate_required_partitions,
@@ -88,6 +93,121 @@ class GroupedSplitTest(unittest.TestCase):
         )
         with self.assertRaisesRegex(ValueError, "multiple partitions"):
             validate_grouped_splits(rows)
+
+
+RATIOS = {"train": 0.60, "validation": 0.15, "calibration": 0.10, "internal_test": 0.15}
+HELD = ("validation", "calibration", "internal_test")
+
+
+def _population(n: int = 4000, niv: int = 120, hfnc: int = 200):
+    """Synthetic patients; the first `niv` are NIV and the next `hfnc` HFNC (first device)."""
+    episodes = pl.DataFrame({"hospitalization_id": [f"h{i}" for i in range(n)],
+                             "patient_id": [f"p{i}" for i in range(n)]})
+    strata = {f"p{i}": "niv" for i in range(niv)}
+    strata.update({f"p{i}": "hfnc" for i in range(niv, niv + hfnc)})
+    return episodes, strata
+
+
+class HeldOutStratificationTest(unittest.TestCase):
+    """Item 46 (product authority, 2026-10-03): NIV and HFNC first-device patients are
+    over-sampled into the held-out partitions; deterministic; partition sizes kept."""
+
+    def split(self, episodes, strata, share=0.5, seed=42):
+        spec = HeldOutStratification(strata=strata, arms=("niv", "hfnc"), share=share, held_out=HELD)
+        return assign_grouped_splits(episodes, RATIOS, seed=seed, held_out=spec)
+
+    def test_each_stratified_arm_reaches_the_configured_held_out_share(self):
+        episodes, strata = _population()
+        default = assign_grouped_splits(episodes, RATIOS, seed=42)
+        stratified = self.split(episodes, strata)
+        before = held_out_shares(default, strata, HELD)
+        after = held_out_shares(stratified, strata, HELD)
+        for arm, n in (("niv", 120), ("hfnc", 200)):
+            self.assertEqual(after[arm]["patients"], n)
+            self.assertAlmostEqual(after[arm]["held_out_share"], 0.5, delta=0.5 / n + 1e-9)
+            self.assertLess(before[arm]["held_out_share"], 0.47)     # default ~0.40
+        validate_grouped_splits(stratified)
+
+    def test_assignment_is_deterministic_by_seed_and_row_order(self):
+        episodes, strata = _population()
+        first = self.split(episodes, strata)
+        again = self.split(episodes.reverse(), strata).sort("hospitalization_id")
+        self.assertTrue(first.sort("hospitalization_id").equals(again))
+        other = self.split(episodes, strata, seed=7)
+        self.assertFalse(first["partition"].equals(other["partition"]))
+
+    def test_partition_sizes_are_kept_and_other_patients_only_rebalance(self):
+        episodes, strata = _population()
+        default = assign_grouped_splits(episodes, RATIOS, seed=42)
+        stratified = self.split(episodes, strata)
+        self.assertEqual(dict(default.group_by("partition").len().iter_rows()),
+                         dict(stratified.group_by("partition").len().iter_rows()))
+        joined = default.join(stratified, on="hospitalization_id", suffix="_new")
+        others = joined.filter(~pl.col("patient_id").is_in(list(strata)))
+        moved = others.filter(pl.col("partition") != pl.col("partition_new"))
+        # Unstratified patients move only between a held-out partition and train, never
+        # between two held-out partitions, and only as many as the arms moved in.
+        self.assertTrue(moved.height > 0)
+        self.assertTrue(((moved["partition"] == "train") | (moved["partition_new"] == "train")).all())
+        stratified_moved = joined.filter(pl.col("patient_id").is_in(list(strata))
+                                         & (pl.col("partition") != pl.col("partition_new"))).height
+        self.assertEqual(moved.height, stratified_moved)
+        self.assertLess(moved.height / others.height, 0.05)
+
+    def test_a_share_below_the_default_moves_arm_patients_back_to_train(self):
+        episodes, strata = _population()
+        low = held_out_shares(self.split(episodes, strata, share=0.2), strata, HELD)
+        self.assertAlmostEqual(low["hfnc"]["held_out_share"], 0.2, delta=0.01)
+
+    def test_strata_read_only_outcome_blind_membership(self):
+        cohort = pl.DataFrame({
+            "patient_id": ["a", "b", "c", "d", "e"],
+            "eligible": [True, True, True, False, True],
+            "arm_first_device": ["niv", "hfnc", "conventional_oxygen", "niv", None],
+            "arm": ["hfnc", "hfnc", "conventional_oxygen", "niv", None],
+            "reintubation_hours": [5.0, None, None, 3.0, None],
+            "death_hours": [None, 10.0, None, None, None],
+        })
+        self.assertEqual(strata_from_cohort(cohort, arm_column="arm_first_device", arms=("niv", "hfnc")),
+                         {"a": "niv", "b": "hfnc"})
+        # Changing every outcome column changes nothing.
+        flipped = cohort.with_columns(pl.lit(1.0).alias("reintubation_hours"), pl.lit(None).alias("death_hours"))
+        self.assertEqual(strata_from_cohort(flipped, arm_column="arm_first_device", arms=("niv", "hfnc")),
+                         strata_from_cohort(cohort, arm_column="arm_first_device", arms=("niv", "hfnc")))
+        # The loader asks parquet for exactly the outcome-blind columns.
+        import tempfile
+        from pathlib import Path
+        from unittest import mock
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "cohort.parquet"
+            cohort.write_parquet(path)
+            real = pl.read_parquet
+            with mock.patch("src.data.splits.pl.read_parquet", side_effect=lambda *a, **k: real(*a, **k)) as spy:
+                loaded = load_held_out_strata(path, arm_column="arm_first_device", arms=("niv", "hfnc"))
+            self.assertEqual(spy.call_args.kwargs["columns"], ["patient_id", "eligible", "arm_first_device"])
+        self.assertEqual(loaded, {"a": "niv", "b": "hfnc"})
+
+    def test_the_option_is_off_by_default_and_fails_closed(self):
+        import yaml
+        from pathlib import Path
+
+        contract = yaml.safe_load((Path(__file__).resolve().parents[1] / "configs/train.yaml").read_text())[
+            "data_contract"]
+        block = contract["held_out_stratification"]
+        self.assertFalse(block["enabled"])
+        self.assertEqual((block["arms"], block["held_out_share"], block["arm_column"]),
+                         (["niv", "hfnc"], 0.5, "arm_first_device"))
+        self.assertIsNone(held_out_stratification(contract, None))
+        with self.assertRaisesRegex(ValueError, "not enabled"):
+            held_out_stratification(contract, {"a": "niv"})
+        enabled = {**contract, "held_out_stratification": {**block, "enabled": True}}
+        with self.assertRaisesRegex(ValueError, "strata source"):
+            held_out_stratification(enabled, None)
+        spec = held_out_stratification(enabled, {"a": "niv"})
+        self.assertEqual((spec.share, spec.held_out), (0.5, ("validation", "calibration", "internal_test")))
+        with self.assertRaises(ValueError):
+            HeldOutStratification(strata={}, arms=("niv",), share=1.0, held_out=HELD)
 
 
 if __name__ == "__main__":

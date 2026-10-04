@@ -1,3 +1,4 @@
+import copy
 import hashlib
 import json
 import tempfile
@@ -9,7 +10,7 @@ import duckdb
 import polars as pl
 import yaml
 
-from src.data.segments import POLICY_VERSION
+from src.data.segments import POLICY_VERSION, json_sha256
 from src.data.splits import content_manifest
 from src.data.tokenize import (
     _read_table,
@@ -46,6 +47,199 @@ def episode_artifact() -> pl.DataFrame:
     )
 
 
+# json_sha256 of `configs/cohort.yaml -> outcomes`, computed 2026-10-03 before the
+# `study_endpoints` block was added. tokenize.py binds every vocabulary's `outcome_spec`
+# hash to this block, so existing vocabularies and signed bundles depend on it.
+OUTCOME_SPEC_SHA256 = "7ddc3edc08e8980e4a1fa13867b66ead2bf2cd9e30ad6ee699cea07ea7fb9324"
+FORBIDDEN_TRUNK_TASKS = ("new_imv_24h", "new_vasopressor_24h")
+
+
+class TreatmentTargetRuleViolation(AssertionError):
+    """A config breaks hard rule #1 or its scoped amendment (2026-10-03)."""
+
+
+def _study_endpoint_sources(name: str, endpoints: dict, seen: tuple = ()) -> set[str]:
+    """Every source table a study endpoint is read from, through its composites."""
+    if name in seen:
+        raise TreatmentTargetRuleViolation(f"study endpoint {name} is a circular composite")
+    spec = endpoints.get(name)
+    if not isinstance(spec, dict):
+        raise TreatmentTargetRuleViolation(f"study endpoint {name} is not declared")
+    if "composite_of" in spec:
+        sources: set[str] = set()
+        for part in spec["composite_of"]:
+            sources |= _study_endpoint_sources(part, endpoints, (*seen, name))
+        return sources
+    if not spec.get("source"):
+        raise TreatmentTargetRuleViolation(
+            f"study endpoint {name} declares neither source nor composite_of")
+    return {spec["source"]}
+
+
+def check_treatment_target_rule(cohort: dict, train: dict, data: dict) -> None:
+    """Hard rule #1: treatments are model inputs, never prediction targets of the trunk.
+
+    Scoped amendment (2026-10-03): study heads downstream of the frozen trunk may use
+    trial endpoints defined by a treatment event (for example reintubation) as labels.
+    Those endpoints live in the top-level `study_endpoints` block of the cohort
+    contract, never under `outcomes`, and each must be declared `use: label_only`.
+    """
+    def fail(message: str):
+        raise TreatmentTargetRuleViolation(message)
+
+    if cohort.get("treatment_target_policy") != "context_only":
+        fail("treatment_target_policy must stay context_only")
+    input_only = {name for name, spec in data["tables"].items() if spec.get("input_only")}
+    declared = set(cohort.get("treatment_sources") or ())
+    if declared - input_only:
+        fail(f"treatment sources are not input_only in data.yaml: {sorted(declared - input_only)}")
+    treatment = declared | input_only
+
+    # The trunk: its supervised tasks are exactly the frozen physiologic outcomes.
+    outcomes = cohort["outcomes"]
+    tasks = train["finetune"]["tasks"]
+    if set(tasks) != set(outcomes):
+        fail("trunk tasks must equal the frozen outcome contract")
+    for name in FORBIDDEN_TRUNK_TASKS:
+        if name in tasks or name in outcomes:
+            fail(f"{name} predicts treatment initiation and cannot be a trunk task")
+    for name, spec in outcomes.items():
+        if spec.get("source") in treatment:
+            fail(f"trunk outcome {name} is read from treatment source {spec['source']}")
+
+    # Study endpoints: labels for heads downstream of the frozen trunk, nothing else.
+    endpoints = cohort.get("study_endpoints") or {}
+    if not isinstance(endpoints, dict):
+        fail("study_endpoints must be a mapping of endpoint name to declaration")
+    trunk_overlap = sorted(set(endpoints) & (set(outcomes) | set(tasks)))
+    if trunk_overlap:
+        fail(f"study endpoints are also trunk targets: {trunk_overlap}")
+    for name, spec in endpoints.items():
+        derived = sorted(_study_endpoint_sources(name, endpoints) & treatment)
+        if spec.get("use") != "label_only":
+            fail(f"study endpoint {name} is not declared label_only"
+                 + (f"; it derives from treatment source(s) {derived}" if derived else ""))
+
+
+def _rule_configs() -> tuple[dict, dict, dict]:
+    root = Path(__file__).parents[1]
+    return tuple(yaml.safe_load((root / f"configs/{name}.yaml").read_text())
+                 for name in ("cohort", "train", "data"))
+
+
+class TreatmentTargetRuleTest(unittest.TestCase):
+    """Hard rule #1 and its scoped amendment for study endpoints (R30, KTD14)."""
+
+    def setUp(self):
+        self.cohort, self.train, self.data = _rule_configs()
+
+    def _mutated(self):
+        return copy.deepcopy(self.cohort), copy.deepcopy(self.train)
+
+    def test_repo_configs_satisfy_the_rule(self):
+        check_treatment_target_rule(self.cohort, self.train, self.data)
+
+    def test_treatment_source_as_trunk_target_fails(self):
+        for source in ("resp_support", "meds", "adt", "crrt", "ecmo"):
+            cohort, train = self._mutated()
+            cohort["outcomes"]["device_started_48h"] = {"source": source}
+            train["finetune"]["tasks"].append("device_started_48h")
+            with self.assertRaisesRegex(TreatmentTargetRuleViolation,
+                                        f"treatment source {source}", msg=source):
+                check_treatment_target_rule(cohort, train, self.data)
+        cohort, train = self._mutated()
+        cohort["treatment_target_policy"] = "target_eligible"
+        with self.assertRaisesRegex(TreatmentTargetRuleViolation, "context_only"):
+            check_treatment_target_rule(cohort, train, self.data)
+
+    def test_new_imv_24h_is_still_rejected_as_a_trunk_task(self):
+        cohort, train = self._mutated()
+        train["finetune"]["tasks"].append("new_imv_24h")
+        with self.assertRaisesRegex(TreatmentTargetRuleViolation, "frozen outcome contract"):
+            check_treatment_target_rule(cohort, train, self.data)
+        # Declaring it in the outcome contract does not make it a legal trunk task either,
+        # even with a source that is not a treatment table.
+        cohort["outcomes"]["new_imv_24h"] = {"source": "vitals"}
+        with self.assertRaisesRegex(TreatmentTargetRuleViolation, "new_imv_24h"):
+            check_treatment_target_rule(cohort, train, self.data)
+
+    def test_extubation_study_endpoints_are_declared_label_only(self):
+        self.assertNotIn("study_endpoints", self.cohort["outcomes"])
+        endpoints = self.cohort["study_endpoints"]
+        self.assertEqual(set(endpoints), {
+            "reintubation_72h", "reintubation_7d", "death_7d", "reintubation_or_death_7d"})
+        for name, spec in endpoints.items():
+            self.assertEqual(spec["use"], "label_only", name)
+            self.assertEqual(spec["study"], "extubation", name)
+        # Reintubation is a treatment event read from respiratory support as a label source.
+        self.assertIn("resp_support", self.cohort["treatment_sources"])
+        self.assertTrue(self.data["tables"]["resp_support"]["input_only"])
+        for name, hours in (("reintubation_72h", 72), ("reintubation_7d", 168)):
+            self.assertEqual(endpoints[name]["source"], "resp_support", name)
+            self.assertEqual(endpoints[name]["event"], "reintubation", name)
+            self.assertEqual(endpoints[name]["horizon_hours"], hours, name)
+        self.assertEqual(endpoints["death_7d"]["event"], "death")
+        self.assertEqual(endpoints["death_7d"]["horizon_hours"], 168)
+        composite = endpoints["reintubation_or_death_7d"]
+        self.assertEqual(composite["composite_of"], ["reintubation_7d", "death_7d"])
+        self.assertEqual(composite["horizon_hours"], 168)
+        # Label-only endpoints never reach the trunk's task list or its outcome contract.
+        self.assertFalse(set(endpoints) & set(self.train["finetune"]["tasks"]))
+        self.assertFalse(set(endpoints) & set(self.cohort["outcomes"]))
+        check_treatment_target_rule(self.cohort, self.train, self.data)
+
+    def test_study_endpoint_without_the_label_only_declaration_is_rejected(self):
+        cohort, train = self._mutated()
+        cohort["study_endpoints"]["reintubation_72h"].pop("use")
+        with self.assertRaisesRegex(
+                TreatmentTargetRuleViolation,
+                r"reintubation_72h is not declared label_only.*treatment source\(s\) "
+                r"\['resp_support'\]"):
+            check_treatment_target_rule(cohort, train, self.data)
+
+        cohort, train = self._mutated()
+        cohort["study_endpoints"]["reintubation_7d"]["use"] = "target"
+        with self.assertRaisesRegex(TreatmentTargetRuleViolation, "reintubation_7d"):
+            check_treatment_target_rule(cohort, train, self.data)
+
+        # A composite inherits the treatment source of its components.
+        cohort, train = self._mutated()
+        cohort["study_endpoints"]["reintubation_or_death_7d"].pop("use")
+        with self.assertRaisesRegex(
+                TreatmentTargetRuleViolation,
+                r"reintubation_or_death_7d is not declared label_only.*resp_support"):
+            check_treatment_target_rule(cohort, train, self.data)
+
+        # A new treatment-defined endpoint (any input-only table) needs the declaration too.
+        cohort, train = self._mutated()
+        cohort["study_endpoints"]["crrt_start_7d"] = {"source": "crrt", "event": "crrt_start"}
+        with self.assertRaisesRegex(TreatmentTargetRuleViolation, r"crrt_start_7d.*crrt"):
+            check_treatment_target_rule(cohort, train, self.data)
+
+    def test_study_endpoint_cannot_become_a_trunk_target(self):
+        cohort, train = self._mutated()
+        train["finetune"]["tasks"].append("reintubation_7d")
+        with self.assertRaisesRegex(TreatmentTargetRuleViolation, "frozen outcome contract"):
+            check_treatment_target_rule(cohort, train, self.data)
+        # Moving the endpoint under `outcomes` makes it a trunk outcome on a treatment source.
+        cohort["outcomes"]["reintubation_7d"] = cohort["study_endpoints"].pop("reintubation_7d")
+        with self.assertRaisesRegex(TreatmentTargetRuleViolation,
+                                    "treatment source resp_support"):
+            check_treatment_target_rule(cohort, train, self.data)
+        # Declared in both blocks: still a trunk target.
+        cohort, train = self._mutated()
+        cohort["outcomes"]["death_7d"] = {"source": "vitals"}
+        train["finetune"]["tasks"].append("death_7d")
+        with self.assertRaisesRegex(TreatmentTargetRuleViolation, "also trunk targets"):
+            check_treatment_target_rule(cohort, train, self.data)
+
+    def test_outcomes_block_and_outcome_spec_hash_are_unchanged(self):
+        self.assertEqual(list(self.cohort["outcomes"]), [
+            "map_below_65_48h", "lactate_above_4_48h", "spo2_below_88_48h"])
+        self.assertEqual(json_sha256(self.cohort["outcomes"]), OUTCOME_SPEC_SHA256)
+        self.assertEqual(self.cohort["contract_version"], "1.0.0")
+
+
 class DataConfigTest(unittest.TestCase):
     def test_training_config_uses_only_frozen_physiologic_outcomes(self):
         root = Path(__file__).parents[1]
@@ -74,7 +268,18 @@ class DataConfigTest(unittest.TestCase):
         self.assertEqual(declared["labs"]["availability"], "result")
         self.assertEqual(declared["meds"]["availability"], "recorded")
         self.assertEqual(declared["adt"]["availability"], "recorded")
-        self.assertTrue(all(d["lag_minutes"] == 0 for d in declared.values()))
+        # decided 2026-10-03 (product authority): 30 min on every table without a real
+        # store time; labs (result time) and charted administration/state tables keep 0.
+        for name, d in declared.items():
+            expected = 30 if d["availability"] == "missing_storetime" else 0
+            self.assertEqual(d["lag_minutes"], expected, name)
+        cfg = yaml.safe_load((root / "configs/data.yaml").read_text())
+        self.assertEqual(cfg["availability_lag_sensitivities"]["minutes"], [15, 60])
+        from src.data.tokenize import with_availability_lag
+        lagged = validate_table_availability(with_availability_lag(cfg, 60)["tables"])
+        self.assertEqual(lagged["vitals"]["lag_minutes"], 60)
+        self.assertEqual(lagged["labs"]["lag_minutes"], 0)
+        self.assertEqual(cfg["tables"]["vitals"]["availability_lag_minutes"], 30)
 
         missing = {**tables, "labs": {k: v for k, v in tables["labs"].items()
                                       if k != "availability"}}
@@ -154,8 +359,18 @@ class DataConfigTest(unittest.TestCase):
             {"lo": 65.0, "hi": None, "lo_closed": True, "hi_closed": False},
         ]}
         binning_sources = {"map": "csv"}
-        reference_units = {"concepts": {"map": "mmHg"}, "dose_targets": {}}
+        from src.data.tokenize import column_units, site_unit_conversions
+
+        # The config declares unit-less column units, so the vocabulary must record them
+        # and its reference site's (here: no) unit conversions.
+        reference_units = {"concepts": {"map": "mmHg"}, "dose_targets": {},
+                           "column_units": column_units(cfg),
+                           "site_conversions": site_unit_conversions(cfg, "synthetic-reference")}
         concept_sources = {"tables": {"map": ["vitals"]}, "treatment_sources": []}
+        # The config declares CLIF harmonization rules (mCIDE gate, GCS, BP method, ...),
+        # so the vocabulary carries their hashed record.
+        from src.data.clif_conformance import harmonization_record
+        harmonization = json.loads(json.dumps(harmonization_record(cfg, "synthetic-reference")))
 
         def digest(value):
             payload = json.dumps(value, sort_keys=True, separators=(",", ":"))
@@ -176,6 +391,7 @@ class DataConfigTest(unittest.TestCase):
                 "target_map": digest(cfg["target_concepts"]),
                 "outcome_spec": digest(cohort_cfg["outcomes"]),
                 "clif_version": digest(cfg["schema_version"]),
+                "harmonization": digest(harmonization),
             },
             "provenance": {
                 "source_site": "synthetic-reference",
@@ -188,7 +404,8 @@ class DataConfigTest(unittest.TestCase):
         def artifact(**over):
             blob = {"vocab": vocab, "segments": segments, "manifest": manifest,
                     "binning_sources": binning_sources, "reference_units": reference_units,
-                    "concept_sources": concept_sources, "precedence_policy": POLICY_VERSION}
+                    "concept_sources": concept_sources, "precedence_policy": POLICY_VERSION,
+                    "harmonization": harmonization}
             blob.update(over)
             return blob
 
@@ -201,6 +418,14 @@ class DataConfigTest(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "hash mismatch"):
             validate_vocabulary_artifact(artifact(vocab={**vocab, "new": 3}), cfg, policy)
+
+        # A vocabulary recording no column units does not bind a config that declares them.
+        bare_units = {"concepts": {"map": "mmHg"}, "dose_targets": {}}
+        bare = json.loads(json.dumps(manifest))
+        bare["hashes"]["reference_units"] = digest(bare_units)
+        with self.assertRaisesRegex(ValueError, "column units"):
+            validate_vocabulary_artifact(artifact(manifest=bare, reference_units=bare_units),
+                                         cfg, policy)
 
         moved = json.loads(json.dumps(segments))
         moved["map"][0]["hi"] = moved["map"][1]["lo"] = 66.0
@@ -340,10 +565,11 @@ class NewSourceConfigTest(unittest.TestCase):
         cls.cfg = yaml.safe_load((root / "configs/data.yaml").read_text())
         cls.tables = cls.cfg["tables"]
 
-    def test_new_tables_are_declared_with_availability_and_zero_lag(self):
+    def test_new_tables_are_declared_with_availability_and_lag(self):
         for name, file in NEW_TABLE_FILES.items():
             self.assertEqual(self.tables[name]["file"], file, name)
-            self.assertEqual(self.tables[name]["availability_lag_minutes"], 0, name)
+            expected = 30 if self.tables[name]["availability"] == "missing_storetime" else 0
+            self.assertEqual(self.tables[name]["availability_lag_minutes"], expected, name)
         semantics = {name: self.tables[name]["availability"] for name in NEW_TABLE_FILES}
         self.assertEqual(semantics, {
             "meds_intermittent": "recorded", "assessments": "missing_storetime",
@@ -375,7 +601,13 @@ class NewSourceConfigTest(unittest.TestCase):
     def test_dose_blocks_and_static_tokens(self):
         meds = self.tables["meds"]["dose"]
         self.assertEqual(meds["kind"], "continuous")
-        self.assertEqual(meds["weight_source"], {"table": "vitals", "concept": "weight_kg"})
+        # Plausible weights for per-kg conversion match the extubation BMI rule.
+        self.assertEqual(meds["weight_source"], {"table": "vitals", "concept": "weight_kg",
+                                                 "plausible_kg": [25.0, 400.0]})
+        extubation = yaml.safe_load((Path(__file__).parents[1] / "configs/extubation.yaml")
+                                    .read_text())
+        self.assertEqual(meds["weight_source"]["plausible_kg"],
+                         extubation["risk_factors"]["bmi"]["plausible_weight_kg"])
         self.assertEqual(self.tables["meds_intermittent"]["dose"]["kind"], "intermittent")
         self.assertEqual(self.tables["ecmo"]["concept_qualifier_col"], "mcs_group")
         self.assertEqual(self.tables["code_status"]["key"], "patient")

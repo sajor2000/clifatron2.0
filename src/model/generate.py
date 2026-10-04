@@ -42,7 +42,7 @@ from collections.abc import Mapping, Sequence
 import torch
 import torch.nn.functional as F
 
-from src.data.segments import DISCHARGE_PREFIX, load_vocab_blob, n_value_bins, vocab_segments
+from src.data.segments import DISCHARGE_PREFIX, load_vocab_blob, vocab_segments
 from src.model.encoder import CLIFEncoder, apply_rope, build_rope_cache
 from src.eval.clinical_plausibility import assess_sequence, split_sequence
 
@@ -97,6 +97,12 @@ def _cached_forward(enc: CLIFEncoder, token_ids: torch.Tensor, pos_min: torch.Te
             "chunked decoding after prefill supports exactly one new token per step"
         )
     x = enc.embed_tokens(token_ids)   # the TextCode arm replaces tok_emb (hook)
+    if getattr(enc, "order_only", False):
+        # Order-only arm (R36): rotary positions are the token index, continued past
+        # the cached prefix.
+        offset = 0 if cache.is_empty() else int(cache.k[0].size(-2))
+        index = torch.arange(offset, offset + T, device=pos_min.device)
+        pos_min = index.expand_as(pos_min)
     cos, sin = build_rope_cache(pos_min, enc.head_dim, enc.rope_base)
     for layer_idx, blk in enumerate(enc.blocks):
         prefill = cache.k[layer_idx] is None
@@ -639,20 +645,19 @@ def load_generation_model(checkpoint_path: str | Path, model_config: str | Path,
     import yaml
 
     from src.train.checkpoint import load_checkpoint, verify_checkpoint_binding
-    from src.train.pretrain import Model
+    from src.train.pretrain import checkpoint_model_config, load_model_from_checkpoint
 
     mcfg = yaml.safe_load(Path(model_config).read_text())
     dcfg = yaml.safe_load(Path(data_config).read_text())
     n_targets = len(dcfg["target_concepts"])
-    vocab_size = mcfg["trunk"].get("target_vocab", 10000)
     blob = load_checkpoint(checkpoint_path)
     verify_checkpoint_binding(blob, vocab_artifact)
     state = blob.get("model", blob)
+    # Embedding rows and trunk from the checkpoint manifest (max id + 1, KTD7/R37).
+    vocab_size, mcfg = checkpoint_model_config(blob, mcfg, vocab_artifact)
     try:
-        model = Model(vocab_size, n_targets, mcfg,
-                      n_value_bins=n_value_bins(vocab_artifact))
-        model.load_state_dict(state)
-        return model.enc
+        return load_model_from_checkpoint(blob, mcfg, n_targets, vocab_artifact,
+                                          verify=False).enc
     except (RuntimeError, KeyError):
         enc_state = {k[len("enc."):]: v for k, v in state.items() if k.startswith("enc.")}
         enc = CLIFEncoder(vocab_size, mcfg)

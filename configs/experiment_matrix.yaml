@@ -1,0 +1,155 @@
+# Experiment matrix for Paper 1 (plan U6; R34, R36, R37; KTD11, KTD12). Read by
+# src/train/run_matrix.py, which expands it to one run specification per (row
+# configuration, seed, budget), validates every referenced arm and key, writes each run's
+# run_spec.json (the src/eval/claims_report.py schema) and PRINTS the launch commands.
+# It never starts training.
+#
+#   uv run python -m src.train.run_matrix                 # list runs + launch commands
+#   uv run python -m src.train.run_matrix --edge-check    # edge-distance table per arm
+#   uv run python -m src.train.run_matrix --write         # + run_spec.json per run
+#
+# A run configuration is (tokenization arm, objective arm, trunk size, positions). Rows
+# that name the same configuration share its runs (the run records every table row it
+# serves). Every configuration runs at every seed, once per budget.
+#
+# KTD12: claims are read only from full-budget runs listed under `claim_bearing` (by
+# arm and seed) before launch. Screening runs are shake-out and size the full budget
+# from a timing run on the L40 node; they never decide which arms or seeds are reported.
+
+schema_version: "1.0.0"
+
+# Every row uses these unless it names its own.
+reference:
+  size: "30m"
+  positions: admission_minutes
+
+# At least three seeds per arm (R34; claims.yaml min_seeds_per_arm).
+seeds: [1, 2, 3]
+
+# Run length in passes over the training data (`schedule.passes`, U5). The full budget is
+# a placeholder until the screening timing run on the L40 node sizes it; every arm of a
+# budget trains for the same passes (equal compute: same data, same updates).
+budgets:
+  screening: 0.05
+  full: 1.0
+
+# Trunk sizes (R37). Overrides of configs/model.yaml `trunk` (`--trunk KEY=VALUE`); the
+# reported size is the MEASURED parameter count in each run's manifest. Measured on the
+# 2,083-row MIMIC verification-sample vocabulary: 3.4M, 11.6M and 36.6M (embeddings and
+# heads included); the full vocabulary moves them.
+sizes:
+  "3m":  {d_model: 192, n_layers: 4, n_heads: 4}
+  "10m": {d_model: 320, n_layers: 6, n_heads: 5}
+  "30m": {d_model: 512, n_layers: 8, n_heads: 8}     # = configs/model.yaml
+
+# Rotary positions (`trunk.rope_position`, R36). admission_minutes is the primary;
+# token_index is the event-order-only ablation.
+positions: [admission_minutes, token_index]
+
+launch:
+  module: src.train.run_tokenization_ablation
+  trajectory: hospitalization
+  nproc_per_node: 2                 # the 2x L40 node
+  sites: [mimic]                    # development sites with staged data (Rush when staged)
+  run_root: output/intermediate_phi/runs
+  # Value stats fit on the arm's gem_events.parquet train stays, in the first site's dir.
+  value_stats_file: gem_value_stats.json
+
+# Each tokenization arm's full-hospitalization shard directory per site (vocab.json +
+# gem_events.parquet). The two decile arms are separate tokenizations (KTD11).
+arm_data:
+  clinical_soft:     {mimic: output/intermediate_phi/mimic}
+  clinical_hard:     {mimic: output/intermediate_phi/mimic}
+  global_deciles:    {mimic: output/intermediate_phi/mimic_decile}
+  deciles_plus_soft: {mimic: output/intermediate_phi/mimic_decile_forced}
+  continuous_fused:  {mimic: output/intermediate_phi/mimic_continuous}
+  textcode:          {mimic: output/intermediate_phi/mimic}
+
+# Every trainable row of notes/ai-novelty-audit.md section 5 (`table_row` is its exact
+# text), plus the claim 2 comparator the table leaves implicit.
+rows:
+  - id: burkhart_replica
+    table_row: "Decile fused, next-token, order-only (Burkhart replica)"
+    tokenization_arm: global_deciles
+    objective_arm: next_token_only
+    positions: token_index
+  - id: clinical_hard_next_token
+    table_row: "Clinical hard, next-token only"
+    tokenization_arm: clinical_hard
+    objective_arm: next_token_only
+  - id: primary
+    table_row: "Clinical soft, full objective (primary)"
+    tokenization_arm: clinical_soft
+    objective_arm: full
+  - id: clinical_hard_full
+    table_row: "Clinical hard, full"
+    tokenization_arm: clinical_hard
+    objective_arm: full
+  - id: global_deciles_full
+    table_row: "Global deciles, full"
+    tokenization_arm: global_deciles
+    objective_arm: full
+  - id: deciles_forced_full
+    table_row: "Deciles plus soft with forced edges, full"
+    tokenization_arm: deciles_plus_soft
+    objective_arm: full
+  - id: continuous_fused_full
+    table_row: "Continuous-fused, full"
+    tokenization_arm: continuous_fused
+    objective_arm: full
+  - id: textcode_full                # the language-grounded arm (R36)
+    table_row: "TextCode, full"
+    tokenization_arm: textcode
+    objective_arm: full
+  - id: objective_ablations          # mark / incidence / curriculum (+ the threshold head)
+    table_row: "Primary minus mark / minus incidence / minus curriculum"
+    tokenization_arm: clinical_soft
+    objective_arm: [minus_value, minus_competing_risk, no_curriculum, minus_threshold]
+  - id: order_only                   # "time tokens" = the primary's admission-relative positions
+    table_row: "Primary with order-only / time tokens"
+    tokenization_arm: clinical_soft
+    objective_arm: full
+    positions: token_index
+  - id: size_sweep                   # 30m is the primary row
+    table_row: "Primary at 3M / 10M"
+    tokenization_arm: clinical_soft
+    objective_arm: full
+    size: ["3m", "10m"]
+  - id: claim_2_next_token
+    table_row: "Claim 2 comparator: clinical soft, next-token only (claims.yaml claim_2)"
+    tokenization_arm: clinical_soft
+    objective_arm: next_token_only
+
+# Table rows with no training run here.
+not_trained:
+  - table_row: "LightGBM counts / LR tokens"
+    source: "U7 count and token baselines (src/eval/baselines.py)"
+  - table_row: "CLIFATRON 0.5B frozen probe (larger comparator)"
+    source: "frozen-probe comparator row, filled when a checkpoint is staged (R38); not trained"
+
+# Claim 1 attribution control (plan "Open items": whether R35's rule uses it is undecided;
+# claims.yaml claim_1.attribution_arm). Decile input tokens, threshold head trained and
+# queried on the clinical grid. OFF by default; the launcher does not implement the
+# clinical query grid yet, so enabling it is refused until it does.
+attribution:
+  enabled: false
+  name: deciles_clinical_query
+  input_arm: global_deciles
+  query_grid_arm: clinical_soft
+  objective_arm: full
+
+# KTD12: the claim-bearing runs, listed by (tokenization arm, objective arm) and seed
+# BEFORE launch, at the reference size and positions, full budget only. These are the runs
+# src/eval/claims_report.py reads (claim 1, claim 2 and their descriptive rows).
+claim_bearing:
+  - {tokenization_arm: clinical_soft,     objective_arm: full,                 seeds: [1, 2, 3], budget: full}
+  - {tokenization_arm: global_deciles,    objective_arm: full,                 seeds: [1, 2, 3], budget: full}
+  - {tokenization_arm: clinical_hard,     objective_arm: full,                 seeds: [1, 2, 3], budget: full}
+  - {tokenization_arm: deciles_plus_soft, objective_arm: full,                 seeds: [1, 2, 3], budget: full}
+  - {tokenization_arm: continuous_fused,  objective_arm: full,                 seeds: [1, 2, 3], budget: full}
+  - {tokenization_arm: textcode,          objective_arm: full,                 seeds: [1, 2, 3], budget: full}
+  - {tokenization_arm: clinical_soft,     objective_arm: next_token_only,      seeds: [1, 2, 3], budget: full}
+  - {tokenization_arm: clinical_soft,     objective_arm: minus_value,          seeds: [1, 2, 3], budget: full}
+  - {tokenization_arm: clinical_soft,     objective_arm: minus_competing_risk, seeds: [1, 2, 3], budget: full}
+  - {tokenization_arm: clinical_soft,     objective_arm: minus_threshold,      seeds: [1, 2, 3], budget: full}
+  - {tokenization_arm: clinical_soft,     objective_arm: no_curriculum,        seeds: [1, 2, 3], budget: full}

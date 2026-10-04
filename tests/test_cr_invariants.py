@@ -1,6 +1,7 @@
+import math
 import unittest
 import torch
-from src.model.heads import CompetingRiskHead, ThresholdHazardHead
+from src.model.heads import CompetingRiskHead, ThresholdHazardHead, time_bin
 
 
 class CompetingRiskInvariants(unittest.TestCase):
@@ -136,6 +137,122 @@ class CompetingRiskInvariants(unittest.TestCase):
         early = head.loss(h, target, tau, direction, crossed, torch.ones(1, dtype=torch.long))
         full = head.loss(h, target, tau, direction, crossed, torch.full((1,), 3, dtype=torch.long))
         self.assertLess(float(early.detach()), float(full.detach()))
+
+
+class CensoredCreditInvariants(unittest.TestCase):
+    """KTD4: a censored interval is credited only through its last FULLY observed bin.
+
+    For a censored sample `dt_bin` is the number of fully observed bins (the index of
+    the bin the censoring time fell in); its likelihood is the event-free probability
+    through those bins and nothing later."""
+
+    def setUp(self):
+        torch.manual_seed(3)
+        self.d, self.K, self.B = 6, 2, 5
+        self.head = CompetingRiskHead(self.d, self.K, self.B)
+        self.h = torch.randn(1, self.d)
+        _, self.event_free = self.head.cif(self.h)          # [1, B]
+
+    def _censored_loss(self, bins: int) -> float:
+        return float(self.head.loss(self.h, torch.tensor([-1]), torch.tensor([bins])))
+
+    def test_censored_credit_stops_before_the_partially_observed_bin(self):
+        for bins in range(1, self.B + 1):
+            with self.subTest(fully_observed_bins=bins):
+                expected = -torch.log(self.event_free[0, bins - 1])
+                self.assertAlmostEqual(self._censored_loss(bins), float(expected), places=5)
+
+    def test_censoring_inside_the_first_bin_gives_no_credit(self):
+        self.assertEqual(self._censored_loss(0), 0.0)
+
+    def test_censored_credit_equals_one_minus_total_incidence(self):
+        cif, _ = self.head.cif(self.h)
+        for bins in range(1, self.B + 1):
+            survival = 1.0 - float(cif[0, :, bins - 1].sum())
+            self.assertAlmostEqual(math.exp(-self._censored_loss(bins)), survival, places=5)
+
+    def test_a_longer_censored_interval_never_costs_less(self):
+        losses = [self._censored_loss(bins) for bins in range(self.B + 1)]
+        self.assertEqual(losses, sorted(losses))
+
+    def test_fully_observed_horizon_is_credited_through_every_bin(self):
+        beyond = self._censored_loss(self.B + 3)             # clamped to the horizon
+        self.assertAlmostEqual(beyond, self._censored_loss(self.B), places=6)
+
+    def test_event_likelihood_is_prior_survival_times_cause_probability(self):
+        q = self.head._distribution(self.h)                  # [1, K+1, B]
+        for b in range(self.B):
+            prior = 1.0 if b == 0 else float(self.event_free[0, b - 1])
+            expected = -math.log(prior * float(q[0, 1, b]))
+            got = float(self.head.loss(self.h, torch.tensor([1]), torch.tensor([b])))
+            with self.subTest(event_bin=b):
+                self.assertAlmostEqual(got, expected, places=5)
+
+    def test_censoring_and_an_event_in_the_same_bin_share_the_prior_survival(self):
+        """Censored in bin b: S(b-1). Event in bin b: S(b-1) * q. Same prior, so the
+        event likelihood can never exceed the censored one."""
+        for b in range(self.B):
+            event = float(self.head.loss(self.h, torch.tensor([0]), torch.tensor([b])))
+            self.assertGreater(event, self._censored_loss(b))
+
+
+class ManyCauseLikelihoodTest(unittest.TestCase):
+    """The production head has 11 causes over 16 bins. At initialization the event-free
+    probability through the horizon is about 12**-16: the likelihood must still be exact
+    and still carry a gradient (it used to be clamped at 1e-8, which froze every
+    event-free and every late-event sample)."""
+
+    def setUp(self):
+        torch.manual_seed(0)
+        self.head = CompetingRiskHead(8, 11, 16)
+        self.h = torch.randn(3, 8)
+
+    def test_full_horizon_survival_is_exact_and_has_a_gradient(self):
+        loss = self.head.loss(self.h, torch.full((3,), -1), torch.full((3,), 16))
+        self.head.double()                                  # reference in float64
+        _, event_free = self.head.cif(self.h.double())
+        expected = -torch.log(event_free[:, 15]).mean()
+        self.head.float()
+        self.assertLess(float(event_free[:, 15].max()), 1e-8)      # below the old clamp
+        self.assertAlmostEqual(float(loss), float(expected), places=3)
+        loss.backward()
+        self.assertGreater(float(self.head.fc.weight.grad.abs().sum()), 0.0)
+
+    def test_late_event_is_exact_and_has_a_gradient(self):
+        loss = self.head.loss(self.h, torch.tensor([0, 5, 10]), torch.tensor([15, 14, 13]))
+        self.assertGreater(float(loss), -math.log(1e-8))           # past the old clamp
+        loss.backward()
+        self.assertGreater(float(self.head.fc.weight.grad.abs().sum()), 0.0)
+
+
+class TimeBinTest(unittest.TestCase):
+    """KTD4: each head bins minutes since the anchor on ITS OWN grid (floor)."""
+
+    def test_five_hours_is_hour_bin_5_and_three_hour_bin_1(self):
+        minutes = torch.tensor([300])
+        self.assertEqual(time_bin(minutes, 48, 48).tolist(), [5])
+        self.assertEqual(time_bin(minutes, 16, 48).tolist(), [1])
+
+    def test_bins_are_left_closed(self):
+        minutes = torch.tensor([0, 59, 60, 179, 180, 181])
+        self.assertEqual(time_bin(minutes, 48, 48).tolist(), [0, 0, 1, 2, 3, 3])
+        self.assertEqual(time_bin(minutes, 16, 48).tolist(), [0, 0, 0, 0, 1, 1])
+
+    def test_ten_hours_is_ten_full_hour_bins_and_three_full_three_hour_bins(self):
+        minutes = torch.tensor([600])
+        self.assertEqual(time_bin(minutes, 48, 48).tolist(), [10])
+        self.assertEqual(time_bin(minutes, 16, 48).tolist(), [3])
+
+    def test_the_horizon_itself_is_one_past_the_last_bin(self):
+        minutes = torch.tensor([2880, 5000])
+        self.assertEqual(time_bin(minutes, 48, 48).tolist(), [48, 83])
+        self.assertEqual(time_bin(minutes, 16, 48).tolist(), [16, 27])
+
+    def test_grid_must_be_positive(self):
+        with self.assertRaises(ValueError):
+            time_bin(torch.tensor([1]), 0, 48)
+        with self.assertRaises(ValueError):
+            time_bin(torch.tensor([1]), 4, 0)
 
 
 if __name__ == "__main__":

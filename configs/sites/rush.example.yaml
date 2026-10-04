@@ -1,0 +1,45 @@
+# TEMPLATE for the Rush site-local declarations (src/data/site_config.py).
+#
+# On the node: cp configs/sites/rush.example.yaml configs/sites/rush.local.yaml, then fill the
+# placeholders from aggregate on-node checks (docs/plans/l40-runbook.md, "Rush day 1").
+# configs/sites/*.local.yaml is git-ignored: the local copy may name Rush's own source strings
+# and NEVER leaves the node or enters git. This template holds no Rush strings.
+#
+# Merged at load time: `profile` into configs/data.yaml sites.rush, `site_harmonization` into
+# site_harmonization.rush, `site_unit_conversions` into site_unit_conversions.rush (local
+# keys win). What was merged is hashed into every Rush shard's binding (`site_declarations`).
+site: rush
+
+profile:
+  # IANA zone of Rush's wall clock: naive timestamps are read as this clock and converted to
+  # UTC; a date-only death at local midnight gets the 24 h date-resolution tolerance.
+  site_timezone: America/Chicago
+  # The data cut (ISO-8601 with an offset, e.g. "YYYY-MM-DDTHH:MM:SSZ"): a stay with no
+  # discharge time is censored there. Fill in before the cohort is built.
+  extraction_dttm: null
+  # Configured tables Rush does not have: skipped quietly and reported. Any other absent
+  # table fails the build. (Decided 2026-10-03: Rush has no ECMO/MCS table.)
+  expected_absent_tables: [ecmo_mcs]
+
+site_harmonization:
+  # Blood-pressure measurement method from Rush's source column. Write a pattern only for a
+  # source name seen in at least 10 rows (aggregate count on the node); map the rest to
+  # `unknown` explicitly.
+  bp_method:
+    source_column: meas_site_name
+    patterns:
+      - {pattern: "<ARTERIAL_SOURCE_NAME_REGEX>", method: arterial}
+      - {pattern: "<CUFF_SOURCE_NAME_REGEX>", method: noninvasive_auto}
+    "null": unknown          # a row with no source name
+  # Non-permissible category values -> mCIDE (fill from the conformance gate's report):
+  category_map: {}
+  # Rush column names that differ from the CLIF 2.1 names: {config column: Rush column}.
+  column_aliases: {}
+  declared_exceptions: {}
+  # A conventional (non-high-sensitivity) troponin T assay gets its own concept, like MIMIC
+  # (decided 2026-10-03: no code change; uncomment only if the day-1 assay check says so):
+  # concept_renames:
+  #   labs: {troponin_t: troponin_t_conventional}
+
+# Explicit unit repairs, as configs/data.yaml site_unit_conversions documents.
+site_unit_conversions: {}

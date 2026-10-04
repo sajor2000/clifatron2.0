@@ -19,6 +19,22 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
+def time_bin(minutes: torch.Tensor, n_time_bins: int, horizon_hours: float) -> torch.Tensor:
+    """Minutes since the anchor -> bin on ONE head's own grid (KTD4): `n_time_bins` equal
+    left-closed bins over `horizon_hours`, ``floor(minutes / bin width)``, not clamped.
+
+    The same number reads two ways. For an event it is the bin the event fell in (the
+    caller clamps to the last bin: an event exactly at the horizon belongs to it). For a
+    censored or event-free interval it is the count of FULLY observed bins (the caller
+    clamps to `n_time_bins`); the bin the interval ended in is only partly observed and
+    earns no survival credit. Integer arithmetic, so a time exactly on a bin edge can
+    never round into the wrong bin."""
+    horizon_minutes = round(float(horizon_hours) * 60)
+    if n_time_bins <= 0 or horizon_minutes <= 0:
+        raise ValueError("time grid needs a positive bin count and horizon")
+    return torch.div(minutes.long() * int(n_time_bins), horizon_minutes, rounding_mode="floor")
+
+
 class NextEventHead(nn.Module):
     """Next-token projection, untied by default with an explicit tied ablation."""
 
@@ -105,7 +121,8 @@ class CompetingRiskHead(nn.Module):
     Each time bin computes (K+1) logits, normalized via softmax.  Event mass for
     cause k at bin t is: S(t-1) * q[k, t] where S(t-1) is the event-free probability
     through bin t-1 and q[k,t] is the conditional cause probability for that bin.
-    Censoring contributes S(c) where c is the last observed interval.
+    Censoring contributes S(c-1) where c is the number of fully observed bins: the bin
+    the censoring time fell in is only partly observed and earns no credit (KTD4).
 
     Invariants: S(t) + sum_k CIF_k(t) = 1 for all t; all CIFs are nonnegative and
     monotone; logits must have at least 2 channels (1 cause + no event minimum)."""
@@ -138,8 +155,10 @@ class CompetingRiskHead(nn.Module):
         """NLL under cause-plus-no-event parameterization.
 
         event_type: 0..K-1, ignored when censored==True.
-        dt_bin: integer bin index.  For censored samples this is the last observed
-                interval; for events it is the bin in which the event occurred.
+        dt_bin: `time_bin` of the observed time on this head's grid.  For events it is
+                the bin in which the event occurred (clamped to the last bin).  For
+                censored samples it is the number of FULLY observed bins, 0..n_bins:
+                survival is credited through bin dt_bin-1 and no further.
         censored: optional bool mask; when not supplied, event_type < 0 signals
                   censoring (legacy).
         """
@@ -149,18 +168,19 @@ class CompetingRiskHead(nn.Module):
             censored = event_type < 0
         N = h.size(0)
         idx = torch.arange(N, device=h.device)
-        q = self._distribution(h)                                        # [N, K+1, B]
-        q_event = q[idx, event_type.clamp(min=0)]                         # [N, B]
-        q_no_event = q[:, -1, :]                                         # [N, B]
+        # Log space: with K causes over B bins the event-free probability through the
+        # horizon starts near (K+1)**-B, far below any clamp a product would need, and a
+        # clamped likelihood has no gradient.
+        log_q = torch.log_softmax(self._logits(h).float(), dim=-2)       # [N, K+1, B]
+        log_q_event = log_q[idx, event_type.clamp(min=0)]                 # [N, B]
+        # log S(c): event-free through the first c bins (S(0) = 1), c = 0..n_bins.
+        log_survival = torch.cat(
+            [torch.zeros_like(log_q[:, -1, :1]), torch.cumsum(log_q[:, -1, :], dim=-1)],
+            dim=-1,
+        )
         b = dt_bin.clamp(min=0, max=self.n_bins - 1)
-        event_free = torch.cumprod(q_no_event, dim=-1)
-        prior = torch.where(
-            b > 0,
-            event_free[idx, (b - 1).clamp(min=0)],
-            torch.ones(N, device=h.device),
-        )                                                                # [N]
-        ll_event = torch.log((prior * q_event[idx, b]).clamp_min(1e-8))
-        ll_censor = torch.log(event_free[idx, b].clamp_min(1e-8))
+        ll_event = log_survival[idx, b] + log_q_event[idx, b]
+        ll_censor = log_survival[idx, dt_bin.clamp(min=0, max=self.n_bins)]
         log_lik = torch.where(censored, ll_censor, ll_event)
         return -log_lik.mean()
 
@@ -187,7 +207,15 @@ class ThresholdHazardHead(nn.Module):
         )
 
     def _logits(self, h_last, target_idx, tau_bin, direction) -> torch.Tensor:
-        if tau_bin.numel():
+        if tau_bin.numel() and tau_bin.is_cuda:
+            # No host sync on the GPU: the check runs on the device and fails the next
+            # kernel launch (a device-side assert) instead of stalling every forward.
+            lo, hi = torch.aminmax(tau_bin)
+            torch._assert_async(
+                (lo >= 0) & (hi < self.thr_emb.num_embeddings),
+                "threshold value bin out of range: n_value_bins must be derived from the "
+                "vocabulary the query's tau_bin was computed against")
+        elif tau_bin.numel():
             lo, hi = torch.stack(torch.aminmax(tau_bin)).tolist()   # one host sync
             if int(lo) < 0 or int(hi) >= self.thr_emb.num_embeddings:
                 raise ValueError(
@@ -212,6 +240,9 @@ class ThresholdHazardHead(nn.Module):
 
     def loss(self, h_last, target_idx, tau_bin, direction, crossed_bin, observed_bin=None) -> torch.Tensor:
         """crossed_bin: first hour the target crossed τ within horizon, or -1 if never.
+        observed_bin: for a query with no crossing, the number of FULLY observed bins
+        (`time_bin` on this head's grid; default: the whole horizon) — survival is
+        credited for those bins only (KTD4).
         Discrete-time hazard NLL with random τ sampled by the trainer."""
         logits = self._logits(h_last, target_idx, tau_bin, direction).float()
         N, Bn = logits.shape

@@ -1,0 +1,510 @@
+# Benchmark registry for the extubation known-answer test (plan U12; R8, R10, R25, R27, R29).
+#
+# What this file is: the candidate benchmark trials, how each is emulated on the
+# extubation cohort (configs/extubation.yaml), the published effect each emulation is
+# compared with, and the PROPOSED parameters of the agreement rule and the feasibility
+# screen. src/eval/causal/benchmark.py reads nothing else.
+#
+# What it is not: a registered protocol. Every margin and threshold below carries
+# `status: proposed`. They become final only when the emulation protocol is registered
+# (R7); until then no adjusted estimate or outcome-by-arm comparison may be run, except
+# the one audit comparison named under `pre_registration_audit` (R32, KTD9).
+#
+# The claim this registry supports is agreement with the pattern the trials established.
+# An emulation that lands inside the margin is consistent with the trial; it is not
+# proof of cause.
+#
+# Source check (2026-10-03): every PMID, the arms, the outcome, the window, the arm
+# counts and the published effect with its interval were read from the PubMed abstract
+# (and, for Hernandez 2022, the PMC full text). A field that could not be confirmed
+# there carries `unverified: true` with the reason. Nothing here was taken from memory.
+
+registry_version: "0.1.0"
+status: proposed
+
+# Arms of the extubation cohort (configs/extubation.yaml `arms.order`) and the cohort
+# columns that hold an assignment. A trial's exposure must use these.
+#
+# CLIF 2.1 (product authority, 2026-10-03): every arm is an explicit grouping of
+# permissible CLIF 2.1.1 respiratory_support.device_category values (mCIDE
+# respiratory_support/clif_respiratory_support_device_categories.csv), restated here so
+# the registry is checkable on its own; it must equal configs/extubation.yaml
+# `arms.device_categories` (test-locked in tests/test_causal_benchmark.py).
+arm_device_categories:
+  conventional_oxygen: ["Nasal Cannula", "Face Mask", "Room Air"]
+  hfnc: ["High Flow NC"]
+  niv: ["NIPPV", "CPAP"]
+cohort:
+  arms: ["conventional_oxygen", "hfnc", "niv"]
+  assignment_columns: ["arm", "arm_first_device", "arm_highest_support"]
+  eligibility_columns: ["eligible", "eligible_ventilation_12h"]
+  patient_id_column: "patient_id"
+
+# Site roles (R33, KTD9). A site that is not `exploratory` needs the R28 freeze hashes
+# before any outcome-by-arm run; a site missing from this list is treated as
+# confirmatory.
+sites:
+  mimic: {role: exploratory}
+  rush: {role: confirmatory}
+  uchicago: {role: external}
+
+# The one comparison the design audit may run unblinded before registration (R32).
+# It is this trial exactly as registered below, on an exploratory site only.
+pre_registration_audit:
+  trial: casey_2021_all_comers
+  site_role: exploratory
+
+# Hashes a confirmatory or external run must present (R28). `locally_verified` hashes
+# are recomputed on the node and must match.
+freeze_manifest:
+  required: ["model_checkpoint", "vocabulary", "cohort_definition", "estimator_code",
+             "hyperparameters", "thresholds", "benchmark_registry"]
+  # cohort_definition = sha256 of configs/extubation.yaml; estimator_code = sha256 over
+  # the source files of src/eval/causal; benchmark_registry = sha256 of this file (it
+  # holds the agreement margins and the screen thresholds).
+  locally_verified: ["cohort_definition", "estimator_code", "benchmark_registry"]
+
+# ---------------------------------------------------------------- estimand
+estimand:
+  # Study primary outcome (R4); each emulation also reports its trial's own outcome.
+  study_primary_outcome: {event: reintubation_or_death, window_hours: 168}
+  # How a patient discharged alive before the horizon with no event is read
+  # (src/eval/extubation_labeler.py). `event_free`: counted as event-free at the
+  # horizon, which assumes no out-of-hospital reintubation or death. `censor`: censored
+  # at discharge. About 29% of MIMIC patients leave alive before day 7, so the choice
+  # matters and both are reported; which one is primary is registered in the protocol.
+  # Product authority, 2026-10-03 (item 39): `event_free` is the primary rule (trial
+  # patients discharged without reintubation counted as successes, emulating the ITT
+  # analysis); the sensitivity analyses read a discharge alive as a COMPETING event
+  # (cumulative incidence, src/eval/causal/emulate.py) and as censoring.
+  discharge_alive_rule: {value: event_free, status: proposed}
+  discharge_alive_rule_sensitivity: ["competing", "censor"]
+  # Item 41: hospice discharge then death competes with the endpoint (primary); the
+  # composite sensitivity counts it as the endpoint (RENOVATE-style framing).
+  hospice_rule: {value: competing, status: proposed}
+  hospice_rule_sensitivity: ["composite"]
+  # Rows still unresolved under the rule in force (unknown discharge disposition under
+  # `event_free`) are left out of the doubly robust step, counted and reported. Above
+  # this share the emulation refuses instead of estimating on the remainder.
+  max_unresolved_share: {value: 0.05, status: proposed}
+
+# ---------------------------------------------------------------- eligibility proxies
+# Trial risk factors as cohort columns (configs/extubation.yaml `risk_factors`).
+# Factors with no CLIF proxy (APACHE II, secretions, cough, airway patency, difficult
+# weaning, comorbidity count) are listed per trial under `not_representable`.
+risk_factor_sets:
+  hernandez_2016: ["age_over_65", "bmi_over_30", "prolonged_ventilation",
+                   "comorbidity_heart_failure", "comorbidity_copd"]
+  hernandez_2022: ["age_over_65", "bmi_over_30", "prolonged_ventilation",
+                   "comorbidity_heart_failure", "comorbidity_copd", "hypercapnia"]
+  high_wean: ["age_over_65", "comorbidity_chronic_cardiac_disease",
+              "comorbidity_chronic_respiratory_disease"]
+# A risk factor that is NULL (no PaCO2 before time zero, no usable diagnosis history)
+# is counted as absent. This pushes patients with unknown history toward the low-risk
+# definitions; coverage of every factor is reported with each emulation.
+missing_risk_factor: {value: absent, status: proposed}
+
+# ---------------------------------------------------------------- adjustment set
+# Cohort columns available strictly before time zero. Unit and calendar period are left
+# out on purpose: they shift device choice without a direct path to the outcome
+# (instrument-like), and adjusting for them can amplify bias. Exposure and rescue
+# columns are post-time-zero and may never appear here.
+adjustment:
+  status: proposed
+  covariates: ["age_at_admission", "imv_hours", "paco2_mmhg", "hypercapnia", "bmi",
+               "comorbidity_copd", "comorbidity_chronic_respiratory_disease",
+               "comorbidity_heart_failure", "comorbidity_chronic_cardiac_disease",
+               "comorbidity_history_available", "code_status_missing"]
+  forbidden: ["arm", "arm_first_device", "arm_highest_support", "rescue_support",
+              "rescue_arm", "rescue_hours_from_time_zero", "escalated_in_grace",
+              "n_device_rows_in_grace", "time_zero_device_category",
+              "unit_at_time_zero", "calendar_period"]
+
+# ---------------------------------------------------------------- agreement rule (R10)
+# Scale: every benchmark effect is a risk ratio (treated over control) and gaps are
+# differences of log risk ratios, emulation minus trial.
+#
+# Conversion: no trial here published a risk ratio. Each published its arm counts, so
+# the benchmark risk ratio and its interval (Katz log method) are computed from those
+# counts by the loader; nothing is converted from an odds ratio by formula. The effect
+# as published (absolute difference or odds ratio) is kept beside it and the loader
+# checks that the counts reproduce it.
+agreement:
+  scale: log_risk_ratio
+  alpha: 0.05
+  # Product authority, 2026-10-03 (item 42; docs/decisions/2026-10-03-clinical-decisions.md).
+  # The single 1.5 agreement margin is retired: it sat at the median of published
+  # mortality non-inferiority margins (relative 1.5, IQR 1.3-1.7; Pong 2021, PMID 33879485,
+  # doi:10.1136/bmjopen-2020-044480), which that review itself calls large. Each trial that
+  # found an effect now gets its own margin by the FDA fixed-margin approach: M1 = the
+  # benchmark interval bound nearest no effect, and the margin preserves
+  # `preserved_fraction` of it (Mauri & D'Agostino 2017, doi:10.1056/NEJMra1510063).
+  # The margin is derived on the relative scale (the decision scale) and stated on the
+  # absolute scale beside it (`benchmark.derive_margin`; both are reported per trial).
+  margin_derivation:
+    method: fda_fixed_margin
+    preserved_fraction: {value: 0.5, status: proposed}
+    # Mortality-type endpoints: the relative margin is capped in the 1.1-1.2 range.
+    mortality_type_events: ["reintubation_or_death", "death"]
+    mortality_composite_cap_ratio: {value: 1.2, status: proposed}
+  # Null trials (no effect to preserve): reproduced only when the emulation's whole
+  # interval lies inside [1 / margin, margin]. A wide interval therefore fails (Pawel
+  # 2024, PMID 38739437). Capped like the effect margins for a mortality-type endpoint.
+  equivalence_margin_ratio: {value: 1.5, status: proposed}
+  # Roehmel & Kieser 2013 "second hurdle" (PMID 22991269, doi:10.1002/sim.5563): a trial
+  # counts as reproduced only if, in addition to the interval rule, the emulation's point
+  # estimate is on the benchmark's side of no effect. `none` switches it off.
+  second_hurdle: {value: direction_consistent, status: proposed}
+  # How per-trial gaps are pooled. `mean_absolute_gap`: the unweighted mean of |gap|,
+  # so gaps of opposite sign cannot cancel. `inverse_variance_signed`: the
+  # inverse-variance weighted mean of signed gaps (always reported as a description of
+  # systematic bias; as the decision statistic it can pass with no trial reproduced).
+  pooling: {value: mean_absolute_gap, status: proposed}
+
+# ---------------------------------------------------------------- feasibility (R25)
+# Checked WITHOUT reading outcomes by arm. A trial that fails is `not evaluable` and is
+# left out of the agreement results of every estimator. A trial may override a value.
+feasibility_screen:
+  status: proposed
+  # Patients observed in each compared arm among the trial-eligible population.
+  min_arm_n: 50
+  overlap:
+    # Share of the trial-eligible population whose cross-fitted probability of
+    # following a compared arm is below `min_probability`, worst of the two arms.
+    min_probability: 0.02
+    max_share_below: 0.20
+  # Kish effective sample size of each arm's inverse-probability weights.
+  min_effective_sample_size: 30
+  precision:
+    alpha: 0.05
+    power: 0.80
+    # Trials that found an effect: the smallest detectable risk difference (from the
+    # effective sample sizes and the trial's published control-arm risk) may be at
+    # most this multiple of the trial's absolute difference.
+    max_multiple_of_trial_difference: 1.5
+    # Null trials: the projected interval half-width of the log risk ratio (from the
+    # effective sample sizes and the trial's published arm risks) may be at most this
+    # fraction of log(equivalence margin); otherwise equivalence could never be shown.
+    max_fraction_of_equivalence_margin: 1.0
+
+# ---------------------------------------------------------------- trials (R8)
+# Per trial:
+#   finding            `effect` or `null`; the two kinds are scored separately (R10).
+#   approximate        true when the exposure or eligibility is a stated approximation.
+#   representability   `representable`, `proxied` or `not_representable`, stated for the
+#                      eligibility, the exposure and the outcome; any `not_representable`
+#                      fails the R25 screen.
+#   eligibility.rules  applied on top of the cohort's own eligibility (first planned
+#                      extubation after >= 24 h of invasive ventilation, adults, no
+#                      tracheostomy, no comfort care, no do-not-reintubate status).
+#   exposure           cohort assignment column and the arm labels compared.
+#   outcome            the trial's primary outcome and the event/window emulated.
+#   arms_published     events / n per arm from the abstract; the benchmark risk ratio
+#                      is computed from these.
+#   published_effect   the effect as the paper states it, on its own scale.
+#   expected_bias      direction residual confounding by indication would push the
+#                      emulation's risk ratio (R12): `upward` = treated arm looks worse.
+trials:
+  hernandez_2016_low_risk:
+    label: "Hernandez 2016, low risk: HFNC vs conventional oxygen"
+    identifier:
+      pmid: "26975498"
+      doi: "10.1001/jama.2016.2711"
+      citation: "Hernandez G, et al. JAMA 2016;315(13):1354-61"
+      trial_registration: "NCT01191489"
+      verified: true
+    finding: effect
+    approximate: true
+    eligibility:
+      base: eligible
+      representability: proxied
+      rules:
+        - {kind: count_at_most, set: hernandez_2016, value: 0}
+      representable: ["planned extubation", "no prolonged ventilation (< 7 days)",
+                      "body mass index not above 30"]
+      proxied:
+        - "age < 65 as NOT age_over_65 (age at admission; a patient aged exactly 65 is kept)"
+        - "no heart failure, no moderate-to-severe COPD as no prior-hospitalization code (severity not known; unknown history counted as absent)"
+      not_representable: ["APACHE II < 12 on extubation day", "adequate secretions management",
+                          "simple weaning", "0 or 1 comorbidity", "no airway patency problem"]
+    exposure:
+      assignment_column: arm
+      treated: hfnc
+      control: conventional_oxygen
+      representability: representable
+      note: "HFNC or conventional oxygen for 24 h; the cohort reads the first device in the grace window"
+    outcome:
+      trial_primary: "reintubation within 72 hours"
+      event: reintubation
+      window_hours: 72
+      representability: representable
+    arms_published:
+      treated: {events: 13, n: 264, percent: 4.9}
+      control: {events: 32, n: 263, percent: 12.2}
+    published_effect:
+      measure: absolute_risk_difference
+      orientation: control_minus_treated
+      estimate: 0.072
+      ci_lower: 0.025
+      ci_upper: 0.122
+      verified: true
+    expected_bias:
+      direction: upward
+      reason: "HFNC is chosen for patients judged more likely to fail than those left on conventional oxygen"
+
+  hernandez_2016_high_risk:
+    label: "Hernandez 2016, high risk: HFNC vs NIV"
+    identifier:
+      pmid: "27706464"
+      doi: "10.1001/jama.2016.14194"
+      citation: "Hernandez G, et al. JAMA 2016;316(15):1565-1574"
+      trial_registration: "NCT01191489"
+      verified: true
+      note: "abstract corrected by erratum (PMID 27838700); numbers below are from the corrected PubMed abstract"
+    # A non-inferiority trial (margin 10 percentage points): HFNC was not inferior to
+    # NIV. No difference was established, so it is scored with the null trials.
+    finding: "null"
+    finding_detail: noninferiority
+    approximate: true
+    eligibility:
+      base: eligible
+      representability: proxied
+      rules:
+        - {kind: count_at_least, set: hernandez_2016, value: 1}
+      representable: ["age > 65", "body mass index > 30", "prolonged ventilation (>= 7 days)"]
+      proxied:
+        - "heart failure as the indication for ventilation as a prior-hospitalization heart-failure code"
+        - "moderate-to-severe COPD as a prior-hospitalization COPD code (severity not known)"
+      not_representable: ["APACHE II > 12 on extubation day", "inadequate secretions management",
+                          "difficult or prolonged weaning", "more than 1 comorbidity",
+                          "airway patency problems"]
+    exposure:
+      assignment_column: arm
+      treated: hfnc
+      control: niv
+      representability: representable
+    outcome:
+      trial_primary: "reintubation within 72 hours (co-primary with post-extubation respiratory failure)"
+      event: reintubation
+      window_hours: 72
+      representability: representable
+    arms_published:
+      treated: {events: 66, n: 290, percent: 22.8}
+      control: {events: 60, n: 314, percent: 19.1}
+    published_effect:
+      measure: absolute_risk_difference
+      orientation: control_minus_treated
+      estimate: -0.037
+      ci_lower: -0.091
+      ci_upper: null          # one-sided interval: "-9.1% to infinity"
+      verified: true
+    expected_bias:
+      direction: downward
+      reason: "NIV is chosen for the sicker patients (hypercapnia, COPD, obesity), so HFNC looks better than it is; a published MIMIC-IV analysis shows this reversal (PMID 37553185)"
+
+  high_wean_2019:
+    label: "HIGH-WEAN (Thille 2019): NIV alternating with HFNC vs HFNC alone"
+    identifier:
+      pmid: "31577036"
+      doi: "10.1001/jama.2019.14901"
+      citation: "Thille AW, et al. JAMA 2019;322(15):1465-1475"
+      trial_registration: "NCT03121482"
+      verified: true
+      note: "erratum PMID 32096830 concerns the intervention description and exploratory outcomes, not the primary result"
+    finding: effect
+    # The alternating regimen (NIV sessions with HFNC between them) cannot be
+    # represented; the treated strategy is emulated as any NIV in the grace window.
+    approximate: true
+    eligibility:
+      base: eligible
+      representability: proxied
+      rules:
+        - {kind: any_true, set: high_wean}
+      representable: ["age > 65"]
+      proxied:
+        - "underlying chronic cardiac or respiratory disease as prior-hospitalization codes (null when the patient has no usable history)"
+      not_representable: []
+    exposure:
+      assignment_column: arm_highest_support
+      treated: niv
+      control: hfnc
+      representability: proxied
+      note: "any NIV inside the grace window (alone or alternating with HFNC) versus HFNC with no NIV"
+    outcome:
+      trial_primary: "reintubation at day 7"
+      event: reintubation
+      window_hours: 168
+      representability: representable
+    arms_published:
+      treated: {events: 40, n: 339, percent: 11.8}
+      control: {events: 55, n: 302, percent: 18.2}
+    published_effect:
+      measure: absolute_risk_difference
+      orientation: treated_minus_control
+      estimate: -0.064
+      ci_lower: -0.120
+      ci_upper: -0.009
+      verified: true
+    expected_bias:
+      direction: upward
+      reason: "NIV is chosen for the sicker patients, so NIV looks worse than it is"
+
+  hernandez_2022_very_high_risk:
+    label: "Hernandez 2022, very high risk: NIV vs HFNC"
+    identifier:
+      pmid: "36400984"
+      doi: "10.1007/s00134-022-06919-3"
+      citation: "Hernandez G, et al. Intensive Care Med 2022;48(12):1751-1759"
+      trial_registration: "NCT04125342"
+      verified: true
+      note: "a correction exists (PMID 36705685); its text could not be retrieved"
+    finding: effect
+    approximate: true
+    eligibility:
+      base: eligible
+      representability: proxied
+      rules:
+        - {kind: count_at_least, set: hernandez_2022, value: 4}
+      representable: ["age > 65", "body mass index > 30", "mechanical ventilation >= 7 days"]
+      proxied:
+        - "hypercapnia at the end of the spontaneous breathing trial as the latest arterial PaCO2 > 45 mmHg in the 24 h before time zero"
+        - "heart failure and COPD as prior-hospitalization codes"
+        - "at least 4 of 11 trial factors as at least 4 of the 6 that can be built: every selected patient meets the trial rule, but many trial-eligible patients are missed"
+      not_representable: ["APACHE II > 12 on extubation day", "inadequate secretions management",
+                          "difficult or prolonged weaning", "2 or more comorbidities",
+                          "airway patency problems"]
+    exposure:
+      assignment_column: arm
+      treated: niv
+      control: hfnc
+      representability: representable
+      note: "trial NIV used active humidification for 48 h; humidification is not recorded"
+    outcome:
+      trial_primary: "all-cause reintubation within 7 days"
+      event: reintubation
+      window_hours: 168
+      representability: representable
+    arms_published:
+      # The paper reports 21 (23.3%) of 92 NIV patients, but 21 / 92 is 22.8% (the
+      # paper's own 5-day figure for the same 21 patients); 23.3% and the published
+      # difference of -15.5% both correspond to a denominator of 90. The count and the
+      # stated denominator (92) are used: risk ratio 0.587. With 90 it would be 0.600.
+      # Neither the percentage nor the published difference is reproduced by the
+      # counts, so both are carried as unverified.
+      treated: {events: 21, n: 92, percent: 23.3, unverified: true,
+                unverified_reason: "published percentage does not match events / n"}
+      control: {events: 35, n: 90, percent: 38.8}
+    published_effect:
+      measure: absolute_risk_difference
+      orientation: treated_minus_control
+      estimate: -0.155
+      ci_lower: -0.283
+      ci_upper: -0.010
+      verified: true
+    expected_bias:
+      direction: upward
+      reason: "NIV is chosen for the sicker patients, so NIV looks worse than it is"
+
+  ferrer_2009_hypercapnic:
+    label: "Ferrer 2009, hypercapnic chronic respiratory disorders: NIV vs conventional oxygen"
+    identifier:
+      pmid: "19682735"
+      doi: "10.1016/S0140-6736(09)61038-2"
+      citation: "Ferrer M, et al. Lancet 2009;374(9695):1082-8"
+      trial_registration: "NCT00539708"
+      verified: true
+    finding: effect
+    approximate: true
+    eligibility:
+      base: eligible
+      representability: proxied
+      rules:
+        - {kind: all_true, columns: ["hypercapnia", "comorbidity_chronic_respiratory_disease"]}
+      representable: []
+      proxied:
+        - "hypercapnia during the spontaneous breathing trial as the latest arterial PaCO2 > 45 mmHg in the 24 h before time zero"
+        - "chronic respiratory disorder as prior-hospitalization codes"
+      not_representable: ["successful spontaneous breathing trial (documented for about 55% of MIMIC extubations)"]
+    exposure:
+      assignment_column: arm
+      treated: niv
+      control: conventional_oxygen
+      representability: representable
+    outcome:
+      trial_primary: "respiratory failure within 72 hours after extubation (clinical criteria)"
+      # The trial's primary outcome is a clinical respiratory-failure definition that
+      # the outcome labels do not build. Reintubation within 72 hours can be emulated,
+      # but the published effect below is for respiratory failure, and the trial's
+      # reintubation result could not be confirmed from the abstract. Until a benchmark
+      # effect on the emulated outcome is registered, this trial fails the R25 screen
+      # and is reported as not evaluable for the gap. It still informs the known-answer
+      # pattern (R13: NIV for hypercapnic patients).
+      event: reintubation
+      window_hours: 72
+      representability: not_representable
+    arms_published:
+      treated: {events: 8, n: 54, percent: 15}
+      control: {events: 25, n: 52, percent: 48}
+    published_effect:
+      measure: odds_ratio
+      orientation: control_over_treated
+      estimate: 5.32
+      ci_lower: 2.11
+      ci_upper: 13.46
+      verified: true
+      note: "odds of respiratory failure, conventional oxygen relative to NIV"
+    reintubation_effect: {unverified: true, unverified_reason: "not stated in the abstract; full text not retrieved"}
+    expected_bias:
+      direction: upward
+      reason: "NIV is chosen for the sicker patients, so NIV looks worse than it is"
+
+  casey_2021_all_comers:
+    label: "Casey 2021, all-comers: protocolized support vs usual care (emulated as HFNC vs conventional oxygen)"
+    identifier:
+      pmid: "33794131"
+      doi: "10.1164/rccm.202009-3561OC"
+      citation: "Casey JD, et al. Am J Respir Crit Care Med 2021;204(3):294-302"
+      trial_registration: "NCT0328831"
+      trial_registration_unverified: true   # as printed in the PubMed abstract; one digit short of a valid identifier
+      verified: true
+    finding: "null"
+    # The trial compared a protocol (NIV for suspected hypercapnia, HFNC otherwise;
+    # 92.2% received support, 74.7% HFNC) with usual care (16.8% received support) by
+    # intention to treat. The emulation compares starting HFNC with starting
+    # conventional oxygen in all eligible patients, so the trial's diluted protocol
+    # effect is an approximate benchmark for a per-device contrast.
+    approximate: true
+    eligibility:
+      base: eligible
+      representability: proxied
+      rules: []
+      representable: ["adults extubated from invasive mechanical ventilation"]
+      proxied:
+        - "one US medical ICU as all eligible extubations at the site (unit_at_time_zero is available for a medical-ICU sensitivity analysis)"
+      not_representable: []
+      unverified: ["the trial's minimum ventilation duration (the cohort requires 24 h; a 12 h column exists)"]
+    exposure:
+      assignment_column: arm
+      treated: hfnc
+      control: conventional_oxygen
+      representability: proxied
+      note: "protocolized support versus usual care emulated as HFNC versus conventional oxygen"
+    outcome:
+      trial_primary: "reintubation within 96 hours of extubation"
+      event: reintubation
+      window_hours: 96
+      representability: representable
+    arms_published:
+      treated: {events: 57, n: 359, percent: 15.9}
+      control: {events: 52, n: 392, percent: 13.3}
+    published_effect:
+      measure: odds_ratio
+      orientation: treated_over_control
+      estimate: 1.23
+      ci_lower: 0.82
+      ci_upper: 1.84
+      verified: true
+      note: "cluster-crossover trial; the count-based interval reproduces the published one closely"
+    expected_bias:
+      direction: upward
+      reason: "HFNC is chosen for patients judged more likely to fail; local MIMIC counts show roughly double the crude outcome rate on HFNC"

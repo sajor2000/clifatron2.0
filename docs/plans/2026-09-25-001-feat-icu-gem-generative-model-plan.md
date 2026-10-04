@@ -96,6 +96,14 @@ rare events (ρ=0.64 with prevalence), and ICU danger events are rare events.
 | **G6 — use case** | Post-extubation device decision (HFNC vs NC vs none): calibrated generated rates + decision-curve panel, obtained by **inference-time steering** (EHR-MPC-style context forcing at rollout time — treatments remain inputs, never targets) | G5 | preprint-ready figure set |
 | **G7 — Arm B** | Prefix-LM masks in trunk + sandwich infilling objective; compare vs base | G2 checkpoint | ablation table (plausibility + downstream) |
 
+> **G6 superseded 2026-10-03** by `docs/plans/2026-10-03-0845-feat-icu-gem-rct-recovery-plan.md`
+> (three-claim paper and extubation-failure risk model). That plan owns the post-extubation
+> application: the device at the actual extubation (NIV, HFNC, conventional oxygen), estimated by
+> an injected-token outcome head and a doubly robust cross-check against a classical emulation
+> and the randomized trials. It drops G6's entry gate on G5: there is no reward-based
+> post-training, rollouts are descriptive only, and no device recommendation is made. The G6 row
+> above is kept as the 2026-09-25 record.
+
 ## Hard rules (unchanged, restated for the GEM track)
 
 1. **Treatments are model inputs, NEVER prediction targets.** In RL terms: reward *realism* of

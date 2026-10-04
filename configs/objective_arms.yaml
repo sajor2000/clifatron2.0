@@ -1,0 +1,56 @@
+# Objective arms for claim 2 (plan R31, KTD5, KTD13) — loaded by src/train/curriculum.py.
+# Select one with `python -m src.train.pretrain --objective-arm <name>` (also
+# `run_tokenization_ablation --objective-arm`); it replaces heads.*.weight and `curriculum`
+# in configs/model.yaml and changes nothing else.
+#
+# EQUAL COMPUTE: an arm may set only `heads`, `curriculum`, `description` and `tags`. Steps,
+# batch size, gradient accumulation and token budget come from the run's train config
+# (configs/train.yaml), so every arm trains on the same budget; the loader refuses any other
+# key. Every head stays constructed in every arm (same parameter count, compatible
+# checkpoints); a head at weight 0 gets a zero gradient and no weight decay, so it stays at
+# its initialisation and is not listed among the run's trained heads.
+#
+# Loss balancing is fixed weights for every arm. With `curriculum: ntp_then_tte` the first
+# 15% of optimizer updates train next_event only, the next 5% blend linearly to the weights
+# below, and the rest use them; `none` uses them from the first update.
+#
+# The next-token arm has no threshold head in its loss, so it is scored by a linear probe on
+# its frozen trunk (KTD13). Claims are read only from full-budget runs listed in the
+# experiment matrix (KTD12).
+
+arms:
+  full:
+    description: "Threshold hazard + competing risk + value regression + low-weight next token, NTP->TTE curriculum (primary)"
+    heads: {next_event: 0.2, competing_risk: 1.0, threshold_hazard: 1.0, value_regression: 0.5}
+    curriculum: ntp_then_tte
+    tags: [objective, primary]
+
+  next_token_only:
+    description: "Next-token prediction only (the comparator claim 2 must beat)"
+    heads: {next_event: 1.0, competing_risk: 0.0, threshold_hazard: 0.0, value_regression: 0.0}
+    curriculum: none
+    tags: [objective, comparator]
+
+  minus_value:
+    description: "Full objective without the value-regression mark"
+    heads: {next_event: 0.2, competing_risk: 1.0, threshold_hazard: 1.0, value_regression: 0.0}
+    curriculum: ntp_then_tte
+    tags: [objective, component-removed]
+
+  minus_competing_risk:
+    description: "Full objective without the competing-risk incidence head"
+    heads: {next_event: 0.2, competing_risk: 0.0, threshold_hazard: 1.0, value_regression: 0.5}
+    curriculum: ntp_then_tte
+    tags: [objective, component-removed]
+
+  minus_threshold:
+    description: "Full objective without the threshold-hazard head"
+    heads: {next_event: 0.2, competing_risk: 1.0, threshold_hazard: 0.0, value_regression: 0.5}
+    curriculum: ntp_then_tte
+    tags: [objective, component-removed]
+
+  no_curriculum:
+    description: "Full objective weights from the first update (curriculum removed)"
+    heads: {next_event: 0.2, competing_risk: 1.0, threshold_hazard: 1.0, value_regression: 0.5}
+    curriculum: none
+    tags: [objective, curriculum-removed]

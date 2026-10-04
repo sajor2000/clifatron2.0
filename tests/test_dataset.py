@@ -89,6 +89,14 @@ class ModelDatasetTest(unittest.TestCase):
         self.assertEqual(decile_seg["outcome_labels"], packed_seg["outcome_labels"])
         self.assertEqual(decile_seg["threshold_query"], packed_seg["threshold_query"])
         self.assertEqual(decile_seg["anchor_offset"], packed_seg["anchor_offset"])
+        # Both adapters emit the same single anchor in the per-anchor contract (U3):
+        # label times in minutes since the anchor, binned later by each head.
+        self.assertEqual(decile_seg["anchors"], packed_seg["anchors"])
+        (anchor,) = decile_seg["anchors"]
+        self.assertEqual(anchor["offset"], 2)
+        self.assertEqual(anchor["cr"], {"status": "negative", "cause": -1, "minutes": 2880})
+        self.assertEqual([(q["status"], q["minutes"]) for q in anchor["queries"]],
+                         [("negative", 2880)])
 
     def test_all_masked_ntp_targets_yield_finite_loss_denominator(self):
         record = target("opaque-a", [3, 4, 5], anchor_idx=2)
@@ -184,6 +192,8 @@ class ModelDatasetTest(unittest.TestCase):
 
         self.assertIsNone(dataset[0]["segments"][0]["anchor_offset"])
         self.assertEqual(dataset[0]["segments"][0]["outcome_labels"], [])
+        self.assertEqual(dataset[0]["segments"][0]["anchors"], [])
+        self.assertEqual(len(dataset[1]["segments"][0]["anchors"]), 1)
         self.assertEqual(dataset[1]["segments"][0]["anchor_offset"], 1)
         self.assertEqual(len(dataset[1]["segments"][0]["outcome_labels"]), 1)
 

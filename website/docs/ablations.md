@@ -6,16 +6,81 @@ sidebar_position: 9
 
 # Ablations
 
-Three design decisions are not asserted — they are to be tested empirically on the same tasks
-and metric panel. Configured by `configs/ablation.yaml` (finetune-vs-scratch) and
-`configs/tokenization_ablation.yaml` (representation); the Qwen2-vs-Qwen3 trunk row is designed but
-not yet configured. **No ablation results exist yet.**
+Paper 1's claims and ablations are read from one **experiment matrix**: every training run is
+listed by arm, objective, size and seed before launch. The finetune-vs-scratch arms and the
+Qwen2-vs-Qwen3 trunk row below are older ablations that now sit beside the matrix as comparator
+rows. **No ablation result exists yet.**
+
+---
+
+## The experiment matrix
+
+`configs/experiment_matrix.yaml` lists the rows of the minimum experiment table in
+`notes/ai-novelty-audit.md`. `python -m src.train.run_matrix` expands it into one run per
+(configuration, seed, budget), validates every arm and key it names, and **prints** the launch
+commands. It never starts training. With the write option it also writes each run's
+`run_spec.json`, the record the [claims report](./paper-claims.md#statistics-configsclaimsyaml)
+reads. The matrix and its command are still being finished, so this section describes the
+concept rather than a frozen table.
+
+```mermaid
+flowchart LR
+    M["configs/experiment_matrix.yaml"] --> E["src.train.run_matrix<br/>expand + validate"]
+    E --> S["Screening runs<br/>short budget, shake-out<br/>+ L40 timing"]
+    E --> F["Full runs<br/>listed as claim-bearing<br/>by arm and seed"]
+    S -.sizes.-> F
+    F --> SPEC["run_spec.json per run<br/>(written before launch)"]
+    SPEC --> CR["claims report<br/>reads only full + claim-bearing"]
+
+    classDef cfg fill:#fff8e1,stroke:#f9a825,color:#0d1b2a;
+    classDef run fill:#e3f2fd,stroke:#1565c0,color:#0d1b2a;
+    classDef out fill:#e8f5e9,stroke:#2e7d32,color:#0d1b2a;
+    class M cfg;
+    class E,S,F,SPEC run;
+    class CR out;
+```
+
+What a run configuration varies:
+
+| Axis | Values | Source |
+|------|--------|--------|
+| Tokenization arm (R34) | physician segments with soft inputs (primary); the same with hard inputs; population deciles; deciles with forced threshold edges; continuous-fused; TextCode | `configs/tokenization_ablation.yaml` |
+| Objective arm (claim 2) | `full`, `next_token_only`, `minus_value`, `minus_competing_risk`, `minus_threshold`, `no_curriculum` | `configs/objective_arms.yaml` |
+| Trunk size (R37) | about 3M, 10M and 30M parameters; the reported size is the measured count in each run's manifest | `trunk` overrides of `configs/model.yaml` |
+| Time positions (R36) | admission-relative minutes (primary) or event order only | `trunk.rope_position` |
+| Seed | at least 3 per arm | model init, batch order, anchor sampling |
+
+Rules the matrix carries:
+
+- **Equal compute.** Run length is set in passes over the training data
+  ([the loader](./objectives-training.md#the-full-hospitalization-loader)). Every arm of a
+  budget trains for the same passes, so the same data and the same number of updates.
+- **Matched granularity (KTD11).** The decile arms request each concept's bin count from the
+  clinical arm, and the forced-edge decile arm inserts the decision thresholds before matching
+  the count. A concept with too few distinct values keeps a smaller count and is listed in the
+  tokenization and claims reports.
+- **Screening vs full budgets (KTD12).** Screening runs are for shake-out and for sizing the
+  full budget from a timing run on the L40 node. They never decide which arms or seeds are
+  reported. Claims are read only from full-budget runs listed as claim-bearing before launch.
+- **Edge check.** The matrix command also prints the edge-distance table for every arm's frozen
+  vocabulary and refuses a control threshold that sits on an edge in any arm
+  ([claim 1](./paper-claims.md#claim-1--threshold-aligned-tokenization)).
+- **Attribution arm.** The optional claim 1 control (decile input tokens, threshold head on the
+  clinical grid) is in the matrix but switched off; whether claim 1's rule uses it is an open
+  decision.
+- **Rows with no training run.** The count and token baselines (`src/eval/baselines.py`) and the
+  CLIFATRON 0.5B frozen-probe comparator are table rows filled by the evaluation code, not by
+  training.
 
 ---
 
 ## Finetune vs train-new — the 4 arms
 
-The central "build ON CLIFATRON or train from scratch?" question. Hypothesis
+Configured by `configs/ablation.yaml` and run by `src/train/run_arm.py`. Since the three-claim
+framing (2026-10-03) the claims are tested on the from-scratch model; the CLIFATRON arms are the
+larger comparator, reported when a checkpoint is staged, and carry none of the claims.
+
+The original question was "build ON CLIFATRON or train from scratch?". Hypothesis
 (`configs/ablation.yaml`): **frozen-backbone head-training > joint fine-tune > from-scratch >
 no-pretrain** for in-domain tasks; from-scratch may only close the gap on *transfer*.
 
@@ -54,7 +119,7 @@ Label-free federated validation is a separate question. A frozen probe trains ta
 **local labels**, so it is the in-domain wedge, not the federation model. The **zero-shot**
 threshold / competing-risk heads that a new site runs without training come from a model
 pretrained *with* our TTE heads: the joint fine-tune of CLIFATRON or, on the primary path, the
-from-scratch model ([Objectives & Training](./objectives-training.md#two-training-entry-points)).
+from-scratch model ([Objectives & Training](./objectives-training.md#training-entry-points)).
 "Label-free" describes the model only; each site still auto-derives evaluation labels locally.
 :::
 
@@ -105,12 +170,15 @@ QK-Norm helps is a **measured row**, not an assumption
 
 ## Tokenization ablation (summary)
 
-Six representation arms on the same trunk and objective: physician **clinical segments** with
-soft discretization (primary), clinical segments with hard ids, population deciles
-(`decile_ablation`, same concept coverage), deciles + soft discretization, continuous-fused, and
-TextCode. Each arm loads its own shard and frozen vocabulary through the shared
-`pretrain.build_loaders` path and trains with masked losses and the configured objective weights.
-The full arm table lives in
+The representation arms are the tokenization axis of the [experiment
+matrix](#the-experiment-matrix): physician **clinical segments** with soft discretization
+(primary), clinical segments with hard ids, population deciles, deciles with forced threshold
+edges, continuous-fused, and TextCode. Each arm loads its own frozen vocabulary through the
+shared `pretrain.build_loaders` path and trains with the same masked losses and objective
+weights. Claim 1 compares the primary arm with population deciles
+([Paper 1 claims](./paper-claims.md#claim-1--threshold-aligned-tokenization)). Event order vs
+admission-relative positions and TextCode vs the frozen vocabulary are reported as ablations,
+not headline claims (R36). The arm table lives in
 **[Tokenization ablation](./data-tokenization.md#9--tokenization-ablation)**.
 
 :::info[Runnable; no result yet]
@@ -127,14 +195,17 @@ vocabulary fit on the full train partition plus the full training run.
 
 ```mermaid
 flowchart TB
-    T1["Tokenization ablation<br/>→ best representation"] --> SPEC["Locked spec"]
-    T2["Finetune-vs-scratch ablation<br/>→ best training mode"] --> SPEC
-    T3["Qwen2-vs-Qwen3 trunk row<br/>→ quantified backbone footnote"] --> SPEC
-    SPEC --> M3["Method 3 wedge<br/>(smallest publishable unit)"]
-    M3 --> FED["Federated external validation<br/>(the deployability headline)"]
+    T1["Tokenization arms<br/>matched bin count"] --> C1["Claim 1<br/>on-edge vs off-edge"]
+    T2["Objective arms<br/>equal compute"] --> C2["Claim 2<br/>combined vs next-token"]
+    T3["Size sweep · order-only positions · TextCode"] --> AB["Reported ablations<br/>(not claims)"]
+    T4["CLIFATRON 0.5B frozen probe · count/token baselines"] --> CMP["Comparator rows"]
+    C1 --> P1["Paper 1"]
+    C2 --> P1
+    AB --> P1
+    CMP --> P1
 
     classDef out fill:#e8f5e9,stroke:#2e7d32,color:#0d1b2a;
-    class M3,FED out;
+    class C1,C2,P1 out;
 ```
 
 Run:
@@ -143,11 +214,12 @@ Run:
 # finetune-vs-scratch
 torchrun --nproc_per_node=2 -m src.train.run_arm --arm frozen_backbone_head_only --checkpoint <ckpt> --data <narratives>
 
-# tokenization ablation (per-arm events/vocab/value_stats paths come from the config;
-# override with --events / --vocab / --value-stats)
-for arm in clinical_soft clinical_hard global_deciles deciles_plus_soft continuous_fused textcode; do
-    torchrun --nproc_per_node=2 -m src.train.run_tokenization_ablation --arm $arm
-done
+# experiment matrix: list every run and print its launch command (never trains)
+uv run python -m src.train.run_matrix
+
+# one tokenization arm (per-arm events/vocab/value_stats paths come from the config;
+# override with --events / --vocab / --value-stats; --objective-arm selects the objective)
+torchrun --nproc_per_node=2 -m src.train.run_tokenization_ablation --arm clinical_soft
 
 # compare
 python -m src.eval.ablation_compare --results results/ablation

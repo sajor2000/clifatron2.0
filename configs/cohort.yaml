@@ -71,11 +71,66 @@ outcomes:
     baseline_lookback_hours: 6
     required_measurement_within_hours_of_horizon: 12
 
+# Optional per-outcome measurement filters, kept OUTSIDE `outcomes` on purpose: tokenize.py
+# hashes `outcomes` into every vocabulary and bundle (`outcome_spec`, pinned by
+# tests/test_data_config.py), and a key added inside it would change that hash for every
+# existing artifact even with the filter off. `bp_method: null` = every method (default,
+# today's behaviour). A list (e.g. [arterial]) restricts the MAP readings that can define
+# the outcome to the BP-method tokens configs/data.yaml `bp_method` emits; it changes the
+# outcome definition, so it needs outcome approval (prerequisites.outcome_approval).
+# Read by the in-stream label derivation (src/data/targets.py `measurement_filters`):
+# OFF by default; a run selects a sensitivity with configs/model.yaml-style
+# `in_stream.outcome_measurement_sensitivity: arterial_only` (src/train/pretrain.py), and a
+# MAP reading then counts only when its `bp_method=arterial` token precedes it at the same
+# minute. decided 2026-10-03 (product authority): all readings primary, arterial-only
+# sensitivity.
+outcome_measurement_filters:
+  map_below_65_48h:
+    bp_method: null
+    sensitivity:
+      arterial_only: {bp_method: [arterial]}
+
 treatment_sources:
   - meds
   - resp_support
   - adt
 treatment_target_policy: context_only
+
+# Hard rule #1, scoped amendment (2026-10-03): the trunk never trains on treatment
+# targets, so nothing here may appear under `outcomes` or in a trunk task list. Study
+# heads downstream of the frozen trunk may use trial endpoints defined by a treatment
+# event as labels; each such endpoint is declared here as `use: label_only`.
+# This block is outside `outcomes` on purpose: tokenize.py hashes `outcomes` into every
+# vocabulary and bundle (`outcome_spec`), and that hash must not change.
+# Enforced by tests/test_data_config.py (TreatmentTargetRuleTest).
+study_endpoints:
+  reintubation_72h:
+    study: extubation
+    use: label_only
+    source: resp_support          # read as a label source only; stays input-only for the trunk
+    event: reintubation           # return to invasive ventilation after time zero
+    time_zero: extubation
+    horizon_hours: 72
+  reintubation_7d:
+    study: extubation
+    use: label_only
+    source: resp_support
+    event: reintubation
+    time_zero: extubation
+    horizon_hours: 168
+  death_7d:
+    study: extubation
+    use: label_only
+    source: patient               # death timestamp; discharge category from hospitalization
+    event: death
+    time_zero: extubation
+    horizon_hours: 168
+  reintubation_or_death_7d:       # primary study outcome; death competes with reintubation
+    study: extubation
+    use: label_only
+    composite_of: [reintubation_7d, death_7d]
+    time_zero: extubation
+    horizon_hours: 168
 
 prerequisites:
   data_qa:

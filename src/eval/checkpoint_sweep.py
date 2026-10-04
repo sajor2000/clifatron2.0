@@ -14,7 +14,7 @@ from torch.utils.data import DataLoader
 
 from src.data.collate import collate_model_samples
 from src.data.dataset import ModelDataset
-from src.data.segments import artifact_binding, load_vocab_blob, n_value_bins
+from src.data.segments import artifact_binding, load_vocab_blob
 from src.data.targets import TargetBuilder
 from src.data.value_stats import load_value_stats
 from src.train.checkpoint import verify_checkpoint_binding
@@ -95,6 +95,14 @@ def evaluate_checkpoint(
     }
 
 
+def build_model(checkpoint, vocab_blob: dict, model_config: dict, *, n_targets: int) -> Model:
+    """The model the swept checkpoints share, sized from `checkpoint`'s manifest
+    (embedding rows = the vocabulary's max id + 1, the recorded trunk)."""
+    from src.train.pretrain import load_model_from_checkpoint
+
+    return load_model_from_checkpoint(checkpoint, model_config, n_targets, vocab_blob)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--checkpoints", nargs="+", required=True)
@@ -120,8 +128,10 @@ def main() -> None:
 
     events_path = data_dir / "events_with_outcomes.parquet"
     records = _load_decile_records(events_path, partition="validation")
+    n_targets = len(data_config["target_concepts"])
+    model = build_model(args.checkpoints[0], vocab_blob, model_config, n_targets=n_targets)
     target_builder = TargetBuilder(
-        vocab_size=model_config["trunk"].get("target_vocab", 10000),
+        vocab_size=model.enc.tok_emb.num_embeddings,
         n_time_bins=model_config["heads"]["competing_risk"]["n_time_bins"],
         horizon_hours=model_config["heads"]["competing_risk"].get("horizon_hours", 48),
         value_stats=value_stats,
@@ -143,9 +153,6 @@ def main() -> None:
         pin_memory=torch.cuda.is_available(),
     )
 
-    n_targets = len(data_config["target_concepts"])
-    vocab_size = model_config["trunk"].get("target_vocab", 10000)
-    model = Model(vocab_size, n_targets, model_config, n_value_bins=n_value_bins(vocab_blob))
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     results = []
     for checkpoint in args.checkpoints:

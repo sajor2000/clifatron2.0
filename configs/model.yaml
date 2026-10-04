@@ -16,10 +16,30 @@ trunk:
   max_tokens: 8192         # match CLIFATRON trunk (we attach to it); 4096 = Lee-tokenizer ablation arm
   # TIME-AWARE RoPE (single highest-leverage arch change per aeb4d2): rotate by admission-relative
   # MINUTES, shared across tokens within one event (same timestamp -> same position). Not token index.
-  rope_base: 10000.0
+  # Pre-training config decision (2026-10-03; docs/decisions/2026-10-03-clinical-decisions.md).
+  # Positions are MINUTES since admission. build_rope_cache uses inv_freq_i = base^(-i/half)
+  # (i = 0..half-1, half = head_dim/2 = 32), so the slowest wavelength is
+  # 2*pi*base^(31/32): base 1e4 -> ~47,000 min (~33 days), shorter than long stays
+  # (66+ days; ~100,000 min), so far-apart minutes alias in the slowest dimension.
+  # base 1e5 -> ~438,000 min (~305 days, ~4x the longest stay) while the fastest dimension
+  # stays 1 rad/min (short-range resolution is set by i = 0, independent of the base); the
+  # per-dimension frequency ratio grows only from 1.33 to 1.43. 5e5 would push the slowest
+  # wavelength to ~4 years, spending dimensions on spans no stay reaches.
+  rope_base: 100000.0
+  # Re-insert the stay's header (<bos>, ADMISSION//, static tokens) before every
+  # continuation window (src/data/dataset.py). Tokenization cuts NEW GEM shards with room for
+  # the header (dataset.gem_window_bounds_with_header) and records the cut mode
+  # (`continuation_header`, `header_length`) in every row's artifact_hashes and in the
+  # GemCorpus cache key. Training refuses a shard cut the other way (e.g. a shard
+  # tokenized before this flag, or with it off): re-tokenize the shard, then train.
+  continuation_header: true
   rope_position: "admission_minutes"   # {admission_minutes | token_index(ablation)}
   rope_time_alibi: false               # optional log-Δt ALiBi bias for severe irregular sampling (HealthFormer)
-  # Untied emb beat tied by +4-7% AUPRC, gap WIDENS under federation (medRxiv 2026.04.24, 31.6M GPT).
+  # UNVERIFIED (2026-10-03, notes/ai-novelty-audit.md §6): an earlier comment here said untied
+  # embeddings beat tied by +4-7% AUPRC, with the gap widening under federation, and cited
+  # medRxiv 2026.04.24.26351503. The retrieved paper is an LLM-vs-clinical-foundation-model
+  # comparison and the claim could not be confirmed there. Untied stays the locked choice
+  # (MEMORY.md §E1); the size of any gain is unmeasured.
   # BUDGET TENSION: untied + large vocab blows the ~30M budget. At untied, vocab*d*2 lives in the
   # embedding tables — so cap fused vocab ~8-12k (untied => ~8-12M emb + ~25M trunk ~= 33-37M).
   # A ~30k vocab would force tied. Chosen: untied + ~10k vocab.
@@ -39,17 +59,35 @@ heads:
     weight: 1.0
     horizon_hours: 48
     n_time_bins: 48                 # hourly discrete hazard over 48h
-    tau_sampling: "empirical_bins"  # sample τ from each concept's frozen bin edges at train time
+    # How in-stream training thresholds are drawn (src/data/threshold_grid.py; an unknown
+    # value is refused): empirical_bins = uniformly from each target concept's own frozen
+    # bin edges under the arm's vocabulary. Evaluation uses configs/thresholds.yaml.
+    tau_sampling: "empirical_bins"
     direction_embed: true           # learned direction (above/below) embedding
     threshold_embed_dim: 32         # learned threshold embedding
   # (D) value regression — the ORA "mark" (arXiv:2602.00541). NOW ENABLED:
-  #     predicting the continuous value lifts physiology/regression tasks +33-38% vs NTP.
+  #     ORA reports marked time-to-event beating NTP by 10.7% (Transformer) and 11.4% (Mamba)
+  #     on average over 14 tasks. (Corrected 2026-10-03: the earlier "+33-38% vs NTP" here did
+  #     not match the source — notes/ai-novelty-audit.md §6.)
   value_regression: {enabled: true, weight: 0.5}
 
-# Multi-task loss balancing (RESEARCH.md §3): uncertainty (Kendall 1/2σ²) + grad-norm,
-# so dense mortality signal doesn't starve sparse auxiliaries. Fallback: fixed weights above.
-loss_balancing: "uncertainty"       # uncertainty | fixed
-curriculum: "ntp_then_tte"          # warm up on next-event, then phase in TTE heads
+# In-stream time-to-event supervision on the full-hospitalization representation (KTD1):
+# anchors are sampled per (seed, epoch, stay) in every context window and labelled from
+# the stay's own future. The label rule (horizon, lookback, ascertainment window) and the
+# competing-risk cause thresholds live in configs/thresholds.yaml.
+in_stream:
+  anchors_per_window: 8      # each carries one competing-risk label
+  queries_per_anchor: 4      # threshold-hazard queries per anchor (tau_sampling above)
+
+# Loss balancing is FIXED weights: the objective is the sum of the heads' losses times the
+# heads.*.weight above. `fixed` is the only value; anything else is refused at config load
+# (an `uncertainty` option sat here for months and was never implemented).
+loss_balancing: "fixed"
+# ntp_then_tte | none. ntp_then_tte (src/train/curriculum.py): the first 15% of the planned
+# optimizer updates train next-event only, the next 5% blend linearly to the weights above,
+# the rest use them. `none` uses them from the first update. configs/objective_arms.yaml
+# names the objective variants; `pretrain --objective-arm <name>` selects one.
+curriculum: "ntp_then_tte"
 
 precision: "bf16"
 compile: true

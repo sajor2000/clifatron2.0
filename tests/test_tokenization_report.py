@@ -675,3 +675,74 @@ class GemReportTest(unittest.TestCase):
 def test_report_module_is_vendored():
     sync = (ROOT / "clif-validate/scripts/sync_vendor.py").read_text()
     assert '"src/data/tokenization_report.py"' in sync
+
+
+class HarmonizationQualityTest(unittest.TestCase):
+    """CLIF harmonization counts (GCS, BP method, duplicates, weights) in the report's
+    data-quality section: shares per BP method, small cells withheld."""
+
+    def test_bp_method_shares_and_suppression(self):
+        from src.data.tokenization_report import _data_quality, suppress_small_cells
+
+        quality = {"harmonization": {
+            "bp_method": {"arterial": 300, "noninvasive_auto": 696, "noninvasive_manual": 4,
+                          "tokens": 500},
+            "gcs": {"verbal_not_testable": 120, "total_dropped": 118, "eye_motor_emitted": 110},
+            "dose_tables": {"meds": {"exact_duplicates_removed": 40, "weights": 900,
+                                     "weights_excluded": 3}}}}
+        out = _data_quality(quality, 10)
+        shares = out["harmonization"]["bp_method_shares"]
+        self.assertAlmostEqual(shares["arterial"], 0.3)
+        self.assertAlmostEqual(shares["noninvasive_auto"], 0.696)
+        self.assertIsNone(shares["noninvasive_manual"])      # 4 readings: withheld
+        report = suppress_small_cells({"suppression": {"min_cell_size": 10},
+                                       "data_quality": out}, 10)
+        harm = report["data_quality"]["harmonization"]
+        self.assertEqual(harm["bp_method"]["noninvasive_manual"], "<10")
+        # 4 manual readings would be total - others (total = arterial / its share): every
+        # share is withheld and the smallest released count is withheld as its complement.
+        self.assertEqual(set(harm["bp_method_shares"].values()), {None})
+        self.assertEqual(harm["bp_method"]["arterial"], "suppressed")
+        self.assertEqual(harm["bp_method"]["noninvasive_auto"], 696)
+        self.assertEqual(harm["dose_tables"]["meds"]["weights_excluded"], "<10")
+        self.assertEqual(harm["gcs"]["total_dropped"], 118)
+
+
+class BinningShareLeakTest(unittest.TestCase):
+    """A binning share times the binned total recovers its count (PR review)."""
+
+    def report(self, sources):
+        from src.data.tokenization_report import _rate
+        total = sum(sources.values())
+        return {"suppression": {"min_cell_size": 10},
+                "token_kinds": {"binned": total, "categorical": 1000},
+                "events": {"total": total + 1000},
+                "binning": {"by_source": {
+                    s: {"concepts": 1, "events": n, "event_share": _rate(n, total, 10)}
+                    for s, n in sources.items()}}}
+
+    def test_small_source_hides_every_share(self):
+        from src.data.tokenization_report import suppress_small_cells
+        out = suppress_small_cells(self.report({"csv": 5, "quantile": 20}), 10)
+        rows = out["binning"]["by_source"]
+        self.assertEqual(rows["csv"]["events"], "<10")
+        self.assertEqual(rows["quantile"]["events"], "suppressed")
+        self.assertIsNone(rows["csv"]["event_share"])
+        self.assertIsNone(rows["quantile"]["event_share"])
+
+    def test_shares_are_kept_when_nothing_is_suppressed(self):
+        from src.data.tokenization_report import suppress_small_cells
+        out = suppress_small_cells(self.report({"csv": 50, "quantile": 150}), 10)
+        rows = out["binning"]["by_source"]
+        self.assertAlmostEqual(rows["csv"]["event_share"], 0.25)
+        self.assertAlmostEqual(rows["quantile"]["event_share"], 0.75)
+
+    def test_bp_shares_kept_without_a_small_method(self):
+        from src.data.tokenization_report import _data_quality, suppress_small_cells
+        quality = _data_quality({"harmonization": {"bp_method": {
+            "arterial": 300, "noninvasive_auto": 700, "tokens": 500}}}, 10)
+        out = suppress_small_cells({"suppression": {"min_cell_size": 10},
+                                    "data_quality": quality}, 10)
+        harm = out["data_quality"]["harmonization"]
+        self.assertAlmostEqual(harm["bp_method_shares"]["arterial"], 0.3)
+        self.assertEqual(harm["bp_method"]["arterial"], 300)

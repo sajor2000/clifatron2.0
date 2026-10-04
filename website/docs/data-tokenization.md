@@ -463,8 +463,18 @@ They stay on their node. External validation returns only aggregate metrics, thr
 :::
 
 **Parallel encoding.** The per-stay encode loop runs in a process pool (`--workers N`, `0` = every
-CPU) over contiguous chunks of the ordered events, cut only at stay boundaries and concatenated in
+usable CPU, capped at 8; each worker single-threaded in polars) over contiguous chunks of the ordered events, cut only at stay boundaries and concatenated in
 order. Every artifact is byte-identical for any worker count (tested on both trajectories).
+
+**Scale and sites (2026-10-03).** The eligible stays and their window bounds are pushed into the
+DuckDB scan, so other stays' rows never reach memory; shards are written grouped by partition in
+row groups of 4,096 rows, so a partition filter skips the other partitions. Every shard row's
+binding also records its site and the hash of that site's declarations (including the
+git-ignored `configs/sites/<site>.local.yaml`). Per site, `configs/data.yaml` `sites` declares the
+time zone (naive timestamps converted to UTC), the data-extraction time (open stays censored) and
+the tables the site does not have; any other absent table fails the build. Every permissible
+CLIF 2.1.1 value of the `vocabulary_allowlist` lists is a vocabulary token, and a medication
+administration whose action is not a dose is excluded.
 
 ---
 
@@ -484,6 +494,26 @@ The target builder (`src/data/targets.py`) consumes the shards:
 - **GEM mode.** `TargetBuilder(mode="gem")` builds next-event targets over the whole
   hospitalization (including the terminal `DISCHARGE//*` token) and no TTE labels; the 24 h mode
   keeps its post-anchor feature check.
+- **In-stream mode (`gem_tte`).** `gem` plus time-to-event labels computed from the stay's own
+  future. Anchors are sampled along the stay, deterministically per (run seed, epoch, stay), and
+  each (anchor, threshold query) gets exactly one state: `prevalent`, `positive`,
+  `competing_event`, `censored`, `not_ascertainable` or `negative`, at the exact threshold value.
+  A horizon with no measurement of the queried concept is `not_ascertainable`, never a negative.
+  This is the mode the full-hospitalization training path uses; the label rule is in
+  [Objectives & Training → in-stream targets](./objectives-training.md#in-stream-targets) and
+  the registered thresholds in `configs/thresholds.yaml`.
+
+| Mode | Stream | Next-event targets | Time-to-event labels |
+|------|--------|--------------------|----------------------|
+| `icu_24h` | `events.parquet` | up to the 24 h anchor | joined outcome labels at the anchor |
+| `gem` | `gem_events.parquet` | whole stay | none |
+| `gem_tte` | `gem_events.parquet` | whole stay | in-stream, at sampled anchors |
+
+:::warning[Value stats for the full-hospitalization path]
+Fit value stats on the reference site's `gem_events.parquet` train stays, not on the 24 h
+`events.parquet`. The 24 h stats lack tokens seen only outside the ICU window (ED, ward,
+post-ICU), and target building refuses a token with no stats.
+:::
 
 ```mermaid
 flowchart TB
@@ -574,6 +604,15 @@ mortality is the `expired` count over terminated rollouts, with a Wilson confide
 the censored count reported separately. The generative evaluation reports terminal-type confusion,
 the nontermination (censoring) rate, and mortality discrimination and calibration against the
 observed disposition. Time-to-terminal is **not** estimated yet (see residuals).
+
+**Training on it.** `python -m src.train.pretrain --trajectory hospitalization` reads one or
+more sites' `gem_events.parquet` under **one** frozen vocabulary and labels anchors in-stream
+(`gem_tte`). Sites are read side by side and never pooled on disk; a stay key is
+`<site>:<hosp_id>`, so the same raw id at two sites stays two stays. Every window of a stay is
+kept, because a window's labels read events from later windows. The windows are stored
+columnar and memory-mapped from a cache beside each shard (`gem_cache/`), so the ranks on one
+node share one copy. Details:
+[Objectives & Training → the full-hospitalization loader](./objectives-training.md#the-full-hospitalization-loader).
 
 ---
 
@@ -741,12 +780,12 @@ Remaining residuals:
 # 1. Reference site (Site 1; --site must equal value_binning.build_from_site)
 uv run python -m src.data.tokenize --site mimic --in "$SITE1_DIR" \
   --out output/intermediate_phi/mimic --build-vocab \
-  --episodes output/intermediate_phi/episodes.parquet --workers 0
+  --episodes output/intermediate_phi/episodes.parquet --workers 8
 
 # 2. GEM artifact with the same frozen vocabulary
 uv run python -m src.data.tokenize --site mimic --in "$SITE1_DIR" \
   --out output/intermediate_phi/mimic --vocab output/intermediate_phi/mimic/vocab.json \
-  --episodes output/intermediate_phi/episodes.parquet --trajectory hospitalization --workers 0
+  --episodes output/intermediate_phi/episodes.parquet --trajectory hospitalization --workers 8
 
 # 3. Every other site: reuse the frozen vocab (hash-verified, no refit)
 uv run python -m src.data.tokenize --site site2 --in "$SITE2_DIR" \
@@ -757,11 +796,15 @@ uv run python -m src.data.tokenize --site site2 --in "$SITE2_DIR" \
 # 4. Value-head stats from the reference site's train partition
 uv run python -m src.data.value_stats \
   --events output/intermediate_phi/mimic/events.parquet --out value_stats.json
+#    For the full-hospitalization training path, refit on the GEM shard's train stays
+uv run python -m src.data.value_stats \
+  --events output/intermediate_phi/mimic/gem_events.parquet \
+  --out output/intermediate_phi/mimic/gem_value_stats.json
 
 # Verification sample (smoke-only vocabulary), then the gate and the training smoke
 uv run python -m src.data.tokenize --site mimic --in "$SITE1_DIR" \
   --out output/intermediate_phi/mimic_v2_sample --build-vocab \
-  --episodes output/intermediate_phi/episodes.parquet --sample-episodes 5000 --workers 0
+  --episodes output/intermediate_phi/episodes.parquet --sample-episodes 5000 --workers 8
 uv run python -m src.data.tokenization_report \
   --report output/intermediate_phi/mimic_v2_sample/tokenization_report.json
 uv run python -m src.train.real_data_smoke --data-dir "$SITE1_DIR" \

@@ -9,6 +9,15 @@
 > Qwen2 0.5B checkpoint = Method-3 wedge / larger comparator) · **physician-designed clinical-segment
 > bins PRIMARY** (population deciles = `decile_ablation` arm) · **tokenizer = `src/data/tokenize.py`**
 > (spec: `website/docs/data-tokenization.md`).
+>
+> **Citation corrections 2026-10-03** (`notes/ai-novelty-audit.md` §6). Figures in this file that did
+> not match the retrieved sources are corrected in place, with the earlier text struck through:
+> the ORA gain (§3), the SCOPE/REACH rollout saving (§3), and the EHR scaling-laws citation
+> (§1, not retrieved — marked **[unverified]**). The same audit could not confirm the
+> "untied +4–7% AUPRC" figure that `configs/model.yaml` attributed to medRxiv 2026.04.24.26351503
+> (the retrieved paper is an LLM-versus-clinical-foundation-model comparison); treat it as
+> **[unverified]**. Lee 2026's "soft discretization wins the tails" is a point-estimate result
+> from unfused arms only. The framing is now the three-claim one in `AGENTS.md` / `MEMORY.md`.
 
 Five parallel research threads (2026-08-27): landscape/novelty, tokenization/architecture,
 pretraining objectives/multi-task, multimodal fusion, benchmarks/fairness/assets. This
@@ -41,7 +50,8 @@ the defensible headline.
   "Federation not centralization," Ann ATS 2026). The consortium is racing toward exactly
   this target. **Move now; this is a first-mover window, not a durable moat.**
 - **Efficiency axis** validated: CoMET saturates at **11–101M params** (arXiv 2508.12104);
-  EHR scaling-laws show utility saturating ~28M (arXiv 2505.22964); specialized ~10²M
+  EHR scaling-laws show utility saturating ~28M (arXiv 2505.22964 — **[unverified]**, not
+  retrieved in the 2026-10-03 audit); specialized ~10²M
   models beat fine-tuned 70B LLMs on **AUPRC** (medRxiv 2026.04.24.26351503). Our ~30M is right.
 - **Threshold-TTE axis** owned by ICareFM (medRxiv 2025.07.25.25331635) — but on ricu, not
   CLIF, and weights are DUA-gated. We port the objective to CLIF.
@@ -94,17 +104,27 @@ tokenizer+backbone fixed: **marked-TTE > TTE > next-token-prediction**. "Marked"
    the zero-shot multi-outcome engine. ICareFM dual-zero-shot (unseen task **and** unseen
    hospital) median AUROC **0.837** — strongest ICU evidence.
 2. **NEW AUXILIARY — value regression (the ORA "mark").** Predict the continuous lab/vital
-   value. Lifts physiology/regression tasks **+33–38% over NTP** — exactly our threshold
-   events (AKI, RRT, lactate, vasopressor need). **`value_regression` flips false→true.**
+   value. ~~Lifts physiology/regression tasks **+33–38% over NTP**~~ → ORA reports marked
+   time-to-event beating NTP by **10.7% (Transformer) and 11.4% (Mamba) on average over 14
+   tasks**, at a 120M budget (corrected 2026-10-03; the earlier figure did not match the
+   source). The original note tied the gain to our threshold events (AKI, RRT, lactate,
+   vasopressor need); ORA's figure is an all-task average, not a physiology-task one.
+   **`value_regression` flips false→true.**
 3. **LOW-WEIGHT AUXILIARY — next-event (NTP).** Weakest representation learner alone, but
    retains open-ended zero-shot for tasks not expressible as a threshold query (the
    readmission failure class of EveryQuery/ETHOS). At inference use **SCOPE/REACH**
-   (arXiv:2602.03730) to cut rollout cost 2.5–3.4× (>80× for rarest outcomes), calibration preserved.
+   (arXiv:2602.03730) to cut rollout cost: ~~2.5–3.4× (>80× for rarest outcomes)~~ → about
+   **10× fewer samples for mortality and about 1.2× for ICU admission** per the retrieved
+   abstract (corrected 2026-10-03), calibration preserved.
 
 **Loss balancing:** uncertainty-weighting (Kendall 1/2σ² learned per task) + grad-norm
 normalization to the primary task's gradient, so the dense mortality signal doesn't starve
 sparse auxiliaries ("signal-balance problem," arXiv:2607.22264). Robust fallback: just sum
 the TTE loss over many randomly-sampled τ per step (MOTOR/ORA default).
+*(Superseded 2026-10-03: uncertainty weighting and grad-norm were never implemented and have been
+removed. The objective is a fixed-weight sum with many sampled τ per anchor, the fallback above;
+whether a dense signal starves the sparse heads is tested by the objective arms in
+`configs/objective_arms.yaml`.)*
 
 **Curriculum:** warm up on NTP to stabilize token embeddings, then phase in TTE/threshold/
 value heads. (Reasoned default; no paper ablates the exact schedule.)
@@ -220,7 +240,8 @@ pre-anchor only.
 
 **Heads / objectives:** threshold-hazard (ICareFM, primary) + competing-risk CIF (SurvivEHR)
 + **value regression (ORA mark, NEW-enabled)** + low-weight next-event. Uncertainty +
-grad-norm loss weighting; NTP→TTE curriculum; random τ/horizons.
+grad-norm loss weighting *(superseded 2026-10-03: never implemented, removed; fixed weights)*;
+NTP→TTE curriculum; random τ/horizons.
 
 **Training:** 2× L40 (48GB, no NVLink), DDP via torchrun, bf16. MacBook (MPS, fp32, no
 compile/DDP) for dev/overfit-one-batch/finetune only. Do not rent GPUs — PhysioNet
@@ -234,7 +255,8 @@ baseline; MEDS-DEV portable tasks; TRIPOD+AI reporting.
 
 ## 8. Hard rules (unchanged — the non-negotiables)
 
-1. Treatments (meds) are **inputs, NEVER prediction targets**.
+1. Treatments (meds) are **inputs, NEVER prediction targets**. *(Amended 2026-10-03 — "of the
+   trunk", with a scoped allowance for label-only study endpoints; current wording in `AGENTS.md`.)*
 2. Value-bin vocab **frozen on one site (MIMIC)**, applied to both — no cross-site raw pooling.
 3. Retrospective reports/discharge summaries = **LABEL source only**; only pre-anchor notes
    may be features. Oversized note gains = leakage.

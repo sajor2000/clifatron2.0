@@ -121,6 +121,13 @@ FIXTURE_DATA_CONFIG = {
     "target_concepts": [
         {"name": "map", "source": "vitals", "direction": "below", "unit": "mmHg"},
     ],
+    # The synthetic site stages only some CLIF tables; a fixture that configures more of
+    # them declares the rest absent (src/data/site_config.py), as a real site must.
+    "sites": {
+        SYNTHETIC_SITE: {"expected_absent_tables": [
+            "labs", "resp_support", "meds", "meds_intermittent", "assessments", "crrt",
+            "ecmo", "code_status", "position", "adt"]},
+    },
     "value_binning": {
         # Quantile target well above the old hard-coded n_value_bins=10, so `map` gets
         # >= 12 segments and every consumer must derive n_value_bins from the vocab.
