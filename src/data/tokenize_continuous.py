@@ -223,9 +223,11 @@ def derive_continuous_fused_shard(primary_events, primary_blob: Mapping,
         tokens = pl.Series("token", [[lookup[int(i)] for i in ids] for ids in old.to_list()],
                            dtype=dtype)
     # The site fields of the primary binding (`tokenize.site_binding`: the site and the
-    # hash of its declarations) are carried over: the rows still come from that site.
+    # hash of its declarations) are carried over: the rows still come from that site. So
+    # are the window-cut fields (`tokenize.cut_binding`): the windows are kept as cut.
     fields = [f.name for f in frame.schema["artifact_hashes"].fields]
-    carried = [f for f in ("site", "site_declarations") if f in fields and f not in binding]
+    carried = [f for f in ("site", "site_declarations", "continuation_header", "header_length")
+               if f in fields and f not in binding]
     rebound = pl.struct(
         [pl.lit(v, pl.String).alias(k) for k, v in binding.items()]
         + [pl.col("artifact_hashes").struct.field(f).alias(f) for f in carried]

@@ -64,7 +64,10 @@ class RealDataSmokeTest(unittest.TestCase):
     def _mcfg(self):
         return {"trunk": {"d_model": 16, "n_layers": 1, "n_heads": 2, "ffn_mult": 2,
                           "dropout": 0.0, "rope_base": 10000.0, "tied_embeddings": False,
-                          "target_vocab": 256},
+                          "target_vocab": 256,
+                          # As the committed config: the synthetic shards are cut for it,
+                          # and training refuses a shard cut the other way.
+                          "continuation_header": True, "max_tokens": 8192},
                 "heads": json.loads(json.dumps(TINY_HEADS))}
 
     def test_gem_steps_and_rollouts(self):

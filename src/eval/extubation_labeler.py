@@ -918,7 +918,11 @@ def main() -> None:
     artifact_policy = args.artifact_policy or config["artifact_policy"]
     cohort = Path(args.cohort or config["outputs"]["cohort"])
     if cohort.exists():
-        site = cohort_site(pl.read_parquet(cohort, columns=["site"]))
+        # An artifact built before the `site` column existed has none: `cohort_site` then
+        # raises its own clear error (reading the missing column would not).
+        has_site = "site" in pl.read_parquet_schema(cohort)
+        site = cohort_site(pl.read_parquet(cohort, columns=["site"]) if has_site
+                           else pl.DataFrame())
         if site != "mimic" and not (args.cohort and args.out):
             # Never the reference site's default cohort or label paths for another site.
             raise SystemExit(f"site {site!r}: pass --cohort and --out explicitly")

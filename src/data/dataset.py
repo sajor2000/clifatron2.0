@@ -31,8 +31,10 @@ again at its start: header positions keep their own minutes (admission, 0) and a
 targets (masked), so labels, anchors' labels and next-event targets are unchanged; anchor
 offsets shift by the header length. The header counts against `max_tokens`: a window that
 would exceed it is refused - the shard must be cut with room for it
-(`gem_window_bounds_with_header`; the tokenizer change is to call it in place of
-`gem_window_bounds`).
+(`gem_window_bounds_with_header`, which the tokenizer calls when `continuation_header` is
+on). The cut mode is part of the shard's identity: the tokenizer records
+`continuation_header` and `header_length` in every row's artifact_hashes and the GemCorpus
+cache is keyed by it; `_check_cut_mode` refuses a mismatch when the dataset is built.
 
 ANCHORS. Every segment that can be supervised lists its anchors under ``"anchors"``:
 ``{"offset": position in the packed row, "cr": competing-risk label or None,
@@ -132,8 +134,14 @@ class ModelDataset(Dataset):
         value_channel: bool = False,
         continuation_header: frozenset[int] | None = None,
         max_tokens: int | None = None,
+        require_cut_match: bool = False,
     ) -> None:
-        """`value_channel` (continuous-fused arm, U6): each canonical or full-hospitalization
+        """`require_cut_match` (training): the shard's recorded window-cut mode
+        (`_check_cut_mode`) must equal this dataset's `continuation_header` setting in both
+        directions; without it only the unsafe one is refused (header requested, shard not
+        cut with room for it), so evaluation can read a header-cut shard without the header.
+
+        `value_channel` (continuous-fused arm, U6): each canonical or full-hospitalization
         sample also carries `input_value` / `input_value_mask`, the CURRENT event's value
         normalized with the target builder's frozen per-token stats
         (`tokenize_continuous.normalize_value`); missing, categorical (NaN) and
@@ -161,6 +169,7 @@ class ModelDataset(Dataset):
             raise ValueError("continuation_header applies to the gem representation only")
         self.continuation_header = None if continuation_header is None else frozenset(continuation_header)
         self.max_tokens = None if max_tokens is None else int(max_tokens)
+        self.require_cut_match = bool(require_cut_match)
         self._gem_built: dict[str, dict[str, Any]] = {}
         if isinstance(records, GemCorpus) and representation != "gem":
             raise TargetContractError(_GEM_ONLY)
@@ -229,6 +238,34 @@ class ModelDataset(Dataset):
         for name, expected in self.expected_hashes.items():
             if hashes.get(name) != expected:
                 raise TargetContractError(f"artifact hash mismatch: {name}")
+        if self.representation == "gem":
+            self._check_cut_mode(hashes)
+
+    def _check_cut_mode(self, hashes: Mapping[str, Any]) -> None:
+        """A GEM shard records how its continuation windows were cut (`continuation_header`
+        and `header_length` in artifact_hashes; a shard without them was cut at full
+        length, "off"). It must match how this dataset trains: a shard cut without room
+        for the header cannot take the header (always refused), and one cut with room
+        silently trains without it (refused under `require_cut_match`). Refused here, when
+        the loader is built, never at the first long stay."""
+        recorded = str(hashes.get("continuation_header") or "off")
+        wanted = "off" if self.continuation_header is None else "on"
+        unsafe = wanted == "on" and recorded != "on"
+        if recorded not in ("on", "off") or unsafe or (
+                self.require_cut_match and recorded != wanted):
+            raise TargetContractError(
+                f"GEM shard was cut with continuation_header={recorded!r} but this run trains "
+                f"with continuation_header={wanted!r}: re-tokenize the shard with the same "
+                f"trunk.continuation_header ({RETOKENIZE})")
+        if wanted == "on":
+            try:
+                length = int(hashes.get("header_length"))
+            except (TypeError, ValueError):
+                length = -1
+            if length < 0 or (self.max_tokens is not None and self.max_tokens - length < 2):
+                raise TargetContractError(
+                    f"GEM shard records header_length={hashes.get('header_length')!r}, which "
+                    f"cannot be cut for max_tokens {self.max_tokens}; re-tokenize the shard")
 
     def _decile_sample(self, record: dict[str, Any]) -> dict[str, Any]:
         built = self.target_builder.build(record, epoch=self.epoch)
@@ -391,7 +428,15 @@ class ModelDataset(Dataset):
             first, _ = part.stay_windows(int(part.win_stay[row]))
             if row > first:
                 base = int(part.win_offset[first])
-                length += stay_header_length(part.token[base:base + 64].tolist(), self.continuation_header)
+                h = stay_header_length(part.token[base:base + 64].tolist(), self.continuation_header)
+                recorded = int(part.hashes[int(part.win_hash[row])].get("header_length") or 0)
+                if h > recorded:
+                    # This dataset's header (token set) is longer than the one the shard
+                    # was cut for: the windows were cut for another header definition.
+                    raise TargetContractError(
+                        f"a stay header of {h} tokens exceeds the header_length {recorded} "
+                        "the shard was cut for: re-tokenize the shard")
+                length += h
             if self.max_tokens is not None and length > self.max_tokens:
                 over += 1
             out.append(length)
@@ -497,7 +542,7 @@ _GEM_ONLY = "GEM (hospitalization) records load only through representation='gem
 # The on-disk cache sits beside the shard (git-ignored data/output tree), one directory
 # per (partition, shard SHA-256, vocabulary hash); bump the version when its layout changes.
 GEM_CACHE_DIR = "gem_cache"
-GEM_CACHE_VERSION = 1
+GEM_CACHE_VERSION = 2
 _TARGET_DTYPES = {"ntp_target": np.int64, "ntp_mask": np.bool_, "ntp_delta_min": np.int64,
                   "value_target": np.float64, "value_mask": np.bool_}
 
@@ -1025,6 +1070,21 @@ def remove_stale_cache_builds(root: Path) -> list[str]:
     return removed
 
 
+def _shard_cut_mode(path: Path) -> str:
+    """The window-cut mode a shard's rows record (`continuation_header`, `header_length`
+    in artifact_hashes; "off"/0 when a row records none), as one canonical string: part
+    of the GEM cache's identity, so a cache is never reused across cut modes."""
+    fields = {f.name for f in pl.scan_parquet(path).collect_schema()["artifact_hashes"].fields}
+    flag = pl.col("artifact_hashes").struct.field("continuation_header") \
+        if "continuation_header" in fields else pl.lit(None, pl.String)
+    length = pl.col("artifact_hashes").struct.field("header_length") \
+        if "header_length" in fields else pl.lit(None, pl.String)
+    modes = pl.scan_parquet(path).select(
+        flag.fill_null("off").alias("continuation_header"),
+        length.fill_null("0").alias("header_length")).unique().collect()
+    return json.dumps(sorted(modes.rows()))
+
+
 def _cached_part(path: Path, partition: str | None) -> _GemPart:
     """The memory-mapped columnar copy of one shard partition, built on first use.
 
@@ -1041,11 +1101,13 @@ def _cached_part(path: Path, partition: str | None) -> _GemPart:
         pl.col("artifact_hashes").struct.field("vocabulary")).unique().collect().to_series())
     vocabulary = vocabularies[0] if len(vocabularies) == 1 else hashlib.sha256(
         json.dumps(vocabularies).encode()).hexdigest()
+    cut = _shard_cut_mode(path)
     expected = {"cache_version": GEM_CACHE_VERSION, "shard_sha256": digest,
-                "vocabulary": vocabulary, "partition": partition}
+                "vocabulary": vocabulary, "partition": partition, "cut_mode": cut}
     root = path.parent / GEM_CACHE_DIR
     root.mkdir(exist_ok=True)
-    directory = root / f"{partition or 'all'}-{digest[:16]}-{vocabulary[:16]}"
+    cut_key = hashlib.sha256(cut.encode()).hexdigest()[:8]
+    directory = root / f"{partition or 'all'}-{digest[:16]}-{vocabulary[:16]}-{cut_key}"
     with (root / ".lock").open("a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         try:

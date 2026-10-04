@@ -194,10 +194,6 @@ class TokenizeBinsTest(unittest.TestCase):
             encoder(token, torch.tensor([[0, 1]]))
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 # ---- KTD11: matched granularity for the decile arms -----------------------------------
 
 def _data_binning(**overrides) -> dict:
@@ -326,3 +322,7 @@ class MatchedGranularityTest(unittest.TestCase):
                                                  matched_granularity=False), self.fit,
                                    TARGETS, _directions())
         self.assertEqual(len(legacy["synth_lab"]), 10)   # n_bins, not the clinical count
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -188,52 +188,100 @@ SMALL = f"<{MIN_CELL}"
 WITHHELD = "suppressed"
 
 
-def _suppress_group(total: int, counts: dict, shares: dict | None,
-                    min_cell: int = MIN_CELL) -> tuple[object, dict, dict | None]:
-    """(total, counts, shares) with every count of 1 to `min_cell - 1` written as
-    ``<min_cell`` and its share withheld; when exactly one nonzero count is hidden, the
-    smallest released count is withheld too (it would be the total minus the others),
-    and so is the total when it is itself small."""
-    hidden = {k for k, n in counts.items() if 0 < n < min_cell}
-    released = sorted((n, k) for k, n in counts.items() if k not in hidden and n > 0)
-    complementary = {released[0][1]} if len(hidden) == 1 and released else set()
-    out_counts = {k: (SMALL if k in hidden else WITHHELD if k in complementary else n)
-                  for k, n in counts.items()}
-    out_shares = None if shares is None else {
-        k: (None if k in hidden or k in complementary else v) for k, v in shares.items()}
-    if 0 < total < min_cell:
-        out_shares = None if shares is None else {k: None for k in shares}
-        total = SMALL
-    return total, out_counts, out_shares
+_GROUPS = ("threshold_queries", "cause_labels", "competing_risk")
+_NOT_SUPERVISED = "not_supervised"
+
+
+def _label_cells(report: dict) -> dict[tuple, int]:
+    """Every released count of `targets.anchor_status_shares`, keyed by its path."""
+    def count(value) -> bool:
+        return isinstance(value, int) and not isinstance(value, bool)
+
+    cells: dict[tuple, int] = {}
+    if count(report.get("anchors")):
+        cells[("anchors",)] = report["anchors"]
+    cause = report.get("competing_risk_by_cause")
+    if isinstance(cause, dict):
+        if count(cause.get("supervised_anchors")):
+            cells[("supervised",)] = cause["supervised_anchors"]
+        for k, v in (cause.get("events") or {}).items():
+            cells[("events", k)] = int(v)
+    for group in _GROUPS:
+        entry = report.get(group)
+        if isinstance(entry, dict):
+            cells[(group, "n")] = int(entry.get("n") or 0)
+            for status, v in (entry.get("counts") or {}).items():
+                cells[(group, "counts", status)] = int(v)
+    return cells
+
+
+def _label_equations(cells: dict[tuple, int]) -> list[list[tuple]]:
+    """The published totals of `targets.anchor_status_shares` and the cells summing to
+    them (any ONE unknown member is recoverable from the others):
+      - each group's `n` is the sum of its status counts;
+      - `anchors` is the competing-risk group's `n` (every anchor has one status);
+      - `supervised_anchors` is that group's counts but `not_supervised`, so `n` is
+        `supervised_anchors` + `not_supervised`;
+      - the per-cause events (an anchor counts for a cause only when its status is
+        `positive` or `competing_event`) sum to those two counts."""
+    equations = [[(g, "n"), *(p for p in cells if p[:2] == (g, "counts"))] for g in _GROUPS]
+    cr = "competing_risk"
+    equations.append([("anchors",), (cr, "n")])
+    equations.append([(cr, "n"), ("supervised",), (cr, "counts", _NOT_SUPERVISED)])
+    equations.append([("supervised",), *(p for p in cells if p[:2] == (cr, "counts")
+                                         and p[2] != _NOT_SUPERVISED)])
+    equations.append([*(p for p in cells if p[0] == "events"),
+                      (cr, "counts", "positive"), (cr, "counts", "competing_event")])
+    equations = [[p for p in eq if p in cells] for eq in equations]
+    return [eq for eq in equations if len(eq) > 1]
 
 
 def suppress_label_status(report: dict, min_cell: int = MIN_CELL) -> dict:
     """`targets.anchor_status_shares` with small cells suppressed (smoke_report.json is
-    aggregate-only): anchor and status counts of 1-9, per-cause competing-risk event
-    counts of 1-9 and every share that would give one back."""
+    aggregate-only): every count of 1 to `min_cell - 1` is written ``<min_cell``, and
+    wherever an equation over the released counts (`_label_equations`) would leave exactly
+    ONE hidden non-zero member recoverable by subtraction, the smallest released non-zero
+    member is withheld too (``suppressed``). A share or rate is withheld with its count
+    or its base, since either gives the other back. Zeros disclose nobody and are shown."""
     out = json.loads(json.dumps(report))
-    anchors = out.get("anchors")
-    if isinstance(anchors, int) and 0 < anchors < min_cell:
-        out["anchors"] = SMALL
+    cells = _label_cells(out)
+    small = {p for p, v in cells.items() if 0 < v < min_cell}
+    hidden, equations = set(small), _label_equations(cells)
+    changed = True
+    while changed:
+        changed = False
+        for equation in equations:
+            exposed = [p for p in equation if p in hidden and cells[p] != 0]
+            released = sorted((cells[p], p) for p in equation
+                              if p not in hidden and cells[p] > 0)
+            if len(exposed) == 1 and released:
+                hidden.add(released[0][1])
+                changed = True
+
+    def shown(path: tuple, value):
+        return (SMALL if path in small else WITHHELD) if path in hidden else value
+
+    if ("anchors",) in cells:
+        out["anchors"] = shown(("anchors",), out["anchors"])
     cause = out.get("competing_risk_by_cause")
     if isinstance(cause, dict):
-        supervised = int(cause.get("supervised_anchors") or 0)
-        events = {k: int(v) for k, v in (cause.get("events") or {}).items()}
-        # Events by cause do not sum to the supervised total (anchors without an event),
-        # so only the small cells themselves (and their rates) are withheld.
-        cause["events"] = {k: (SMALL if 0 < v < min_cell else v) for k, v in events.items()}
-        cause["rates"] = {k: (None if 0 < events.get(k, 0) < min_cell
-                              or 0 < supervised < min_cell else v)
+        events = dict(cause.get("events") or {})
+        cause["events"] = {k: shown(("events", k), v) for k, v in events.items()}
+        base_hidden = ("supervised",) in hidden
+        cause["rates"] = {k: (None if ("events", k) in hidden or base_hidden else v)
                           for k, v in (cause.get("rates") or {}).items()}
-        if 0 < supervised < min_cell:
-            cause["supervised_anchors"] = SMALL
-    for group in ("threshold_queries", "cause_labels", "competing_risk"):
+        if ("supervised",) in cells:
+            cause["supervised_anchors"] = shown(("supervised",), cause["supervised_anchors"])
+    for group in _GROUPS:
         entry = out.get(group)
         if not isinstance(entry, dict):
             continue
-        entry["n"], entry["counts"], entry["shares"] = _suppress_group(
-            int(entry.get("n") or 0), {k: int(v) for k, v in (entry.get("counts") or {}).items()},
-            entry.get("shares"), min_cell)
+        entry["n"] = shown((group, "n"), entry.get("n"))
+        entry["counts"] = {k: shown((group, "counts", k), v)
+                           for k, v in (entry.get("counts") or {}).items()}
+        entry["shares"] = None if entry.get("shares") is None else {
+            k: (None if (group, "n") in hidden or (group, "counts", k) in hidden else v)
+            for k, v in entry["shares"].items()}
     return out
 
 

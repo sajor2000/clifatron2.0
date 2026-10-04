@@ -145,6 +145,31 @@ class RunbookCommandsTest(unittest.TestCase):
                               "src.eval.extubation_labeler"):
                     self.assertIn("--out", line)
 
+    def test_every_hospitalization_shard_of_a_site_adds_the_same_extubation_index_stays(self):
+        """`--extubation-cohort` adds each eligible extubation's index stay to the GEM stays.
+        Every arm's hospitalization shard of a site (clinical and both decile arms) must
+        add the same ones, or the arms train on different stays: the comparison would be
+        confounded by the stay set."""
+        seen = set()
+        for tokens in runbook_commands():
+            if module_and_subcommand(tokens)[0] != "src.data.tokenize":
+                continue
+            line = " ".join(tokens)
+            if "--trajectory hospitalization" not in line or "--sample-episodes" in line:
+                continue
+            site = tokens[tokens.index("--site") + 1]
+            out = tokens[tokens.index("--out") + 1]
+            seen.add((site, out))
+            with self.subTest(site=site, out=out):
+                self.assertIn("--extubation-cohort", tokens, line[:160])
+                cohort = tokens[tokens.index("--extubation-cohort") + 1]
+                self.assertEqual(cohort, "output/intermediate_phi/extubation_cohort"
+                                 + ("" if site == "mimic" else f"_{site}") + ".parquet")
+        for site in ("mimic", "rush"):
+            outs = {out.rsplit("/", 1)[-1] for s, out in seen if s == site}
+            self.assertGreaterEqual(
+                outs, {site, f"{site}_decile", f"{site}_decile_forced"})
+
     def test_every_module_exists_and_accepts_every_flag(self):
         commands = runbook_commands()
         self.assertGreater(len(commands), 20)

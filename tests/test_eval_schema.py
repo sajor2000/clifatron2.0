@@ -294,10 +294,6 @@ class CurveResolutionTest(unittest.TestCase):
         self.assertTrue(S.curves_releasable(S.curve_release_min()))
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class PolicyOverrideTest(unittest.TestCase):
     """The bundle, not the package, owns the policy in a deployed validator.
 
@@ -356,3 +352,7 @@ class PolicyOverrideTest(unittest.TestCase):
         S.min_cell_size.cache_clear()
         with self.assertRaises((S.DisclosureError, FileNotFoundError)):
             S.min_cell_size()
+
+
+if __name__ == "__main__":
+    unittest.main()

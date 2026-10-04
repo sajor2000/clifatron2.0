@@ -1019,8 +1019,9 @@ def _build_gem_loaders(
         vocab_size=vocab_size, value_stats=value_stats, run_seed=seed)
     rss_before = resident_set_bytes()
     datasets = {}
-    # Continuation header (src/data/dataset.py): off until the shards are cut with room
-    # for it (`dataset.gem_window_bounds_with_header`).
+    # Continuation header (src/data/dataset.py): the shards record how they were cut
+    # (`continuation_header`, `header_length` in artifact_hashes) and training refuses a
+    # shard cut the other way (`require_cut_match`): re-tokenize it, never train it as is.
     header = (header_token_ids(vocab_blob["vocab"])
               if mcfg["trunk"].get("continuation_header", False) else None)
     for partition in ("train", "validation"):
@@ -1047,7 +1048,7 @@ def _build_gem_loaders(
         datasets[partition] = ModelDataset(
             corpus, representation="gem", target_builder=target_builder,
             expected_hashes=dict(binding), value_channel=value_channel,
-            continuation_header=header,
+            continuation_header=header, require_cut_match=True,
             max_tokens=None if header is None else int(mcfg["trunk"]["max_tokens"]),
         ) if len(corpus) else None
     memory = loader_memory(rss_before, datasets.values())

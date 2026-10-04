@@ -1,3 +1,4 @@
+import json
 import unittest
 from datetime import UTC, datetime, timedelta
 
@@ -223,6 +224,102 @@ class CohortContractTest(unittest.TestCase):
 
         self.assertEqual(episode["hospitalization_id"], "eligible-stay")
         self.assertTrue(episode["eligible"])
+
+
+def _waterfall(**override):
+    """A cohort waterfall (`build_cohort`) whose equations all hold."""
+    base = {
+        "episode_source": 1000, "episode_excluded_no_icu": 400,
+        "episode_excluded_invalid_adt": 0, "episode_candidates": 600,
+        "episode_excluded_non_index": 150, "episode_selected": 450,
+        "patient_source": 700, "patient_excluded_no_icu": 250,
+        "episode_excluded_underage": 50, "patient_excluded_underage": 40,
+        "episode_excluded_missing_age": 0, "patient_excluded_missing_age": 0,
+        "episode_excluded_open_stay_no_extraction_time": 0,
+        "patient_excluded_open_stay_no_extraction_time": 0,
+        "episode_excluded_not_observed_at_anchor": 100,
+        "patient_excluded_not_observed_at_anchor": 80,
+        "episode_excluded_not_in_icu_at_anchor": 150,
+        "patient_excluded_not_in_icu_at_anchor": 120,
+        "episode_eligible_at_anchor": 300, "patient_eligible": 210,
+    }
+    base.update(override)
+    return base
+
+
+class CohortWaterfallDisplayTest(unittest.TestCase):
+    """The printed waterfall hides small cells AND the cells that would reveal them."""
+
+    def recoverable(self, shown):
+        """Equations with exactly one withheld non-zero member: that member is recoverable
+        by subtraction from the published ones."""
+        from src.data.cohort import waterfall_equations
+
+        full = _waterfall()
+        return [eq for eq in waterfall_equations(full)
+                if sum(isinstance(shown[k], str) and full[k] != 0 for k in eq) == 1]
+
+    def test_the_fixture_waterfall_satisfies_its_equations(self):
+        from src.data.cohort import waterfall_equations
+
+        full = _waterfall()
+        equations = waterfall_equations(full)
+        self.assertEqual(len(equations), 5)
+        for total, *cells in equations:
+            self.assertEqual(full[total], sum(full[k] for k in cells), total)
+
+    def test_a_small_cell_is_not_recoverable_by_subtraction(self):
+        from src.data.cohort import suppress_cohort_waterfall
+
+        # 5 stays without ICU: source (1000) - candidates (995) would give it away.
+        full = _waterfall(episode_source=1000, episode_excluded_no_icu=5,
+                          episode_candidates=995, episode_excluded_non_index=545)
+        shown = suppress_cohort_waterfall(full, 10)
+        self.assertEqual(shown["episode_excluded_no_icu"], "<10")
+        withheld = [k for k, v in shown.items() if v == "suppressed"]
+        self.assertTrue(withheld)       # a complementary cell is withheld
+        from src.data.cohort import waterfall_equations
+        for eq in waterfall_equations(full):
+            self.assertNotEqual(
+                sum(isinstance(shown[k], str) and full[k] != 0 for k in eq), 1, eq)
+        # The old per-cell mask published everything else in the equation.
+        self.assertNotEqual(shown["episode_source"], "<10")
+
+    def test_nothing_is_hidden_when_every_cell_is_large_or_zero(self):
+        from src.data.cohort import suppress_cohort_waterfall
+
+        full = _waterfall()
+        self.assertEqual(suppress_cohort_waterfall(full, 10), full)
+
+    def test_a_small_status_cell_withholds_the_smallest_released_cell_of_its_equation(self):
+        from src.data.cohort import suppress_cohort_waterfall
+
+        full = _waterfall(episode_excluded_underage=6, episode_excluded_not_in_icu_at_anchor=194)
+        shown = suppress_cohort_waterfall(full, 10)
+        self.assertEqual(shown["episode_excluded_underage"], "<10")
+        # candidates = statuses + eligible: the smallest released non-zero member goes too.
+        self.assertEqual(shown["episode_excluded_not_observed_at_anchor"], "suppressed")
+        self.assertEqual(self.recoverable(shown), [])
+
+    def test_the_cli_prints_the_complementary_suppression(self):
+        import contextlib
+        import io
+        from unittest import mock
+
+        from src.data import cohort
+
+        full = _waterfall(episode_excluded_no_icu=5, episode_candidates=995,
+                          episode_source=1000, episode_excluded_non_index=545)
+        manifest = {"waterfall": full}
+        with mock.patch.object(cohort, "build_cohort_artifact",
+                               return_value=(None, manifest)), \
+                mock.patch("sys.argv", ["cohort", "--data", "x", "--site", "mimic"]), \
+                contextlib.redirect_stdout(io.StringIO()) as out:
+            cohort.main()
+        printed = json.loads(out.getvalue())["waterfall"]
+        self.assertEqual(printed["episode_excluded_no_icu"], "<10")
+        self.assertIn("suppressed", printed.values())
+        self.assertEqual(printed, cohort.suppress_cohort_waterfall(full, 10))
 
 
 if __name__ == "__main__":

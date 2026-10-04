@@ -95,10 +95,6 @@ class GroupedSplitTest(unittest.TestCase):
             validate_grouped_splits(rows)
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 RATIOS = {"train": 0.60, "validation": 0.15, "calibration": 0.10, "internal_test": 0.15}
 HELD = ("validation", "calibration", "internal_test")
 
@@ -212,3 +208,7 @@ class HeldOutStratificationTest(unittest.TestCase):
         self.assertEqual((spec.share, spec.held_out), (0.5, ("validation", "calibration", "internal_test")))
         with self.assertRaises(ValueError):
             HeldOutStratification(strata={}, arms=("niv",), share=1.0, held_out=HELD)
+
+
+if __name__ == "__main__":
+    unittest.main()

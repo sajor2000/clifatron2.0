@@ -157,10 +157,18 @@ class LeanDatasetEquivalenceTest(unittest.TestCase):
                 self.assertEqual(batch_bytes(collate_model_samples(got[start:start + 4])),
                                  batch_bytes(collate_model_samples(expected[start:start + 4])))
 
+    @staticmethod
+    def _without_header(dataset):
+        """The loader's corpus read as the oracle does: no re-inserted stay header (the
+        loaders train with the committed `continuation_header`, which the oracle lacks)."""
+        return ModelDataset(dataset.corpus, representation="gem",
+                            target_builder=dataset.target_builder,
+                            expected_hashes=dataset.expected_hashes)
+
     def test_loader_samples_equal_the_list_of_dicts_implementation(self):
-        self.assert_same_as_reference(self.loaders.train_dataset, self.records["train"],
-                                      value_channel=False)
-        self.assert_same_as_reference(self.loaders.validation_dataset,
+        self.assert_same_as_reference(self._without_header(self.loaders.train_dataset),
+                                      self.records["train"], value_channel=False)
+        self.assert_same_as_reference(self._without_header(self.loaders.validation_dataset),
                                       self.records["validation"], value_channel=False)
 
     def test_value_channel_samples_equal_the_list_of_dicts_implementation(self):

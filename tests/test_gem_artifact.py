@@ -360,6 +360,11 @@ class GemArtifactTest(unittest.TestCase):
             self.assertLessEqual(n + h, MAX_TOKENS)
         self.assertEqual(sum(lengths), total)
         self.assertGreater(len(lengths), off.height)
+        # The cut mode is bound into every row, so a loader can refuse a mismatch.
+        for flag, frame in ((False, pl.read_parquet(out[False])), (True, pl.read_parquet(out[True]))):
+            (hashes,) = frame["artifact_hashes"].unique().to_list()
+            self.assertEqual(hashes["continuation_header"], "on" if flag else "off")
+            self.assertEqual(hashes["header_length"], str(h) if flag else "0")
 
     def test_short_stays_are_one_window(self):
         rows = self._windows("synth-001")
@@ -375,7 +380,9 @@ class GemArtifactTest(unittest.TestCase):
             # The vocabulary binding, plus the site binding (tokenize.site_binding): the
             # site and the SHA-256 of its declarations.
             self.assertEqual({k: hashes[k] for k in binding}, binding)
-            self.assertEqual(set(hashes) - set(binding), {"site", "site_declarations"})
+            self.assertEqual(set(hashes) - set(binding),
+                             {"site", "site_declarations", "continuation_header",
+                              "header_length"})
             self.assertEqual(len(hashes["site_declarations"]), 64)
         self.assertEqual(set(self.gem["trajectory"].to_list()), {"hospitalization"})
 

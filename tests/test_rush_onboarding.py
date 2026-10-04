@@ -578,6 +578,76 @@ def test_smoke_label_status_suppresses_counts_under_ten():
     assert out["competing_risk"]["shares"]["positive"] is None
 
 
+def _consistent_label_report(*, positive=43, competing=0, events=None, not_supervised=20):
+    """A `targets.anchor_status_shares` report whose identities hold: per-cause events sum
+    to positive + competing_event, supervised is the competing-risk group but
+    not_supervised, and anchors is that group's n."""
+    events = {"0": 3, "1": 40} if events is None else events
+    negative, censored = 200, 100
+    supervised = positive + competing + negative + censored
+    n = supervised + not_supervised
+    counts = {"positive": positive, "competing_event": competing, "negative": negative,
+              "censored": censored, "not_supervised": not_supervised}
+    return {"anchors": n,
+            "competing_risk_by_cause": {
+                "supervised_anchors": supervised, "events": events,
+                "rates": {k: v / supervised for k, v in events.items()}},
+            "competing_risk": {"n": n, "counts": counts,
+                               "shares": {k: v / n for k, v in counts.items()}}}
+
+
+def _recoverable_label_cells(shown, full):
+    """Equations with exactly one withheld non-zero member (recoverable by subtraction)."""
+    from src.train.real_data_smoke import _label_cells, _label_equations
+
+    cells = _label_cells(full)
+    flat = {}
+    for path in cells:
+        node = shown
+        for part in {("supervised",): ("competing_risk_by_cause", "supervised_anchors"),
+                     ("anchors",): ("anchors",)}.get(
+                path, ("competing_risk_by_cause", "events", path[1]) if path[0] == "events"
+                else (path[0], *path[1:])):
+            node = node[part]
+        flat[path] = node
+    return [eq for eq in _label_equations(cells)
+            if sum(isinstance(flat[p], str) and cells[p] != 0 for p in eq) == 1]
+
+
+def test_smoke_label_status_does_not_leak_a_small_cause_count_through_the_cr_counts():
+    # events sum to competing_risk positive + competing_event, both released: 43 - 40 = 3.
+    from src.train.real_data_smoke import SMALL, WITHHELD, suppress_label_status
+
+    report = _consistent_label_report()
+    out = suppress_label_status(report)
+    cause = out["competing_risk_by_cause"]
+    assert cause["events"] == {"0": SMALL, "1": WITHHELD}
+    assert cause["rates"] == {"0": None, "1": None}
+    assert out["competing_risk"]["counts"]["positive"] == 43       # still published
+    assert _recoverable_label_cells(out, report) == []
+
+
+def test_smoke_label_status_does_not_leak_not_supervised_through_anchors_and_supervised():
+    # anchors - supervised_anchors is the not_supervised count (here 4): one hidden cell
+    # of an equation whose other members are published.
+    from src.train.real_data_smoke import SMALL, suppress_label_status
+
+    report = _consistent_label_report(not_supervised=4, events={"0": 100, "1": 243})
+    out = suppress_label_status(report)
+    assert out["competing_risk"]["counts"]["not_supervised"] == SMALL
+    assert _recoverable_label_cells(out, report) == []
+    withheld = [out["anchors"], out["competing_risk_by_cause"]["supervised_anchors"],
+                out["competing_risk"]["n"]]
+    assert any(isinstance(v, str) for v in withheld)
+
+
+def test_smoke_label_status_publishes_everything_when_no_cell_is_small():
+    from src.train.real_data_smoke import suppress_label_status
+
+    report = _consistent_label_report(events={"0": 20, "1": 23})
+    assert suppress_label_status(report) == report
+
+
 def test_failure_messages_suppress_small_counts_and_stay_on_the_node():
     from src.data.cohort import QualificationError
     from src.data.tokenize import NODE_ONLY, apply_bp_method

@@ -3154,12 +3154,14 @@ def _gem_records(shards: pl.DataFrame, stays: pl.DataFrame, vocab: dict, gem_cfg
             stay_header_length
         header_ids = header_token_ids(vocab)
         heads64 = framed["token"].list.head(64).to_list()
+    longest_header = 0
     for row, n in enumerate(framed["token"].list.len().to_list()):
         if header_ids is None:
             bounds = gem_window_bounds(n, max_tokens)
         else:
-            bounds = gem_window_bounds_with_header(
-                n, max_tokens, stay_header_length(heads64[row], header_ids))
+            header_len = stay_header_length(heads64[row], header_ids)
+            longest_header = max(longest_header, header_len)
+            bounds = gem_window_bounds_with_header(n, max_tokens, header_len)
         for i, (lo, hi) in enumerate(bounds):
             stay_rows.append(row)
             starts.append(lo)
@@ -3187,7 +3189,19 @@ def _gem_records(shards: pl.DataFrame, stays: pl.DataFrame, vocab: dict, gem_cfg
         # Aggregate-only (no identifiers): stays, windows and label counts.
         stats["gem"] = {"stays": frame.height, "windows": len(records),
                         **{k: dict(sorted(v.items())) for k, v in counts.items()}}
-    return records.with_columns(binding_expr(binding))
+    # The cut mode is part of the shard's identity: a shard cut with room for the stay
+    # header is not interchangeable with one cut at full length (the loader refuses a
+    # mismatch: dataset.ModelDataset._check_cut_mode).
+    cut = cut_binding(header_ids is not None, longest_header)
+    return records.with_columns(binding_expr({**binding, **cut}))
+
+
+def cut_binding(continuation_header: bool, header_length: int = 0) -> dict[str, str]:
+    """The window-cut fields a GEM shard's ``artifact_hashes`` records next to the
+    vocabulary binding: whether continuation windows were cut with room for the stay
+    header, and the longest header (tokens) among its stays."""
+    return {"continuation_header": "on" if continuation_header else "off",
+            "header_length": str(int(header_length) if continuation_header else 0)}
 
 
 def model_continuation_header(path: Path | None = None) -> bool:

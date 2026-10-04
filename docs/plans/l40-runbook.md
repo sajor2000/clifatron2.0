@@ -460,10 +460,15 @@ uv run python -c "import yaml; from src.train.run_tokenization_ablation import a
 
 ```bash
 uv run python -m src.data.tokenize --config output/intermediate_phi/configs/data.global_deciles.yaml --site mimic --in ~/Data/clif-source --out output/intermediate_phi/mimic_decile --build-vocab --episodes output/intermediate_phi/episodes.parquet --workers 8
-uv run python -m src.data.tokenize --config output/intermediate_phi/configs/data.global_deciles.yaml --site mimic --in ~/Data/clif-source --out output/intermediate_phi/mimic_decile --vocab output/intermediate_phi/mimic_decile/vocab.json --trajectory hospitalization --episodes output/intermediate_phi/episodes.parquet --workers 8
+uv run python -m src.data.tokenize --config output/intermediate_phi/configs/data.global_deciles.yaml --site mimic --in ~/Data/clif-source --out output/intermediate_phi/mimic_decile --vocab output/intermediate_phi/mimic_decile/vocab.json --trajectory hospitalization --episodes output/intermediate_phi/episodes.parquet --extubation-cohort output/intermediate_phi/extubation_cohort.parquet --workers 8
 uv run python -m src.data.tokenize --config output/intermediate_phi/configs/data.deciles_plus_soft.yaml --site mimic --in ~/Data/clif-source --out output/intermediate_phi/mimic_decile_forced --build-vocab --episodes output/intermediate_phi/episodes.parquet --workers 8
-uv run python -m src.data.tokenize --config output/intermediate_phi/configs/data.deciles_plus_soft.yaml --site mimic --in ~/Data/clif-source --out output/intermediate_phi/mimic_decile_forced --vocab output/intermediate_phi/mimic_decile_forced/vocab.json --trajectory hospitalization --episodes output/intermediate_phi/episodes.parquet --workers 8
+uv run python -m src.data.tokenize --config output/intermediate_phi/configs/data.deciles_plus_soft.yaml --site mimic --in ~/Data/clif-source --out output/intermediate_phi/mimic_decile_forced --vocab output/intermediate_phi/mimic_decile_forced/vocab.json --trajectory hospitalization --episodes output/intermediate_phi/episodes.parquet --extubation-cohort output/intermediate_phi/extubation_cohort.parquet --workers 8
 ```
+
+Both decile hospitalization builds take the same `--extubation-cohort` as the clinical build
+in step 8: the index stays it adds must be the same in every arm, or the arms train on
+different stays and the tokenization comparison is confounded by the stay set. The
+vocabulary builds above take no cohort (they fit on the eligible episodes, as step 8's does).
 
 Check: `tokenization_report.json` lists the matched-granularity exceptions (concepts with
 too few distinct values keep fewer bins, KTD11).
@@ -522,8 +527,8 @@ Only once Rush is staged. Rush never fits a vocabulary; it imports each arm's.
 ```bash
 uv run python -m src.data.tokenize --site rush --in ~/Data/clif-rush --out output/intermediate_phi/rush --vocab output/intermediate_phi/mimic/vocab.json --episodes output/intermediate_phi/episodes_rush.parquet --workers 8
 uv run python -m src.data.tokenize --site rush --in ~/Data/clif-rush --out output/intermediate_phi/rush --vocab output/intermediate_phi/mimic/vocab.json --trajectory hospitalization --episodes output/intermediate_phi/episodes_rush.parquet --extubation-cohort output/intermediate_phi/extubation_cohort_rush.parquet --workers 8
-uv run python -m src.data.tokenize --config output/intermediate_phi/configs/data.global_deciles.yaml --site rush --in ~/Data/clif-rush --out output/intermediate_phi/rush_decile --vocab output/intermediate_phi/mimic_decile/vocab.json --trajectory hospitalization --episodes output/intermediate_phi/episodes_rush.parquet --workers 8
-uv run python -m src.data.tokenize --config output/intermediate_phi/configs/data.deciles_plus_soft.yaml --site rush --in ~/Data/clif-rush --out output/intermediate_phi/rush_decile_forced --vocab output/intermediate_phi/mimic_decile_forced/vocab.json --trajectory hospitalization --episodes output/intermediate_phi/episodes_rush.parquet --workers 8
+uv run python -m src.data.tokenize --config output/intermediate_phi/configs/data.global_deciles.yaml --site rush --in ~/Data/clif-rush --out output/intermediate_phi/rush_decile --vocab output/intermediate_phi/mimic_decile/vocab.json --trajectory hospitalization --episodes output/intermediate_phi/episodes_rush.parquet --extubation-cohort output/intermediate_phi/extubation_cohort_rush.parquet --workers 8
+uv run python -m src.data.tokenize --config output/intermediate_phi/configs/data.deciles_plus_soft.yaml --site rush --in ~/Data/clif-rush --out output/intermediate_phi/rush_decile_forced --vocab output/intermediate_phi/mimic_decile_forced/vocab.json --trajectory hospitalization --episodes output/intermediate_phi/episodes_rush.parquet --extubation-cohort output/intermediate_phi/extubation_cohort_rush.parquet --workers 8
 uv run python -m src.data.tokenize_continuous --primary-vocab output/intermediate_phi/mimic/vocab.json --primary-events output/intermediate_phi/rush/gem_events.parquet --out output/intermediate_phi/rush_continuous
 ```
 

@@ -701,10 +701,6 @@ class VocabularyBindingTest(unittest.TestCase):
         _check_harmonization_binding({}, {}, bare)
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class Clif21UnitsTest(unittest.TestCase):
     """Every literature edge is in the CLIF 2.1 unit of its concept; derived / non-CLIF
     concepts are listed explicitly."""
@@ -825,3 +821,7 @@ class DerivedAndRenamedConceptsTest(unittest.TestCase):
 def with_lag0(cfg):
     from src.data.tokenize import with_availability_lag
     return with_availability_lag(cfg, 0)
+
+
+if __name__ == "__main__":
+    unittest.main()

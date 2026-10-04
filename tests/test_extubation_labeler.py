@@ -743,5 +743,19 @@ class ExtubationLabelArtifactTest(unittest.TestCase):
                 os.chdir(old_cwd)
 
 
+class CohortWithoutSiteTest(unittest.TestCase):
+    def test_a_cohort_artifact_built_before_the_site_column_gets_the_clear_error(self):
+        """The CLI reads the site from the artifact; one without a `site` column must reach
+        `cohort_site`'s QualificationError, not die on a polars ColumnNotFoundError."""
+        with tempfile.TemporaryDirectory() as directory:
+            cohort = Path(directory) / "extubation_cohort.parquet"
+            pl.DataFrame({"patient_id": ["p1", "p2"]}).write_parquet(cohort)
+            argv = ["extubation_labeler", "--data", directory, "--cohort", str(cohort),
+                    "--out", str(Path(directory) / "labels.parquet")]
+            with patch("sys.argv", argv), self.assertRaisesRegex(
+                    QualificationError, "exactly one site"):
+                labeler_main()
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -6,6 +6,7 @@ import argparse
 import hashlib
 import json
 import os
+from collections.abc import Mapping
 from datetime import timedelta
 from pathlib import Path
 from typing import Any
@@ -627,6 +628,57 @@ def validate_episode_artifact(episodes: pl.DataFrame) -> None:
         raise QualificationError("episode artifact content hash mismatch")
 
 
+_ELIGIBILITY_STATUSES = ("underage", "missing_age", "open_stay_no_extraction_time",
+                         "not_observed_at_anchor", "not_in_icu_at_anchor")
+WATERFALL_SUPPRESSED = "suppressed"
+
+
+def waterfall_equations(waterfall: Mapping[str, int]) -> list[list[str]]:
+    """The cohort waterfall's published totals and the cells summing to them,
+    ``[total, *cells]`` (`build_cohort`). Any ONE unknown member of an equation is
+    recoverable from the others. One episode is kept per patient, so `episode_selected`
+    is also the patients with an ICU stay."""
+    status = [f"episode_excluded_{v}" for v in _ELIGIBILITY_STATUSES]
+    patient = [f"patient_excluded_{v}" for v in _ELIGIBILITY_STATUSES]
+    equations = [
+        ["episode_source", "episode_excluded_no_icu", "episode_candidates"],
+        ["episode_candidates", *status, "episode_eligible_at_anchor"],
+        ["episode_candidates", "episode_excluded_non_index", "episode_selected"],
+        ["patient_source", "patient_excluded_no_icu", "episode_selected"],
+        ["episode_selected", *patient, "patient_eligible"],
+    ]
+    equations = [[key for key in equation if key in waterfall] for equation in equations]
+    return [equation for equation in equations if len(equation) > 2]
+
+
+def suppress_cohort_waterfall(waterfall: Mapping[str, Any], min_cell: int) -> dict[str, Any]:
+    """The waterfall as printed on the node: every count of 1 to `min_cell - 1` becomes
+    ``"<{min_cell}"``, and wherever an equation (`waterfall_equations`) would leave exactly
+    ONE hidden non-zero member recoverable by subtraction from the published others, the
+    smallest released non-zero member is withheld too (``"suppressed"``). A zero discloses
+    nobody and is shown."""
+    def count(value: Any) -> bool:
+        return isinstance(value, int) and not isinstance(value, bool)
+
+    hidden = {k for k, v in waterfall.items() if count(v) and 0 < v < min_cell}
+    complementary: set[str] = set()
+    equations = waterfall_equations({k: v for k, v in waterfall.items() if count(v)})
+    changed = True
+    while changed:
+        changed = False
+        for equation in equations:
+            exposed = [k for k in equation if k in hidden]
+            released = sorted((waterfall[k], k) for k in equation
+                              if k not in hidden and waterfall[k] > 0)
+            if len(exposed) == 1 and released:
+                hidden.add(released[0][1])
+                complementary.add(released[0][1])
+                changed = True
+    return {k: (WATERFALL_SUPPRESSED if k in complementary
+                else f"<{min_cell}" if k in hidden else v)
+            for k, v in waterfall.items()}
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Build the canonical ICU episode/split artifact")
     parser.add_argument("--data", required=True)
@@ -656,9 +708,9 @@ def main() -> None:
     # Aggregate counts only (suppressed below the minimum cell size).
     policy = yaml.safe_load(Path(args.artifact_policy).read_text())
     min_cell = int(policy["classes"]["aggregate_no_phi"]["minimum_cell_size"])
-    print(json.dumps({"site": args.site, "waterfall": {
-        k: (f"<{min_cell}" if isinstance(v, int) and 0 < v < min_cell else v)
-        for k, v in manifest["waterfall"].items()}}, indent=2))
+    print(json.dumps({"site": args.site,
+                      "waterfall": suppress_cohort_waterfall(manifest["waterfall"], min_cell)},
+                     indent=2))
     if manifest.get("held_out_stratification"):
         # Aggregate shares only (patients per arm and held-out share).
         print(json.dumps({"held_out_stratification": manifest["held_out_stratification"]}, indent=2))

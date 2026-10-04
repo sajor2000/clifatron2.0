@@ -64,7 +64,11 @@ def _registry() -> dict:
 def tiny_mcfg(**weights) -> dict:
     mcfg = {
         "trunk": {"d_model": 16, "n_layers": 1, "n_heads": 2, "ffn_mult": 2, "dropout": 0.0,
-                  "rope_base": 10000.0, "tied_embeddings": False, "target_vocab": 10000},
+                  "rope_base": 10000.0, "tied_embeddings": False, "target_vocab": 10000,
+                  # As the committed config: the synthetic shards are cut for it, and
+                  # training refuses a shard cut the other way.
+                  "continuation_header": MODEL_CFG["trunk"]["continuation_header"],
+                  "max_tokens": MODEL_CFG["trunk"]["max_tokens"]},
         "heads": copy.deepcopy(MODEL_CFG["heads"]),
         "in_stream": {"anchors_per_window": 3, "queries_per_anchor": 2},
     }
@@ -317,6 +321,70 @@ class GemLoaderTest(unittest.TestCase):
             gem_loaders(self.corpus, sites, td=self.work)
         self.assertRegex(str(ctx.exception), "hash|binding|vocabulary")
 
+    def _recut(self, name: str, **cut) -> Path:
+        """A copy of site_b's shard whose rows record another window-cut mode (`cut`: the
+        fields to set; a None value drops the field, as a shard cut before they existed)."""
+        copy_dir = self.work / name
+        shutil.rmtree(copy_dir, ignore_errors=True)
+        shutil.copytree(self.corpus["gem"]["site_b"].parent, copy_dir)
+        shutil.rmtree(copy_dir / "gem_cache", ignore_errors=True)
+        path = copy_dir / "gem_events.parquet"
+        frame = pl.read_parquet(path)
+        hashes = dict(frame["artifact_hashes"][0])
+        for key, value in cut.items():
+            hashes.pop(key) if value is None else hashes.__setitem__(key, value)
+        frame.with_columns(pl.struct(**{k: pl.lit(v) for k, v in hashes.items()})
+                           .alias("artifact_hashes")).write_parquet(path)
+        return path
+
+    def test_the_shard_records_how_its_windows_were_cut(self):
+        hashes = pl.read_parquet(self.corpus["gem"]["site_a"])["artifact_hashes"].unique()
+        self.assertEqual(hashes.len(), 1)
+        recorded = hashes[0]
+        self.assertEqual(recorded["continuation_header"], "on")
+        self.assertGreaterEqual(int(recorded["header_length"]), 2)    # <bos>, ADMISSION//
+
+    def test_a_shard_cut_without_the_header_is_refused_when_training_with_it(self):
+        # The cut flag is bound into the shard: a shard cut at full length (or one that
+        # predates the flag) cannot take the header, and is refused when the loader is
+        # built - not trained, and not discovered at the first over-budget window.
+        for label, cut in (("off", {"continuation_header": "off", "header_length": "0"}),
+                           ("legacy", {"continuation_header": None, "header_length": None})):
+            with self.subTest(shard=label):
+                path = self._recut(f"cut_{label}", **cut)
+                with self.assertRaisesRegex(TargetContractError, "continuation_header"):
+                    gem_loaders(self.corpus, {"site_a": path}, td=self.work)
+
+    def test_a_shard_cut_with_the_header_is_refused_when_training_without_it(self):
+        mcfg = tiny_mcfg()
+        mcfg["trunk"]["continuation_header"] = False
+        with self.assertRaisesRegex(TargetContractError, "continuation_header"):
+            gem_loaders(self.corpus, mcfg=mcfg, td=self.work)
+        # Evaluation may still read it without the header (no require_cut_match).
+        loaded = self.loaders.train_dataset
+        ModelDataset(loaded.corpus, representation="gem", target_builder=loaded.target_builder,
+                     expected_hashes=loaded.expected_hashes)
+
+    def test_the_cut_mode_is_part_of_the_corpus_cache_key(self):
+        from src.data.dataset import GemCorpus, _shard_cut_mode
+
+        modes = {label: _shard_cut_mode(self._recut(f"key_{label}", **cut))
+                 for label, cut in (("on", {}),
+                                    ("off", {"continuation_header": "off", "header_length": "0"}),
+                                    ("legacy", {"continuation_header": None,
+                                                "header_length": None}))}
+        self.assertEqual(modes["off"], modes["legacy"])      # no field means cut at full length
+        self.assertNotEqual(modes["on"], modes["off"])
+        path = self._recut("key_cache")
+        GemCorpus.from_parquet(path, partition="train", cache=True)
+        (cache,) = [c for c in (path.parent / "gem_cache").iterdir() if c.is_dir()]
+        meta = cache / "meta.json"
+        self.assertEqual(json.loads(meta.read_text())["cut_mode"], modes["on"])
+        # A cache recording another cut mode is refused, never read.
+        meta.write_text(meta.read_text().replace('\\"on\\"', '\\"off\\"'))
+        with self.assertRaisesRegex(TargetContractError, "stale"):
+            GemCorpus.from_parquet(path, partition="train", cache=True)
+
     def test_a_vocabulary_built_from_a_sample_is_refused(self):
         sites = {"site_a": self.corpus["gem"]["site_a"], "sample": self.corpus["sample"]}
         with self.assertRaisesRegex(SystemExit, "sample"):
@@ -366,7 +434,12 @@ class GemLoaderTest(unittest.TestCase):
 
         from src.data.dataset import ModelDataset, header_token_ids, stay_header_length
 
-        base = self.loaders.train_dataset
+        loaded = self.loaders.train_dataset
+        # The header-less view of the same corpus (evaluation reads a header-cut shard
+        # without the header; training would refuse that, `require_cut_match`).
+        base = ModelDataset(loaded.corpus, representation="gem",
+                            target_builder=loaded.target_builder,
+                            expected_hashes=loaded.expected_hashes)
         header = header_token_ids(self.corpus["blob"]["vocab"])
         key = f"site_a:{LONG_STAY}"
         indices = [i for i, r in enumerate(base.records) if r.get("episode_key") == key]
