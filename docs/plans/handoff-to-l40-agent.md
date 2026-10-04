@@ -18,11 +18,12 @@ Written 2026-10-03 for the agent (or person) who takes this branch to `rudu-hpcg
 
 ## 2. State of the branch
 
-- Branch `t3code/extubation-counterfactual-plan`, PR #17 (draft). Everything up to the
-  CLIF 2.1 conformance commit is pushed and CI is green on Python 3.11 and 3.13.
-- PR #17 is merged to `main`. It passes the full local suite (about 1,530 tests) and the
-  `clif-validate` suite (34), and the docs build. The full-MIMIC tokenization timing is in
-  section 4, item 1.
+- **Use `main`.** PRs #17 (the full Milestone 1 build) and #18 (the tokenizer dedupe fix) are
+  merged. The old feature branch `t3code/extubation-counterfactual-plan` points to the
+  pre-merge commit and does NOT have the #18 fix: checking it out restores a quadratic join
+  that makes full-MIMIC tokenization take hours. Always clone or pull `main`.
+- `main` passes the full local suite (about 1,530 tests), the `clif-validate` suite (34), and the
+  docs build. The full-MIMIC tokenization timing is in section 4, item 1.
 - Code is built for every Milestone 1 unit: tokenizer arms and literature-grounded bins,
   in-stream time-to-event targets, curriculum, multi-site loader, experiment matrix (96 runs),
   claims panel, CLIF task suite and baselines, extubation cohort, labels, estimators, audit
@@ -100,7 +101,7 @@ the git-ignored `configs/sites/rush.local.yaml`.
 
 ```bash
 git clone https://github.com/sajor2000/clifatron2.0.git && cd clifatron2.0   # or git pull
-git checkout t3code/extubation-counterfactual-plan
+git checkout main && git pull        # never the old feature branch (see section 2)
 uv sync --group dev
 uv run python -c "import torch; print(torch.cuda.is_available(), torch.cuda.device_count(), torch.version.cuda)"
 nvidia-smi        # fails today on a driver/library mismatch: reboot first (runbook step 2)
