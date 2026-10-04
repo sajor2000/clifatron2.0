@@ -78,8 +78,12 @@ outcomes:
 # today's behaviour). A list (e.g. [arterial]) restricts the MAP readings that can define
 # the outcome to the BP-method tokens configs/data.yaml `bp_method` emits; it changes the
 # outcome definition, so it needs outcome approval (prerequisites.outcome_approval).
-# Not yet read by the label derivation (src/data/targets.py): an open item.
-# decided 2026-10-03 (product authority): all readings primary, arterial-only sensitivity.
+# Read by the in-stream label derivation (src/data/targets.py `measurement_filters`):
+# OFF by default; a run selects a sensitivity with configs/model.yaml-style
+# `in_stream.outcome_measurement_sensitivity: arterial_only` (src/train/pretrain.py), and a
+# MAP reading then counts only when its `bp_method=arterial` token precedes it at the same
+# minute. decided 2026-10-03 (product authority): all readings primary, arterial-only
+# sensitivity.
 outcome_measurement_filters:
   map_below_65_48h:
     bp_method: null

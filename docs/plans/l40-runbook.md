@@ -171,32 +171,201 @@ df -hT ~/Data/clif-source output
 Check: the CLIF tables are present, and `output/` is on a local filesystem (`ext4`, `xfs`;
 not `nfs`, `cifs`).
 
-Rush: placeholder. Stage the Rush CLIF tables at `~/Data/clif-rush` only once the
-governance approval is in place. Every Rush step below is marked "(Rush)"; skip it until
-then. UChicago is external validation by model-to-data and is never staged here.
+Rush: stage the Rush CLIF tables at `~/Data/clif-rush` only once the governance approval
+is in place, then run "Rush day 1" (below) before any Rush step. Every Rush step below is
+marked "(Rush)"; skip it until then. UChicago is external validation by model-to-data and
+is never staged here.
+
+## Rush day 1 (aggregate-only checks before any Rush step)
+
+Rush University Medical Center is ONE hospital (one `hospital_id`; the cohort and the
+tokenizer refuse more than one). Rush has no ECMO/MCS table, and its CRRT rows often say
+only that a patient was on dialysis. Nothing has run on Rush data yet: do these steps in
+order, each aggregate-only, before steps 4-13 for Rush.
+
+**Governance (every step).**
+
+- Rush tables and everything derived from rows (episode and extubation artifacts, shards,
+  vocabularies built from them, caches) stay under `~/Data/clif-rush/` and
+  `output/intermediate_phi/`, on the node.
+- Never paste a traceback, a log line or an error message off the node: error messages
+  are aggregate (counts under 10 print as `<10`, small-cell quantiles are withheld) but
+  can echo Rush's own source strings. Copy off the node only the aggregate JSON written
+  under `output/final_no_phi/`, after disclosure review.
+- No Rush string (source names, unit labels, local codes) in a committed file: Rush
+  mappings live only in the git-ignored `configs/sites/rush.local.yaml`. `git status`
+  must not list it.
+
+**1. Stage the files.** One parquet per CLIF table in `~/Data/clif-rush/`, named
+`clif_<table>.parquet` (`clif_hospitalization.parquet`, `clif_adt.parquet`,
+`clif_vitals.parquet`, ...), identifiers (`patient_id`, `hospitalization_id`,
+`hospital_id`) as strings, timestamps in UTC (a naive column is read as Rush's wall clock,
+America/Chicago, and converted; a time inside the spring DST gap becomes null and is
+counted).
+
+```bash
+ls ~/Data/clif-rush/clif_*.parquet | wc -l
+```
+
+**2. Site-local declarations.**
+
+```bash
+cp configs/sites/rush.example.yaml configs/sites/rush.local.yaml
+git status --short configs/sites/
+```
+
+Fill the profile (`extraction_dttm`, the data cut, as ISO-8601 UTC), keep
+`expected_absent_tables: [ecmo_mcs]`, and fill the BP patterns from check 10 below. The
+local file is merged into `sites.rush`, `site_harmonization.rush` and
+`site_unit_conversions.rush` at load time and hashed into every Rush shard's binding.
+`git status` must print nothing for it (it is ignored).
+
+**3. CLIF 2.1 / mCIDE conformance (report only).**
+
+```bash
+uv run python -m src.data.clif_conformance --data ~/Data/clif-rush --site rush --report-only
+```
+
+Check: `failure_messages` is empty, or each failing value gets a `category_map` alias or a
+`declared_exceptions` entry in `rush.local.yaml`; `tables.ecmo` reads `expected_absent`.
+
+**4. Tokenizer dry run (every table read through Rush's declarations, no window).**
+
+```bash
+uv run python -m src.data.tokenize --site rush --in ~/Data/clif-rush --out output/intermediate_phi/rush_day1 --vocab output/intermediate_phi/mimic/vocab.json --episodes output/intermediate_phi/episodes_rush.parquet --dry-run
+```
+
+Check: events and concepts per table, `ecmo: absent (declared ...)`, no `NOT DECLARED`
+table, and the count of timestamps nulled in a DST gap (expected near zero).
+
+**5. Episode artifact for Rush.**
+
+```bash
+uv run python -m src.data.cohort --site rush --data ~/Data/clif-rush --out output/intermediate_phi/episodes_rush.parquet
+```
+
+Check: the waterfall; `stays_open_censored_at_extraction` is the number of stays still in
+hospital at the data cut (0 if `extraction_dttm` is not yet declared, in which case those
+stays are `open_stay_no_extraction_time`, never eligible).
+
+**6. Extubation cohort for Rush.**
+
+```bash
+uv run python -m src.data.extubation_cohort --data ~/Data/clif-rush --site rush --episodes output/intermediate_phi/episodes_rush.parquet --out output/intermediate_phi/extubation_cohort_rush.parquet
+```
+
+No labels: the labeler refuses Rush (confirmatory) before the freeze.
+
+**7. Sample tokenization with the frozen MIMIC vocabulary, and the `<unk>` gate.**
+
+```bash
+uv run python -m src.data.tokenize --site rush --in ~/Data/clif-rush --out output/intermediate_phi/rush_day1 --vocab output/intermediate_phi/mimic/vocab.json --episodes output/intermediate_phi/episodes_rush.parquet --sample-episodes 2000 --workers 8
+uv run python -m src.data.tokenize --site rush --in ~/Data/clif-rush --out output/intermediate_phi/rush_day1 --vocab output/intermediate_phi/mimic/vocab.json --trajectory hospitalization --episodes output/intermediate_phi/episodes_rush.parquet --extubation-cohort output/intermediate_phi/extubation_cohort_rush.parquet --sample-episodes 2000 --workers 8
+uv run python -m src.data.tokenization_report --report output/intermediate_phi/rush_day1/tokenization_report.json --report output/intermediate_phi/rush_day1/gem_tokenization_report.json
+```
+
+Check: `GATE PASS` (`<unk>` under 1% on Rush, which is all non-fit); the report's
+`unk.by_concept` names any concept to harmonize; `data_quality.crrt_coverage` gives the
+share of CRRT rows with each setting (low shares mean the derived effluent dose is a
+MIMIC-mostly concept); `data_quality.site_profile` lists the expected-absent tables.
+
+**8. Context length of Rush histories.**
+
+```bash
+uv run python -m src.eval.context_length --site rush --shard output/intermediate_phi/rush_day1/gem_events.parquet --cohort output/intermediate_phi/extubation_cohort_rush.parquet --episodes output/intermediate_phi/episodes_rush.parquet
+```
+
+Check: the share of Rush stays and prompts over 8,192 tokens (revisit 16K only if Rush is
+much denser than MIMIC); `prompts.missing_from_shard` counts sampled-out index stays here
+(the full step-13 build has none).
+
+**9. Blind audit stage (no outcome read).**
+
+```bash
+uv run python -m src.eval.extubation_audit blind --cohort rush=output/intermediate_phi/extubation_cohort_rush.parquet
+```
+
+**10. On-node checks (aggregate prints only; run them, do not copy their output off the
+node).**
+
+Local time stored as UTC: if admissions cluster 5-6 hours off the expected morning and
+afternoon peaks of Chicago wall-clock time, Rush wrote local times with a UTC label;
+declare it with the data provider before going on (the hour-of-day histogram, counts only):
+
+```bash
+uv run python -c "import duckdb; print(duckdb.sql(\"SELECT hour(admission_dttm AT TIME ZONE 'America/Chicago') AS local_hour, count(*) AS n FROM read_parquet('$HOME/Data/clif-rush/clif_hospitalization.parquet') GROUP BY 1 ORDER BY 1\").fetchall())"
+```
+
+BP source names, before writing the `bp_method` patterns: only names charted at least 10
+times are printed (the number of rarer names is printed as one count); write patterns
+from these, map the rest to `unknown`, and keep the names in `rush.local.yaml` only:
+
+```bash
+uv run python -c "import duckdb; q = \"SELECT meas_site_name, count(*) AS n FROM read_parquet('$HOME/Data/clif-rush/clif_vitals.parquet') WHERE vital_category IN ('sbp','dbp','map') GROUP BY 1\"; rows = duckdb.sql(q).fetchall(); print([r for r in rows if r[1] >= 10]); print('names under 10 rows:', sum(1 for r in rows if r[1] < 10))"
+```
+
+Troponin assay (decided 2026-10-03: no code change). If Rush's `troponin_t` is a
+conventional (4th-generation) assay in ng/mL rather than high-sensitivity ng/L, add the
+MIMIC-style rename to `rush.local.yaml` (`concept_renames: {labs: {troponin_t:
+troponin_t_conventional}}`) before step 13; the unit and median say which:
+
+```bash
+uv run python -c "import duckdb; print(duckdb.sql(\"SELECT reference_unit, count(*) AS n, median(lab_value_numeric) AS p50 FROM read_parquet('$HOME/Data/clif-rush/clif_labs.parquet') WHERE lab_category = 'troponin_t' GROUP BY 1 HAVING count(*) >= 10\").fetchall())"
+```
+
+Lab result time (hard rule 4: availability, not collection): the share of labs with no
+result time, with a result before collection, and the median collection-to-result delay;
+a result time equal to the collection time on most rows means Rush stores collection
+time there, which must be raised before training:
+
+```bash
+uv run python -c "import duckdb; print(duckdb.sql(\"SELECT count(*) AS n, avg((lab_result_dttm IS NULL)::INT) AS no_result, avg((lab_result_dttm < lab_collect_dttm)::INT) AS result_before_collect, avg((lab_result_dttm = lab_collect_dttm)::INT) AS result_equals_collect, median(epoch(lab_result_dttm - lab_collect_dttm) / 60) AS median_minutes FROM read_parquet('$HOME/Data/clif-rush/clif_labs.parquet')\").fetchall())"
+```
+
+Calendar period (decided 2026-10-03): optional for Rush; `configs/extubation.yaml`
+`sites.rush.calendar_period_source` stays null.
 
 ## 4. Build the episode artifact
 
 ```bash
-uv run python -m src.data.cohort --data ~/Data/clif-source --out output/intermediate_phi/episodes.parquet
+uv run python -m src.data.cohort --site mimic --data ~/Data/clif-source --out output/intermediate_phi/episodes.parquet
 # (Rush)
-uv run python -m src.data.cohort --data ~/Data/clif-rush --out output/intermediate_phi/episodes_rush.parquet
+uv run python -m src.data.cohort --site rush --data ~/Data/clif-rush --out output/intermediate_phi/episodes_rush.parquet
 ```
 
 Produces: the patient-grouped episode and split artifact, with partitions from
-`configs/train.yaml` `data_contract.partitions` (60/15/10/15 today) and `split_seed`.
-Check: the command finishes without a `QualificationError`.
+`configs/train.yaml` `data_contract.partitions` (60/15/10/15 today) and `split_seed`, bound
+to its site (a `site` column; every later step refuses an artifact of another site).
+Timestamps follow the site profile (`configs/data.yaml` `sites.<site>`): naive local times
+are converted to UTC, and a stay with no discharge time is censored at the declared
+`extraction_dttm`. Check: the command finishes without a `QualificationError` and prints
+the aggregate waterfall (small cells as `<10`).
 
 ## 5. Extubation cohort and labels
 
 ```bash
 uv run python -m src.data.extubation_cohort --data ~/Data/clif-source --site mimic --episodes output/intermediate_phi/episodes.parquet --out output/intermediate_phi/extubation_cohort.parquet
 uv run python -m src.eval.extubation_labeler --data ~/Data/clif-source --cohort output/intermediate_phi/extubation_cohort.parquet --out output/intermediate_phi/extubation_cohort_labels.parquet
+# (Rush) the cohort only; see the note on Rush labels below
+uv run python -m src.data.extubation_cohort --data ~/Data/clif-rush --site rush --episodes output/intermediate_phi/episodes_rush.parquet --out output/intermediate_phi/extubation_cohort_rush.parquet
 ```
 
 Produces: the extubation cohort (each patient's partition inherited from the episode
 artifact) and its outcome labels. Check: the printed waterfall counts are suppressed
-aggregates only. The labels are not read by the blind stage.
+aggregates only. The labels are not read by the blind stage. A site other than MIMIC must
+pass `--episodes` and `--out` (never the MIMIC defaults), and `--data` must be the
+directory its episode artifact was built from (file hashes compared).
+
+Rush labels: none before the freeze (decided 2026-10-03). Rush is `confirmatory` in
+`configs/extubation_benchmarks.yaml`, so the labeler refuses it unless the R28 freeze
+manifest verifies; after the freeze:
+
+```bash
+uv run python -m src.eval.extubation_labeler --data ~/Data/clif-rush --cohort output/intermediate_phi/extubation_cohort_rush.parquet --out output/intermediate_phi/extubation_cohort_rush_labels.parquet --freeze-manifest output/final_no_phi/freeze_manifest.json
+```
+
+Anything that reads labels (the unblinded audit) refuses labels whose recorded
+`extubation_sha256` is not the cohort's: relabel after every cohort rebuild.
 
 ## 6. Audit blind stage
 
@@ -219,21 +388,29 @@ then rebuild the episode artifact with the step-5 extubation cohort as the strat
 and rerun steps 5 and 6 so the cohort inherits the new partitions:
 
 ```bash
-uv run python -m src.data.cohort --data ~/Data/clif-source --out output/intermediate_phi/episodes.parquet --held-out-strata output/intermediate_phi/extubation_cohort.parquet
+uv run python -m src.data.cohort --site mimic --data ~/Data/clif-source --out output/intermediate_phi/episodes.parquet --held-out-strata output/intermediate_phi/extubation_cohort.parquet
+# (Rush) the same stratified rule, the same 0.5 share for NIV and HFNC
+uv run python -m src.data.cohort --site rush --data ~/Data/clif-rush --out output/intermediate_phi/episodes_rush.parquet --held-out-strata output/intermediate_phi/extubation_cohort_rush.parquet
 ```
+
+`--held-out-strata` must be the same site's extubation cohort (its `site` column is
+checked).
 
 Check: the printed `held_out_stratification.achieved` shows each of NIV and HFNC at about
 0.5 (aggregate shares only), and the step-6 blind stage's `held_out` arm sizes grew. The
 other patients only rebalance between train and the held-out partitions, so the overall
 shares stay 60/15/10/15. Rebuilding with the extubation cohort of the old split is fine:
 arms do not depend on the partition. With Rush staged, do the same for
-`episodes_rush.parquet` with the Rush extubation cohort. Then freeze:
+`episodes_rush.parquet` with the Rush extubation cohort (the second line above), and rebuild
+the Rush extubation cohort from it. Then freeze MIMIC and Rush together in ONE record:
 
 ```bash
-uv run python -m src.train.preflight --write-split-freeze --episodes mimic=output/intermediate_phi/episodes.parquet --audit-blind output/final_no_phi/extubation_audit_blind_mimic.json --approver "J.C. Rojas"
+uv run python -m src.train.preflight --write-split-freeze --episodes mimic=output/intermediate_phi/episodes.parquet --episodes rush=output/intermediate_phi/episodes_rush.parquet --audit-blind output/final_no_phi/extubation_audit_blind_mimic.json --approver "J.C. Rojas"
 ```
 
-With Rush staged, add `--episodes rush=output/intermediate_phi/episodes_rush.parquet`.
+Before Rush is staged, drop the `--episodes rush=...` argument (and refreeze with it, by
+`--force`, before any checkpoint exists). Each `SITE=PATH` must be that site's own
+artifact (its `site` column is checked).
 
 Produces: `output/final_no_phi/split_freeze.json` (episode artifact SHA-256, content split
 hash, configured and observed partition shares, split seed, held-out arm counts from the
@@ -244,12 +421,24 @@ checkpoint exists. Every vocabulary, shard and checkpoint from here on carries t
 ## 8. Tokenize the clinical arm (reference vocabulary)
 
 The 24-hour build fits the ONE frozen vocabulary on the train partition; the
-hospitalization build reuses it to write the full-hospitalization shard.
+hospitalization build reuses it to write the full-hospitalization shard, with every
+eligible extubation's index stay added (`--extubation-cohort`; partition inherited from
+the patient).
+
+Memory: each run holds one site's windowed events, their sort and the encoded shard.
+Measured on full MIMIC (2026-10-03 review) at 33-36 GB peak before the window pushdown;
+see the after-change figures recorded with this runbook's commit. Before each run check
+`free -g` (`available` column): the tokenizer warns below 48 GB free. Run the tokenizations
+one at a time, never beside a training run or a cache build.
 
 ```bash
-uv run python -m src.data.tokenize --site mimic --in ~/Data/clif-source --out output/intermediate_phi/mimic --build-vocab --episodes output/intermediate_phi/episodes.parquet --workers 0
-uv run python -m src.data.tokenize --site mimic --in ~/Data/clif-source --out output/intermediate_phi/mimic --vocab output/intermediate_phi/mimic/vocab.json --trajectory hospitalization --episodes output/intermediate_phi/episodes.parquet --workers 0
+uv run python -m src.data.tokenize --site mimic --in ~/Data/clif-source --out output/intermediate_phi/mimic --build-vocab --episodes output/intermediate_phi/episodes.parquet --workers 8
+uv run python -m src.data.tokenize --site mimic --in ~/Data/clif-source --out output/intermediate_phi/mimic --vocab output/intermediate_phi/mimic/vocab.json --trajectory hospitalization --episodes output/intermediate_phi/episodes.parquet --extubation-cohort output/intermediate_phi/extubation_cohort.parquet --workers 8
 ```
+
+`--workers 8`: encode processes (each single-threaded in polars); `--workers 0` means every
+usable CPU, capped at 8. The vocabulary carries every permissible CLIF 2.1.1 value of the
+`vocabulary_allowlist` lists even where MIMIC never charts it.
 
 Produces in `output/intermediate_phi/mimic/`: `vocab.json`, `events.parquet` (24 h, for
 the baselines), `gem_events.parquet` (full hospitalization) and the aggregate
@@ -270,10 +459,10 @@ uv run python -c "import yaml; from src.train.run_tokenization_ablation import a
 ```
 
 ```bash
-uv run python -m src.data.tokenize --config output/intermediate_phi/configs/data.global_deciles.yaml --site mimic --in ~/Data/clif-source --out output/intermediate_phi/mimic_decile --build-vocab --episodes output/intermediate_phi/episodes.parquet --workers 0
-uv run python -m src.data.tokenize --config output/intermediate_phi/configs/data.global_deciles.yaml --site mimic --in ~/Data/clif-source --out output/intermediate_phi/mimic_decile --vocab output/intermediate_phi/mimic_decile/vocab.json --trajectory hospitalization --episodes output/intermediate_phi/episodes.parquet --workers 0
-uv run python -m src.data.tokenize --config output/intermediate_phi/configs/data.deciles_plus_soft.yaml --site mimic --in ~/Data/clif-source --out output/intermediate_phi/mimic_decile_forced --build-vocab --episodes output/intermediate_phi/episodes.parquet --workers 0
-uv run python -m src.data.tokenize --config output/intermediate_phi/configs/data.deciles_plus_soft.yaml --site mimic --in ~/Data/clif-source --out output/intermediate_phi/mimic_decile_forced --vocab output/intermediate_phi/mimic_decile_forced/vocab.json --trajectory hospitalization --episodes output/intermediate_phi/episodes.parquet --workers 0
+uv run python -m src.data.tokenize --config output/intermediate_phi/configs/data.global_deciles.yaml --site mimic --in ~/Data/clif-source --out output/intermediate_phi/mimic_decile --build-vocab --episodes output/intermediate_phi/episodes.parquet --workers 8
+uv run python -m src.data.tokenize --config output/intermediate_phi/configs/data.global_deciles.yaml --site mimic --in ~/Data/clif-source --out output/intermediate_phi/mimic_decile --vocab output/intermediate_phi/mimic_decile/vocab.json --trajectory hospitalization --episodes output/intermediate_phi/episodes.parquet --workers 8
+uv run python -m src.data.tokenize --config output/intermediate_phi/configs/data.deciles_plus_soft.yaml --site mimic --in ~/Data/clif-source --out output/intermediate_phi/mimic_decile_forced --build-vocab --episodes output/intermediate_phi/episodes.parquet --workers 8
+uv run python -m src.data.tokenize --config output/intermediate_phi/configs/data.deciles_plus_soft.yaml --site mimic --in ~/Data/clif-source --out output/intermediate_phi/mimic_decile_forced --vocab output/intermediate_phi/mimic_decile_forced/vocab.json --trajectory hospitalization --episodes output/intermediate_phi/episodes.parquet --workers 8
 ```
 
 Check: `tokenization_report.json` lists the matched-granularity exceptions (concepts with
@@ -300,16 +489,26 @@ uv run python -c "from transformers import AutoModel, AutoTokenizer; m = 'thomas
 ## 12. Refit value stats on the full-hospitalization train stays
 
 The 24-hour stats lack tokens seen only outside the ICU window, so every arm directory
-gets stats fit on its own `gem_events.parquet` train stays:
+gets stats fit on its `gem_events.parquet` train stays. Decided 2026-10-03 (product
+authority): the stats are fit on the MIMIC AND Rush train partitions together (each
+shard bound to the arm's one vocabulary). Before Rush is staged, MIMIC alone:
 
 ```bash
-uv run python -m src.data.value_stats --events output/intermediate_phi/mimic/gem_events.parquet --out output/intermediate_phi/mimic/gem_value_stats.json
-uv run python -m src.data.value_stats --events output/intermediate_phi/mimic_decile/gem_events.parquet --out output/intermediate_phi/mimic_decile/gem_value_stats.json
-uv run python -m src.data.value_stats --events output/intermediate_phi/mimic_decile_forced/gem_events.parquet --out output/intermediate_phi/mimic_decile_forced/gem_value_stats.json
-uv run python -m src.data.value_stats --events output/intermediate_phi/mimic_continuous/gem_events.parquet --out output/intermediate_phi/mimic_continuous/gem_value_stats.json
+uv run python -m src.data.value_stats --events mimic=output/intermediate_phi/mimic/gem_events.parquet --out output/intermediate_phi/mimic/gem_value_stats.json
+uv run python -m src.data.value_stats --events mimic=output/intermediate_phi/mimic_decile/gem_events.parquet --out output/intermediate_phi/mimic_decile/gem_value_stats.json
+uv run python -m src.data.value_stats --events mimic=output/intermediate_phi/mimic_decile_forced/gem_events.parquet --out output/intermediate_phi/mimic_decile_forced/gem_value_stats.json
+uv run python -m src.data.value_stats --events mimic=output/intermediate_phi/mimic_continuous/gem_events.parquet --out output/intermediate_phi/mimic_continuous/gem_value_stats.json
 ```
 
-Check: each JSON carries `fit_partition: train` and the vocabulary and segments hashes.
+With Rush tokenized (step 13), refit each arm with both sites, e.g. the clinical arm:
+
+```bash
+uv run python -m src.data.value_stats --events mimic=output/intermediate_phi/mimic/gem_events.parquet --events rush=output/intermediate_phi/rush/gem_events.parquet --vocab output/intermediate_phi/mimic/vocab.json --out output/intermediate_phi/mimic/gem_value_stats.json
+```
+
+Check: each JSON carries `fit_partition: train`, the vocabulary and segments hashes, and
+(pooled) `sites` with the train rows read per site. The pre-flight (step 15) and the
+launcher check that EVERY site's numeric tokens have stats and list the gaps per site.
 Memory: the shard is streamed in row batches and only the finite values are kept (about
 8 bytes per numeric event). On a synthetic 8.8M-event shard the peak was 0.55 GB
 resident against 1.5 GB for the previous whole-shard version (which peaked at 1.7 GB on
@@ -321,19 +520,21 @@ not 20-25. Run the four commands one at a time and watch `free -g` the first tim
 Only once Rush is staged. Rush never fits a vocabulary; it imports each arm's.
 
 ```bash
-uv run python -m src.data.tokenize --site rush --in ~/Data/clif-rush --out output/intermediate_phi/rush --vocab output/intermediate_phi/mimic/vocab.json --episodes output/intermediate_phi/episodes_rush.parquet --workers 0
-uv run python -m src.data.tokenize --site rush --in ~/Data/clif-rush --out output/intermediate_phi/rush --vocab output/intermediate_phi/mimic/vocab.json --trajectory hospitalization --episodes output/intermediate_phi/episodes_rush.parquet --workers 0
-uv run python -m src.data.tokenize --config output/intermediate_phi/configs/data.global_deciles.yaml --site rush --in ~/Data/clif-rush --out output/intermediate_phi/rush_decile --vocab output/intermediate_phi/mimic_decile/vocab.json --trajectory hospitalization --episodes output/intermediate_phi/episodes_rush.parquet --workers 0
-uv run python -m src.data.tokenize --config output/intermediate_phi/configs/data.deciles_plus_soft.yaml --site rush --in ~/Data/clif-rush --out output/intermediate_phi/rush_decile_forced --vocab output/intermediate_phi/mimic_decile_forced/vocab.json --trajectory hospitalization --episodes output/intermediate_phi/episodes_rush.parquet --workers 0
+uv run python -m src.data.tokenize --site rush --in ~/Data/clif-rush --out output/intermediate_phi/rush --vocab output/intermediate_phi/mimic/vocab.json --episodes output/intermediate_phi/episodes_rush.parquet --workers 8
+uv run python -m src.data.tokenize --site rush --in ~/Data/clif-rush --out output/intermediate_phi/rush --vocab output/intermediate_phi/mimic/vocab.json --trajectory hospitalization --episodes output/intermediate_phi/episodes_rush.parquet --extubation-cohort output/intermediate_phi/extubation_cohort_rush.parquet --workers 8
+uv run python -m src.data.tokenize --config output/intermediate_phi/configs/data.global_deciles.yaml --site rush --in ~/Data/clif-rush --out output/intermediate_phi/rush_decile --vocab output/intermediate_phi/mimic_decile/vocab.json --trajectory hospitalization --episodes output/intermediate_phi/episodes_rush.parquet --workers 8
+uv run python -m src.data.tokenize --config output/intermediate_phi/configs/data.deciles_plus_soft.yaml --site rush --in ~/Data/clif-rush --out output/intermediate_phi/rush_decile_forced --vocab output/intermediate_phi/mimic_decile_forced/vocab.json --trajectory hospitalization --episodes output/intermediate_phi/episodes_rush.parquet --workers 8
 uv run python -m src.data.tokenize_continuous --primary-vocab output/intermediate_phi/mimic/vocab.json --primary-events output/intermediate_phi/rush/gem_events.parquet --out output/intermediate_phi/rush_continuous
 ```
 
 Then, in a commit, add `rush` to `launch.sites` in `configs/experiment_matrix.yaml` and a
 `rush:` directory to every `arm_data` entry (`rush`, `rush_decile`,
-`rush_decile_forced`, `rush_continuous`). Value stats stay the reference site's (MIMIC,
-the first `--data` directory), and so does the training vocabulary (the first `--data`
-directory's `vocab.json`). A Rush directory without a `vocab.json` is fine; one that has
-it must carry the same binding, which the pre-flight checks.
+`rush_decile_forced`, `rush_continuous`). The training vocabulary stays the reference
+site's (the first `--data` directory's `vocab.json`); the value stats are refit on both
+sites (step 12, second form). A Rush directory without a `vocab.json` is fine; one that has
+it must carry the same binding, which the pre-flight checks. Every Rush shard row records
+the hash of Rush's declarations (`site_declarations`, including the site-local file); the
+pre-flight fails a shard built under other declarations.
 
 ## 14. Pre-flight rehearsal off the node (optional)
 
@@ -351,7 +552,8 @@ Check: `PRE-FLIGHT PASSED`; the two-rank smoke runs over gloo on CPU.
 uv run python -m src.train.preflight --episodes mimic=output/intermediate_phi/episodes.parquet --extubation-cohort mimic=output/intermediate_phi/extubation_cohort.parquet
 ```
 
-With Rush: add `--episodes rush=output/intermediate_phi/episodes_rush.parquet`.
+With Rush: add `--episodes rush=output/intermediate_phi/episodes_rush.parquet
+--extubation-cohort rush=output/intermediate_phi/extubation_cohort_rush.parquet`.
 
 Prints one table and exits non-zero on any FAIL. It checks:
 

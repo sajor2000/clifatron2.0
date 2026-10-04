@@ -116,6 +116,12 @@ class InStreamTargets:
     queries_per_anchor: int
     baseline_lookback_hours: float
     required_measurement_within_hours_of_horizon: float
+    # Optional outcome measurement filter (configs/cohort.yaml
+    # `outcome_measurement_filters`; OFF by default): target concept index -> the method
+    # token ids (e.g. `bp_method=arterial`) a reading of that concept must follow, at the
+    # same minute, to count as a measurement. `method_tokens` = every method token id.
+    measurement_filters: Mapping[int, frozenset] | None = None
+    method_tokens: frozenset = frozenset()
 
 
 def _whole_minutes(hours: float, what: str) -> int:
@@ -249,10 +255,21 @@ class TargetBuilder:
         times: dict[int, list[int]] = {}
         observed: dict[int, list[float]] = {}
         token_target = grid.token_target
+        filters = self.in_stream.measurement_filters or {}
+        methods = self.in_stream.method_tokens
+        method, method_min = None, None      # the latest method token and its minute
         for i in range(end_idx):
+            if filters and token[i] in methods:
+                method, method_min = token[i], pos_min[i]
+                continue
             target = token_target.get(token[i])
             value = values[i]
             if target is None or value is None or not math.isfinite(float(value)):
+                continue
+            if target in filters and not (method in filters[target]
+                                          and method_min == pos_min[i]):
+                # Sensitivity filter: the reading's method token (emitted right before
+                # its readings) is not an allowed method -> not a measurement.
                 continue
             times.setdefault(target, []).append(pos_min[i])
             observed.setdefault(target, []).append(float(value))
@@ -652,6 +669,46 @@ def kdigo_aki_flags(times: np.ndarray, values: np.ndarray, *, absolute_rise: flo
         if end > abs_lo and values[j] - float(values[abs_lo:end].min()) >= absolute_rise - _RULE_TOL:
             meets[j] = True
     return meets, assessable
+
+
+def measurement_filters(cohort_cfg: Mapping, data_cfg: Mapping, vocab: Mapping[str, int],
+                        target_concepts: Sequence[Mapping], sensitivity: str | None = None,
+                        ) -> tuple[dict[int, frozenset], frozenset]:
+    """The outcome measurement filters (configs/cohort.yaml `outcome_measurement_filters`)
+    as ``({target index: allowed method token ids}, every method token id)``.
+
+    OFF by default: with `sensitivity` None each outcome's primary `bp_method` applies
+    (null = every reading, decided 2026-10-03: all readings primary); a named sensitivity
+    (e.g. ``arterial_only``) applies that entry's methods. An outcome's concept must be a
+    target concept; a method must be one of configs/data.yaml `bp_method.methods`."""
+    block = (data_cfg or {}).get("bp_method") or {}
+    concept_name = block.get("token_concept", "bp_method")
+    known = list(block.get("methods") or ())
+    all_methods = frozenset(vocab[f"{concept_name}={m}"] for m in known
+                            if f"{concept_name}={m}" in vocab)
+    index = {c["name"]: i for i, c in enumerate(target_concepts)}
+    outcomes = (cohort_cfg or {}).get("outcomes") or {}
+    filters: dict[int, frozenset] = {}
+    for name, entry in ((cohort_cfg or {}).get("outcome_measurement_filters") or {}).items():
+        chosen = entry.get("bp_method")
+        if sensitivity is not None:
+            options = entry.get("sensitivity") or {}
+            if sensitivity not in options:
+                continue
+            chosen = options[sensitivity].get("bp_method")
+        if chosen is None:
+            continue
+        concept = (outcomes.get(name) or {}).get("concept")
+        if concept not in index:
+            raise TargetContractError(f"outcome_measurement_filters.{name}: concept "
+                                      f"{concept!r} is not a target concept")
+        unknown = sorted(set(chosen) - set(known))
+        if unknown:
+            raise TargetContractError(f"outcome_measurement_filters.{name}: unknown BP "
+                                      f"method(s) {unknown}")
+        filters[index[concept]] = frozenset(vocab[f"{concept_name}={m}"] for m in chosen
+                                             if f"{concept_name}={m}" in vocab)
+    return filters, all_methods
 
 
 def anchor_status_shares(builds: Iterable[Mapping[str, Any]]) -> dict[str, Any]:

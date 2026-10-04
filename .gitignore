@@ -52,3 +52,7 @@ config/credentials.json
 /skills-lock.json
 bin/
 docusaurus-dev.log
+
+# site-local declarations (a site's own source strings, e.g. Rush BP source names): never
+# committed; the template configs/sites/rush.example.yaml is
+configs/sites/*.local.yaml

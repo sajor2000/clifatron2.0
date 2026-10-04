@@ -183,15 +183,70 @@ def stay_targets(frame: pl.DataFrame) -> list[dict]:
     return list(stays.values())
 
 
+MIN_CELL = 10
+SMALL = f"<{MIN_CELL}"
+WITHHELD = "suppressed"
+
+
+def _suppress_group(total: int, counts: dict, shares: dict | None,
+                    min_cell: int = MIN_CELL) -> tuple[object, dict, dict | None]:
+    """(total, counts, shares) with every count of 1 to `min_cell - 1` written as
+    ``<min_cell`` and its share withheld; when exactly one nonzero count is hidden, the
+    smallest released count is withheld too (it would be the total minus the others),
+    and so is the total when it is itself small."""
+    hidden = {k for k, n in counts.items() if 0 < n < min_cell}
+    released = sorted((n, k) for k, n in counts.items() if k not in hidden and n > 0)
+    complementary = {released[0][1]} if len(hidden) == 1 and released else set()
+    out_counts = {k: (SMALL if k in hidden else WITHHELD if k in complementary else n)
+                  for k, n in counts.items()}
+    out_shares = None if shares is None else {
+        k: (None if k in hidden or k in complementary else v) for k, v in shares.items()}
+    if 0 < total < min_cell:
+        out_shares = None if shares is None else {k: None for k in shares}
+        total = SMALL
+    return total, out_counts, out_shares
+
+
+def suppress_label_status(report: dict, min_cell: int = MIN_CELL) -> dict:
+    """`targets.anchor_status_shares` with small cells suppressed (smoke_report.json is
+    aggregate-only): anchor and status counts of 1-9, per-cause competing-risk event
+    counts of 1-9 and every share that would give one back."""
+    out = json.loads(json.dumps(report))
+    anchors = out.get("anchors")
+    if isinstance(anchors, int) and 0 < anchors < min_cell:
+        out["anchors"] = SMALL
+    cause = out.get("competing_risk_by_cause")
+    if isinstance(cause, dict):
+        supervised = int(cause.get("supervised_anchors") or 0)
+        events = {k: int(v) for k, v in (cause.get("events") or {}).items()}
+        # Events by cause do not sum to the supervised total (anchors without an event),
+        # so only the small cells themselves (and their rates) are withheld.
+        cause["events"] = {k: (SMALL if 0 < v < min_cell else v) for k, v in events.items()}
+        cause["rates"] = {k: (None if 0 < events.get(k, 0) < min_cell
+                              or 0 < supervised < min_cell else v)
+                          for k, v in (cause.get("rates") or {}).items()}
+        if 0 < supervised < min_cell:
+            cause["supervised_anchors"] = SMALL
+    for group in ("threshold_queries", "cause_labels", "competing_risk"):
+        entry = out.get(group)
+        if not isinstance(entry, dict):
+            continue
+        entry["n"], entry["counts"], entry["shares"] = _suppress_group(
+            int(entry.get("n") or 0), {k: int(v) for k, v in (entry.get("counts") or {}).items()},
+            entry.get("shares"), min_cell)
+    return out
+
+
 def label_shares(builder, gem_path: Path, *, max_stays: int = 64) -> dict:
     """Aggregate label-status counts and shares of the in-stream labels over (up to)
-    `max_stays` train stays (`targets.anchor_status_shares`)."""
+    `max_stays` train stays (`targets.anchor_status_shares`), small cells suppressed
+    (`suppress_label_status`)."""
     from src.data.targets import anchor_status_shares
 
     frame = pl.read_parquet(gem_path).filter(pl.col("partition") == "train")
     keys = sorted(frame["hosp_id"].unique().to_list())[:max_stays]
     stays = stay_targets(frame.filter(pl.col("hosp_id").is_in(keys)))
-    return anchor_status_shares(builder.build(stay) for stay in stays)
+    return suppress_label_status(anchor_status_shares(builder.build(stay) for stay in stays))
 
 
 def _finite(losses: dict) -> bool:

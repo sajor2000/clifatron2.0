@@ -207,7 +207,13 @@ class ChunkingTest(unittest.TestCase):
         from src.data.tokenize import resolve_workers
 
         self.assertEqual(resolve_workers(1), 1)
-        self.assertEqual(resolve_workers(0), os.cpu_count() or 1)
+        # 0 = every usable CPU (the affinity mask where there is one), capped at 8.
+        from src.data.tokenize import MAX_AUTO_WORKERS, usable_cpus
+        self.assertEqual(resolve_workers(0), min(usable_cpus(), MAX_AUTO_WORKERS))
+        self.assertLessEqual(resolve_workers(0), 8)
+        if hasattr(os, "sched_getaffinity"):
+            self.assertEqual(usable_cpus(), len(os.sched_getaffinity(0)))
+        self.assertEqual(resolve_workers(12), 12)        # an explicit count is used as is
         with self.assertRaises(ValueError):
             resolve_workers(-2)
 

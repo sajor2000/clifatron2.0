@@ -201,14 +201,19 @@ def build_cohort(
     ).with_columns(
         (pl.col("anchor_dttm") + horizon_delta).alias("prediction_end_dttm")
     )
+    # A stay with no discharge time is still open at the data cut: the caller censors it
+    # at the site's declared extraction time (`build_cohort_artifact`); one still null here
+    # (no extraction time declared) cannot be followed and is never eligible, with its
+    # own status (eligibility and status always agree; a null never reads as eligible).
     eligible = (
         (pl.col("age_at_admission") >= cfg["minimum_age"])
         & (pl.col("icu_out_dttm") > pl.col("anchor_dttm"))
         & (pl.col("discharge_dttm") > pl.col("anchor_dttm"))
-    )
+    ).fill_null(False)
     status = (
         pl.when(pl.col("age_at_admission").is_null()).then(pl.lit("missing_age"))
         .when(pl.col("age_at_admission") < cfg["minimum_age"]).then(pl.lit("underage"))
+        .when(pl.col("discharge_dttm").is_null()).then(pl.lit("open_stay_no_extraction_time"))
         .when(pl.col("discharge_dttm") <= pl.col("anchor_dttm")).then(pl.lit("not_observed_at_anchor"))
         .when(pl.col("icu_out_dttm") <= pl.col("anchor_dttm")).then(pl.lit("not_in_icu_at_anchor"))
         .otherwise(pl.lit("eligible"))
@@ -262,7 +267,8 @@ def build_cohort(
         "patient_source": source_patients,
         "patient_excluded_no_icu": source_patients - patients_with_icu,
     }
-    for value in ["underage", "missing_age", "not_observed_at_anchor", "not_in_icu_at_anchor"]:
+    for value in ["underage", "missing_age", "open_stay_no_extraction_time",
+                  "not_observed_at_anchor", "not_in_icu_at_anchor"]:
         waterfall[f"episode_excluded_{value}"] = all_episodes.filter(
             pl.col("eligibility_status") == value
         ).height
@@ -431,12 +437,28 @@ def build_cohort_artifact(
     train_config: str | Path,
     artifact_policy: str | Path,
     held_out_strata: str | Path | None = None,
+    site: str = "mimic",
+    data_config: str | Path | None = "configs/data.yaml",
 ) -> tuple[pl.DataFrame, dict[str, Any]]:
     """Build, validate, and persist the canonical patient-grouped episode artifact.
 
     `held_out_strata` is the extubation cohort artifact, required exactly when
     `data_contract.held_out_stratification.enabled` (item 46; src/data/splits.py): only its
-    patient_id, eligible and device-arm columns are read."""
+    patient_id, eligible and device-arm columns are read (and its `site`, which must be
+    `site`).
+
+    The artifact is bound to `site` (a `site` column and the `site` of its manifest). The
+    site profile (`data_config` `sites.<site>`, after the site-local merge;
+    src/data/site_config.py) converts naive or non-UTC timestamps to UTC and censors a
+    stay with no discharge time at the declared `extraction_dttm`."""
+    from clif_validate._vendor.data.site_config import (
+        SiteConfigError,
+        censor_open_stays,
+        site_profile,
+        to_utc,
+        with_site_local,
+    )
+
     base = Path(data_dir)
     cohort_path = Path(cohort_config)
     train_path = Path(train_config)
@@ -450,18 +472,45 @@ def build_cohort_artifact(
     for source in (hospitalization_path, adt_path):
         if not source.exists():
             raise QualificationError(f"required CLIF table is missing: {source.name}")
+    try:
+        data_cfg = (with_site_local(yaml.safe_load(Path(data_config).read_text()), site)
+                    if data_config is not None and Path(data_config).exists() else {})
+        profile = site_profile(data_cfg, site)
+        hospitalization, nulled_h = to_utc(pl.read_parquet(hospitalization_path),
+                                           ["admission_dttm", "discharge_dttm"],
+                                           profile["site_timezone"])
+        adt, nulled_a = to_utc(pl.read_parquet(adt_path), ["in_dttm", "out_dttm"],
+                               profile["site_timezone"])
+    except SiteConfigError as exc:
+        raise QualificationError(str(exc)) from exc
+    # A stay still in hospital at the data cut: censored at the extraction time.
+    hospitalization, open_stays = censor_open_stays(hospitalization, profile["extraction_dttm"])
     episodes, waterfall = build_cohort(
-        pl.read_parquet(hospitalization_path),
-        pl.read_parquet(adt_path),
+        hospitalization,
+        adt,
         cohort_cfg,
         return_waterfall=True,
     )
+    waterfall["timestamps_nulled_dst"] = nulled_h + nulled_a
+    waterfall["stays_open_censored_at_extraction"] = (
+        open_stays if profile["extraction_dttm"] is not None else 0)
     block = train_cfg.get("held_out_stratification") or {}
     strata = None
     if held_out_strata is not None:
         if not block.get("enabled"):
             raise QualificationError("--held-out-strata given but data_contract.held_out_stratification "
                                      "is not enabled in the train config")
+        # The strata must come from THIS site's extubation cohort.
+        strata_columns = pl.read_parquet_schema(held_out_strata)
+        if "site" in strata_columns:
+            strata_sites = pl.read_parquet(held_out_strata, columns=["site"])["site"]
+            recorded = strata_sites.drop_nulls().unique().to_list()
+            if recorded != [site]:
+                raise QualificationError(
+                    f"--held-out-strata is an extubation cohort of site(s) {recorded}, not "
+                    f"{site!r}: stratify each site with its own cohort")
+        elif site != "mimic":
+            raise QualificationError("--held-out-strata records no site; rebuild it")
         strata = load_held_out_strata(held_out_strata, arm_column=block["arm_column"], arms=block["arms"])
     try:
         stratification = held_out_stratification(train_cfg, strata)
@@ -481,6 +530,7 @@ def build_cohort_artifact(
     )
     manifest = {
         "artifact_family": "canonical_episode_split",
+        "site": site,
         "contract_version": cohort_cfg["contract_version"],
         "clif_version": cohort_cfg["clif_version"],
         "mcide_version": cohort_cfg["mcide_version"],
@@ -502,6 +552,7 @@ def build_cohort_artifact(
         },
     }
     episodes = episodes.with_columns(
+        pl.lit(site).alias("site"),
         pl.lit(manifest["contract_version"]).alias("cohort_contract_version"),
         pl.lit(manifest["split_sha256"]).alias("split_sha256"),
         pl.lit(manifest["episode_sha256"]).alias("episode_sha256"),
@@ -545,12 +596,15 @@ def validate_episode_artifact(episodes: pl.DataFrame) -> None:
             "source_provenance_json",
         ],
     )
+    # hospitalization_joined_id is optional linkage: a null is a stay linked to nothing
+    # (a singleton), so it may be null on any row, not only on all of them.
     _reject_null_identifiers(
         episodes,
         "episode artifact",
-        ["hospitalization_id", "patient_id", "hospitalization_joined_id"],
-        allow_all_null={"hospitalization_joined_id"},
+        ["hospitalization_id", "patient_id"],
     )
+    if "site" in episodes.columns and episodes["site"].drop_nulls().n_unique() > 1:
+        raise QualificationError("episode artifact names more than one site")
     _require_utc(episodes, "episode artifact", ["icu_admit_dttm", "anchor_dttm"])
     eligible = episodes.filter(pl.col("eligible"))
     if eligible["partition"].has_nulls():
@@ -576,6 +630,11 @@ def validate_episode_artifact(episodes: pl.DataFrame) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description="Build the canonical ICU episode/split artifact")
     parser.add_argument("--data", required=True)
+    parser.add_argument("--site", required=True,
+                        help="the site these CLIF tables belong to (recorded in the artifact; "
+                             "its profile is configs/data.yaml sites.<site> plus the "
+                             "site-local configs/sites/<site>.local.yaml)")
+    parser.add_argument("--data-config", default="configs/data.yaml")
     parser.add_argument("--out", default="output/intermediate_phi/episodes.parquet")
     parser.add_argument("--cohort-config", default="configs/cohort.yaml")
     parser.add_argument("--train-config", default="configs/train.yaml")
@@ -591,7 +650,15 @@ def main() -> None:
         train_config=args.train_config,
         artifact_policy=args.artifact_policy,
         held_out_strata=args.held_out_strata,
+        site=args.site,
+        data_config=args.data_config,
     )
+    # Aggregate counts only (suppressed below the minimum cell size).
+    policy = yaml.safe_load(Path(args.artifact_policy).read_text())
+    min_cell = int(policy["classes"]["aggregate_no_phi"]["minimum_cell_size"])
+    print(json.dumps({"site": args.site, "waterfall": {
+        k: (f"<{min_cell}" if isinstance(v, int) and 0 < v < min_cell else v)
+        for k, v in manifest["waterfall"].items()}}, indent=2))
     if manifest.get("held_out_stratification"):
         # Aggregate shares only (patients per arm and held-out share).
         print(json.dumps({"held_out_stratification": manifest["held_out_stratification"]}, indent=2))

@@ -38,6 +38,7 @@ from typing import Any, Mapping
 import yaml
 
 from src.data.cohort import QualificationError
+from src.data.site_config import strip_notes
 
 ROOT = Path(__file__).parents[2]
 STATUSES = ("compliant", "aliased", "declared_exception", "failing")
@@ -444,7 +445,11 @@ def global_record(cfg: Mapping) -> dict:
             record[key] = coverage
     if cfg.get("derived_concepts"):
         record["derived_concepts"] = cfg["derived_concepts"]
-    return record
+    if cfg.get("vocabulary_allowlist"):
+        # The mCIDE lists whose every permissible value is a vocabulary token.
+        record["vocabulary_allowlist"] = cfg["vocabulary_allowlist"]
+    # Free-text notes are documentation: editing one never invalidates a vocabulary.
+    return strip_notes(record)
 
 
 def harmonization_record(cfg: Mapping, site: str) -> dict:
@@ -454,7 +459,8 @@ def harmonization_record(cfg: Mapping, site: str) -> dict:
     decl = site_harmonization(cfg, site)
     if not glob and not decl["declared"]:
         return {}
-    site_part = {k: v for k, v in decl.items() if k != "declared"}
+    # Declared-exception reasons and `note` fields are free text, not rules: stripped.
+    site_part = strip_notes({k: v for k, v in decl.items() if k != "declared"})
     return {"global": glob, "reference_site": site, "site": site_part}
 
 
@@ -536,11 +542,15 @@ def check_conformance(con, base: Path, cfg: Mapping, site: str,
     # 1. table / column presence (after the site's column aliases).
     present_by_table: dict[str, set[str]] = {}
     raw_by_table: dict[str, set[str]] = {}
+    from src.data.site_config import site_profile
+    expected_absent = set(site_profile(cfg, site)["expected_absent_tables"])
     for name in [*(cfg.get("tables") or {}), *STATIC_ENTITIES]:
         stem, spec = _table_entity(cfg, name)
         fp = base / f"{stem}.parquet"
         if not fp.exists():
-            record["tables"][name] = "absent"
+            # A table the site declares it does not have (sites.<site>
+            # .expected_absent_tables) is reported as such; the tokenizer refuses any other.
+            record["tables"][name] = "expected_absent" if name in expected_absent else "absent"
             continue
         raw_cols = {r[0].lower() for r in con.execute(
             f"DESCRIBE SELECT * FROM read_parquet('{fp}')").fetchall()}
@@ -656,7 +666,9 @@ def check_conformance(con, base: Path, cfg: Mapping, site: str,
     record["failures"] = len(failures)
     if failures and fail:
         raise QualificationError(f"site {site!r} is not CLIF 2.1 / mCIDE {snapshot['version']} "
-                                 "conformant: " + "; ".join(failures))
+                                 "conformant: " + "; ".join(failures)
+                                 + " [aggregate only; this message stays on the node: never "
+                                   "paste it, or a traceback, off the node]")
     record["failure_messages"] = failures
     return record
 
@@ -696,7 +708,10 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--report-only", action="store_true",
                     help="print failures instead of raising")
     args = ap.parse_args(argv)
-    cfg = yaml.safe_load(Path(args.config).read_text())
+    from src.data.site_config import with_site_local
+
+    # The site's git-ignored local declarations (configs/sites/<site>.local.yaml).
+    cfg = with_site_local(yaml.safe_load(Path(args.config).read_text()), args.site)
     policy = yaml.safe_load((ROOT / cfg["artifact_policy"]).read_text())
     min_cell = int(policy["classes"]["aggregate_no_phi"]["minimum_cell_size"])
     con = duckdb.connect()

@@ -235,6 +235,18 @@ def in_stream_target_builder(
     else:
         grid = ThresholdGrid(vocab_blob, dcfg["target_concepts"], thresholds,
                              tau_sampling=tau)
+    # Outcome measurement filter (configs/cohort.yaml outcome_measurement_filters): OFF by
+    # default; `in_stream.outcome_measurement_sensitivity: arterial_only` (model config)
+    # counts only arterial MAP readings as measurements (the item-12 sensitivity arm).
+    sensitivity = (mcfg.get("in_stream") or {}).get("outcome_measurement_sensitivity")
+    filters, methods = None, frozenset()
+    if sensitivity is not None:
+        from src.data.targets import measurement_filters
+
+        root = Path(__file__).resolve().parents[2]
+        cohort_cfg = yaml.safe_load((root / dcfg["cohort_contract"]).read_text())
+        filters, methods = measurement_filters(cohort_cfg, dcfg, vocab_blob["vocab"],
+                                               dcfg["target_concepts"], sensitivity)
     return TargetBuilder(
         vocab_size=vocab_size,
         n_time_bins=mcfg["heads"]["threshold_hazard"]["n_time_bins"],
@@ -249,6 +261,7 @@ def in_stream_target_builder(
             baseline_lookback_hours=rule["baseline_lookback_hours"],
             required_measurement_within_hours_of_horizon=rule[
                 "required_measurement_within_hours_of_horizon"],
+            measurement_filters=filters, method_tokens=methods,
         ),
     )
 
@@ -990,6 +1003,17 @@ def _build_gem_loaders(
         expected_segments_hash=binding["numeric_edges"],
         expected_fit_partition="train",
     )
+    if value_stats:
+        # Fail before the first step, not at the first target: EVERY site's numeric
+        # tokens (train + validation) must have value stats (fit on all sites' train).
+        from src.data.value_stats import coverage_gaps, describe_gaps
+
+        gaps = coverage_gaps({name: Path(path) for name, path in sites.items()}, value_stats)
+        if gaps:
+            names = {v: k for k, v in vocab_blob["vocab"].items()}
+            raise SystemExit(describe_gaps(gaps, names) + ": refit the value stats on every "
+                             "site's shard (python -m src.data.value_stats --events "
+                             "mimic=... --events rush=...)")
     target_builder = in_stream_target_builder(
         vocab_blob=vocab_blob, mcfg=mcfg, dcfg=dcfg, thresholds=thresholds,
         vocab_size=vocab_size, value_stats=value_stats, run_seed=seed)

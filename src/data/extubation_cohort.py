@@ -792,12 +792,17 @@ def _add_comorbidities(
 
 
 def death_record_flags(
-    hospitalization: pl.DataFrame, patient: pl.DataFrame | None, config: Mapping[str, Any]
+    hospitalization: pl.DataFrame, patient: pl.DataFrame | None, config: Mapping[str, Any],
+    *, site_timezone: str | None = None,
 ) -> pl.DataFrame:
     """Per patient, `death_record_inconsistent`: the death timestamp precedes the
     admission of one of the patient's hospitalizations. A death charted exactly at
     midnight is a date-resolution timestamp and is inconsistent only when an admission is
-    more than `exclusions.death_record.date_resolution_tolerance_hours` later."""
+    more than `exclusions.death_record.date_resolution_tolerance_hours` later.
+
+    Midnight is the SITE's local midnight (`site_timezone`, configs/data.yaml
+    `sites.<site>.site_timezone`): a date-only death converted to UTC sits at 05:00 UTC
+    in Boston winter (MIMIC), not at 00:00 UTC. Without a declared zone, UTC midnight."""
     schema = {"patient_id": pl.String, "death_record_inconsistent": pl.Boolean}
     if patient is None:
         return pl.DataFrame(schema=schema)
@@ -809,8 +814,9 @@ def death_record_flags(
     rule = (config["exclusions"].get("death_record") or {})
     tolerance = timedelta(hours=float(rule.get("date_resolution_tolerance_hours", 24.0)))
     death = pl.col("death_dttm")
-    midnight = (death.dt.hour() == 0) & (death.dt.minute() == 0) & (death.dt.second() == 0) & (
-        death.dt.microsecond() == 0
+    local = death.dt.convert_time_zone(site_timezone) if site_timezone else death
+    midnight = (local.dt.hour() == 0) & (local.dt.minute() == 0) & (local.dt.second() == 0) & (
+        local.dt.microsecond() == 0
     )
     limit = pl.when(midnight).then(death + tolerance).otherwise(death)
     return (
@@ -830,8 +836,10 @@ def _add_death_record(
     hospitalization: pl.DataFrame,
     tables: Mapping[str, pl.DataFrame],
     config: Mapping[str, Any],
+    site_timezone: str | None = None,
 ) -> pl.DataFrame:
-    flags = death_record_flags(hospitalization, _table(tables, "patient"), config)
+    flags = death_record_flags(hospitalization, _table(tables, "patient"), config,
+                               site_timezone=site_timezone)
     return cohort.join(flags, on="patient_id", how="left").with_columns(
         pl.col("death_record_inconsistent").fill_null(False)
     )
@@ -1078,6 +1086,7 @@ def build_extubation_cohort(
     grace_hours: float | None = None,
     null_device_rows: str | None = None,
     unit_map: Mapping[str, str] | None = None,
+    site_timezone: str | None = None,
 ) -> ExtubationCohort:
     """Build one first-extubation row per patient without dropping exclusion states.
 
@@ -1120,7 +1129,7 @@ def build_extubation_cohort(
     cohort = _add_comorbidities(cohort, hospitalization, tables, config)
     cohort = _add_calendar_period(cohort, period_source, calendar_periods)
     cohort = _add_unit(cohort, tables, availability, unit_map)
-    cohort = _add_death_record(cohort, hospitalization, tables, config)
+    cohort = _add_death_record(cohort, hospitalization, tables, config, site_timezone)
     risk = config["risk_factors"]
     cohort = cohort.with_columns(
         (pl.col("age_at_admission") > risk["age_over_65"]["threshold"]).alias("age_over_65"),
@@ -1211,6 +1220,35 @@ def validate_extubation_artifact(cohort: pl.DataFrame) -> None:
         raise QualificationError("extubation cohort content hash mismatch")
 
 
+# Timestamp columns read per source table besides its availability column.
+_TIME_COLUMNS = {"hospitalization": ("admission_dttm", "discharge_dttm"),
+                 "patient": ("death_dttm",)}
+
+
+def ingest_times(tables: dict[str, pl.DataFrame], availability: Mapping[str, Availability],
+                 profile: Mapping[str, Any] | None) -> dict[str, int]:
+    """Timestamp ingest (src/data/site_config.py) in place: every read time column in
+    UTC (naive = the site's wall clock), and a null hospitalization discharge censored at
+    the site's `extraction_dttm`. Returns aggregate counts."""
+    from src.data.site_config import SiteConfigError, censor_open_stays, to_utc
+
+    tz = (profile or {}).get("site_timezone")
+    counts = {"timestamps_nulled_dst": 0, "stays_open_censored_at_extraction": 0}
+    for name, frame in list(tables.items()):
+        columns = [*(c for c in (availability[name].column,) if c),
+                   *_TIME_COLUMNS.get(name, ())] if name in availability else []
+        try:
+            frame, nulled = to_utc(frame, columns, tz)
+        except SiteConfigError as exc:
+            raise QualificationError(f"{name}: {exc}") from exc
+        counts["timestamps_nulled_dst"] += nulled
+        if name == "hospitalization" and (profile or {}).get("extraction_dttm") is not None:
+            frame, n = censor_open_stays(frame, profile["extraction_dttm"])
+            counts["stays_open_censored_at_extraction"] += n
+        tables[name] = frame
+    return counts
+
+
 def _read_tables(
     base: Path, config: Mapping[str, Any], availability: Mapping[str, Availability]
 ) -> tuple[dict[str, pl.DataFrame], dict[str, str]]:
@@ -1270,19 +1308,40 @@ def build_extubation_artifact(
     device_destination = destination.with_name(f"{destination.stem}_device_rows.parquet")
     for path in (destination, device_destination):
         validate_artifact_destination(path, "patient_level_phi", policy)
-    data = yaml.safe_load(Path(data_config).read_text())
+    from src.data.site_config import (
+        SiteConfigError,
+        episode_site,
+        require_explicit_episodes,
+        require_site_match,
+        site_profile,
+        with_site_local,
+    )
+
+    try:
+        # Never the reference site's default episode artifact for another site.
+        require_explicit_episodes(site, episode_artifact, "extubation cohort")
+        data = with_site_local(yaml.safe_load(Path(data_config).read_text()), site)
+        profile = site_profile(data, site)
+    except SiteConfigError as exc:
+        raise QualificationError(str(exc)) from exc
     availability = table_availability(config, data)
     unit_map = _location_type_map(data, site)
     split = yaml.safe_load(Path(train_config).read_text())["data_contract"]
     period_source = _period_source(config, site)
     base = Path(data_dir)
     tables, provenance = _read_tables(base, config, availability)
+    ingest = ingest_times(tables, availability, profile)
 
     episode_path = Path(episode_artifact or config["episode_artifact"])
     episodes = None
     if episode_path.exists():
         episodes = pl.read_parquet(episode_path)
         validate_episode_artifact(episodes)
+        try:
+            require_site_match(episode_site(episodes), site, "episode artifact")
+        except SiteConfigError as exc:
+            raise QualificationError(str(exc)) from exc
+        check_data_provenance(episodes, provenance)
     elif not allow_missing_episode_artifact:
         raise QualificationError(
             f"episode artifact is missing: {episode_path.name}; build it with src.data.cohort "
@@ -1306,7 +1365,9 @@ def build_extubation_artifact(
         grace_hours=grace_hours,
         null_device_rows=null_device_rows,
         unit_map=unit_map,
+        site_timezone=profile["site_timezone"],
     )
+    result.waterfall.update(ingest)
     cohort = result.cohort.with_columns(
         pl.lit(json.dumps(provenance, sort_keys=True)).alias("source_provenance_json"),
         pl.lit(json.dumps(result.waterfall, sort_keys=True)).alias("waterfall_json"),
@@ -1316,6 +1377,20 @@ def build_extubation_artifact(
     cohort.write_parquet(destination)
     result.device_rows.write_parquet(device_destination)
     return result.waterfall
+
+
+def check_data_provenance(episodes: pl.DataFrame, provenance: Mapping[str, str]) -> None:
+    """Refuse `--data` that is not the directory the episode artifact was built from: the
+    SHA-256 of every table both record (hospitalization, ADT) must agree."""
+    if "source_provenance_json" not in episodes.columns or episodes.is_empty():
+        return
+    recorded = json.loads(episodes["source_provenance_json"][0])
+    differ = sorted(name for name in set(recorded) & set(provenance)
+                    if recorded[name] != provenance[name])
+    if differ:
+        raise QualificationError(
+            f"--data is not the CLIF directory the episode artifact was built from "
+            f"({', '.join(differ)} differ): pass the site's own --data and --episodes")
 
 
 def _location_type_map(data_config: Mapping[str, Any], site: str) -> dict[str, str]:
@@ -1388,12 +1463,17 @@ def main() -> None:
     parser.add_argument("--data-config", default=None)
     parser.add_argument("--train-config", default=None)
     parser.add_argument("--artifact-policy", default=None)
-    parser.add_argument("--episodes", default=None)
+    parser.add_argument("--episodes", default=None,
+                        help="the site's episode artifact; required for every site but the "
+                             "reference site (mimic), whose default is the config's")
     parser.add_argument("--allow-missing-episode-artifact", action="store_true")
     parser.add_argument("--grace-hours", type=float, default=None)
     parser.add_argument("--null-device-rows", choices=NULL_DEVICE_RULES, default=None,
                         help="override detection.null_device_rows (sensitivity: ignore)")
     args = parser.parse_args()
+    if args.site != "mimic" and not (args.episodes and args.out):
+        # Never the reference site's default episode artifact or output path.
+        raise SystemExit(f"site {args.site!r}: pass --episodes and --out explicitly")
     config = load_extubation_config(args.config)
     artifact_policy = args.artifact_policy or config["artifact_policy"]
     waterfall = build_extubation_artifact(

@@ -552,8 +552,8 @@ def _load_train_contract(train_config: str | Path) -> dict:
     return yaml.safe_load(Path(train_config).read_text())["data_contract"]
 
 
-def episode_split_summary(path: str | Path, train_config: str | Path = TRAIN_CONFIG_PATH
-                          ) -> dict:
+def episode_split_summary(path: str | Path, train_config: str | Path = TRAIN_CONFIG_PATH,
+                          site: str | None = None) -> dict:
     """Aggregate identity of one episode artifact: the file's SHA-256, the content split
     hash (verified by `cohort.validate_episode_artifact`), the observed partition shares
     of eligible episodes and the configured proportions and seed."""
@@ -563,6 +563,12 @@ def episode_split_summary(path: str | Path, train_config: str | Path = TRAIN_CON
 
     episodes = pl.read_parquet(path)
     validate_episode_artifact(episodes)            # recomputes both content hashes
+    if site is not None:
+        from src.data.site_config import episode_site, require_site_match
+        try:
+            require_site_match(episode_site(episodes), site, f"episode artifact {Path(path).name}")
+        except ValueError as exc:
+            raise PreflightError(str(exc)) from exc
     eligible = episodes.filter(pl.col("eligible"))
     counts = dict(eligible.group_by("partition").len().iter_rows())
     total = max(sum(counts.values()), 1)
@@ -611,7 +617,9 @@ def build_split_freeze(episodes: Mapping[str, str | Path], *, approver: str,
                     "the first L40 training run",
         "approver": approver.strip(),
         "date": date or dt.datetime.now(dt.UTC).date().isoformat(),
-        "sites": {site: episode_split_summary(path, train_config)
+        # One record for every development site (MIMIC and Rush together), each
+        # artifact checked to be that site's own.
+        "sites": {site: episode_split_summary(path, train_config, site)
                   for site, path in episodes.items()},
     }
     if audit_blind is not None:
@@ -656,7 +664,7 @@ def check_split_freeze(freeze_path: str | Path | None, episodes: Mapping[str, st
             problems.append(f"site {site}: episode artifact missing")
             continue
         try:
-            now = episode_split_summary(path, train_config)
+            now = episode_split_summary(path, train_config, site)
         except Exception as exc:  # noqa: BLE001
             problems.append(f"site {site}: episode artifact invalid ({type(exc).__name__})")
             continue
@@ -684,18 +692,27 @@ def check_split_freeze(freeze_path: str | Path | None, episodes: Mapping[str, st
     return Check(name, PASS, detail)
 
 
-def check_shard_partitions(site: str, shard: str | Path, episodes: str | Path) -> Check:
+def check_shard_partitions(site: str, shard: str | Path, episodes: str | Path,
+                           cohort: str | Path | None = None) -> Check:
     """Every stay of the shard carries the episode artifact's partition (the shard was
-    tokenized from the frozen split)."""
+    tokenized from the frozen split). An extubation index stay added to the GEM stays
+    (item 13) carries the extubation cohort's partition (`cohort`, inherited from the
+    patient)."""
     import polars as pl
 
     name = f"split: {site} shard partitions"
     stays = (pl.scan_parquet(shard).select("hosp_id", "partition").unique().collect())
     if stays["hosp_id"].n_unique() != stays.height:
         return Check(name, FAIL, "a stay carries two partitions in the shard")
-    ref = pl.scan_parquet(episodes).select(
+    ref = pl.scan_parquet(episodes).filter(pl.col("eligible")).select(
         pl.col("hospitalization_id").alias("hosp_id"),
         pl.col("partition").alias("episode_partition")).collect()
+    if cohort is not None and Path(cohort).exists():
+        extra = (pl.scan_parquet(cohort).filter(pl.col("eligible"))
+                 .select(pl.col("hospitalization_id").alias("hosp_id"),
+                         pl.col("partition").alias("episode_partition")).collect()
+                 .join(ref.select("hosp_id"), on="hosp_id", how="anti"))
+        ref = pl.concat([ref, extra])
     joined = stays.join(ref, on="hosp_id", how="left")
     missing = int(joined["episode_partition"].is_null().sum())
     differ = int((joined["episode_partition"] != joined["partition"]).sum())
@@ -838,13 +855,16 @@ def check_arm_binding(arm: ArmData) -> list[Check]:
     return checks
 
 
-def check_value_stats(arm: ArmData, sample: Path | None = None) -> Check:
+def check_value_stats(arm: ArmData, sample: Path | None = None, *,
+                      all_sites: bool = True) -> Check:
     """Bound to the arm's vocabulary and segments, fit on train, and covering every
-    numeric token of the sample's train stays."""
+    numeric token of the train and validation stays of EVERY site's shard (a site whose
+    numeric tokens lack stats fails, listed per site), or of `sample` alone when
+    `all_sites` is False."""
     import polars as pl
 
     from src.data.segments import artifact_binding, load_vocab_blob
-    from src.data.value_stats import load_value_stats
+    from src.data.value_stats import coverage_gaps, describe_gaps, load_value_stats
 
     name = f"data: {arm.name} value stats"
     if not arm.value_stats.exists():
@@ -858,6 +878,23 @@ def check_value_stats(arm: ArmData, sample: Path | None = None) -> Check:
     except Exception as exc:  # noqa: BLE001
         return Check(name, FAIL, str(exc)[:200])
     detail = f"{len(stats)} tokens, bound to the vocabulary and segments, fit on train"
+    if all_sites:
+        shards = {site: d / GEM_EVENTS for site, d in arm.sites.items()
+                  if (d / GEM_EVENTS).exists()}
+        if not shards:
+            return Check(name, PASS, detail + "; no shard to check coverage on")
+        try:
+            gaps = coverage_gaps(shards, stats)
+        except Exception as exc:  # noqa: BLE001
+            return Check(name, FAIL, f"coverage check failed: {str(exc)[:200]}")
+        if gaps:
+            vocab = load_vocab_blob(arm.vocab)["vocab"]
+            names = {v: k for k, v in vocab.items()}
+            return Check(name, FAIL, describe_gaps(gaps, names) + ": refit with every "
+                         "site's gem_events.parquet (python -m src.data.value_stats --events "
+                         "mimic=... --events rush=...)")
+        return Check(name, PASS, detail + f"; covers every numeric token of "
+                     f"{', '.join(shards)} (train + validation)")
     if sample is None:
         return Check(name, PASS, detail)
     numeric = (pl.scan_parquet(sample).filter(pl.col("partition") == "train")
@@ -871,6 +908,45 @@ def check_value_stats(arm: ArmData, sample: Path | None = None) -> Check:
                      "on gem_events.parquet")
     return Check(name, PASS, detail + f"; covers all {len(numeric)} numeric tokens of the "
                  "sample")
+
+
+def site_binding_checks(arms: Sequence[ArmData], *,
+                        data_config: str | Path | None = None) -> list[Check]:
+    """Every site shard records the hash of that site's declarations (site-local ones
+    included) it was built with (`tokenize.site_binding`); it must equal the current
+    config's, or the shard is stale. A shard that predates the site binding is a WARN."""
+    from src.data.site_config import with_site_local
+    from src.data.tokenize import site_binding
+
+    cfg_path = Path(data_config) if data_config else DATA_CONFIG_PATH
+    base = yaml.safe_load(cfg_path.read_text())
+    checks, seen = [], set()
+    for arm in arms:
+        for site, directory in arm.sites.items():
+            shard = directory / GEM_EVENTS
+            if not shard.exists() or shard.resolve() in seen:
+                continue
+            seen.add(shard.resolve())
+            name = f"data: {arm.name}/{site} site declarations"
+            try:
+                expected = site_binding(with_site_local(base, site), site)
+                recorded = _shard_bindings(shard)
+            except Exception as exc:  # noqa: BLE001
+                checks.append(Check(name, FAIL, f"{type(exc).__name__}: {str(exc)[:200]}"))
+                continue
+            sites = {h.get("site") for h in recorded}
+            hashes = {h.get("site_declarations") for h in recorded}
+            if hashes == {None}:
+                checks.append(Check(name, WARN, "shard predates the site binding: rebuild it "
+                                    "to bind it to the site's declarations"))
+            elif sites != {site} or hashes != {expected["site_declarations"]}:
+                checks.append(Check(name, FAIL, "the shard was built under other site "
+                                    "declarations (configs/data.yaml or the site-local file) "
+                                    "or for another site: re-tokenize it"))
+            else:
+                checks.append(Check(name, PASS, f"bound to {site} declarations "
+                                    f"{_short(expected['site_declarations'])}"))
+    return checks
 
 
 def textcode_cache_check(arms: Sequence[ArmData]) -> Check | None:
@@ -1252,7 +1328,7 @@ def memory_checks(arm: ArmData, *, n_stays: int, scratch: Path, policy: Mapping,
     try:
         sample = write_sample_shard(first, work, n_stays, policy)
         measured = measure_sample(sample)
-        sample_value_check = check_value_stats(arm, sample)
+        sample_value_check = check_value_stats(arm)
     finally:
         if not keep_scratch:
             shutil.rmtree(work, ignore_errors=True)
@@ -1310,7 +1386,8 @@ def _existing(path: Path) -> Path:
 
 # ------------------------------------------------------------------ synthetic site
 
-SYNTHETIC_SITE_NAME = "synthetic"
+# The synthetic bundle's own site name: its shards record it (tokenize.site_binding).
+SYNTHETIC_SITE_NAME = "SYNTH-A"
 
 
 def build_synthetic_site(work: str | Path) -> dict:
@@ -1348,6 +1425,7 @@ def build_synthetic_site(work: str | Path) -> dict:
     cfg["artifact_policy"] = str(work / "artifact_policy.yaml")
     cfg["tables"]["adt"] = copy.deepcopy(data_cfg["tables"]["adt"])
     cfg["gem"] = copy.deepcopy(data_cfg["gem"])
+    (work / "data.yaml").write_text(yaml.safe_dump(cfg, sort_keys=False))
     phi = work / "output/intermediate_phi"
     episodes_path = phi / "episodes.parquet"
     episodes_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1364,7 +1442,7 @@ def build_synthetic_site(work: str | Path) -> dict:
                       vocab=blob["vocab"], segments=blob["segments"],
                       fit_partition_name="train")
     return {"work": work, "shard_dir": shard_dir, "episodes": episodes_path,
-            "value_stats": stats_path, "policy": policy,
+            "value_stats": stats_path, "policy": policy, "data_config": work / "data.yaml",
             "split_freeze": work / "output/final_no_phi/split_freeze.json"}
 
 
@@ -1395,7 +1473,8 @@ def context_checks(arm: ArmData, *, episodes: Mapping[str, str | Path],
             if site in cohorts and site in episodes:
                 prompts = prompt_context_report(shard, cohorts[site], episodes[site])
                 share = prompts["share_over"].get(str(max_tokens))
-                detail += f"; extubation prompts (n={prompts['n']}): {prompts['share_over']}"
+                detail += (f"; extubation prompts (n={prompts['n']}): {prompts['share_over']}; "
+                           f"index stays missing from the shard: {prompts['missing_from_shard']}")
                 if isinstance(share, float) and share > PROMPT_OVER_CONTEXT_WARN:
                     status = WARN
                     detail += (f": more than {PROMPT_OVER_CONTEXT_WARN:.0%} of prompts exceed "
@@ -1415,7 +1494,8 @@ def run_preflight(*, arms: Sequence[ArmData], episodes: Mapping[str, Path],
                   train_config: Path = TRAIN_CONFIG_PATH, keep_scratch: bool = False,
                   thresholds_path: Path = THRESHOLDS_PATH,
                   budgets: Mapping[str, float] | None = None,
-                  extubation_cohorts: Mapping[str, Path] | None = None) -> Report:
+                  extubation_cohorts: Mapping[str, Path] | None = None,
+                  data_config: Path = DATA_CONFIG_PATH) -> Report:
     import torch
 
     report = Report()
@@ -1438,7 +1518,8 @@ def run_preflight(*, arms: Sequence[ArmData], episodes: Mapping[str, Path],
             if site in episodes and shard.exists() and shard.resolve() not in seen_shards:
                 seen_shards.add(shard.resolve())
                 if Path(episodes[site]).exists():
-                    check = check_shard_partitions(site, shard, episodes[site])
+                    check = check_shard_partitions(site, shard, episodes[site],
+                                                   (extubation_cohorts or {}).get(site))
                     check.name = f"split: {arm.name}/{site} shard partitions"
                     report.checks.append(check)
     textcode = textcode_cache_check(arms)
@@ -1469,6 +1550,7 @@ def run_preflight(*, arms: Sequence[ArmData], episodes: Mapping[str, Path],
     for arm in arms:
         if arm is not target:
             report.checks.append(check_value_stats(arm))
+    report.extend(site_binding_checks(arms, data_config=data_config))
     if target is not None and budgets is None:
         report.add(f"schedule: updates per budget [{target.name}]", SKIP,
                    "no matrix budgets (synthetic site)")
@@ -1602,7 +1684,7 @@ def _main_synthetic(args: argparse.Namespace) -> int:
             run_root=site["work"], memory_arm="synthetic",
             sample_stays=args.sample_stays, min_free_gb=min(args.min_free_gb, 1.0),
             smoke_timeout=args.smoke_timeout, train_config=Path(args.train_config),
-            thresholds_path=Path(args.thresholds))
+            thresholds_path=Path(args.thresholds), data_config=site["data_config"])
         print(report.table())
         return 1 if report.failed else 0
 

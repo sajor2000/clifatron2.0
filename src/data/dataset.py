@@ -49,6 +49,7 @@ import itertools
 import json
 import math
 import os
+import re
 import shutil
 from collections.abc import Mapping, Sequence
 from copy import deepcopy
@@ -998,6 +999,32 @@ def _file_sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+_TMP_BUILD = re.compile(r"^\.(?P<name>.+)\.(?P<pid>\d+)\.tmp$")
+
+
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True          # exists, owned by someone else
+    return True
+
+
+def remove_stale_cache_builds(root: Path) -> list[str]:
+    """Delete every ``.<name>.<pid>.tmp`` cache build directory under `root` whose pid
+    is not a running process (a crashed build); returns the names removed. Called with
+    the cache lock held, so a live build (its pid running) is never touched."""
+    removed = []
+    for entry in Path(root).iterdir() if Path(root).is_dir() else ():
+        match = _TMP_BUILD.match(entry.name)
+        if match and entry.is_dir() and not _pid_alive(int(match.group("pid"))):
+            shutil.rmtree(entry, ignore_errors=True)
+            removed.append(entry.name)
+    return removed
+
+
 def _cached_part(path: Path, partition: str | None) -> _GemPart:
     """The memory-mapped columnar copy of one shard partition, built on first use.
 
@@ -1022,6 +1049,9 @@ def _cached_part(path: Path, partition: str | None) -> _GemPart:
     with (root / ".lock").open("a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         try:
+            # A build that crashed (killed rank, OOM) leaves its temporary directory
+            # behind; under the lock, any whose writer is no longer running is removed.
+            remove_stale_cache_builds(root)
             if not directory.exists():
                 temporary = root / f".{directory.name}.{os.getpid()}.tmp"
                 shutil.rmtree(temporary, ignore_errors=True)

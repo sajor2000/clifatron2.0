@@ -372,7 +372,11 @@ class GemArtifactTest(unittest.TestCase):
 
         binding = artifact_binding(self.blob)
         for hashes in self.gem["artifact_hashes"].to_list():
-            self.assertEqual(hashes, binding)
+            # The vocabulary binding, plus the site binding (tokenize.site_binding): the
+            # site and the SHA-256 of its declarations.
+            self.assertEqual({k: hashes[k] for k in binding}, binding)
+            self.assertEqual(set(hashes) - set(binding), {"site", "site_declarations"})
+            self.assertEqual(len(hashes["site_declarations"]), 64)
         self.assertEqual(set(self.gem["trajectory"].to_list()), {"hospitalization"})
 
     # --- vocabulary ------------------------------------------------------------------------

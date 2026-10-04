@@ -359,6 +359,7 @@ def build_extubation_labels(
     availability: Mapping[str, Availability],
     data_config: Mapping[str, Any],
     cohort_config: Mapping[str, Any],
+    site_timezone: str | None = None,
 ) -> pl.DataFrame:
     """One label row per cohort row, in cohort order, with times in hours from time zero.
 
@@ -380,7 +381,7 @@ def build_extubation_labels(
     # the patient) OR this table's own check (the stays it was given). Flagged, not removed.
     stays = _table(tables, "hospitalization", required=True)
     own = (death_record_flags(stays.select("patient_id", "admission_dttm"),
-                              _table(tables, "patient"), config)
+                              _table(tables, "patient"), config, site_timezone=site_timezone)
            if {"patient_id", "admission_dttm"} <= set(stays.columns)
            else pl.DataFrame(schema={"patient_id": pl.String,
                                      "death_record_inconsistent": pl.Boolean}))
@@ -416,8 +417,12 @@ def build_extubation_labels(
             "cohort rows have no index hospitalization in the hospitalization table"
         )
     if frame["discharge_dttm"].has_nulls():
+        # A stay still open at the data cut is censored at the site's extraction_dttm
+        # (`build_label_artifact`); without a declared one, follow-up cannot be bounded.
         raise QualificationError(
-            "an index hospitalization has no discharge time; follow-up cannot be bounded"
+            "an index hospitalization has no discharge time and the site declares no "
+            "extraction_dttm (configs/data.yaml sites.<site>.extraction_dttm or the "
+            "site-local profile): follow-up cannot be bounded"
         )
     if frame["_in_patient"].has_nulls():
         raise QualificationError("cohort patients are missing from the patient table")
@@ -763,6 +768,60 @@ def _read_tables(
     return tables, provenance
 
 
+def cohort_site(cohort: pl.DataFrame) -> str:
+    """The one site an extubation cohort artifact was built for."""
+    sites = cohort["site"].drop_nulls().unique().to_list() if "site" in cohort.columns else []
+    if len(sites) != 1:
+        raise QualificationError("the extubation cohort must record exactly one site")
+    return str(sites[0])
+
+
+def require_label_freeze(site: str, *, registry_path: str | Path,
+                         freeze_manifest: str | Path | Mapping | None,
+                         cohort_config: str | Path) -> str:
+    """Item 9 (product authority, 2026-10-03): no outcome labels at a site that is not
+    exploratory (Rush: confirmatory) before the freeze. The site's role comes from the
+    benchmark registry; a non-exploratory site needs the R28 freeze manifest, verified
+    with the outcome-by-arm gate's own check (`emulate.verify_freeze_manifest`; the
+    locally recomputable hashes must match this node). Returns the role."""
+    from src.eval.causal import benchmark as bm
+    from src.eval.causal import emulate as em
+
+    registry = bm.load_benchmark_registry(registry_path)
+    role = registry.site_role(site)
+    if role == "exploratory":
+        return role
+    manifest = freeze_manifest
+    if isinstance(manifest, (str, Path)):
+        manifest = json.loads(Path(manifest).read_text())
+    local = (em.local_freeze_hashes(cohort_config=cohort_config, registry_path=registry_path)
+             if manifest else None)
+    try:
+        em.verify_freeze_manifest(registry, [site], manifest, local)
+    except em.EmulationRefused as exc:
+        raise QualificationError(
+            f"site {site!r} is {role}: its outcome labels are derived only after the freeze. "
+            f"{exc}") from exc
+    return role
+
+
+def check_label_provenance(cohort: pl.DataFrame, provenance: Mapping[str, str]) -> None:
+    """Refuse `--data` that is not the directory the cohort was built from (the SHA-256
+    of every table both record must agree)."""
+    if "source_provenance_json" not in cohort.columns or cohort.is_empty():
+        return
+    recorded = json.loads(cohort["source_provenance_json"][0])
+    differ = sorted(name for name in set(recorded) & set(provenance)
+                    if recorded[name] != provenance[name])
+    if differ:
+        raise QualificationError(
+            f"--data is not the CLIF directory the extubation cohort was built from "
+            f"({', '.join(differ)} differ)")
+
+
+DEFAULT_REGISTRY = Path(__file__).resolve().parents[2] / "configs/extubation_benchmarks.yaml"
+
+
 def build_label_artifact(
     data_dir: str | Path,
     output: str | Path,
@@ -772,16 +831,24 @@ def build_label_artifact(
     data_config: str | Path,
     cohort_config: str | Path,
     artifact_policy: str | Path,
+    registry: str | Path = DEFAULT_REGISTRY,
+    freeze_manifest: str | Path | Mapping | None = None,
 ) -> dict[str, int]:
-    """Label a site's extubation cohort and persist the rows; return only the counts."""
+    """Label a site's extubation cohort and persist the rows; return only the counts.
+
+    The site is the cohort's own. A site that is not exploratory (the registry's role;
+    Rush is confirmatory) is refused unless the R28 freeze manifest verifies
+    (`require_label_freeze`). `data_dir` must be the directory the cohort was built from.
+    Timestamps are ingested with the site profile (UTC; a stay still open at the data cut
+    is censored at `extraction_dttm`, its disposition unknown)."""
+    from src.data.extubation_cohort import Availability, ingest_times
+    from src.data.site_config import SiteConfigError, site_profile, with_site_local
+
     config = load_extubation_config(extubation_config)
     policy = yaml.safe_load(Path(artifact_policy).read_text())
     destination = Path(output)
     validate_artifact_destination(destination, "patient_level_phi", policy)
-    data = yaml.safe_load(Path(data_config).read_text())
     contract = yaml.safe_load(Path(cohort_config).read_text())
-    # Refuse before any source table is opened.
-    endpoints = _label_endpoints(contract, data, config)
     cohort_path = Path(cohort_artifact)
     if not cohort_path.exists():
         raise QualificationError(
@@ -790,10 +857,30 @@ def build_label_artifact(
         )
     cohort = pl.read_parquet(cohort_path)
     validate_extubation_artifact(cohort)
+    site = cohort_site(cohort)
+    try:
+        data = with_site_local(yaml.safe_load(Path(data_config).read_text()), site)
+        profile = site_profile(data, site)
+    except SiteConfigError as exc:
+        raise QualificationError(str(exc)) from exc
+    # Refuse before any source table is opened.
+    endpoints = _label_endpoints(contract, data, config)
+    require_label_freeze(site, registry_path=registry, freeze_manifest=freeze_manifest,
+                         cohort_config=extubation_config)
     availability = table_availability(config, data)
     tables, provenance = _read_tables(
         Path(data_dir), cohort, config, data, availability["respiratory_support"]
     )
+    check_label_provenance(cohort, provenance)
+    # A stay still open at the data cut is censored at the extraction time with an
+    # UNKNOWN disposition (never read as a discharge alive).
+    if profile["extraction_dttm"] is not None and "hospitalization" in tables:
+        tables["hospitalization"] = tables["hospitalization"].with_columns(
+            pl.when(pl.col("discharge_dttm").is_null()).then(pl.lit(None, pl.String))
+            .otherwise(pl.col("discharge_category")).alias("discharge_category"))
+    ingest_times(tables, {"respiratory_support": availability["respiratory_support"],
+                          "hospitalization": Availability("", None, 0),
+                          "patient": Availability("", None, 0)}, profile)
     labels = build_extubation_labels(
         cohort,
         tables,
@@ -801,6 +888,7 @@ def build_label_artifact(
         availability=availability,
         data_config=data,
         cohort_config=contract,
+        site_timezone=profile["site_timezone"],
     )
     horizons = sorted({endpoint.horizon_hours for endpoint in endpoints.values()})
     counts = label_counts(cohort, labels, horizons)
@@ -820,10 +908,20 @@ def main() -> None:
     parser.add_argument("--data-config", default=None)
     parser.add_argument("--cohort-config", default="configs/cohort.yaml")
     parser.add_argument("--artifact-policy", default=None)
+    parser.add_argument("--registry", default=DEFAULT_REGISTRY,
+                        help="benchmark registry (site roles, R28 freeze requirements)")
+    parser.add_argument("--freeze-manifest", default=None,
+                        help="JSON of the R28 freeze hashes; required for a site that is "
+                             "not exploratory (Rush)")
     args = parser.parse_args()
     config = load_extubation_config(args.config)
     artifact_policy = args.artifact_policy or config["artifact_policy"]
     cohort = Path(args.cohort or config["outputs"]["cohort"])
+    if cohort.exists():
+        site = cohort_site(pl.read_parquet(cohort, columns=["site"]))
+        if site != "mimic" and not (args.cohort and args.out):
+            # Never the reference site's default cohort or label paths for another site.
+            raise SystemExit(f"site {site!r}: pass --cohort and --out explicitly")
     counts = build_label_artifact(
         args.data,
         # Default: the cohort artifact's sibling `<stem>_labels.parquet`.
@@ -833,6 +931,8 @@ def main() -> None:
         data_config=args.data_config or config["data_config"],
         cohort_config=args.cohort_config,
         artifact_policy=artifact_policy,
+        registry=args.registry,
+        freeze_manifest=args.freeze_manifest,
     )
     policy = yaml.safe_load(Path(artifact_policy).read_text())
     min_cell = policy["classes"]["aggregate_no_phi"]["minimum_cell_size"]

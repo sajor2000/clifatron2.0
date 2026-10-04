@@ -182,5 +182,13 @@ class RealDataSmokeTest(unittest.TestCase):
                 self.assertEqual(result["optimizer_updates"], 2)
                 shares = result["label_status"]
                 self.assertGreater(shares["anchors"], 0)
-                self.assertAlmostEqual(sum(shares["threshold_queries"]["shares"].values()),
-                                       1.0)
+                # Small cells are suppressed in the smoke report (counts 1-9 -> "<10",
+                # their shares withheld): the released shares sum to 1 only when none is.
+                released = [v for v in shares["threshold_queries"]["shares"].values()
+                            if v is not None]
+                if len(released) == len(shares["threshold_queries"]["shares"]):
+                    self.assertAlmostEqual(sum(released), 1.0)
+                else:
+                    self.assertLess(sum(released), 1.0 + 1e-9)
+                    self.assertTrue(any(isinstance(v, str) for v in
+                                        shares["threshold_queries"]["counts"].values()))

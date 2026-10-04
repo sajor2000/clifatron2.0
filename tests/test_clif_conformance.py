@@ -696,6 +696,7 @@ class VocabularyBindingTest(unittest.TestCase):
         bare["value_binning"] = {k: v for k, v in cfg["value_binning"].items()
                                  if k not in ("csv_coverage", "literature_coverage")}
         bare.pop("derived_concepts")
+        bare.pop("vocabulary_allowlist")
         self.assertEqual(global_record(bare), {})
         _check_harmonization_binding({}, {}, bare)
 

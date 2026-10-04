@@ -74,6 +74,11 @@ tables:
       kind: "continuous"
       action_col: "mar_action_category"
       stop_actions: [stop]
+      # Decided 2026-10-03 (product authority, Rush onboarding): an administration whose
+      # action is not a dose (CLIF 2.1 continuous `other`: "unable to map") is removed from
+      # the input stream at every site, before conversion; counted per table in the report
+      # (`dose_conversion.<table>.excluded_action`).
+      exclude_actions: [other]
       # Weights outside plausible_kg (configs/extubation.yaml risk_factors.bmi, the same
       # [25, 400] kg) are never used to convert a per-kg dose (staged MIMIC: 815 zero
       # weights, 369 in (0, 20) kg, 72 above 400 kg); excluded counts are reported.
@@ -94,6 +99,11 @@ tables:
     dose:
       kind: "intermittent"
       weight_source: {table: vitals, concept: weight_kg, plausible_kg: [25.0, 400.0]}
+      # Decided 2026-10-03 (product authority): an ordered dose that was NOT given (CLIF 2.1
+      # intermittent `not_given`: missed, refused, cancelled) or could not be mapped
+      # (`other`) never enters the input stream, at any site; counted in the report.
+      action_col: "mar_action_category"
+      exclude_actions: [not_given, other]
     input_only: true
   assessments:                            # TARGET-ELIGIBLE (R9): measurements, not treatments
     file: "clif_patient_assessments"
@@ -170,6 +180,27 @@ availability_lag_sensitivities:
   semantics: missing_storetime          # every table declared with this semantics
   minutes: [15, 60]
 
+# PER-SITE PROFILE (Rush onboarding; product authority 2026-10-03; src/data/site_config.py).
+#   site_timezone: IANA zone of the site's wall clock. Naive timestamps are read as this
+#       clock and converted to UTC at ingest (rows inside a DST gap become null, counted); a
+#       date-only death charted at local midnight gets the 24 h date-resolution tolerance.
+#       UTC-stamped data are unchanged.
+#   extraction_dttm: ISO-8601 UTC data cut; a stay with no discharge time (still in
+#       hospital) is censored there by the cohort, the extubation labeler and the tokenizer.
+#   expected_absent_tables: configured tables (data.yaml key or CLIF table name) the site
+#       does not have: skipped quietly and reported. Any OTHER absent table fails the build.
+# Declarations that name a site's own strings (e.g. Rush BP source names) never go here:
+# they live in the git-ignored configs/sites/<site>.local.yaml (template
+# configs/sites/rush.example.yaml), merged into sites / site_harmonization /
+# site_unit_conversions at load time and hashed into the site's shard binding.
+sites:
+  mimic:
+    # MIMIC-IV (Beth Israel Deaconess, Boston). Staged timestamps are already UTC; date-only
+    # deaths sit at local midnight (05:00 UTC), read with this zone.
+    site_timezone: America/New_York
+    extraction_dttm: null                # every staged MIMIC stay has a discharge time
+    expected_absent_tables: []
+
 # Static admission tokens (R21, KTD11; BBJ CLIF GEM): emitted once at the stay start,
 # before any other event, in this fixed order. `age_decile` bins age_at_admission (years)
 # on the CLINICAL AGE BANDS of configs/literature_segments/labs.yaml (<45, 45-54, 55-64,
@@ -181,6 +212,27 @@ static_tokens: [age_decile, sex, race, ethnicity, admission_type]
 static_source:
   hospitalization_file: "clif_hospitalization"   # age_at_admission, admission_type_category
   patient_file: "clif_patient"                   # sex_category, race_category, ethnicity_category
+
+# CLIF 2.1.1 mCIDE VOCABULARY ALLOWLIST (decided 2026-10-03, product authority). The vocabulary is
+# fit on MIMIC train only, so a permissible CLIF value MIMIC never charts (device_category Room
+# Air, code status DNAR / UDNR / DNI_only / Presume Full / Other, location hospice / rehab /
+# radiology / dialysis, admission type osh / facility / other, sex Unknown, mode Blow by)
+# would be <unk> at Rush. Every permissible value of each list below gets a token anyway,
+# appended after the data-derived tokens (configuration, not data: no cell floor), in the
+# token form the tokenizer emits: `concept=<value>` (categorical) or the bare value (`bare`:
+# ADT location concepts). Hashed into the vocabulary (its tokens) and into the
+# harmonization record (this block).
+vocabulary_allowlist:
+  - {permissible: respiratory_support.device_category, concept: device_category}
+  - {permissible: respiratory_support.mode_category, concept: mode_category}
+  - {permissible: code_status.code_status_category, concept: code_status}
+  - {permissible: position.position_category, concept: position}
+  - {permissible: crrt_therapy.crrt_mode_category, concept: crrt_mode_category}
+  - {permissible: adt.location_category, form: bare}
+  - {permissible: hospitalization.admission_type_category, concept: admission_type}
+  - {permissible: patient.sex_category, concept: sex}
+  - {permissible: patient.race_category, concept: race}
+  - {permissible: patient.ethnicity_category, concept: ethnicity}
 
 # Full-hospitalization GEM artifact (U8; R17, R18, KTD10). `tokenize_site(...,
 # trajectory="hospitalization")` writes gem_events.parquet beside events.parquet with the
@@ -564,7 +616,7 @@ site_harmonization:
   #     source_column: meas_site_name
   #     patterns: [{pattern: "arterial|a-?line", method: arterial},
   #                {pattern: "cuff|non.?invasive", method: noninvasive_auto}]
-  #     null: unknown        # only if the site really cannot tell
+  #     "null": unknown      # only if the site really cannot tell
 
 value_binning:
   # PRIMARY SCHEME: physician-designed clinical-segment bins with measurement-density

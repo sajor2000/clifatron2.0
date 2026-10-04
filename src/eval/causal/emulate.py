@@ -166,33 +166,47 @@ def authorize_outcome_by_arm(
     freeze_verified = False
     gated = sorted(site for site, role in roles.items() if role != "exploratory")
     if gated:
-        if not freeze_manifest:
-            raise EmulationRefused(
-                f"site(s) {gated} are not exploratory and need the R28 freeze manifest "
-                f"({', '.join(registry.freeze_required)})"
-            )
-        missing = [key for key in registry.freeze_required if not freeze_manifest.get(key)]
-        if missing:
-            raise EmulationRefused(f"the freeze manifest is missing {', '.join(missing)}")
-        malformed = [
-            key for key in registry.freeze_required
-            if not isinstance(freeze_manifest[key], str) or not _SHA256.match(freeze_manifest[key])
-        ]
-        if malformed:
-            raise EmulationRefused(f"freeze hash for {', '.join(malformed)} is not a sha256 digest")
-        if local_hashes is None or any(key not in local_hashes for key in registry.freeze_locally_verified):
-            raise EmulationRefused(
-                f"the freeze hashes for {', '.join(registry.freeze_locally_verified)} must be "
-                "recomputed on the node (local_freeze_hashes) before a confirmatory run"
-            )
-        stale = [key for key in registry.freeze_locally_verified if local_hashes[key] != freeze_manifest[key]]
-        if stale:
-            raise EmulationRefused(
-                f"the frozen hash of {', '.join(stale)} does not match this node; "
-                "something changed after the freeze"
-            )
+        verify_freeze_manifest(registry, gated, freeze_manifest, local_hashes)
         freeze_verified = True
     return Authorization(trial_id, site_list, "registered_protocol", protocol_hash, roles, freeze_verified)
+
+
+def verify_freeze_manifest(
+    registry: bm.Registry,
+    gated: Sequence[str],
+    freeze_manifest: Mapping[str, str] | None,
+    local_hashes: Mapping[str, str] | None,
+) -> None:
+    """The R28 freeze check for the non-exploratory site(s) `gated`; raise
+    `EmulationRefused` unless `freeze_manifest` holds a sha256 for every required item and
+    the locally recomputable ones (`local_freeze_hashes`) match this node. Shared by the
+    outcome-by-arm gate and the extubation labeler (no confirmatory-site labels before the
+    freeze)."""
+    if not freeze_manifest:
+        raise EmulationRefused(
+            f"site(s) {sorted(gated)} are not exploratory and need the R28 freeze manifest "
+            f"({', '.join(registry.freeze_required)})"
+        )
+    missing = [key for key in registry.freeze_required if not freeze_manifest.get(key)]
+    if missing:
+        raise EmulationRefused(f"the freeze manifest is missing {', '.join(missing)}")
+    malformed = [
+        key for key in registry.freeze_required
+        if not isinstance(freeze_manifest[key], str) or not _SHA256.match(freeze_manifest[key])
+    ]
+    if malformed:
+        raise EmulationRefused(f"freeze hash for {', '.join(malformed)} is not a sha256 digest")
+    if local_hashes is None or any(key not in local_hashes for key in registry.freeze_locally_verified):
+        raise EmulationRefused(
+            f"the freeze hashes for {', '.join(registry.freeze_locally_verified)} must be "
+            "recomputed on the node (local_freeze_hashes) before a confirmatory run"
+        )
+    stale = [key for key in registry.freeze_locally_verified if local_hashes[key] != freeze_manifest[key]]
+    if stale:
+        raise EmulationRefused(
+            f"the frozen hash of {', '.join(stale)} does not match this node; "
+            "something changed after the freeze"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -211,6 +225,29 @@ class SiteData:
     cohort: pl.DataFrame
     labels: pl.DataFrame | None = None
     device_rows: pl.DataFrame | None = None
+
+    def __post_init__(self) -> None:
+        check_label_binding(self.cohort, self.labels)
+
+
+class LabelBindingError(ValueError):
+    """Labels derived from another cohort build than the one they are joined to."""
+
+
+def check_label_binding(cohort: pl.DataFrame, labels: pl.DataFrame | None) -> None:
+    """Labels are read only with the cohort build they were derived from: when the
+    cohort carries its content hash (`extubation_sha256`), the labels must record the
+    same one (the labeler passes it through). Refuses labels with none, or another."""
+    if labels is None or "extubation_sha256" not in cohort.columns or cohort.is_empty():
+        return
+    expected = cohort["extubation_sha256"].drop_nulls().unique().to_list()
+    if "extubation_sha256" not in labels.columns:
+        raise LabelBindingError("the labels record no extubation_sha256: relabel this cohort "
+                                "with src.eval.extubation_labeler")
+    recorded = labels["extubation_sha256"].drop_nulls().unique().to_list()
+    if sorted(recorded) != sorted(expected):
+        raise LabelBindingError("the labels were derived from another extubation cohort build "
+                                "(extubation_sha256 differs): relabel the cohort in use")
 
 
 def _rule_expr(rule: bm.EligibilityRule) -> pl.Expr:

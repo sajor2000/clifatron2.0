@@ -325,9 +325,12 @@ def validate_grouped_splits(rows: pl.DataFrame) -> None:
     for column in ["patient_id", "hospitalization_joined_id"]:
         if column not in rows.columns:
             continue
-        if rows[column].null_count() == rows.height:
+        # A null linkage id is a singleton (linked to nothing), never one shared group:
+        # only the non-null rows are checked.
+        linked = rows.filter(pl.col(column).is_not_null())
+        if linked.is_empty():
             continue
-        leaked = rows.group_by(column).agg(pl.col("partition").n_unique().alias("n")).filter(
+        leaked = linked.group_by(column).agg(pl.col("partition").n_unique().alias("n")).filter(
             pl.col("n") != 1
         )
         if leaked.height:

@@ -93,8 +93,57 @@ class RunbookCommandsTest(unittest.TestCase):
                          "src.eval.extubation_labeler", "src.eval.extubation_audit",
                          "src.train.preflight", "src.train.run_matrix",
                          "src.train.run_tokenization_ablation", "src.eval.threshold_eval",
-                         "src.eval.claims_report", "src.eval.baselines"):
+                         "src.eval.claims_report", "src.eval.baselines",
+                         "src.data.clif_conformance", "src.data.tokenization_report",
+                         "src.eval.context_length"):
             self.assertIn(expected, modules)
+
+    def test_rush_day_one_runs_the_aggregate_checks_in_order(self):
+        text = RUNBOOK.read_text()
+        start = text.index("## Rush day 1")
+        section = text[start:text.index("\n## ", start + 1)]
+        lines = [line for language, block in FENCE.findall(section) if language in SHELL
+                 for line in (raw.strip() for raw in block.splitlines())
+                 if line.startswith("uv run python -m ")]
+        order = [(module_and_subcommand(shlex.split(line))[0], line) for line in lines]
+        modules = [m for m, _ in order]
+        expected = ["src.data.clif_conformance", "src.data.tokenize", "src.data.cohort",
+                    "src.data.extubation_cohort", "src.data.tokenize",
+                    "src.data.tokenization_report", "src.eval.context_length",
+                    "src.eval.extubation_audit"]
+        positions = [modules.index(m, modules.index(expected[i - 1]) if i else 0)
+                     for i, m in enumerate(expected)]
+        self.assertEqual(positions, sorted(positions))
+        joined = "\n".join(lines)
+        self.assertIn("--report-only", joined)
+        self.assertIn("--dry-run", joined)
+        self.assertIn("--sample-episodes", joined)
+        self.assertIn("--vocab output/intermediate_phi/mimic/vocab.json", joined)
+        # Governance and the on-node checks are written down.
+        for needle in ("rush.example.yaml", "rush.local.yaml", "never paste",
+                       "meas_site_name", "troponin_t", "lab_result_dttm",
+                       "America/Chicago", "expected_absent_tables"):
+            self.assertIn(needle.lower(), section.lower())
+
+    def test_every_rush_command_names_its_own_artifacts(self):
+        """No Rush line falls back to a MIMIC default: cohort, extubation cohort, tokenize
+        and context length name the site and the Rush episode artifact (or output)."""
+        for tokens in runbook_commands():
+            line = " ".join(tokens)
+            if "clif-rush" not in line and "rush" not in line.split("--site ")[-1][:4]:
+                continue
+            module = module_and_subcommand(tokens)[0]
+            with self.subTest(command=line[:120]):
+                if module in ("src.data.cohort", "src.data.extubation_cohort",
+                              "src.data.tokenize", "src.eval.context_length"):
+                    self.assertIn("--site rush", line)
+                if module in ("src.data.extubation_cohort", "src.data.tokenize",
+                              "src.eval.context_length"):
+                    self.assertIn("--episodes output/intermediate_phi/episodes_rush.parquet",
+                                  line)
+                if module in ("src.data.cohort", "src.data.extubation_cohort",
+                              "src.eval.extubation_labeler"):
+                    self.assertIn("--out", line)
 
     def test_every_module_exists_and_accepts_every_flag(self):
         commands = runbook_commands()

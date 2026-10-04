@@ -7,8 +7,9 @@ Evidence matrix: see configs/ablation.yaml
   from_scratch               TOO-BERT PMC12177421
   no_pretrain_baseline       negative control
 
-Run one arm:
-    torchrun --nproc_per_node=2 -m src.train.run_arm \
+Run one arm (always `uv run torchrun`: a bare `torchrun` is whichever one is first on
+PATH, with whatever torch it brings):
+    uv run torchrun --nproc_per_node=2 -m src.train.run_arm \
         --arm frozen_backbone_head_only \
         --checkpoint /path/to/clifatron_checkpoint \
         --data /path/to/tokenized_narratives
@@ -198,11 +199,14 @@ def main():
         is_main=is_main,
     )
 
-    if mcfg.get("compile"):
-        model = torch.compile(model, dynamic=True)
-
+    # DDP first, then compile (PyTorch DDP notes: wrapping before torch.compile lets
+    # TorchDynamo's DDPOptimizer split the graph at the DDP bucket boundaries, so
+    # gradient all-reduce overlaps the backward). compile is off by default.
     if is_distributed():
         model = wrap_ddp(model, dev, local)
+
+    if mcfg.get("compile"):
+        model = torch.compile(model, dynamic=True)
 
     # --------------- optimizer: the trunk (CLIFEncoder incl. its next-event projection, or
     # the CLIFATRON backbone) at the trunk LR; heads at the head LR, one group each so a

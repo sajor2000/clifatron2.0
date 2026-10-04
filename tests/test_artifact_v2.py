@@ -166,7 +166,11 @@ class ArtifactV2Test(unittest.TestCase):
         binding = artifact_binding(self.blob)
         self.assertEqual(binding["tokenizer_version"], "2")
         for hashes in self.events["artifact_hashes"].to_list():
-            self.assertEqual(hashes, binding)
+            # The vocabulary binding, plus the site binding (tokenize.site_binding): the
+            # site and the SHA-256 of its declarations.
+            self.assertEqual({k: hashes[k] for k in binding}, binding)
+            self.assertEqual(set(hashes) - set(binding), {"site", "site_declarations"})
+            self.assertEqual(len(hashes["site_declarations"]), 64)
 
     def _dataset(self, records, expected):
         from src.data.dataset import ModelDataset

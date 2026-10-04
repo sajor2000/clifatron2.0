@@ -126,6 +126,15 @@ from clif_validate._vendor.data.segments import (
     validate_partition,
     with_zero_point,
 )
+from clif_validate._vendor.data.site_config import (
+    SiteConfigError,
+    censor_open_stays,
+    profile_record,
+    site_profile,
+    strip_notes,
+    to_utc,
+    with_site_local,
+)
 from clif_validate._vendor.data.splits import fit_partition
 from clif_validate._vendor.data.tokenization_report import (
     DEFAULT_CONTEXT,
@@ -327,13 +336,15 @@ def _check_unit_repair_binding(units: dict, cfg: dict, source_site: str | None) 
     """The frozen segments of a unit-less column are in its canonical unit, as repaired
     by the reference site's declared conversions. A config declaring other canonical
     units, or other conversions for the reference site, does not bind the vocabulary."""
-    declared = column_units(cfg)
-    if (units.get("column_units") or {}) != declared:
+    declared = _hashed_column_units(cfg)
+    recorded_units = {k: {f: v for f, v in (spec or {}).items() if f != "flag"}
+                      for k, spec in (units.get("column_units") or {}).items()}
+    if recorded_units != declared:
         raise QualificationError(
             "vocabulary was built under different canonical column units (column_units) "
             f"than this config declares; {RETOKENIZE}")
-    recorded = units.get("site_conversions") or {}
-    expected = site_unit_conversions(cfg, source_site) if source_site else {}
+    recorded = strip_notes(units.get("site_conversions") or {})
+    expected = strip_notes(site_unit_conversions(cfg, source_site)) if source_site else {}
     if (declared or recorded) and recorded != expected:
         raise QualificationError(
             f"vocabulary was built with different unit conversions for its reference site "
@@ -616,8 +627,8 @@ def _melt_sql(fp: Path, spec: dict, keep_ids: list | None, cols: list, *,
     """, params
 
 
-def _patient_keyed_sql(base: Path, fp: Path, spec: dict,
-                       keep_ids: list | None) -> tuple[str, list] | None:
+def _patient_keyed_sql(base: Path, fp: Path, spec: dict, keep_ids: list | None, *,
+                       window: str | None = None) -> tuple[str, list] | None:
     """R21: a patient-keyed state table (code status) joined to stays.
 
     For each hospitalization, the latest state with `start <= admission` is emitted AT
@@ -636,6 +647,10 @@ def _patient_keyed_sql(base: Path, fp: Path, spec: dict,
     cat = spec["categorical_value_col"]
     concept = _literal(spec.get("concept"), "concept")
     id_sql, params = _id_filter(keep_ids)
+    if window is not None:
+        # Only the windowed stays (window pushdown, `_register_window`).
+        id_sql += (f" AND CAST(hospitalization_id AS VARCHAR) IN "
+                   f"(SELECT hosp_id FROM {window})")
     return f"""
         WITH s AS (
             SELECT CAST({pid} AS VARCHAR) AS pid, {time_col} AS t,
@@ -715,6 +730,19 @@ def _read_dose_table(con, base: Path, fp: Path, spec: dict, keep_ids: list | Non
         dose_sql = (f"CASE WHEN lower(CAST({action} AS VARCHAR)) IN ({placeholders}) "
                     f"THEN 0.0 ELSE {dose_sql} END")
         params += stops
+    # Administrations whose action is not a dose (`exclude_actions`, e.g. intermittent
+    # not_given / other): flagged here (after the site's category map), counted and
+    # removed below, before any conversion.
+    excluded = [str(a).strip().lower() for a in dose.get("exclude_actions") or ()]
+    excl_sql, excl_params = "FALSE", []
+    if excluded:
+        if not action:
+            raise QualificationError(
+                f"{name_of(spec)}.dose.exclude_actions needs dose.action_col")
+        mapped_action = mapped_sql(action, (spec.get("_category_rules") or {}).get(action))
+        excl_sql = (f"coalesce(lower(trim({mapped_action})) IN "
+                    f"({', '.join('?' for _ in excluded)}), FALSE)")
+        excl_params = excluded
     id_sql, id_params = _id_filter(keep_ids)
     lag = int(spec.get("availability_lag_minutes", 0))
     med_sql = mapped_sql(concept_col, (spec.get("_category_rules") or {}).get(concept_col))
@@ -740,12 +768,13 @@ def _read_dose_table(con, base: Path, fp: Path, spec: dict, keep_ids: list | Non
                {med_sql} AS med, {dose_sql} AS dose,
                coalesce(CAST({unit} AS VARCHAR), '') AS unit_raw,
                {time_col} + INTERVAL {lag} MINUTE AS avail,
-               {dup_sql} AS _dup
+               {dup_sql} AS _dup, {excl_sql} AS _excl
         FROM {source} s {dup_join}
         WHERE {concept_col} IS NOT NULL AND {time_col} IS NOT NULL {id_sql}
     """
-    # Bound in textual order: the stop actions (SELECT), the duplicate join, the ids.
-    params = [*params, *dup_params, *id_params]
+    # Bound in textual order: the stop actions and excluded actions (SELECT), the
+    # duplicate join, the ids.
+    params = [*params, *excl_params, *dup_params, *id_params]
     # Continuous doses convert per-kg rates; an intermittent table declaring a weight
     # source converts per-kg single doses (e.g. ketamine mg/kg) to absolute mass.
     weight = dose.get("weight_source")
@@ -787,16 +816,17 @@ def _read_dose_table(con, base: Path, fp: Path, spec: dict, keep_ids: list | Non
                       {w_range} {w_id_sql}
                 ) GROUP BY hosp_id, avail
             )
-            SELECT d.hosp_id, d.dttm, d.med, d.dose, d.unit_raw, d._dup, w.weight_kg
+            SELECT d.hosp_id, d.dttm, d.med, d.dose, d.unit_raw, d._dup, d._excl, w.weight_kg
             FROM d ASOF LEFT JOIN w ON d.hosp_id = w.hosp_id AND d.avail >= w.avail
         """
         params += [weight["concept"], *w_params]
     else:
-        sql = f"""SELECT hosp_id, dttm, med, dose, unit_raw, _dup,
+        sql = f"""SELECT hosp_id, dttm, med, dose, unit_raw, _dup, _excl,
                          CAST(NULL AS DOUBLE) AS weight_kg FROM ({doses})"""
     frame = con.execute(sql, params).pl()
     n_duplicates = int(frame["_dup"].sum()) if len(frame) else 0
-    frame = frame.filter(~pl.col("_dup")).drop("_dup")
+    n_excluded = int((frame["_excl"] & ~frame["_dup"]).sum()) if len(frame) else 0
+    frame = frame.filter(~pl.col("_dup") & ~pl.col("_excl")).drop("_dup", "_excl")
     frame, n_corrected = _apply_dose_corrections(frame, corrections or {})
 
     target_units = target_units or {}
@@ -846,6 +876,8 @@ def _read_dose_table(con, base: Path, fp: Path, spec: dict, keep_ids: list | Non
         counts.update(corrected=n_corrected, quarantined=0)
     if rule:
         counts["exact_duplicates_removed"] = n_duplicates
+    if excluded:
+        counts["excluded_action"] = n_excluded
     counts.update(weight_counts)
     for status, n in joined.group_by("status").len().iter_rows():
         counts[status] = int(n)
@@ -948,6 +980,7 @@ def _read_source(con, base: Path, spec: dict, keep_ids: list | None = None, *,
                  column_factors: dict[str, dict] | None = None,
                  dose_corrections: dict | None = None,
                  harmonization: dict | None = None, name: str | None = None,
+                 window: str | None = None,
                  ) -> tuple[pl.DataFrame, pl.DataFrame | None, dict | None]:
     """Read one configured table -> (events, fit-only shadows or None, dose status
     counts or None). See `_read_table`. Configured optional columns (`value_cols`,
@@ -957,12 +990,19 @@ def _read_source(con, base: Path, spec: dict, keep_ids: list | None = None, *,
     table (`column_factors`, `dose_corrections`). `harmonization`: the site's declarations
     (`clif_conformance.site_harmonization`) - column aliases, category maps, exact
     duplicates and the BP-method source column - for table `name`. A table declaring
-    `on_missing_column: error` refuses a configured column the site lacks."""
+    `on_missing_column: error` refuses a configured column the site lacks.
+
+    `window` (the name of a registered DuckDB relation ``hosp_id, lo, hi``;
+    `_register_window`) pushes the eligible stays and their window bounds into the scan,
+    so rows of other stays, and rows outside a stay's window, are never materialized
+    (`_windowed_source`)."""
     fp = base / f"{spec['file']}.parquet"
     if not fp.exists():
         print(f"  [skip] {fp.name} not found")
         return _empty_events(), None, None
     spec = _harmonized_spec(con, fp, spec, harmonization, name)
+    if window is not None and spec.get("key", "hospitalization") == "hospitalization":
+        spec["_from_sql"] = _windowed_source(con, _from(fp, spec), spec, window)
     if spec.get("dose"):
         return _read_dose_table(con, base, fp, spec, keep_ids, tables, target_units,
                                 fit_shadows, dose_corrections)
@@ -976,7 +1016,7 @@ def _read_source(con, base: Path, spec: dict, keep_ids: list | None = None, *,
     absent: list[str] = []
     configured_qualifier = spec.get("concept_qualifier_col")
     if key == "patient":
-        part = _patient_keyed_sql(base, fp, spec, keep_ids)
+        part = _patient_keyed_sql(base, fp, spec, keep_ids, window=window)
         if part is None:
             return _empty_events(), None, None
         parts.append(part)
@@ -1051,6 +1091,53 @@ def _harmonized_spec(con, fp: Path, spec: dict, harmonization: dict | None,
                 f"table {name!r}: the declared BP-method source column {source!r} is missing")
         spec["_bp_source_column"] = source
     return spec
+
+
+# Window pushdown (memory): the eligible stays and their window bounds are registered in
+# the DuckDB session; every hospitalization-keyed table is scanned through a JOIN on
+# them, so other stays' rows and rows outside a stay's window never reach polars. The
+# polars window join (`_windowed`) still applies the exact bounds afterwards: the SQL
+# bounds are a superset (a table's availability lag widens the lower bound; a naive
+# local-time column is compared with a 26 h pad, since it is converted to UTC only after
+# it is read). State tables (`carry_forward`, `emit: transitions`) keep every row before
+# the window: their state at the window start is read from them.
+WINDOW_RELATION = "_clif_window"
+_NAIVE_PAD_HOURS = 26
+
+
+def _register_window(con, stays: pl.DataFrame, start: str, end: str) -> str:
+    """Register ``hosp_id, lo, hi`` (UTC) for `stays` (one row per stay) and return the
+    relation name. A null `end` (open stay) leaves the stay unbounded above."""
+    frame = stays.select(pl.col("hospitalization_id").cast(pl.String).alias("hosp_id"),
+                         pl.col(start).alias("lo"), pl.col(end).alias("hi")).unique("hosp_id")
+    con.register(WINDOW_RELATION, frame.to_arrow())
+    return WINDOW_RELATION
+
+
+def _column_type(con, source: str, column: str) -> str | None:
+    for name, dtype, *_ in con.execute(f"DESCRIBE SELECT * FROM {source}").fetchall():
+        if name.lower() == column.lower():
+            return str(dtype).upper()
+    return None
+
+
+def _windowed_source(con, source: str, spec: dict, window: str) -> str:
+    """`source` restricted to the registered stays and window bounds (see above)."""
+    time_col = spec["availability_col"]
+    lag = int(spec.get("availability_lag_minutes", 0))
+    naive = (_column_type(con, source, time_col) or "").startswith("TIMESTAMP") and \
+        "TIME ZONE" not in (_column_type(con, source, time_col) or "")
+    pad = f" + INTERVAL {_NAIVE_PAD_HOURS} HOUR" if naive else ""
+    upper = f"(w.hi IS NULL OR s.{time_col} <= w.hi{pad})"
+    state = spec.get("carry_forward") or spec.get("emit") == "transitions"
+    lower = "" if state else (
+        f" AND s.{time_col} >= w.lo - INTERVAL {lag} MINUTE"
+        + (f" - INTERVAL {_NAIVE_PAD_HOURS} HOUR" if naive else ""))
+    # An equality join with the bounds in WHERE: DuckDB runs a SEMI JOIN carrying range
+    # predicates in ON as a slow range join (measured 275 s against 0.1 s for this form on
+    # 55M vitals rows). `hosp_id` is unique in the window relation, so no row is repeated.
+    return (f"(SELECT s.* FROM {source} s JOIN {window} w "
+            f"ON CAST(s.hospitalization_id AS VARCHAR) = w.hosp_id WHERE {upper}{lower})")
 
 
 def _read_table(con, base: Path, spec: dict,
@@ -1199,7 +1286,8 @@ def validate_units(events: pl.DataFrame, cfg: dict,
     mismatch descriptions for the tokenization report when it does not raise."""
     mismatches = unit_mismatches(events, cfg, reference_units)
     if mismatches and cfg.get("unit_normalization", {}).get("on_mismatch") == "error":
-        raise ValueError("Non-canonical CLIF units: " + "; ".join(mismatches))
+        raise ValueError("Non-canonical CLIF units: " + "; ".join(mismatches) + " "
+                         + NODE_ONLY)
     return mismatches
 
 
@@ -1245,6 +1333,18 @@ def units_equivalent(concept: str, a: str, b: str, cfg: dict) -> bool:
 # nothing is detected or converted silently. Declarations are per site: the reference
 # site's are recorded (and hashed) in the vocabulary's `reference_units`, and every other
 # site applies only its own.
+
+# Failure messages may echo a site's free text (a BP source name, a charted unit) and
+# aggregate counts or quantiles; counts under the minimum cell size are printed as "<10",
+# quantiles of a small cell are withheld, and every such message says where it may go.
+NODE_ONLY = ("[aggregate only; this message stays on the node: never paste it, or a "
+             "traceback, off the node]")
+
+
+def _cell(n: int, min_cell: int = 10) -> str:
+    """A count for a failure message: ``<min_cell`` when 0 < n < min_cell."""
+    return f"<{min_cell}" if 0 < int(n) < min_cell else f"{int(n):,}"
+
 
 DEFAULT_MAX_OUT_OF_RANGE_SHARE = 0.01
 DEFAULT_MAX_IMPLAUSIBLE_DOSE_SHARE = 0.02
@@ -1437,7 +1537,7 @@ def _scale_hint(con, source_sql: str, params: list, lo: float, hi: float,
 
 
 def check_column_units(con, base: Path, cfg: dict, site: str,
-                       keep_ids: list | None = None) -> dict:
+                       keep_ids: list | None = None, *, min_cell: int = 10) -> dict:
     """Validate every `column_units` column a site charts, AFTER its declared conversion
     (aggregate-only). A column with more than `unit_normalization.max_out_of_range_share`
     of its non-null values outside the plausible range is refused (under
@@ -1489,20 +1589,23 @@ def check_column_units(con, base: Path, cfg: dict, site: str,
             if entry["status"] == "refused":
                 suggestion = (f"likely scale {hint[0]} ({hint[1]:.1%} in range after it)"
                               if hint else "no simple scale factor fits")
+                quantiles = (f" (p1={entry['p01']}, p50={entry['p50']}, p99={entry['p99']})"
+                             if n >= min_cell else " (quantiles withheld: small cell)")
                 failures.append(
-                    f"site {site!r} column {key}: {share:.1%} of {n:,} values outside the "
-                    f"plausible range [{lo:g}, {hi:g}] {spec['unit']} (p1={entry['p01']}, "
-                    f"p50={entry['p50']}, p99={entry['p99']}); {suggestion}. Declare it "
+                    f"site {site!r} column {key}: {share:.1%} of {_cell(n, min_cell)} values "
+                    f"outside the plausible range [{lo:g}, {hi:g}] {spec['unit']}{quantiles}; "
+                    f"{suggestion}. Declare it "
                     f"explicitly: site_unit_conversions.{site}.{key}: {{from: <charted "
                     f"unit>, to: {spec['unit']}, factor: <factor>}}")
         record["columns"][key] = entry
     if failures and norm.get("on_mismatch", "error") == "error":
-        raise QualificationError("Implausible unit-less column values: " + "; ".join(failures))
+        raise QualificationError("Implausible unit-less column values: " + "; ".join(failures)
+                                 + " " + NODE_ONLY)
     return record
 
 
 def check_dose_plausibility(dose_events: dict[str, pl.DataFrame], cfg: dict,
-                            site: str) -> dict:
+                            site: str, *, min_cell: int = 10) -> dict:
     """Per declared dose concept (`dose_plausibility.ranges`, the unit after conversion),
     count running doses (value > 0; 0 is the stop bin) outside the plausible range.
     A share above `max_implausible_share` is refused (under ``on_mismatch: error``) with
@@ -1542,10 +1645,12 @@ def check_dose_plausibility(dose_events: dict[str, pl.DataFrame], cfg: dict,
                         for f, label in SCALE_HINTS))
             hint = (f"best scale {fits[1]} puts {fits[0]:.1%} in range" if fits[0] > 0
                     else "no simple scale factor fits")
+            quantiles = (f"(p1={np.quantile(arr, 0.01):.4g}, p50={np.quantile(arr, 0.5):.4g}, "
+                         f"p99={np.quantile(arr, 0.99):.4g})" if n >= min_cell
+                         else "(quantiles withheld: small cell)")
             failures.append(
-                f"site {site!r} dose {concept}: {share:.1%} of {n:,} running doses outside "
-                f"[{lo:g}, {hi:g}] {spec.get('unit')} (p1={np.quantile(arr, 0.01):.4g}, "
-                f"p50={np.quantile(arr, 0.5):.4g}, p99={np.quantile(arr, 0.99):.4g}); "
+                f"site {site!r} dose {concept}: {share:.1%} of {_cell(n, min_cell)} running "
+                f"doses outside [{lo:g}, {hi:g}] {spec.get('unit')} {quantiles}; "
                 f"{hint}. Declare a correction "
                 f"for the mislabeled charted unit: site_unit_conversions.{site}."
                 "<dose_table>.<med_category>[<charted unit>]: {from, to, factor} or "
@@ -1553,7 +1658,8 @@ def check_dose_plausibility(dose_events: dict[str, pl.DataFrame], cfg: dict,
         record[concept] = entry
     if failures and (cfg.get("unit_normalization") or {}).get("on_mismatch",
                                                               "error") == "error":
-        raise QualificationError("Implausible medication doses: " + "; ".join(failures))
+        raise QualificationError("Implausible medication doses: " + "; ".join(failures)
+                                 + " " + NODE_ONLY)
     return {"doses": record}
 
 
@@ -1625,10 +1731,18 @@ def reference_units(fit_events: pl.DataFrame, segments: dict, cfg: dict,
     if deviations:
         record["clif_unit_deviations"] = dict(sorted(deviations.items()))
     if declared:
-        record["column_units"] = declared
-        record["site_conversions"] = (site_unit_conversions(cfg, site)
+        # Hashed with the vocabulary: the rules only (free-text `flag` / `note` stripped,
+        # so editing a note never invalidates a vocabulary).
+        record["column_units"] = _hashed_column_units(cfg)
+        record["site_conversions"] = (strip_notes(site_unit_conversions(cfg, site))
                                       if site is not None else {})
     return record
+
+
+def _hashed_column_units(cfg: dict) -> dict:
+    """`column_units` without its free-text semantic `flag` (reported, not hashed)."""
+    return {key: {k: v for k, v in spec.items() if k != "flag"}
+            for key, spec in column_units(cfg).items()}
 
 
 def clif_unit_map(cfg: dict) -> dict[str, str]:
@@ -1688,18 +1802,23 @@ def _check_window_inputs(events: pl.DataFrame, episodes: pl.DataFrame,
 
 def _windowed(events: pl.DataFrame, episodes: pl.DataFrame,
               treatment_sources: set[str] | None, times: tuple[str, ...], end: str,
-              *extra: pl.Expr) -> pl.DataFrame:
+              *extra: pl.Expr, extra_stays: pl.DataFrame | None = None) -> pl.DataFrame:
     """Join the canonical episodes (their `times` columns) and keep each ELIGIBLE stay's
     events in the window ``[times[0], end]`` (inclusive); `pos_min` = minutes since
     ``times[0]``, then `target_eligible` and any `extra` columns. Ineligible episodes
     are dropped before the join (after the full artifact is validated) — the same rows
-    the post-join eligibility filter keeps."""
+    the post-join eligibility filter keeps. `extra_stays` (validated by their builder,
+    `extubation_index_stays`) are appended to the eligible episodes after validation."""
     _check_window_inputs(events, episodes, list(times))
     start = times[0]
+    stays = episodes.filter(pl.col("eligible")).select(
+        "hospitalization_id", *times, "eligible", "partition")
+    if extra_stays is not None and len(extra_stays):
+        stays = pl.concat([stays, extra_stays.select(stays.columns).cast(stays.schema)],
+                          how="vertical")
     return (
         events.join(
-            episodes.filter(pl.col("eligible"))
-            .select("hospitalization_id", *times, "eligible", "partition"),
+            stays,
             left_on="hosp_id", right_on="hospitalization_id", how="inner",
         )
         .filter(
@@ -1717,18 +1836,34 @@ def _windowed(events: pl.DataFrame, episodes: pl.DataFrame,
     )
 
 
+# Columns the window join adds that nothing after the window needs: the stay's own times
+# (pos_min / _le_anchor were derived from them) and the eligibility flag. Dropped before
+# the sort so each of the ~100M-row copies the sort and the report hold is ~70 bytes a row
+# lighter (memory, 2026-10-03 full-MIMIC review).
+_WINDOW_ONLY_COLUMNS = ("admission_dttm", "discharge_dttm", "anchor_dttm", "icu_admit_dttm",
+                        "eligible")
+
+
+def slim_windowed(events: pl.DataFrame) -> pl.DataFrame:
+    return events.drop([c for c in _WINDOW_ONLY_COLUMNS if c in events.columns])
+
+
 def restrict_to_hospitalization_window(
     events: pl.DataFrame,
     episodes: pl.DataFrame,
     treatment_sources: set[str] | None = None,
+    *,
+    extra_stays: pl.DataFrame | None = None,
 ) -> pl.DataFrame:
     """GEM (U8): join canonical episodes and retain each ELIGIBLE stay's events from
     hospital admission to discharge (inclusive) — pre-ICU (ED/ward), ICU and post-ICU.
     `pos_min` = minutes since hospital admission; `_le_anchor` marks events at or before
-    the ICU-admit+24 h anchor (for the record's `anchor_idx`)."""
+    the ICU-admit+24 h anchor (for the record's `anchor_idx`; false for an
+    `extra_stays` stay, which has no anchor)."""
     return _windowed(events, episodes, treatment_sources,
                      ("admission_dttm", "discharge_dttm", "anchor_dttm"), "discharge_dttm",
-                     (pl.col("dttm") <= pl.col("anchor_dttm")).alias("_le_anchor"))
+                     (pl.col("dttm") <= pl.col("anchor_dttm")).fill_null(False)
+                     .alias("_le_anchor"), extra_stays=extra_stays)
 
 
 def restrict_to_observation_window(
@@ -1852,7 +1987,7 @@ def apply_gcs_not_testable(events: pl.DataFrame, rule: dict) -> tuple[pl.DataFra
 
 
 def apply_bp_method(events: pl.DataFrame, glob: dict, decl: dict | None,
-                    site: str) -> tuple[pl.DataFrame, dict]:
+                    site: str, *, min_cell: int = 10) -> tuple[pl.DataFrame, dict]:
     """Emit one ``bp_method=<method>`` token per (stay, time, method) of the declared BP
     concepts, ordered immediately before that method's readings (`_okey` / `_osub` sort
     keys, `_event_sort`). The readings themselves are unchanged. The method comes from the
@@ -1874,7 +2009,8 @@ def apply_bp_method(events: pl.DataFrame, glob: dict, decl: dict | None,
     for name, n in names:
         method = bp_method_of(name, decl)
         if method is None:
-            unmapped.append(f"{'<null>' if name is None else name!r} ({n:,} rows)")
+            unmapped.append(f"{'<null>' if name is None else name!r} "
+                            f"({_cell(n, min_cell)} rows)")
         elif name is None:
             null_method = method
         else:
@@ -1883,7 +2019,8 @@ def apply_bp_method(events: pl.DataFrame, glob: dict, decl: dict | None,
         raise QualificationError(
             f"site {site!r}: BP source name(s) map to no measurement method: "
             f"{'; '.join(unmapped)}. Add a pattern (or map them to `unknown` explicitly) in "
-            f"site_harmonization.{site}.bp_method")
+            f"site_harmonization.{site}.bp_method (the site-local "
+            f"configs/sites/{site}.local.yaml for a site's own source names) {NODE_ONLY}")
     method = (pl.when(pl.col("_bp_src").is_null()).then(pl.lit(null_method, pl.String))
               .otherwise(pl.col("_bp_src").replace_strict(
                   mapping, default=None, return_dtype=pl.String)))
@@ -1940,6 +2077,59 @@ def harmonization_tokens(cfg: dict) -> list[str]:
     return [t for t in tokens if t]
 
 
+ALLOWLIST_FORMS = ("categorical", "bare")
+DEFAULT_MCIDE_SNAPSHOT = "configs/clif_mcide_2.1.1"
+
+
+def vocabulary_allowlist(cfg: dict) -> list[dict]:
+    """The validated `vocabulary_allowlist` block: ``[{permissible, concept, form}]``,
+    each naming a list of the mCIDE snapshot (`clif_conformance.permissible`)."""
+    raw = cfg.get("vocabulary_allowlist") or []
+    if not isinstance(raw, list):
+        raise QualificationError("vocabulary_allowlist must be a list of {permissible, concept}")
+    out = []
+    for i, entry in enumerate(raw):
+        where = f"vocabulary_allowlist[{i}]"
+        if not isinstance(entry, dict) or not isinstance(entry.get("permissible"), str):
+            raise QualificationError(f"{where} needs `permissible` (a snapshot list name)")
+        form = entry.get("form", "categorical")
+        if form not in ALLOWLIST_FORMS:
+            raise QualificationError(f"{where}.form must be one of {ALLOWLIST_FORMS}")
+        concept = entry.get("concept")
+        if form == "categorical" and (not isinstance(concept, str) or not concept):
+            raise QualificationError(f"{where}: a categorical entry needs `concept`")
+        out.append({"permissible": entry["permissible"], "form": form,
+                    **({"concept": concept} if form == "categorical" else {})})
+    return out
+
+
+def allowlist_tokens(cfg: dict) -> list[str]:
+    """Every permissible CLIF 2.1.1 value of the `vocabulary_allowlist` lists, in the
+    token form the tokenizer emits (`categorical_token` for a categorical concept, the
+    stripped value itself for a bare concept), in list then snapshot order. Decided
+    2026-10-03 (product authority): the vocabulary is fit on MIMIC train only, so these
+    keep another site's permissible values off `<unk>`."""
+    entries = vocabulary_allowlist(cfg)
+    if not entries:
+        return []
+    block = cfg.get("clif_conformance") or {}
+    from clif_validate._vendor.data.clif_conformance import load_snapshot
+    # The conformance gate's snapshot, else the repository's pinned CLIF 2.1.1 snapshot.
+    permissible = load_snapshot(block.get("snapshot") or DEFAULT_MCIDE_SNAPSHOT)["permissible"]
+    tokens: list[str] = []
+    for entry in entries:
+        values = permissible.get(entry["permissible"])
+        if values is None:
+            raise QualificationError(
+                f"vocabulary_allowlist: the snapshot has no list {entry['permissible']!r}")
+        for value in values:
+            token = (categorical_token(entry["concept"], value) if entry["form"] == "categorical"
+                     else str(value).strip() or None)
+            if token and token not in tokens:
+                tokens.append(token)
+    return tokens
+
+
 def apply_dose_floors(events: pl.DataFrame, cfg: dict) -> tuple[pl.DataFrame, dict]:
     """Remove running doses below their declared single-dose floor
     (`dose_plausibility.floors`, in the concept's converted unit): charting errors,
@@ -1982,7 +2172,8 @@ def derived_concept_specs(cfg: dict) -> dict[str, dict]:
 
 
 def derive_concepts(events: pl.DataFrame, table: str, cfg: dict, con, base: Path,
-                    keep_ids: list | None) -> tuple[pl.DataFrame, dict]:
+                    keep_ids: list | None, *, site_timezone: str | None = None,
+                    ) -> tuple[pl.DataFrame, dict]:
     """Append each derived concept of `table`: the sum of its `sum_of` concepts charted on
     the same row (same stay and time; every component required), divided by the latest
     plausible weight available at or before that time (`divide_by_weight`; the weight
@@ -2020,6 +2211,9 @@ def derive_concepts(events: pl.DataFrame, table: str, cfg: dict, con, base: Path
                 GROUP BY 1, 2""", [weight["concept"], *params]).pl() if fp.exists() else \
                 pl.DataFrame(schema={"hosp_id": pl.String, "_avail": pl.Datetime("us", "UTC"),
                                      "_w": pl.Float64})
+            # The weights' clock, like every event's, is UTC after ingest (site_config).
+            weights, _ = to_utc(weights, ["_avail"], site_timezone)
+            weights = weights.filter(pl.col("_avail").is_not_null())
             derived = (derived.with_columns(
                 (pl.col("dttm") + pl.duration(minutes=lag)).alias("_avail"))
                 .sort("hosp_id", "_avail")
@@ -2946,7 +3140,9 @@ def _gem_records(shards: pl.DataFrame, stays: pl.DataFrame, vocab: dict, gem_cfg
             pl.col(k).fill_null(pl.lit([], dtype=GEM_SCHEMA[k])),
             pl.Series(f"_tail_{k}", tails[k], dtype=GEM_SCHEMA[k]),
         ]).alias(k) for k in _GEM_STREAM_FIELDS),
-        (1 + pl.col("_n_le_anchor").fill_null(0)).alias("anchor_idx"),
+        # A stay with no ICU+24 h anchor (an added extubation index stay) has none.
+        pl.when(pl.col("anchor_min").is_not_null())
+        .then(1 + pl.col("_n_le_anchor").fill_null(0)).alias("anchor_idx"),
     )
     stay_rows, starts, ends, index, n_windows = [], [], [], [], []
     header_ids = None
@@ -3203,13 +3399,31 @@ _ENCODE_COLUMNS = ("hosp_id", "concept", "value", "cat_value", "pos_min",
 ENCODE_CHUNK_EVENTS = 2_000_000
 
 
+# `--workers 0` (every usable CPU) is capped: each worker holds a chunk's Python objects
+# (~1 GB at the default chunk budget), and past ~8 the encode is bound by the parent's
+# concatenation, not by the workers.
+MAX_AUTO_WORKERS = 8
+
+
+def usable_cpus() -> int:
+    """CPUs this process may run on: the scheduler affinity mask where the platform has
+    one (Linux: a cgroup / taskset limit), else `os.cpu_count()`."""
+    if hasattr(os, "sched_getaffinity"):
+        try:
+            return max(1, len(os.sched_getaffinity(0)))
+        except OSError:
+            pass
+    return os.cpu_count() or 1
+
+
 def resolve_workers(workers: int | None) -> int:
-    """`workers` 0 -> every CPU (`os.cpu_count()`); a positive count is used as is."""
+    """`workers` 0 -> every usable CPU (`usable_cpus`), capped at `MAX_AUTO_WORKERS`; a
+    positive count is used as is."""
     if workers is None:
         return 1
     if isinstance(workers, bool) or not isinstance(workers, int) or workers < 0:
         raise ValueError(f"workers must be a non-negative integer, got {workers!r}")
-    return workers if workers > 0 else (os.cpu_count() or 1)
+    return workers if workers > 0 else min(usable_cpus(), MAX_AUTO_WORKERS)
 
 
 def resolve_chunk_events(chunk_events: int | None) -> int:
@@ -3277,11 +3491,214 @@ def _parallel_encode(events: pl.DataFrame, vocab: dict, edges: dict, bin_cfg: di
         collect(_encode_events(*job) for job in jobs)
     else:
         context = multiprocessing.get_context("spawn")   # never fork a polars/duckdb process
-        with ProcessPoolExecutor(max_workers=min(workers, len(bounds)),
-                                 mp_context=context) as pool:
-            collect(pool.map(_encode_chunk, jobs))
+        # Each spawned worker is single-threaded in polars: N workers x a full polars
+        # thread pool each would oversubscribe the node. The children read the variable
+        # at import; the parent's own pool (already started) is unaffected.
+        previous = os.environ.get("POLARS_MAX_THREADS")
+        os.environ["POLARS_MAX_THREADS"] = "1"
+        try:
+            with ProcessPoolExecutor(max_workers=min(workers, len(bounds)),
+                                     mp_context=context) as pool:
+                collect(pool.map(_encode_chunk, jobs))
+        finally:
+            if previous is None:
+                os.environ.pop("POLARS_MAX_THREADS", None)
+            else:
+                os.environ["POLARS_MAX_THREADS"] = previous
     shards = pl.concat(parts, how="vertical").rechunk()
     return shards, dict(sorted(unk.items()))
+
+
+# ---- memory gate, site binding, extubation index stays, CRRT coverage --------------------
+
+# A full-site tokenization holds the windowed events, their sort and the encoded shard at
+# once: measured at 33-36 GB peak on full MIMIC before the window pushdown (2026-10-03
+# review). Below this much free RAM the run is likely to swap or be killed: warn first.
+MEMORY_WARN_FREE_BYTES = 48 * 2**30
+
+
+def available_memory_bytes() -> int | None:
+    """Free RAM the kernel can hand out without swapping: Linux ``MemAvailable``
+    (/proc/meminfo); macOS free + inactive + speculative pages (vm_stat); else None."""
+    meminfo = Path("/proc/meminfo")
+    if meminfo.exists():
+        fields = {}
+        for line in meminfo.read_text().splitlines():
+            key, _, rest = line.partition(":")
+            parts = rest.split()
+            if parts and parts[0].isdigit():
+                fields[key] = int(parts[0]) * 1024
+        return fields.get("MemAvailable", fields.get("MemFree"))
+    import subprocess
+    import sys
+
+    if sys.platform == "darwin":
+        try:
+            out = subprocess.run(["vm_stat"], capture_output=True, text=True,
+                                 check=False).stdout
+            page = int(re.search(r"page size of (\d+)", out).group(1))
+            pages = {k.strip(): int(v.strip().rstrip(".")) for k, v in
+                     (line.split(":", 1) for line in out.splitlines()[1:] if ":" in line)}
+            return page * sum(pages.get(k, 0) for k in
+                              ("Pages free", "Pages inactive", "Pages speculative"))
+        except (OSError, AttributeError, ValueError):
+            return None
+    try:
+        return os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_AVPHYS_PAGES")
+    except (OSError, ValueError, AttributeError):
+        return None
+
+
+def memory_gate(minimum: int = MEMORY_WARN_FREE_BYTES) -> int | None:
+    """Warn (never fail) when less than `minimum` bytes of RAM are free before a run."""
+    free = available_memory_bytes()
+    if free is not None and free < minimum:
+        print(f"  [warn] only {free / 2**30:.1f} GiB of RAM free (< {minimum / 2**30:.0f} GiB): "
+              "a full-site tokenization may swap or be killed; close other jobs first "
+              "(docs/plans/l40-runbook.md, before step 8)", flush=True)
+    return free
+
+
+def site_record(cfg: dict, site: str) -> dict:
+    """What a site's shards are bound to beyond the vocabulary: the site's own
+    harmonization declarations, unit conversions and profile (after the site-local merge,
+    free-text notes stripped)."""
+    decl = site_harmonization(cfg, site)
+    return {"site": site,
+            "harmonization": strip_notes({k: v for k, v in decl.items() if k != "declared"}),
+            "unit_conversions": strip_notes(site_unit_conversions(cfg, site)),
+            "profile": profile_record(cfg, site)}
+
+
+def site_binding(cfg: dict, site: str) -> dict[str, str]:
+    """The site fields every shard row's ``artifact_hashes`` carries next to the
+    vocabulary binding: the site name and the SHA-256 of `site_record`, so a shard is
+    reproducibly bound to the declarations (local ones included) it was built with."""
+    return {"site": str(site), "site_declarations": json_sha256(site_record(cfg, site))}
+
+
+def shard_binding(vocab_artifact: dict, cfg: dict, site: str) -> dict[str, str]:
+    return {**artifact_binding(vocab_artifact), **site_binding(cfg, site)}
+
+
+_GEM_STAY_COLUMNS = ("hospitalization_id", "admission_dttm", "discharge_dttm", "icu_admit_dttm",
+                     "anchor_dttm", "discharge_category", "admission_type_category",
+                     "partition", "eligible")
+
+
+def extubation_index_stays(cohort: pl.DataFrame, episodes: pl.DataFrame, con, base: Path,
+                           cfg: dict, site: str) -> tuple[pl.DataFrame, dict]:
+    """Item 13 (product authority, 2026-10-03): the INDEX hospitalization of every
+    eligible extubation that is not an eligible episode of the artifact (the extubation
+    fell in another, or an ineligible, hospitalization of the patient), as GEM stays:
+    ``(stays, counts)``. Each stay takes the extubation cohort's partition (inherited from
+    the patient's episode-artifact partition, else the split rule); it has no ICU+24 h
+    anchor (`anchor_dttm` null). Aggregate counts only: `added`, `not_found` (not in the
+    hospitalization table, or no admission time)."""
+    from clif_validate._vendor.data.site_config import episode_site, require_site_match
+
+    need = {"hospitalization_id", "eligible", "partition"}
+    missing = sorted(need - set(cohort.columns))
+    if missing:
+        raise QualificationError(f"extubation cohort is missing {', '.join(missing)}")
+    recorded = cohort["site"].drop_nulls().unique().to_list() if "site" in cohort.columns else []
+    require_site_match(recorded[0] if len(recorded) == 1 else None, site, "extubation cohort")
+    require_site_match(episode_site(episodes), site, "episode artifact")
+    cohort_eps = (cohort["episode_sha256"].drop_nulls().unique().to_list()
+                  if "episode_sha256" in cohort.columns else [])
+    artifact_eps = episodes["episode_sha256"].unique().to_list()
+    if cohort_eps and cohort_eps != artifact_eps:
+        raise QualificationError("the extubation cohort was built from another episode "
+                                 "artifact (episode_sha256 differs): rebuild it first")
+    eligible_ids = set(episodes.filter(pl.col("eligible"))["hospitalization_id"].to_list())
+    index = (cohort.filter(pl.col("eligible").fill_null(False))
+             .select(pl.col("hospitalization_id").cast(pl.String), "partition")
+             .filter(~pl.col("hospitalization_id").is_in(sorted(eligible_ids)))
+             .unique("hospitalization_id"))
+    schema = {"hospitalization_id": pl.String, "admission_dttm": pl.Datetime("us", "UTC"),
+              "discharge_dttm": pl.Datetime("us", "UTC"),
+              "icu_admit_dttm": pl.Datetime("us", "UTC"),
+              "anchor_dttm": pl.Datetime("us", "UTC"), "discharge_category": pl.String,
+              "admission_type_category": pl.String, "partition": pl.String,
+              "eligible": pl.Boolean}
+    if index.is_empty():
+        return pl.DataFrame(schema=schema), {"added": 0, "not_found": 0}
+    source = cfg.get("static_source") or {}
+    hosp_fp = base / f"{source.get('hospitalization_file', 'clif_hospitalization')}.parquet"
+    if not hosp_fp.exists():
+        raise QualificationError(f"{hosp_fp.name} is required to add extubation index stays")
+    present = {c.lower() for c in _parquet_columns(con, hosp_fp)}
+    admission_type = ("CAST(admission_type_category AS VARCHAR)"
+                      if "admission_type_category" in present else "CAST(NULL AS VARCHAR)")
+    con.register("_clif_index_ids", index.select("hospitalization_id").to_arrow())
+    rows = con.execute(f"""
+        SELECT CAST(hospitalization_id AS VARCHAR) AS hospitalization_id, admission_dttm,
+               discharge_dttm, CAST(discharge_category AS VARCHAR) AS discharge_category,
+               {admission_type} AS admission_type_category
+        FROM read_parquet('{hosp_fp}')
+        WHERE CAST(hospitalization_id AS VARCHAR) IN (SELECT hospitalization_id FROM _clif_index_ids)
+    """).pl()
+    con.unregister("_clif_index_ids")
+    profile = site_profile(cfg, site)
+    rows, _ = to_utc(rows, ["admission_dttm", "discharge_dttm"], profile["site_timezone"])
+    rows, _ = censor_open_stays(rows, profile["extraction_dttm"])
+    rows = rows.filter(pl.col("admission_dttm").is_not_null()
+                       & pl.col("discharge_dttm").is_not_null())
+    stays = (index.join(rows, on="hospitalization_id", how="inner")
+             .with_columns(pl.lit(None, pl.Datetime("us", "UTC")).alias("icu_admit_dttm"),
+                           pl.lit(None, pl.Datetime("us", "UTC")).alias("anchor_dttm"),
+                           pl.lit(True).alias("eligible"))
+             .select(list(schema)).cast(schema).sort("hospitalization_id"))
+    return stays, {"added": stays.height, "not_found": index.height - stays.height}
+
+
+def setting_coverage(con, source: str, columns: list[str], present: set[str]) -> dict:
+    """Rows of a wide table and, per configured column, the rows where it is charted
+    (aggregate counts; the report suppresses small cells and withholds their shares)."""
+    cols = [c for c in columns if c.lower() in present]
+    if not cols:
+        return {"rows": 0, "with": {}}
+    counts = con.execute(
+        "SELECT count(*), " + ", ".join(f"count({c})" for c in cols) + f" FROM {source}"
+    ).fetchone()
+    return {"rows": int(counts[0]),
+            "with": {c: int(n) for c, n in zip(cols, counts[1:])},
+            "absent_columns": sorted(c for c in columns if c.lower() not in present)}
+
+
+def crrt_coverage(con, base: Path, cfg: dict, harmonization: dict, name: str,
+                  window: str | None) -> dict | None:
+    """Item 6 (Rush onboarding): per site, the share of CRRT rows (of the windowed stays)
+    with each setting present. A site charting mostly whether a patient was on dialysis
+    has low shares, and the derived effluent dose (all four rates on one row) is then
+    mostly a MIMIC concept. None when the table is absent."""
+    spec = cfg["tables"].get(name)
+    if not spec:
+        return None
+    fp = base / f"{spec['file']}.parquet"
+    if not fp.exists():
+        return None
+    spec = _harmonized_spec(con, fp, spec, harmonization, name)
+    source = _from(fp, spec)
+    if window is not None:
+        source = _windowed_source(con, source, spec, window)
+    present = {c.lower() for c in _parquet_columns(con, fp, spec.get("_from_sql"))}
+    columns = [*(spec.get("value_cols") or ()), *(spec.get("categorical_value_cols") or ())]
+    return setting_coverage(con, source, columns, present)
+
+
+def _write_shard(frame: pl.DataFrame, path: Path) -> None:
+    """Write a shard grouped by partition (stable: the stay order within a partition is
+    unchanged) in row groups of `SHARD_ROW_GROUP_ROWS` rows, so a partition filter
+    (`pl.scan_parquet(...).filter(partition == ...)`, the GemCorpus cache build, the
+    value-stats fit) skips the other partitions' row groups by their statistics."""
+    if len(frame) and "partition" in frame.columns:
+        frame = frame.sort("partition", maintain_order=True, nulls_last=True)
+    frame.write_parquet(path, row_group_size=SHARD_ROW_GROUP_ROWS, statistics=True)
+
+
+# Rows (stays or GEM windows) per parquet row group of a written shard.
+SHARD_ROW_GROUP_ROWS = 4096
 
 
 def tokenize_site(cfg: dict, site: str, base: Path, out: Path,
@@ -3296,13 +3713,15 @@ def tokenize_site(cfg: dict, site: str, base: Path, out: Path,
                   report: bool = True,
                   workers: int = 1,
                   encode_chunk_events: int | None = None,
-                  continuation_header: bool | None = None):
+                  continuation_header: bool | None = None,
+                  extubation_cohort: pl.DataFrame | None = None):
     """Tokenize one site.
 
     `vocab_artifact` None builds the frozen tokenizer-v2 vocabulary (reference site);
     otherwise it is a whole `vocab.json` blob, validated (`validate_vocabulary_artifact`)
     and applied unchanged. Every stay row of `events.parquet` carries the artifact
-    binding (`artifact_hashes`: tokenizer version, vocabulary and segments hashes).
+    binding (`artifact_hashes`: tokenizer version, vocabulary and segments hashes, and
+    the site's binding `site_binding`: its name and the hash of its declarations).
     `stats`, if given, is filled with aggregate-only run counts (`dose_conversion`:
     {dose table: {status: rows}}) for the tokenization report. Returns
     ``(vocab, segments)``.
@@ -3312,24 +3731,32 @@ def tokenize_site(cfg: dict, site: str, base: Path, out: Path,
     vocabulary, which must be imported (`vocab_artifact`; the reference site passes the
     vocab.json its icu_24h build just wrote) and must carry the `gem` allowlist. One row
     per window of at most `max_tokens` (default `gem.max_tokens`) tokens.
+    `extubation_cohort` (hospitalization only; item 13): the site's extubation cohort;
+    the index stay of every eligible extubation that is not an eligible episode is added
+    to the GEM stays (`extubation_index_stays`).
 
     One reference build, one vocabulary: when the config has a `gem` block, the build
     keeps the 24 h fit unchanged (same segments and ids for every concept in the 24 h
     train window) and appends (a) tokens for concepts / categorical values seen ONLY in
     the full-hospitalization train events (ED and ward ADT locations, ward-only labs) —
     their bins fit on those train events — and then (b) the fixed ADMISSION// and
-    DISCHARGE// allowlist.
+    DISCHARGE// allowlist. The CLIF 2.1.1 mCIDE allowlist (`allowlist_tokens`) follows
+    the data-derived 24 h tokens.
+
+    Site profile (`site_config`): the site's git-ignored local declarations are merged
+    first; naive or non-UTC timestamps are converted to UTC at ingest; a configured table
+    the site lacks fails the build unless declared in `expected_absent_tables`.
 
     `sample_episodes` (U7, KTD9) restricts the run to `sample_episode_ids(episodes, N)`:
     N eligible ICU episodes drawn deterministically from the episode artifact. A vocabulary
     built from a sample (or from `limit_stays`) records ``provenance.sample: true`` and
     ``sample_size``; training refuses it (`pretrain.build_loaders`, non-dry-run).
 
-    `workers` (default 1; 0 = every CPU) encodes stays in a spawn-context process pool
-    over stay-contiguous chunks of at most `encode_chunk_events` events (default
-    `ENCODE_CHUNK_EVENTS`; `_parallel_encode`), which bounds encode memory; artifacts
-    are byte-identical for any worker count and budget. Both are validated before any
-    table is read.
+    `workers` (default 1; 0 = every usable CPU, at most `MAX_AUTO_WORKERS`) encodes stays
+    in a spawn-context process pool over stay-contiguous chunks of at most
+    `encode_chunk_events` events (default `ENCODE_CHUNK_EVENTS`; `_parallel_encode`),
+    which bounds encode memory; artifacts are byte-identical for any worker count and
+    budget. Both are validated before any table is read.
 
     `report` (default on) writes the aggregate-only tokenization report beside the
     events (`tokenization_report.json`, or `gem_tokenization_report.json` for GEM; see
@@ -3338,6 +3765,11 @@ def tokenize_site(cfg: dict, site: str, base: Path, out: Path,
         raise ValueError(f"trajectory must be one of {TRAJECTORIES}, got {trajectory!r}")
     workers = resolve_workers(workers)
     encode_chunk_events = resolve_chunk_events(encode_chunk_events)
+    try:
+        cfg = with_site_local(cfg, site)
+        profile = site_profile(cfg, site)
+    except SiteConfigError as exc:
+        raise QualificationError(str(exc)) from exc
     gem_mode = trajectory == "hospitalization"
     gem_cfg = cfg.get("gem")
     if gem_mode:
@@ -3352,6 +3784,9 @@ def tokenize_site(cfg: dict, site: str, base: Path, out: Path,
             raise ValueError(f"max_tokens must be >= 2, got {max_tokens}")
     elif gem_cfg is not None:
         validate_gem_config(gem_cfg)
+    if extubation_cohort is not None and not gem_mode:
+        raise QualificationError("extubation index stays are added to the hospitalization "
+                                 "(GEM) trajectory only")
     policy = artifact_policy or yaml.safe_load((ROOT / cfg["artifact_policy"]).read_text())
     # Disclosure floor (aggregate_no_phi.minimum_cell_size): the report's small-cell
     # threshold and the vocabulary's categorical-value floor. Fails closed if undeclared.
@@ -3369,6 +3804,15 @@ def tokenize_site(cfg: dict, site: str, base: Path, out: Path,
                     f"{absent[0]!r}); rebuild it with the configured `gem` block"
                 )
     availability = validate_table_availability(cfg.get("tables"))
+    if episodes is None:
+        raise QualificationError("a canonical episode/split artifact is required")
+    validate_episode_artifact(episodes)
+    from clif_validate._vendor.data.site_config import episode_site, require_site_match
+    try:
+        require_site_match(episode_site(episodes), site, "episode artifact")
+    except SiteConfigError as exc:
+        raise QualificationError(str(exc)) from exc
+    memory_gate()
     con = duckdb.connect()
     # DuckDB renders TIMESTAMPTZ columns in the SESSION timezone, so on a non-UTC
     # host every tz-aware parquet came back as e.g. America/Chicago and
@@ -3379,9 +3823,6 @@ def tokenize_site(cfg: dict, site: str, base: Path, out: Path,
     if sample_episodes is not None and limit_stays is not None:
         raise ValueError("pass either sample_episodes or limit_stays, not both")
     if sample_episodes is not None:
-        if episodes is None:
-            raise QualificationError("sample_episodes draws from the canonical episode "
-                                     "artifact; pass episodes")
         keep_ids = sample_episode_ids(episodes, sample_episodes)
         print(f"  verification sample: {len(keep_ids):,} eligible episodes "
               "(smoke-only vocabulary)")
@@ -3401,11 +3842,33 @@ def tokenize_site(cfg: dict, site: str, base: Path, out: Path,
         ]
         print(f"  limiting to {len(keep_ids):,} stays (sample mode)")
     building = vocab is None
+    # The stays a run windows: the eligible episodes and, for GEM, the extubation index
+    # stays (item 13). The 24 h import windows [ICU admit, anchor]; GEM and the reference
+    # build (whose GEM extension fits the full hospitalization) window [admission,
+    # discharge].
+    extra_stays, extra_counts = None, None
+    if extubation_cohort is not None:
+        extra_stays, extra_counts = extubation_index_stays(
+            extubation_cohort, episodes, con, base, cfg, site)
+        if keep_ids is not None:
+            extra_stays = extra_stays.filter(pl.col("hospitalization_id").is_in(keep_ids))
+        print(f"  extubation index stays added to the GEM stays: {extra_counts['added']:,} "
+              f"(not found: {extra_counts['not_found']:,})")
+    eligible_episodes = episodes.filter(pl.col("eligible"))
+    stays = eligible_episodes
+    if gem_mode:
+        stays = pl.concat(
+            [eligible_episodes.select([c for c in _GEM_STAY_COLUMNS
+                                       if c in eligible_episodes.columns]),
+             *([extra_stays] if extra_stays is not None else [])], how="diagonal_relaxed")
+    if keep_ids is not None:
+        stays = stays.filter(pl.col("hospitalization_id").is_in(keep_ids))
+    full_window = gem_mode or (building and gem_cfg is not None)
+    window = _register_window(con, stays, *(("admission_dttm", "discharge_dttm")
+                                            if full_window else
+                                            ("icu_admit_dttm", "anchor_dttm")))
     target_units = _dose_target_units(cfg, None if building else vocab_artifact)
     frames, shadow_frames, dose_stats = [], [], {}
-    # Explicit unit repair (per site, fail closed): unit-less wide-table columns are
-    # validated AFTER this site's declared conversions, before anything is read for
-    # binning; dose plausibility is checked after conversion, below.
     # CLIF 2.1 / mCIDE conformance gate (per site, after the site's alias maps), before a
     # vocabulary is built or imported: fails closed on an undeclared non-permissible value
     # or a missing required column. Aggregate record -> the report's data-quality section.
@@ -3415,7 +3878,10 @@ def tokenize_site(cfg: dict, site: str, base: Path, out: Path,
     gcs = gcs_rule(cfg)
     if bp_glob is not None:
         harmonization["_bp_table"] = bp_glob["table"]
-    data_quality = check_column_units(con, base, cfg, site, keep_ids)
+    # Explicit unit repair (per site, fail closed): unit-less wide-table columns are
+    # validated AFTER this site's declared conversions, before anything is read for
+    # binning; dose plausibility is checked after conversion, below.
+    data_quality = check_column_units(con, base, cfg, site, keep_ids, min_cell=min_cell)
     if conformance:
         data_quality["conformance"] = {
             "mcide_version": conformance["mcide_version"],
@@ -3427,15 +3893,41 @@ def tokenize_site(cfg: dict, site: str, base: Path, out: Path,
     dose_frames: dict[str, pl.DataFrame] = {}
     # Configured columns a site's parquet lacks, per table (report: `missing_columns`).
     missing_columns: dict[str, list[str]] = {}
+    expected_absent: list[str] = []
+    dst_nulled: dict[str, int] = {}
     for name, spec in cfg["tables"].items():
+        if not (base / f"{spec['file']}.parquet").exists():
+            if name in profile["expected_absent_tables"]:
+                # Declared (sites.<site>.expected_absent_tables): skipped quietly, reported.
+                expected_absent.append(name)
+                continue
+            raise QualificationError(
+                f"site {site!r}: configured table {name!r} ({spec['file']}.parquet) is "
+                f"missing. If the site does not have it, declare it in "
+                f"sites.{site}.expected_absent_tables (configs/data.yaml or the site-local "
+                "configs/sites/<site>.local.yaml)")
         absent: list[str] = []
         df, shadows, counts = _read_source(
             con, base, spec, keep_ids, tables=cfg["tables"], target_units=target_units,
             fit_shadows=building, missing=absent,
             column_factors=column_factors(cfg, site, name),
             dose_corrections=dose_corrections(cfg, site, name) if spec.get("dose") else None,
-            harmonization=harmonization, name=name,
+            harmonization=harmonization, name=name, window=window,
         )
+        # Timestamp ingest (site_config.to_utc): naive local / non-UTC -> UTC; a time
+        # inside a DST gap becomes null and is counted, then dropped.
+        nulled = 0
+        try:
+            df, nulled = to_utc(df, ["dttm"], profile["site_timezone"])
+            if shadows is not None:
+                shadows, _ = to_utc(shadows, ["dttm"], profile["site_timezone"])
+        except SiteConfigError as exc:
+            raise QualificationError(f"table {name!r}: {exc}") from exc
+        if nulled:
+            dst_nulled[name] = nulled
+            df = df.filter(pl.col("dttm").is_not_null())
+            if shadows is not None:
+                shadows = shadows.filter(pl.col("dttm").is_not_null())
         if absent:
             missing_columns[name] = absent
         if counts is not None:
@@ -3452,9 +3944,10 @@ def tokenize_site(cfg: dict, site: str, base: Path, out: Path,
             df, harmonized["gcs"] = apply_gcs_not_testable(df, gcs)
         if bp_glob is not None and name == bp_glob["table"]:
             df, harmonized["bp_method"] = apply_bp_method(
-                df, bp_glob, harmonization["bp_method"], site)
+                df, bp_glob, harmonization["bp_method"], site, min_cell=min_cell)
         df = apply_concept_renames(df, harmonization["concept_renames"].get(name) or {})
-        df, derived = derive_concepts(df, name, cfg, con, base, keep_ids)
+        df, derived = derive_concepts(df, name, cfg, con, base, keep_ids,
+                                      site_timezone=profile["site_timezone"])
         if derived:
             harmonized.setdefault("derived_concepts", {}).update(derived)
         lag = availability[name]["lag_minutes"]
@@ -3468,7 +3961,20 @@ def tokenize_site(cfg: dict, site: str, base: Path, out: Path,
                 # is positioned at its shifted time.
                 frame = frame.with_columns(pl.col("dttm") + pl.duration(minutes=lag))
             sink.append(frame.with_columns(source=pl.lit(name)))
-    data_quality.update(check_dose_plausibility(dose_frames, cfg, site))
+        del df, shadows
+    data_quality.update(check_dose_plausibility(dose_frames, cfg, site, min_cell=min_cell))
+    crrt = crrt_coverage(con, base, cfg, harmonization, "crrt", window)
+    if crrt is not None:
+        effluent = ((harmonized.get("derived_concepts") or {})
+                    .get("crrt_effluent_dose_ml_kg_h") or {})
+        crrt["derived_effluent_dose_rows"] = int(effluent.get("emitted", 0))
+        data_quality["crrt_coverage"] = crrt
+    data_quality["site_profile"] = {
+        "site_timezone": profile["site_timezone"],
+        "extraction_dttm_declared": profile["extraction_dttm"] is not None,
+        "expected_absent_tables": sorted(expected_absent),
+        "dst_nulled_rows": dict(sorted(dst_nulled.items())),
+    }
     if harmonized:
         data_quality["harmonization"] = harmonized
     dose_frames.clear()
@@ -3486,55 +3992,73 @@ def tokenize_site(cfg: dict, site: str, base: Path, out: Path,
     mismatched_units = validate_units(
         events, cfg, None if building else vocab_artifact["reference_units"])
 
-    if episodes is None:
-        raise QualificationError("a canonical episode/split artifact is required")
     static = _read_static(con, base, cfg, keep_ids) if static_tokens else None
+    # Guard: verify single-hospital consistency (hospital_id is a CLIF 2.1 column that
+    # distinguishes hospitals within a health system; pooling hospitals under one vocab
+    # silently merges different clinical workflows and populations).
+    _check_single_hospital(con, base)
+    # Every DuckDB read is done: release its buffer pool before the polars joins, the sort
+    # and the encode (it counted toward the process peak).
+    con.close()
     carried = {name for name, spec in cfg["tables"].items() if spec.get("carry_forward")}
-    raw_events = events
+    # Stay starts for the static tokens and the carried state: every episode (eligible
+    # or not; the window join keeps the eligible) plus, for GEM, the extubation stays.
+    starts = (pl.concat([episodes.select("hospitalization_id", "admission_dttm",
+                                         "icu_admit_dttm"),
+                         extra_stays.select("hospitalization_id", "admission_dttm",
+                                            "icu_admit_dttm")], how="vertical_relaxed")
+              if extra_stays is not None and len(extra_stays) else episodes)
 
-    def at_stay_start(start_col: str) -> pl.DataFrame:
+    def at_stay_start(raw: pl.DataFrame, start_col: str) -> pl.DataFrame:
         """R21: static admission tokens at the stay start (`start_col`: ICU admission
         for the 24 h artifact, hospital admission for GEM), ahead of every other event
         there (`static_rank`); then state carried forward to that start."""
-        frame = raw_events
+        frame = raw
         if static is not None:
             placed = static.join(
-                episodes.select(pl.col("hospitalization_id").alias("hosp_id"),
-                                pl.col(start_col).alias("dttm")),
+                starts.select(pl.col("hospitalization_id").alias("hosp_id"),
+                              pl.col(start_col).alias("dttm")),
                 on="hosp_id", how="inner",
-            )
+            ).filter(pl.col("dttm").is_not_null())
             if len(placed):
                 frame = pl.concat(
                     [frame, placed.with_columns(unit=pl.lit(None, pl.String),
                                                 source=pl.lit(STATIC_SOURCE))],
                     how="diagonal_relaxed",
                 )
-        return _carry_forward(frame, episodes, carried, start_col)
+        return _carry_forward(frame, starts, carried, start_col)
 
     treatment_sources = {
         name for name, spec in cfg["tables"].items() if spec.get("input_only")
     } | ({STATIC_SOURCE} if static_tokens else set())
+    gem_window = None
     if gem_mode:
-        events = restrict_to_hospitalization_window(
-            at_stay_start("admission_dttm"), episodes, treatment_sources)
+        windowed = restrict_to_hospitalization_window(
+            at_stay_start(events, "admission_dttm"), episodes, treatment_sources,
+            extra_stays=extra_stays)
     else:
-        events = restrict_to_observation_window(
-            at_stay_start("icu_admit_dttm"), episodes, treatment_sources)
-    if vocab is not None or gem_cfg is None:
-        # The pre-window events are needed again only by the vocabulary build's GEM fit
-        # (below); otherwise release them before the sort, the fit and the encode.
-        raw_events = None
+        windowed = restrict_to_observation_window(
+            at_stay_start(events, "icu_admit_dttm"), episodes, treatment_sources)
+        if building and gem_cfg is not None:
+            # The reference build's GEM extension fits the full-hospitalization train
+            # events: windowed here, from the same pre-window events, before those are
+            # released.
+            gem_window = restrict_to_hospitalization_window(
+                at_stay_start(events, "admission_dttm"), episodes, treatment_sources)
+    # The pre-window events are not needed again: release them (and the static frame)
+    # before the sort, the fit and the encode.
+    del events
+    static = None
+    events = slim_windowed(windowed)
+    del windowed
+    if gem_window is not None:
+        gem_window = slim_windowed(gem_window)
     # KTD6: full-key sort AFTER the join (polars does not guarantee row order for equal
     # keys through a join or an unmaintained sort). Nulls sort last so a missing value
     # or categorical result has one fixed place; `group_by(maintain_order=True)` below
     # hands `encode` each stay's rows in exactly this order.
     events = _event_sort(events)
 
-    # Guard: verify single-hospital consistency for reference-site vocab.
-    # hospital_id is a CLIF 2.1 column that distinguishes hospitals within
-    # a health system. Multi-hospital pooling under one vocab silently merges
-    # different clinical workflows and populations.
-    _check_single_hospital(con, base)
     print(f"  {site}: {len(events):,} raw events, {events['hosp_id'].n_unique():,} stays")
 
     if vocab is None:  # --build-vocab path
@@ -3548,15 +4072,15 @@ def tokenize_site(cfg: dict, site: str, base: Path, out: Path,
         bin_cfg = cfg["value_binning"]
         fit_name = bin_cfg.get("fit_partition", "train")
 
-        def fit_rows(windowed: pl.DataFrame, window) -> pl.DataFrame:
+        def fit_rows(windowed: pl.DataFrame, window_fn) -> pl.DataFrame:
             """The fit partition of `windowed` events, plus — R6 / KTD5 — the
             native-unit fallback rows of weight-converted doses, which are fit
-            (windowed by the same `window` and fit-partition-only, like every event)
+            (windowed by the same `window_fn` and fit-partition-only, like every event)
             but never tokenized."""
             fit = fit_partition(windowed, fit_name)
             if shadow_frames:
-                shadows = window(pl.concat(shadow_frames, how="diagonal_relaxed"),
-                                 episodes, treatment_sources)
+                shadows = window_fn(pl.concat(shadow_frames, how="diagonal_relaxed"),
+                                    episodes, treatment_sources)
                 fit = pl.concat([fit, shadows.filter(pl.col("partition") == fit_name)],
                                 how="diagonal_relaxed")
             return fit
@@ -3587,14 +4111,17 @@ def tokenize_site(cfg: dict, site: str, base: Path, out: Path,
         vocab = build_vocab(fit_events, edges, min_category_stays=min_cell)
         for token in harmonization_tokens(cfg):   # config allowlist, after data tokens
             vocab.setdefault(token, max(vocab.values()) + 1)
+        # CLIF 2.1.1 mCIDE allowlist (configuration, not data: no cell floor), after the
+        # harmonization tokens; hashed with the vocabulary.
+        for token in allowlist_tokens(cfg):
+            vocab.setdefault(token, max(vocab.values()) + 1)
         units = reference_units(fit_events, edges, cfg, target_units, site)
         sources = concept_sources(fit_events, treatment_sources)
         if gem_cfg is not None:
             # U8: one vocabulary for both artifacts. Extend it with what only the
             # full-hospitalization train events chart, then the fixed allowlist.
-            gem_fit = fit_rows(restrict_to_hospitalization_window(
-                at_stay_start("admission_dttm"), episodes, treatment_sources),
-                restrict_to_hospitalization_window)
+            gem_fit = fit_rows(gem_window, restrict_to_hospitalization_window)
+            gem_window = None
             vocab, edges, binning_sources, units, sources = _extend_for_gem(
                 gem_cfg, gem_fit, fit_events, vocab, edges, binning_sources, units,
                 bin_cfg=bin_cfg, cfg=cfg, directions=directions, target_units=target_units,
@@ -3603,7 +4130,8 @@ def tokenize_site(cfg: dict, site: str, base: Path, out: Path,
                 literature=literature, site=site,
             )
             del gem_fit
-        raw_events = None   # last pre-window use was the GEM fit above
+        del fit_events
+        shadow_frames.clear()
         cohort_cfg = yaml.safe_load((ROOT / cfg["cohort_contract"]).read_text())
         split_hashes = episodes["split_sha256"].drop_nulls().unique().to_list()
         if len(split_hashes) != 1:
@@ -3625,8 +4153,9 @@ def tokenize_site(cfg: dict, site: str, base: Path, out: Path,
             hashes["literature_segments"] = json_sha256(literature)
         harmonization_rec = harmonization_record(cfg, site)
         if harmonization_rec:
-            # mCIDE snapshot version + hash, GCS / BP / flag / weight / unit rules and
-            # this reference site's alias maps, duplicates and BP mapping.
+            # mCIDE snapshot version + hash, GCS / BP / flag / weight / unit rules,
+            # the mCIDE allowlist and this reference site's alias maps, duplicates and
+            # BP mapping (free-text notes stripped).
             harmonization_rec = json.loads(json.dumps(harmonization_rec))
             hashes["harmonization"] = json_sha256(harmonization_rec)
         vocab_manifest = {
@@ -3682,6 +4211,7 @@ def tokenize_site(cfg: dict, site: str, base: Path, out: Path,
             vocab_artifact["literature_segments"] = literature
         if harmonization_rec:
             vocab_artifact["harmonization"] = harmonization_rec
+    shadow_frames.clear()
 
     # The unknown-concept fallback below emits SPECIAL["<unk>"] for a concept+bin the
     # frozen vocab does not cover (cross-site coverage). That is only safe if the vocab
@@ -3695,41 +4225,42 @@ def tokenize_site(cfg: dict, site: str, base: Path, out: Path,
             f"(found {vocab.get('<unk>')!r}); the unknown-concept fallback is unsafe otherwise"
         )
 
+    binding = shard_binding(vocab_artifact, cfg, site)
     shards, unk_by_concept = _parallel_encode(
         events, vocab, edges, cfg["value_binning"], gem_mode, workers, encode_chunk_events)
     if gem_mode:
         soft_width = _soft_width(cfg["value_binning"])
-        stays = episodes.filter(pl.col("eligible"))
-        if keep_ids is not None:
-            stays = stays.filter(pl.col("hospitalization_id").is_in(keep_ids))
         gem_stats: dict = {}
         if continuation_header is None:
             continuation_header = model_continuation_header()
-        gem = _gem_records(shards, stays, vocab, gem_cfg, max_tokens, soft_width,
-                           artifact_binding(vocab_artifact),
+        gem = _gem_records(shards, stays, vocab, gem_cfg, max_tokens, soft_width, binding,
                            stats if stats is not None else gem_stats,
                            continuation_header=bool(continuation_header))
+        del shards
         out.mkdir(parents=True, exist_ok=True)
-        gem.write_parquet(events_path)
+        _write_shard(gem, events_path)
         # DATA-CLASSIFICATION: PHI (hosp_id + per-stay sequences + timing), like
         # events.parquet. vocab.json / events.parquet are not touched by this mode.
         print(f"  wrote {events_path} ({gem['hosp_id'].n_unique() if len(gem) else 0:,} "
               f"stays, {len(gem):,} windows)")
         if report:
+            gem_record = dict((stats if stats is not None else gem_stats).get("gem") or {})
+            if extra_counts is not None:
+                gem_record["extubation_index_stays"] = dict(extra_counts)
             _write_run_report(out / GEM_REPORT_FILE, trajectory, events, gem,
                               vocab_artifact, site, availability, cfg, dose_stats,
                               mismatched_units, unk_by_concept, keep_ids, episodes,
-                              max_tokens,
-                              (stats if stats is not None else gem_stats).get("gem"),
+                              max_tokens, gem_record,
                               min_cell=min_cell, missing_columns=missing_columns,
                               data_quality=data_quality)
         return vocab, edges
     if len(shards):
         # KTD7: every shard row is bound to the tokenizer version, vocabulary and
-        # segments it was encoded with; ModelDataset refuses a row without it.
-        shards = shards.with_columns(binding_expr(artifact_binding(vocab_artifact)))
+        # segments it was encoded with, and to the site's declarations; ModelDataset
+        # refuses a row without the vocabulary binding.
+        shards = shards.with_columns(binding_expr(binding))
     out.mkdir(parents=True, exist_ok=True)
-    shards.write_parquet(events_path)
+    _write_shard(shards, events_path)
     # DATA-CLASSIFICATION: PHI — contains hosp_id + per-stay token sequences + timing.
     # Do not export off-node. For external validation, use clif_validate.py which
     # returns only aggregate metrics. See NEXT_STEPS.md §6 rule 4.
@@ -3812,8 +4343,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
                          "deterministically from --episodes; the vocabulary is marked "
                          "provenance.sample: true and training refuses it")
     ap.add_argument("--workers", type=int, default=1, metavar="N",
-                    help="processes for per-stay encoding (0 = every CPU); the output is "
-                         "byte-identical for any value")
+                    help=f"processes for per-stay encoding (0 = every usable CPU, at most "
+                         f"{MAX_AUTO_WORKERS}); the output is byte-identical for any value")
+    ap.add_argument("--extubation-cohort", default=None, metavar="PATH",
+                    help="hospitalization trajectory only: the site's extubation cohort; "
+                         "the index stay of every eligible extubation that is not an "
+                         "eligible episode is added to the GEM stays (partition inherited "
+                         "from the patient)")
     ap.add_argument("--encode-chunk-events", type=int, default=None, metavar="N",
                     help=f"events per encode chunk (default {ENCODE_CHUNK_EVENTS:,}); bounds "
                          "encode memory, output byte-identical for any value")
@@ -3825,7 +4361,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None):
     args = build_arg_parser().parse_args(argv)
 
-    cfg = yaml.safe_load(Path(args.config).read_text())
+    # The site's git-ignored local declarations (configs/sites/<site>.local.yaml).
+    cfg = with_site_local(yaml.safe_load(Path(args.config).read_text()), args.site)
     validate_table_availability(cfg.get("tables"))
     policy = yaml.safe_load((ROOT / cfg["artifact_policy"]).read_text())
     blob = None
@@ -3836,16 +4373,14 @@ def main(argv: list[str] | None = None):
         raise SystemExit("pass --build-vocab (first site) or --vocab PATH (later sites)")
 
     if args.dry_run:
-        con = duckdb.connect()
-        con.execute("SET TimeZone = 'UTC'")  # same session-tz pin as tokenize_site
-        target_units = _dose_target_units(cfg, blob)
-        for name, spec in cfg["tables"].items():
-            df = _read_table(con, Path(args.indir), spec, tables=cfg["tables"],
-                             target_units=target_units)
-            print(f"{name}: {len(df):,} events, concepts={df['concept'].n_unique() if len(df) else 0}")
-        return
+        return dry_run(cfg, args.site, Path(args.indir), blob)
 
     episodes = pl.read_parquet(args.episodes)
+    cohort = None
+    if args.extubation_cohort:
+        if args.trajectory != "hospitalization":
+            raise SystemExit("--extubation-cohort is read by --trajectory hospitalization only")
+        cohort = pl.read_parquet(args.extubation_cohort)
     tokenize_site(
         cfg,
         args.site,
@@ -3860,8 +4395,46 @@ def main(argv: list[str] | None = None):
         report=not args.no_report,
         workers=args.workers,
         encode_chunk_events=args.encode_chunk_events,
+        extubation_cohort=cohort,
     )
 
 
+def dry_run(cfg: dict, site: str, base: Path, blob: dict | None) -> int:
+    """`--dry-run`: read every configured table through the site's declarations (column
+    aliases, category maps, unit conversions; no window) and print, per table, aggregate
+    events and concepts, the timestamps inside a DST gap, and whether an absent table is
+    declared absent. Returns 1 (and prints the fix) when a table is missing undeclared."""
+    profile = site_profile(cfg, site)
+    con = duckdb.connect()
+    con.execute("SET TimeZone = 'UTC'")  # same session-tz pin as tokenize_site
+    target_units = _dose_target_units(cfg, blob)
+    harmonization = site_harmonization(cfg, site)
+    bp_glob = bp_config(cfg)
+    if bp_glob is not None:
+        harmonization["_bp_table"] = bp_glob["table"]
+    unexpected = []
+    for name, spec in cfg["tables"].items():
+        if not (base / f"{spec['file']}.parquet").exists():
+            expected = name in profile["expected_absent_tables"]
+            print(f"{name}: absent ({'declared in expected_absent_tables' if expected else 'NOT DECLARED: the build fails'})")
+            if not expected:
+                unexpected.append(name)
+            continue
+        df, _, _ = _read_source(
+            con, base, spec, None, tables=cfg["tables"], target_units=target_units,
+            column_factors=column_factors(cfg, site, name),
+            dose_corrections=dose_corrections(cfg, site, name) if spec.get("dose") else None,
+            harmonization=harmonization, name=name)
+        df, nulled = to_utc(df, ["dttm"], profile["site_timezone"])
+        print(f"{name}: {len(df):,} events, concepts={df['concept'].n_unique() if len(df) else 0}"
+              + (f", {nulled:,} timestamps inside a DST gap (nulled)" if nulled else ""))
+        del df
+    if unexpected:
+        print(f"MISSING undeclared table(s): {', '.join(unexpected)}; declare them in "
+              f"sites.{site}.expected_absent_tables if the site does not have them")
+        return 1
+    return 0
+
+
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main() or 0)

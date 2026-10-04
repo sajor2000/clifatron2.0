@@ -31,7 +31,18 @@ result: agreement with the trial's pattern is not proof of cause.
 
 from __future__ import annotations
 
-import argparse
+import os
+
+# The causal estimators are numpy (BLAS) nuisance fits on small matrices: a BLAS / OpenMP
+# pool of every core on the L40 node only oversubscribes it (and makes the last bits of a
+# reduction depend on the core count). Capped to one thread unless the caller set the
+# variables; read by the BLAS library when numpy is first imported, so this must precede
+# that import (`python -m src.eval.extubation_audit`). The audit's output is unchanged.
+for _var in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS",
+             "VECLIB_MAXIMUM_THREADS"):
+    os.environ.setdefault(_var, "1")
+
+import argparse  # noqa: E402
 import csv
 import hashlib
 import io

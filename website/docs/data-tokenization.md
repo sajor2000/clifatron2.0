@@ -463,8 +463,18 @@ They stay on their node. External validation returns only aggregate metrics, thr
 :::
 
 **Parallel encoding.** The per-stay encode loop runs in a process pool (`--workers N`, `0` = every
-CPU) over contiguous chunks of the ordered events, cut only at stay boundaries and concatenated in
+usable CPU, capped at 8; each worker single-threaded in polars) over contiguous chunks of the ordered events, cut only at stay boundaries and concatenated in
 order. Every artifact is byte-identical for any worker count (tested on both trajectories).
+
+**Scale and sites (2026-10-03).** The eligible stays and their window bounds are pushed into the
+DuckDB scan, so other stays' rows never reach memory; shards are written grouped by partition in
+row groups of 4,096 rows, so a partition filter skips the other partitions. Every shard row's
+binding also records its site and the hash of that site's declarations (including the
+git-ignored `configs/sites/<site>.local.yaml`). Per site, `configs/data.yaml` `sites` declares the
+time zone (naive timestamps converted to UTC), the data-extraction time (open stays censored) and
+the tables the site does not have; any other absent table fails the build. Every permissible
+CLIF 2.1.1 value of the `vocabulary_allowlist` lists is a vocabulary token, and a medication
+administration whose action is not a dose is excluded.
 
 ---
 
@@ -770,12 +780,12 @@ Remaining residuals:
 # 1. Reference site (Site 1; --site must equal value_binning.build_from_site)
 uv run python -m src.data.tokenize --site mimic --in "$SITE1_DIR" \
   --out output/intermediate_phi/mimic --build-vocab \
-  --episodes output/intermediate_phi/episodes.parquet --workers 0
+  --episodes output/intermediate_phi/episodes.parquet --workers 8
 
 # 2. GEM artifact with the same frozen vocabulary
 uv run python -m src.data.tokenize --site mimic --in "$SITE1_DIR" \
   --out output/intermediate_phi/mimic --vocab output/intermediate_phi/mimic/vocab.json \
-  --episodes output/intermediate_phi/episodes.parquet --trajectory hospitalization --workers 0
+  --episodes output/intermediate_phi/episodes.parquet --trajectory hospitalization --workers 8
 
 # 3. Every other site: reuse the frozen vocab (hash-verified, no refit)
 uv run python -m src.data.tokenize --site site2 --in "$SITE2_DIR" \
@@ -794,7 +804,7 @@ uv run python -m src.data.value_stats \
 # Verification sample (smoke-only vocabulary), then the gate and the training smoke
 uv run python -m src.data.tokenize --site mimic --in "$SITE1_DIR" \
   --out output/intermediate_phi/mimic_v2_sample --build-vocab \
-  --episodes output/intermediate_phi/episodes.parquet --sample-episodes 5000 --workers 0
+  --episodes output/intermediate_phi/episodes.parquet --sample-episodes 5000 --workers 8
 uv run python -m src.data.tokenization_report \
   --report output/intermediate_phi/mimic_v2_sample/tokenization_report.json
 uv run python -m src.train.real_data_smoke --data-dir "$SITE1_DIR" \

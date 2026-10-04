@@ -45,7 +45,6 @@ from src.data.segments import (
     TOKENIZER_VERSION,
     ArtifactBindingError,
     artifact_binding,
-    binding_expr,
     compare_binding,
     json_sha256,
     n_value_bins_of,
@@ -223,7 +222,15 @@ def derive_continuous_fused_shard(primary_events, primary_blob: Mapping,
         # the error it always has (TypeError / KeyError).
         tokens = pl.Series("token", [[lookup[int(i)] for i in ids] for ids in old.to_list()],
                            dtype=dtype)
-    return frame.with_columns(tokens.alias("token"), binding_expr(binding))
+    # The site fields of the primary binding (`tokenize.site_binding`: the site and the
+    # hash of its declarations) are carried over: the rows still come from that site.
+    fields = [f.name for f in frame.schema["artifact_hashes"].fields]
+    carried = [f for f in ("site", "site_declarations") if f in fields and f not in binding]
+    rebound = pl.struct(
+        [pl.lit(v, pl.String).alias(k) for k, v in binding.items()]
+        + [pl.col("artifact_hashes").struct.field(f).alias(f) for f in carried]
+    ).alias("artifact_hashes")
+    return frame.with_columns(tokens.alias("token"), rebound)
 
 
 def write_continuous_fused_arm(primary_vocab: str | Path, primary_events: str | Path,
@@ -247,7 +254,8 @@ def write_continuous_fused_arm(primary_vocab: str | Path, primary_events: str | 
     shard = derive_continuous_fused_shard(pl.read_parquet(primary_events), primary_blob,
                                           blob, remap)
     out.mkdir(parents=True, exist_ok=True)
-    shard.write_parquet(events_path)
+    # Same layout as the primary shard (partition-grouped rows, small row groups).
+    shard.write_parquet(events_path, row_group_size=4096, statistics=True)
     vocab_path = out / "vocab.json"
     vocab_path.write_text(json.dumps(blob))
     return vocab_path, events_path
