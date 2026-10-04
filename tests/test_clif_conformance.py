@@ -535,6 +535,84 @@ class ReadSourceTest(unittest.TestCase):
         self.assertEqual(h1["concept"].to_list(), ["norepinephrine_mcg_kg_min"])
         self.assertAlmostEqual(h1["value"][0], 0.1)
 
+    MED_SCHEMA = {
+        "hospitalization_id": pl.String, "med_order_id": pl.String, "admin_dttm": UTC_DT,
+        "med_name": pl.String, "med_category": pl.String, "med_dose": pl.Float64,
+        "med_dose_unit": pl.String, "mar_action_category": pl.String,
+    }
+
+    def read_meds(self, rows, *, weights=True):
+        """Read the continuous-med table through a connection that records its SQL."""
+        from src.data.tokenize import _dose_target_units
+
+        class Spy:
+            def __init__(self, inner):
+                self.inner, self.statements = inner, []
+
+            def execute(self, sql, params=None):
+                self.statements.append((sql, params))
+                return self.inner.execute(sql, params) if params is not None \
+                    else self.inner.execute(sql)
+
+            def __getattr__(self, name):
+                return getattr(self.inner, name)
+
+        pl.DataFrame(rows, orient="row", schema=self.MED_SCHEMA).write_parquet(
+            self.base / "clif_medication_admin_continuous.parquet")
+        if weights:
+            pl.DataFrame([("SYN-H-1", T0 - timedelta(hours=1), "weight_kg", 80.0)],
+                         orient="row", schema={
+                             "hospitalization_id": pl.String, "recorded_dttm": UTC_DT,
+                             "vital_category": pl.String, "vital_value": pl.Float64},
+                         ).write_parquet(self.base / "clif_vitals.parquet")
+        spy = Spy(con())
+        out = _read_source(
+            spy, self.base, self.cfg["tables"]["meds"], tables=self.cfg["tables"],
+            target_units=_dose_target_units(self.cfg, None), harmonization=self.decl,
+            name="meds")
+        return out, spy
+
+    def test_exact_duplicate_rule_is_null_safe_and_exact(self):
+        # Rule semantics, pinned independently of how the SQL joins: a `drop` row is removed
+        # only when a `keep` row matches on EVERY match column (NULL = NULL); a differing
+        # dose, a lone `drop` row, a lone `keep` row and any other category stay.
+        def row(order, name, category, dose=50.0):
+            return ("SYN-H-1", order, T0, name, category, dose, "mL/hour", "start")
+        rows = [
+            row("o1", "Dextrose 5%", "dextrose"), row("o1", "Dextrose 5%", "dextrose_in_water_d5w"),
+            row(None, "Dextrose 5%", "dextrose"), row(None, "Dextrose 5%", "dextrose_in_water_d5w"),
+            row("o3", "Dextrose 10%", "dextrose"),                       # lone drop row: kept
+            row("o4", "Dextrose 5%", "dextrose_in_water_d5w"),           # lone keep row: kept
+            row("o5", "Dextrose 5%", "dextrose"),
+            row("o5", "Dextrose 5%", "dextrose_in_water_d5w", dose=60.0),  # dose differs: both kept
+            row("o6", "Albumin 5%", "albumin_infusion"),
+            row("o6", "Albumin 5%", "albumin"),                          # not a drop category
+        ]
+        (events, _, counts), _ = self.read_meds(rows, weights=False)
+        self.assertEqual(counts["exact_duplicates_removed"], 2)
+        concepts = events["concept"].to_list()
+        self.assertEqual(concepts.count("dextrose_5_water_ml_hr"), 5)   # o1, null, o4, o5 x2
+        self.assertEqual(concepts.count("dextrose_10_water_ml_hr"), 1)
+        self.assertEqual(concepts.count("albumin_ml_hr"), 2)
+
+    def test_exact_duplicate_join_is_not_a_nested_loop(self):
+        # Performance guard (2026-10-04): with the `drop` membership test in the join's ON
+        # clause DuckDB planned a BLOCKWISE_NL_JOIN, quadratic in the med rows (46 s for
+        # 0.55 M rows, hours on full MIMIC). The dedupe must plan as a hash join.
+        rows = [("SYN-H-1", f"o{i}", T0 + timedelta(minutes=i), "Dextrose 5%", cat, 50.0,
+                 "mL/hour", "start")
+                for i in range(200) for cat in ("dextrose", "dextrose_in_water_d5w")]
+        (_, _, counts), spy = self.read_meds(rows)
+        self.assertEqual(counts["exact_duplicates_removed"], 200)
+        dose_sql = [(sql, params) for sql, params in spy.statements if "ASOF" in sql]
+        self.assertEqual(len(dose_sql), 1)
+        sql, params = dose_sql[0]
+        plan = " ".join(str(cell) for r in con().execute("EXPLAIN " + sql, params).fetchall()
+                        for cell in r)
+        self.assertIn("HASH_JOIN", plan)
+        for bad in ("NESTED_LOOP", "BLOCKWISE_NL", "CROSS_PRODUCT"):
+            self.assertNotIn(bad, plan)
+
     def test_ketamine_mg_per_kg_and_dose_floors(self):
         from src.data.tokenize import apply_dose_floors, dose_corrections
         rows = [("SYN-H-1", T0 + timedelta(hours=h), "ketamine", dose, unit, "given")

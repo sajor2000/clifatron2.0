@@ -750,7 +750,14 @@ def _read_dose_table(con, base: Path, fp: Path, spec: dict, keep_ids: list | Non
     # Declared exact duplicates (site_harmonization.<site>.exact_duplicates): a `drop`
     # category row identical to a `keep` category row on every `match` column is the same
     # administration charted twice; it is flagged here and removed (counted) below.
-    dup_sql, dup_join, dup_params = "FALSE", "", []
+    #
+    # The ON clause carries ONLY the `match` equalities. Putting the `drop` membership test
+    # (`name(category) IN (...)`) in the ON clause as well makes DuckDB plan the join as a
+    # BLOCKWISE_NL_JOIN (nested loop, O(rows x keep rows)): 46 s for 0.55 M continuous-med
+    # rows on a 5 000-stay sample, hours on full MIMIC. As a pure equi-join it is a hash
+    # join (the `keep` side is DISTINCT on the match columns, so a row matches at most
+    # once), and the `drop` test moves to the SELECT, where it ANDs with the match flag.
+    dup_sql, dup_join, dup_select_params, dup_join_params = "FALSE", "", [], []
     rule = spec.get("_exact_duplicates")
     if rule:
         match = rule["match"]
@@ -758,10 +765,10 @@ def _read_dose_table(con, base: Path, fp: Path, spec: dict, keep_ids: list | Non
         on = " AND ".join(f"s.{c} IS NOT DISTINCT FROM k._k{i}" for i, c in enumerate(match))
         drop = ", ".join("?" for _ in rule["drop"])
         dup_join = (f"LEFT JOIN (SELECT DISTINCT {keys}, TRUE AS _hit FROM {source} "
-                    f"WHERE {_name_sql(concept_col)} = ?) k ON {_name_sql('s.' + concept_col)} "
-                    f"IN ({drop}) AND {on}")
-        dup_params = [rule["keep"], *rule["drop"]]
-        dup_sql = "coalesce(k._hit, FALSE)"
+                    f"WHERE {_name_sql(concept_col)} = ?) k ON {on}")
+        dup_sql = (f"coalesce({_name_sql('s.' + concept_col)} IN ({drop}) AND k._hit, FALSE)")
+        dup_select_params = list(rule["drop"])
+        dup_join_params = [rule["keep"]]
     # Column references stay unqualified: the duplicate side only carries _k*/_hit.
     doses = f"""
         SELECT CAST(hospitalization_id AS VARCHAR) AS hosp_id, {time_col} AS dttm,
@@ -772,9 +779,9 @@ def _read_dose_table(con, base: Path, fp: Path, spec: dict, keep_ids: list | Non
         FROM {source} s {dup_join}
         WHERE {concept_col} IS NOT NULL AND {time_col} IS NOT NULL {id_sql}
     """
-    # Bound in textual order: the stop actions and excluded actions (SELECT), the
-    # duplicate join, the ids.
-    params = [*params, *excl_params, *dup_params, *id_params]
+    # Bound in textual order: the stop actions, the duplicate `drop` categories and the
+    # excluded actions (SELECT), the duplicate join's `keep` category, the ids.
+    params = [*params, *dup_select_params, *excl_params, *dup_join_params, *id_params]
     # Continuous doses convert per-kg rates; an intermittent table declaring a weight
     # source converts per-kg single doses (e.g. ketamine mg/kg) to absolute mass.
     weight = dose.get("weight_source")
