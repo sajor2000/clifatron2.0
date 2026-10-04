@@ -20,9 +20,9 @@ Written 2026-10-03 for the agent (or person) who takes this branch to `rudu-hpcg
 
 - Branch `t3code/extubation-counterfactual-plan`, PR #17 (draft). Everything up to the
   CLIF 2.1 conformance commit is pushed and CI is green on Python 3.11 and 3.13.
-- The commit after that holds the data-pipeline and Rush-onboarding work. It passes the
-  full local suite (about 1,515 tests) and the `clif-validate` suite (34), and the docs
-  build. **It has not been run at full MIMIC scale** (see section 4).
+- PR #17 is merged to `main`. It passes the full local suite (about 1,530 tests) and the
+  `clif-validate` suite (34), and the docs build. The full-MIMIC tokenization timing is in
+  section 4, item 1.
 - Code is built for every Milestone 1 unit: tokenizer arms and literature-grounded bins,
   in-stream time-to-event targets, curriculum, multi-site loader, experiment matrix (96 runs),
   claims panel, CLIF task suite and baselines, extubation cohort, labels, estimators, audit
@@ -44,12 +44,13 @@ Written 2026-10-03 for the agent (or person) who takes this branch to `rudu-hpcg
 
 ## 4. Known risks and open problems (read before launching)
 
-1. **Unexplained tokenizer slowdown.** The last local full-MIMIC full-hospitalization
-   tokenization had run about 25 minutes (about 176 CPU-minutes, 23 GB) when it was stopped;
-   the earlier build of the same step took about 96 seconds. The new work in that step (each
-   extubation's index stay added to the tokenized set, site config, conformance gate, memory
-   gate) may explain it, or it is a regression. Time runbook step 8 on the node with
-   `/usr/bin/time -v`; if it is far slower than a few minutes, profile before going further.
+1. **Tokenizer slowdown: found and fixed.** The exact-duplicate dedupe for dextrose
+   medication rows (added in the conformance commit) used a join that DuckDB planned as a
+   nested loop, quadratic in the medication rows. The fix keeps the join on equalities only,
+   so it plans as a hash join, with a plan-guard test. Outputs are byte-identical. Measured
+   on full MIMIC with `--workers 8` on a 16-core Mac: 24 h build 50 s, full-hospitalization
+   build 110 s, peak RSS about 30 GB. Still time runbook step 8 on the node with
+   `/usr/bin/time -v`; anything over about 10 minutes is a new problem.
 2. **CUDA paths are untested.** Run the pre-flight (runbook step 15) first; it checks GPUs,
    the NCCL wheel and version, the driver against the CUDA 13 build (needs driver 580+), a
    two-GPU smoke, memory, data binding, value-stat coverage for every site, the schedule and
